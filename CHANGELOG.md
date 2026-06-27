@@ -2,26 +2,41 @@
 
 All notable changes to Qobuz Librarian are recorded here, newest first. The project follows [semantic versioning](https://semver.org/); dates are when each version was tagged during local development.
 
-## [0.9.4] - 2026-06-24
+## [0.9.4] - 2026-06-25
 
-**Web UI**
+**Search and review**
 
-- Search now respects your library. Albums you already own are marked "In library" with a quiet "Download again" instead of a plain Download button, so search stops inviting you to re-grab music you have — it uses the same owned-album match the scans do. The whole app is gap-fill, and an unconditional Download on an owned album contradicted that.
-- A review now completes the moment you dismiss its last album. Before, hiding everything left the job stuck "awaiting review" over an empty list and kept a stale new-release banner on the dashboard that read "0 new releases"; the banner is now also gated on a non-zero count so it can never read zero again.
-- "New releases" now means recently released. The check was a plain catalog diff, so an old album Qobuz back-filled into an artist's catalog got flagged as new — a 2020 album could show up as a "new release". It now only surfaces albums released within a recency window (`NEW_RELEASE_MAX_AGE_DAYS`, default 365 days; 0 disables it). Gap-fill still surfaces old albums you're missing, as before.
-- The search box is one clean bar again — the input and button are joined at every width — instead of a small field above an oversized full-width button on phones.
-- Decluttered the dashboard: dropped the marketing tagline and the quick-action tiles that just duplicated the nav, so it leads straight with search and recent activity.
-- Finish fixes: the hidden-albums list no longer crushes the artist name to "R…" on a phone, history result lines wrap instead of clipping, and a few headers stack cleanly on small screens.
-- A failed download now says what actually went wrong — tracks failed, downloaded-but-import-failed, or nothing retrieved (Qobuz rate-limiting or an unavailable release, try again) — instead of the catch-all "download or import failed".
-- The nav Queue badge now updates itself (it polls a small count endpoint) instead of being baked in at page load — so it can't sit reading "1" beside an empty Queue after a job finished while you were on another page.
+- Search results are grouped by album and show what is already in your library. A matched album shows "In library" with no download button; other editions (remaster, deluxe, a live take) are grouped under expandable "other versions" you can still download. Quality upgrades stay on the Upgrade page, keeping search focused on finding music. Albums filed under a collaboration folder are now matched correctly.
+- Closing a scan review now returns to the queue with the scan parked and reopenable; discarding is a separate, confirmed action. Select-all, clear-all, and "dismiss unselected" are available from the review screen, with dismissed albums recoverable from the Dismissed albums page.
+- Dismissing a review's last album completes it instead of leaving the job stuck on an empty list with an old "0 new releases" banner.
+- "New releases" means new to the saved Qobuz catalogue baseline and within the release-age window, so a back-filled old album no longer shows as new (window `NEW_RELEASE_MAX_AGE_DAYS`, default 365 days).
+
+**Library and tools**
+
+- The Library page now treats the full scan as a one-time baseline. After the baseline exists, new-release checks become the main action, while a full re-scan remains available when needed.
+- The queue and history spell out destructive actions: bulk actions show how many they affect ("Cancel all N jobs", "Clear all N finished jobs") and each per-job control says what it does (remove from queue, stop, or discard the scan).
+- Cancelling a queued job takes effect at once: it leaves the queue the moment you cancel it, instead of sitting as "Queued" until the job ahead of it finishes.
+- The Library and maintenance tool pages use consistent naming and warnings; Downsample and Lyrics run without a Qobuz token; an unconnected account gets a setup prompt rather than a warning; and Settings holds back the operational toggles until a token is saved.
+
+**Polish and fixes**
+
+- The search box is one joined bar at every width, the dashboard leads with search and recent activity, a single-track release reads "1 track" rather than "1 tracks", and a failed download says what actually went wrong rather than a catch-all.
+- The navigation menu closes when you tap outside it, not only when you tap the button again, and the dismissed-albums list moved out of the menu (it stays one tap away on the Library page and after any review).
+- Approving a review with nothing selected used to flip the job to done over an empty set; it now keeps the job in review and says nothing was selected.
+- Saved Qobuz credentials are flushed to disk durably, the dismissed-album store is safe against two processes writing it at once, and the lyrics pass no longer prints raw status codes and counter dicts to the log.
+- Mobile polish: dismissed-album artist names no longer truncate to "R…", history lines wrap instead of clipping, and small-screen headers stack cleanly.
+
+**Setup and docs**
+
+- compose.yaml forwards the documented `.env` knobs it previously dropped, and a new `WEB_BIND` sets the host interface the UI binds to. The README, configuration docs, and example env are brought in line with the current UI.
 
 ## [0.9.3] - 2026-06-23
 
 **Data-safety polish**
 
-- Migrating in place into a destination that's short on space is now blocked before anything moves, the same way the CLI already refused it — a move that runs out mid-way would leave your library half-relocated. Tick "proceed even if low on space" on the Migrate screen to override deliberately. The copy mode (the default) still only warns, since it leaves your originals intact.
+- In-place migration to a destination short on space is blocked before files move, matching the CLI safeguard. The Migrate screen includes an explicit low-space override. Copy mode still warns rather than blocks, because the source library is left intact.
 - The migration space preview now counts the cover art, booklets, and `.cue`/`.log` sidecars that get carried alongside the audio, so the estimate matches what the copy actually writes — previously a library with large booklets could see an estimate that was too low, and an in-place move could read "0 bytes" while still copying art.
-- When a parked album finally imports on a retry, any non-audio companions it left behind (booklets, scans, cover art) are now moved somewhere safe instead of being deleted with the staging folder — the same protection the upgrade path already had.
+- When a parked album finally imports on a retry, any non-audio companions it left behind (booklets, scans, cover art) are now preserved outside the staging folder before cleanup — the same protection the upgrade path already had.
 
 **Correctness**
 
@@ -34,25 +49,25 @@ All notable changes to Qobuz Librarian are recorded here, newest first. The proj
 **Setup, docs, and release polish**
 
 - `compose.yaml` now forwards the documented `.env` knobs that it previously dropped — `WEB_AUTH_PASSWORD_FILE`, the free-space floor, the repair cache/pacing settings, beets path/plugin overrides, and the live-album filter — so setting them in `.env` actually takes effect.
-- New `WEB_BIND` controls the host interface the UI is published on; set `WEB_BIND=127.0.0.1` to keep it off the LAN. (The old advice to set `WEB_HOST=127.0.0.1` was wrong for Docker — that's the in-container bind.)
-- New releases are described everywhere as flagged/badged for review rather than "pre-ticked": the review screen leaves them un-ticked so one click can't queue a whole list.
-- Configuration docs now state the real new-release and catalog-cache defaults, clarify that Settings covers the common behaviour knobs while advanced ones stay in `.env`/Compose, and fix the migration-results filename, lock-handoff, and CLI-container wording. The Docker image's license metadata now reflects the third-party (GPL) tools it bundles, and the release smoke test verifies the compiled stylesheet is actually served.
+- New `WEB_BIND` controls the host interface the UI is published on; set `WEB_BIND=127.0.0.1` to keep it off the LAN. `WEB_HOST` remains the in-container bind for non-Docker runs.
+- New releases are described everywhere as listed for review rather than "pre-ticked": the review screen leaves them un-ticked so they cannot all be queued by accident.
+- Configuration docs now state the real new-release and catalogue-cache defaults, clarify that Settings covers the common behaviour knobs while advanced ones stay in `.env`/Compose, and fix the migration-results filename, lock-handoff, and CLI-container wording. The Docker image's licence metadata now reflects the third-party (GPL) tools it bundles, and the release smoke test verifies the compiled stylesheet is actually served.
 
 ## [0.9.2] - 2026-06-23
 
 **New-release check needs a baseline first**
 
-- A new-release check compares your artists' Qobuz catalogs against a baseline that a full library scan builds, so it now needs one first. Until your first full scan finishes, "Check for new releases" is disabled (with a note saying why) and a direct request is refused — instead of crawling to an empty baseline, surfacing nothing, and marking the baseline "done," which previously left an interrupted library scan unable to resume. The automatic daily check likewise waits behind an interrupted scan you're resuming.
+- New-release checks now require the baseline produced by a full library scan. Until that baseline exists, "Check for new releases" is disabled with an explanatory note, direct requests are refused, and the automatic daily check waits behind an interrupted baseline scan.
 
 ## [0.9.1] - 2026-06-23
 
-**Reviews no longer pile up**
+**Reviews no longer duplicate**
 
-- Re-running a scan — repair, library gap-fill, upgrade, or downsample — replaces its earlier pending review instead of stacking a second one. A parked review doesn't clear itself, so without this a repeat scan left a duplicate "N candidates" review sitting on the dashboard every time.
+- Re-running a scan — repair, library gap-fill, upgrade, or downsample — replaces its earlier pending review instead of stacking duplicate review cards on the dashboard.
 
-**"New releases" means actually new**
+**New-release checks use the saved baseline**
 
-- The new-release check flags an album when it appears in an artist's catalog and you don't own it — including an old album Qobuz only just added, which is genuinely new to you. The fix is in keeping the baseline trustworthy so this can't dump your back-catalog: a catalog bigger than the fetch limit is recorded but not diffed (its order isn't stable run to run), the baseline grows by union instead of being overwritten, and when the catalog fetch limit itself grows the check re-baselines once rather than treating the newly-visible older albums as fresh arrivals. Candidates default to un-ticked, so a review never queues a pile of downloads in one tap.
+- The new-release check flags albums in an artist's catalogue that are not in the baseline, including older albums newly added to Qobuz. Candidates default to un-ticked so a review cannot queue a large set of downloads in one tap.
 
 **Repair scan — cleaner live activity**
 
@@ -62,30 +77,30 @@ All notable changes to Qobuz Librarian are recorded here, newest first. The proj
 
 - A repair scan now stays on the Repair page from start to finish — scanning, reviewing the flagged albums, and the repair itself all happen there and update live, instead of handing you off to a separate job page partway through. A parked review is no longer reachable only behind a "Start scan" button that would have discarded it.
 
-**Jobs say what they're doing**
+**Clearer job status**
 
-- A queued job now tells you what it's waiting behind instead of a bare "Queued"; a run that works through many albums keeps its progress on "album 3 of 16" rather than resetting to 1 of 1 for each one; and the Upgrade, Downsample, and Lyrics pages show when they last ran, so a fresh visit isn't indistinguishable from never having run.
+- A queued job now shows what it is waiting behind instead of only "Queued"; multi-album jobs keep progress on the full run rather than resetting per album; and the Upgrade, Downsample, and Lyrics pages show when they last ran.
 
 **Safety fixes**
 
-- Undo on a single-track grab can no longer remove a same-numbered track from a different disc of a multi-disc album. A flood of failed logins can no longer lock the admin out — a request that already carries a valid session skips the limit — and an unreadable credentials file now fails closed instead of re-opening first-run setup. A library migration to a destination short on free space no longer starts an unattended run that would relocate files until it ran out.
-- Upgrading an album no longer discards its booklets, scans, `.cue`/`.log`, or hand-placed cover art: the bulk and web upgrade paths now carry those companions into the rebuilt folder before clearing the backup, matching the single-album path. Consolidating duplicate folders moves the overlapping tracks to a recoverable backup rather than deleting them outright, so a mistaken match can be undone. A repair no longer removes a pre-existing album folder it failed to recognise before refilling. And a near-full disk now stops the download queue cleanly and keeps the rest for a retry, instead of failing each album in turn.
+- Undo on a single-track download can no longer remove a same-numbered track from a different disc of a multi-disc album. A flood of failed logins can no longer lock the admin out — a request that already carries a valid session skips the limit — and an unreadable credentials file now fails closed instead of re-opening first-run setup. A library migration to a destination short on free space no longer starts an unattended run that would relocate files until it ran out.
+- Upgrading an album now carries its booklets, scans, `.cue`/`.log`, and hand-placed cover art into the rebuilt folder instead of discarding them, matching the single-album path. Consolidation moves overlapping tracks to a recoverable backup rather than deleting them, repair no longer removes an album folder it failed to recognise, and a near-full disk stops the download queue cleanly for a retry rather than failing each album in turn.
 
 ## [0.9.0] - 2026-06-21
 
-The repair scan, rebuilt — it catches more, runs far faster, and shows what it's doing — plus reliability and safety fixes from a follow-up audit. The one changed default: the unusable 320 kbps tier is gone.
+The repair scan was rebuilt for broader detection, faster scans, and clearer live progress. This release also includes reliability and safety fixes. The only changed default is removal of the unusable 320 kbps tier.
 
 **Repair catches truncated files that still play**
 
-- The whole-library repair scan now checks every track's length against its exact Qobuz recording, not only files that look obviously small. A track cut short at a frame boundary, with its FLAC header rewritten to the shorter length, decodes cleanly and passes the size check — so the old sweep marked it intact and moved on, and a genuinely damaged album could scan green. Every ISRC-tagged track is now duration-verified (the command-line sweep too).
+- The whole-library repair scan now checks every track's length against its exact Qobuz recording, not only visibly short files. A track cut short at a frame boundary, with its FLAC header rewritten to the shorter length, decodes cleanly and passes the size check — so the old sweep marked it intact and moved on, and a genuinely damaged album could scan green. Every ISRC-tagged track is now duration-verified (the command-line sweep too).
 
 **Faster, and re-scans skip the network**
 
-- The sweep now checks several artists at once instead of plodding one at a time, so the first scan of a large library is several times quicker. The slow part is the per-track Qobuz lookup, and that's now cached: a re-scan — and any album that shares a track's ISRC — skips the network round trip. The files themselves are still decode-tested fresh on every scan, so a re-scan still catches corruption that has appeared since the last one rather than trusting an old verdict. Set `REPAIR_CACHE_ENABLED=false` to skip the lookup cache, or `REPAIR_CACHE_TTL_DAYS` to change how often a cached lookup re-verifies against Qobuz.
+- The sweep now checks several artists at once instead of one at a time, making the first scan of a large library several times quicker. Per-track Qobuz lookups are cached: a re-scan, or any album that shares a track's ISRC, skips the network round trip. Files are still decode-tested fresh on every scan, so new corruption is still detected. Set `REPAIR_CACHE_ENABLED=false` to skip the lookup cache, or `REPAIR_CACHE_TTL_DAYS` to change how often a cached lookup re-verifies against Qobuz.
 
-**The repair scan shows what it's doing**
+**Clearer repair progress**
 
-- A clean library prints nothing for long stretches — only problems are listed — which used to read as a hang on "Waiting for output…". The scan now shows a live "now checking" line, a periodic "still scanning — checked N albums…" heartbeat, and an elapsed clock, with the activity log open by default, so a long scan visibly works instead of looking frozen.
+- A clean library can produce long periods with no findings. The scan now shows the current album, a periodic "still scanning — checked N albums…" heartbeat, and an elapsed clock, with the activity log open by default.
 
 **Fresh downloads are double-checked**
 
@@ -120,7 +135,7 @@ Quality-of-life and reliability improvements across search, scanning, and the we
 **Web UI**
 
 - The Search page lays out correctly on narrow phone screens.
-- Snappier under load, plus a few list/pagination edges tidied up.
+- Improved web UI responsiveness under load and fixed list/pagination edge cases.
 
 **Under the hood**
 
@@ -144,7 +159,7 @@ Strengthens the library repair scan so it can no longer report a corrupt file as
 
 ## [0.6.1] - 2026-06-13
 
-Bugfix release. All seventeen changes are fixes to edge cases found by an exhaustive post-release audit — no new features, no changed defaults.
+Bugfix release — seventeen edge-case fixes, no new features or changed defaults.
 
 **Backup safety**
 
@@ -153,10 +168,10 @@ Bugfix release. All seventeen changes are fixes to edge cases found by an exhaus
 - The beets import override now always forces `move: yes`. A user beets config with `copy: yes` was silently leaving every newly-downloaded album in staging, which the pipeline's success check read as "import failed" and parked.
 - Retrying parked albums now checks whether the audio actually left disk before removing the parking entry. A beets run that exits 0 while skipping a library duplicate (under `duplicate_action: skip`) used to trigger cleanup on the strength of the exit code alone, deleting the only copy.
 
-**Single-track grab and undo**
+**Single-track download and undo**
 
-- Grabbing the last missing track of an album now clears the "grabbed single" mark an earlier partial grab may have left. Without this the album's artist stayed hidden from bulk scans and the new-release check even after you completed the album.
-- The upgrade walk now keys the "skip grabbed singles" check on the Qobuz artist name, not the folder name. A folder called "Beatles" where Qobuz says "The Beatles" was leaking the grabbed single back into upgrade candidates.
+- Downloading the last missing track of an album now clears the "downloaded single" mark an earlier partial download may have left. Without this the album's artist stayed hidden from bulk scans and the new-release check even after you completed the album.
+- The upgrade walk now keys the "skip downloaded singles" check on the Qobuz artist name, not the folder name. A folder called "Beatles" where Qobuz says "The Beatles" was leaking the downloaded single back into upgrade candidates.
 - The single-track undo now takes the cross-process run lock before deleting any files or touching the beets database.
 - The undo track-match now uses the `tracknumber` field (the one `read_album_dir` actually writes). Also, two tracks with no ISRC and no track number on record can no longer accidentally match each other and delete the wrong file.
 
@@ -164,26 +179,26 @@ Bugfix release. All seventeen changes are fixes to edge cases found by an exhaus
 
 - Consolidation stops immediately under `--dry-run` — it deletes overlapping tracks, so letting it run was a dry-run violation.
 - Repair stops under `--dry-run` before moving any files aside, for the same reason: repair moves the truncated originals out of the way before re-ripping, so an interrupt could have stranded them.
-- A sibling FLAC whose quality can't be read (broken STREAMINFO or no title tag) now shows as "quality unreadable" and requires the same explicit DELETE confirmation as a track that's clearly better quality. Previously it was silently counted as safe to delete.
+- A sibling FLAC whose quality cannot be read (broken STREAMINFO or no title tag) now shows as "quality unreadable" and requires the same explicit DELETE confirmation as a clearly better-quality track. Previously it was silently counted as safe to delete.
 
 **Web and CLI polish**
 
 - The settings page keeps the token you just typed in the (masked) field when Qobuz rejects it, so you can fix a paste slip without re-entering the whole thing.
-- Pasting an album URL into Tracks mode now shows a clear "that's an album URL — switch to Albums" message instead of a silent empty result.
+- Pasting an album URL into Tracks mode now shows a clear "album URL — switch to Albums" message instead of a silent empty result.
 - An interrupted repair scan now tells you to start the repair scan again (which resumes from the checkpoint), not the library scan.
 
 ## [0.6.0] - 2026-06-09
 
-- **Get one song.** Search has a Tracks mode and a *Get track* button that pulls a single track instead of the whole album. It lands in the right `Artist/Album (Year)/` folder over the same per-track path repair uses — never a full-album rip — and the partial folder it leaves is recorded so the bulk scans don't nag you to finish that album. An artist you own only a grabbed sample by isn't read as one you're collecting, so their back catalogue stays out of the scans and the new-release check too. If the grabbed track was the album's last missing one you now own the whole thing and it's filed as a normal complete album; finishing the album the usual way later clears the mark the same way. Asking for a track you already have downloads nothing. The Upgrade walk leaves grabbed singles alone unless you set `UPGRADE_SINGLES_ENABLED`. A finished grab carries an **Undo** that deletes the track, drops its beets row, clears the mark, and removes the folder if the grab created it and it's now empty.
-- Two quick retries of the same album can no longer double-queue it — retry now re-checks for a job already touching that album under the submit lock, the same way the download route does.
+- **Single-track downloads.** Search has a Tracks mode with a *Get track* button that pulls one track into the right `Artist/Album (Year)/` folder, never a full-album rip. It's recorded as a deliberate single, so scans and the new-release check don't treat that artist as one you're collecting; finish the album later and it files as a normal complete album. **Undo** removes the track and any empty folder it created, and the Upgrade walk leaves single-track downloads alone unless you set `UPGRADE_SINGLES_ENABLED`.
+- Two quick retries of the same album can no longer double-queue it; retry now re-checks for a job already touching that album under the submit lock.
 - The downsample step caps the ffmpeg encode at ten minutes, so a track on a hung NFS or FUSE mount fails with a clear message and leaves the original untouched instead of pinning a worker forever.
 - Behind a reverse proxy the entrypoint passes `--proxy-headers` and honours `FORWARDED_ALLOW_IPS`, so the login rate-limiter sees each client's real address instead of the proxy's and stops locking everyone out at once.
 
 ## [0.5.0] - 2026-06-05
 
-First public release. Major additions included:
+First packaged release during local development. Major additions included:
 
-- **Migrate** mode turns an existing, messy or half-tagged collection into the `Artist/Album (Year)/` layout the rest of the tool expects. It reads each file's tags first and can fall back to AcoustID fingerprinting; it copies by default, so the originals are never touched, and anything it can't place confidently is left alone and listed in a manifest.
+- **Migrate** mode turns an existing or partially tagged collection into the `Artist/Album (Year)/` layout the rest of the tool expects. It reads each file's tags first and can fall back to AcoustID fingerprinting; copy mode leaves the originals in place, and anything it cannot place confidently is left alone and listed in a manifest.
 - ISRC-anchored **repair** now snapshots a truncated file's tags before it goes and restores them onto the refilled track, and backs up the source by ISRC before replacing it — a crash mid-refill can no longer strand a track.
 - The awaiting-review list pages by artist and keeps its selection on the server, so approving thousands of candidates no longer rides on form state.
 - Lyric state and the retry manifest are locked across processes; rejected staging files are quarantined instead of silently left in place.
@@ -196,7 +211,7 @@ First public release. Major additions included:
 
 ## [0.4.0] - 2026-05-21
 
-- **Check for new releases** — across the whole library or one artist — compares each artist's current Qobuz catalogue against what you've seen and surfaces only what's genuinely new, flagged for review. It reads the catalogue listing alone, so it's about one API call per artist.
+- **Check for new releases** — across the whole library or one artist — compares each artist's current Qobuz catalogue against the saved baseline and surfaces albums newly added to that baseline, flagged for review. It reads the catalogue listing alone, so it's about one API call per artist.
 - On-disk caches (album fetches, parsed FLAC tags keyed on path+mtime+size, and artist catalogues with a TTL) turn a re-scan of an unchanged library into seconds instead of minutes.
 - Jobs survive a container restart: an awaiting-review list comes back, and an interrupted job returns marked as such with a retry hint instead of vanishing.
 
@@ -208,9 +223,9 @@ First public release. Major additions included:
 ## [0.3.0] - 2026-04-28
 
 - **Upgrade** mode re-rips albums Qobuz can now serve at a higher quality, backing up the originals first.
-- **Downsample** mode shrinks hi-res FLACs above CD rate to 44.1/48 kHz, each verified to decode cleanly before it replaces the original.
-- **Repair** finds truncated or short FLACs and refills the exact missing tracks by ISRC, leaving good files untouched.
-- **Lyrics** mode backfills synced lyrics across tracks already on disk.
+- **Downsample** mode shrinks hi-res FLACs above 44.1/48 kHz, each verified to decode cleanly before it replaces the original.
+- **Repair** finds truncated or short FLACs and refills exact tracks by ISRC when matching is safe, leaving good files untouched.
+- **Lyrics** mode backfills lyrics across tracks already on disk.
 
 ## [0.2.1] - 2026-04-03
 

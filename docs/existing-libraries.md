@@ -2,14 +2,14 @@
 
 [← README](../README.md)
 
-The defaults assume a fresh library. For a collection you already have — beets-managed or just well-organised — here's the layout the scanner expects and how to bring one in.
+The defaults assume a fresh library. This covers the layout the scanner expects, and how to bring an existing collection in.
 
 ## Folder layout
 
-The scanner expects a two-level tree, `$MUSIC_ROOT/<Artist>/<Album>/`:
+The scanner expects a two-level tree under your music library. In Docker, this is the folder set by `QL_MUSIC_DIR`; inside the container it is mounted at `/music`. The folder should contain artist folders, with album folders inside them:
 
 ```
-$MUSIC_ROOT/
+/music/
 ├── Artist Name/
 │   ├── Album Name/
 │   │   └── 01 - Track.flac
@@ -21,37 +21,39 @@ $MUSIC_ROOT/
         └── 01 - Track.flac
 ```
 
-The album folder name is flexible — `Album`, `Album (2017)`, `Album [2017]`, and `2017 - Album` all work. A year is used when present but isn't required, since matching is driven by track tags, not folder names. Per-disc subdirs (`CD1/`, `CD2/`) are recursed into; hidden directories and the staging dir are skipped. Flat (`/music/<track>.flac`) and extra-nested (`/music/<Genre>/<Artist>/…`) layouts aren't detected, so point `QL_MUSIC_DIR` at the artist-level directory.
+The album folder name is flexible: `Album`, `Album (2017)`, `Album [2017]`, and `2017 - Album` all work. The year is optional; matching uses track tags, not folder names. Per-disc subdirs (`CD1/`, `CD2/`) are recursed into; hidden directories and the staging dir are skipped. Flat (`/music/<track>.flac`) and extra-nested (`/music/<Genre>/<Artist>/...`) layouts are not detected, so point `QL_MUSIC_DIR` at the folder that contains the artist folders.
 
 ## Migrating into the layout
 
-If your collection isn't in `Artist/Album (Year)/` shape — flat folders, inconsistent names, half-tagged files — the **Migrate** tool builds a tidy copy in the expected layout from what your files already say. It's a one-time step, separate from downloading, and needs no Qobuz login.
+If your library is not already organised as artist folders with album folders inside them, the **Migrate** tool can build the expected structure. It is a one-time local-library preparation step.
 
-It places each file by tags first (album artist, album, title, track, disc), which is fast and entirely offline. For files whose tags can't place them, an optional AcoustID fingerprint pass identifies them by sound; it's slower and needs network access, so it's off by default. No API key is needed.
+It places each file by its tags (album artist, album, title, track, disc). For files whose tags are not enough to place them, an optional AcoustID fingerprint pass identifies them by sound (slower, needs network, off by default; no API key required).
 
-Migrate copies by default, so your originals are only read. It previews the full plan first — where each file goes, what it couldn't place, and the space the copy needs against what's free — then waits for you to confirm. Files it can't confidently identify are left in place and listed, never moved into a wrong guess. Two CSVs land at the destination: `migration-manifest.csv` (the full plan, including everything left behind and why) and a results file recording what the run copied, skipped, or failed on. A web migration writes `migration-results.csv`; a CLI migration writes a timestamped `migration-results-YYYYMMDD-HHMMSS.csv` so repeated command-line runs don't overwrite each other.
+Migrate copies by default, so the source library stays where it is. Optional move mode relocates the originals after preview and removes source folders that become empty. The tool previews the full plan first: where each file goes, what it could not place, and how much space is needed at the destination. Nothing is copied or moved until you confirm. Files it cannot confidently place are left alone and listed.
 
-Point it at two folders — the messy source (read-only) and an empty destination — in `.env` / `compose.yaml`:
+Two CSVs land at the destination: `migration-manifest.csv` (the full plan, including everything left behind and why) and a results file recording what the run copied, moved, skipped, or failed on. A web migration writes `migration-results.csv`; a CLI migration writes a timestamped `migration-results-YYYYMMDD-HHMMSS.csv` so repeated command-line runs do not overwrite each other.
+
+Mount the source library and destination folder into the container, then set `MIGRATE_SRC` and `MIGRATE_DEST` to those container paths. Keep the source mount read-only if you only plan to copy; move mode needs the source to be writable.
 
 ```yaml
 services:
   qobuz-librarian:
     environment:
-      QL_MIGRATE_SRC: /old-library
-      QL_MIGRATE_DEST: /organised
+      MIGRATE_SRC: /migrate-source
+      MIGRATE_DEST: /migrate-dest
     volumes:
-      - /path/to/your/messy/library:/old-library:ro   # :ro = read-only
-      - /path/to/new/empty/folder:/organised
+      - /path/to/your/current/library:/migrate-source:ro # remove :ro for move mode
+      - /path/to/new/empty/folder:/migrate-dest
 ```
 
 Then either:
 
-- **Web:** open **Migrate**, optionally tick *Fingerprint files my tags can't place*, click **Preview migration**, review the per-artist list, then **Copy N selected** (reads **Move N selected** in move mode).
-- **CLI:** `docker compose run --rm qobuz-librarian cli --migrate` — add `--acoustid` for fingerprinting, `--in-place` to move instead of copy, or `--dry-run` to preview. Source and destination come from the env vars above or `--migrate-src` / `--migrate-dest`.
+- **Web:** open **Migrate**, optionally tick *Fingerprint unclear files*, click **Preview migration**, review the per-artist list, then **Copy N selected** (reads **Move N selected** in move mode).
+- **CLI:** `docker compose run --rm qobuz-librarian cli --migrate`. Add `--acoustid` for fingerprinting, `--in-place` to move instead of copy, or `--dry-run` to preview. Source and destination come from the env vars above or `--migrate-src` / `--migrate-dest`.
 
-When it's done, point `QL_MUSIC_DIR` at the new destination and run a Library scan.
+After migration finishes, point `QL_MUSIC_DIR` at the new destination and run a Library scan.
 
-A few things to check in the result: AcoustID matches are a best guess, so review them. A compilation with no signal at all (no compilation flag, no "Various Artists" album artist, no disc numbers) can't be recognised as one — each track lands under its own track-artist and scatters across folders. The year comes from tags only, so a file tagged without one lands in `Artist/Album/` rather than `Artist/Album (Year)/`. It's a copy, so the worst case is wasted disk: spot-check, then delete and re-run if you don't like it.
+Review AcoustID matches before using the migrated library; fingerprint matches are probabilistic. A compilation with no signal at all (no compilation flag, no "Various Artists" album artist, no disc numbers) cannot be recognised as one, so each track lands under its own track artist. The year comes from tags only, so a file tagged without one lands in `Artist/Album/` rather than `Artist/Album (Year)/`. In copy mode, spot-check the destination before switching `QL_MUSIC_DIR` to it. In move mode, review the preview carefully before confirming.
 
 ## Bringing an existing beets database
 
@@ -63,14 +65,14 @@ docker run --rm -v qobuz-librarian-config:/dest -v /your/beets/dir:/src alpine \
          cp /src/library.db /dest/beets/musiclibrary.db'
 ```
 
-Replace `library.db` with your filename (check the `library:` path in your `config.yaml` if unsure), or bind-mount a host directory at `/config/beets` instead. The container won't overwrite either file on start. If renaming the DB to `musiclibrary.db` isn't convenient, point `BEETS_DB_PATH` at your file instead (e.g. `BEETS_DB_PATH=/config/beets/library.db`) and the app reads it from there.
+Replace `library.db` with your filename (check the `library:` path in your `config.yaml` if unsure), or bind-mount a host directory at `/config/beets` instead. The container will not overwrite either file on start. If renaming the DB to `musiclibrary.db` is not convenient, point `BEETS_DB_PATH` at your file instead (e.g. `BEETS_DB_PATH=/config/beets/library.db`) and the app reads it from there.
 
-## Tagging an untagged collection
+## Optional beets fingerprinting
 
-Qobuz downloads arrive fully tagged, so import leaves the autotagger off. For older untagged files, beets' `chroma` plugin can identify them by audio fingerprint (AcoustID) and tag them in place — nothing is moved, copied, or deleted (`fpcalc` ships in the image). A ready-made config keeps it separate from your normal beets settings:
+Qobuz downloads arrive fully tagged, so import leaves the autotagger off. If you are bringing in older untagged files, beets' `chroma` plugin can identify them by audio fingerprint (AcoustID) and tag them in place (`fpcalc` ships in the image). A ready-made config keeps that optional pass separate from your normal beets settings:
 
 ```bash
-docker compose run --rm -e BEETSDIR=/config/beets qobuz-librarian \
+docker compose run --rm qobuz-librarian \
   beet -c /app/docker/beets-chroma.yaml import /music/<your-untagged-folder>
 ```
 
@@ -78,6 +80,6 @@ It shows the matching MusicBrainz releases one album at a time, for you to accep
 
 ## The first scan on a big library
 
-A library-wide scan makes roughly one Qobuz call per artist directory (cached on re-scans, so repeats are mostly free), fanned across a few artists at once (`ARTIST_SCAN_WORKERS`, default 4). There's no artificial delay between calls (`ARTIST_API_DELAY`, default 0); Qobuz's rate limit is handled by automatic retry and back-off, so raise it only if you get throttled. It's scan-then-review, not a daemon, so re-run it whenever you've added music. Singles and very short EPs are hidden from the missing-albums step by default; lower `MISSING_ALBUMS_MIN_TRACKS` (e.g. to 1) or pass `--include-singles` to surface them.
+A library-wide scan makes roughly one Qobuz call per artist directory (cached on re-scans, so repeated scans mostly use cached data), fanned across a few artists at once (`ARTIST_SCAN_WORKERS`, default 4). There is no artificial delay between calls (`ARTIST_API_DELAY`, default 0); Qobuz's rate limit is handled by automatic retry and back-off, so raise it only if you get throttled. It is scan-then-review, not a daemon; re-run after adding music. Singles and very short EPs are hidden from the missing-albums step by default; lower `MISSING_ALBUMS_MIN_TRACKS` (e.g. to 1) to surface them. (A single-artist run can also pass `--include-singles`.)
 
-On **Library**, **Upgrade**, and **Downsample** scans you can dismiss albums you've decided against; they're remembered and skipped next time, so a big library can be triaged over several sessions. Restore them from the **Hidden** view. Dismissing is per album, so a new release by an already-reviewed artist still surfaces. The single-artist **Artist** scan never hides anything.
+Review choices are remembered, so a large library can be handled over several sessions. Library dismissals hide missing-album suggestions, Upgrade dismissals hide skipped upgrades, and Downsample remembers albums you keep hi-res. Restore them from the **Hidden** view. Saved choices are per album, so a new release by an already-reviewed artist still surfaces. Explicit single-artist CLI scans do not use the hidden list.

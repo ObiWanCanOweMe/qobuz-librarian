@@ -37,6 +37,9 @@ pip install --no-cache-dir -q --no-deps "$beets_pin" >/dev/null
 pip install --no-cache-dir -q confuse jellyfish lap mediafile munkres packaging \
     "pillow>=12.2.0" platformdirs pyacoustid pyyaml requests requests-ratelimiter \
     typing_extensions unidecode >/dev/null
+# streamrip caps a few helpers below the versions the app requires. Re-apply
+# the app lock last so image-lock.txt matches the runtime contract.
+pip install --no-cache-dir -q -r /tmp/requirements.txt >/dev/null
 pip freeze
 EOF
 )

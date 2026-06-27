@@ -3,11 +3,7 @@ services:
     image: dinkeyes/qobuz-librarian:latest
     container_name: qobuz-librarian
     restart: unless-stopped
-    # Run an init (tini) as PID 1 to reap orphaned processes. The app is the
-    # container's main process, and when a download is cancelled or times out
-    # it kills streamrip's process group; without an init to harvest them,
-    # any children left behind would linger as zombies for the container's
-    # whole life.
+    # Run tini as PID 1 so cancelled streamrip children are reaped cleanly.
     init: true
     mem_limit: 1g
     pids_limit: 256
@@ -24,29 +20,29 @@ services:
     ports:
       # WEB_PORT (from .env) only changes the host-side mapping; the
       # container always listens on 8666 internally. WEB_BIND sets the host
-      # interface the port is published on — leave it 0.0.0.0 for LAN access, or
+      # interface the port is published on. Leave it 0.0.0.0 for LAN access, or
       # set WEB_BIND=127.0.0.1 in .env to keep the UI reachable only from the
-      # Docker host. (Don't use WEB_HOST for this — that's the in-container bind
-      # and must stay 0.0.0.0 or the published port can't reach the app.)
+      # Docker host. WEB_HOST is the in-container bind and must stay 0.0.0.0
+      # for Docker port publishing.
       - "${WEB_BIND:-0.0.0.0}:${WEB_PORT:-8666}:8666"
 
     environment:
       # ── User / permissions ────────────────────────────────────────────────
       # The app runs as PUID:PGID (default 1000:1000) so downloaded and
       # imported files aren't root-owned. Set these to match the host user
-      # that owns your media — find your values with `id -u` / `id -g` — by
+      # that owns your media (find your values with `id -u` / `id -g`) by
       # putting PUID/PGID in .env. PUID=0 PGID=0 runs as root if you need it.
       PUID: "${PUID:-1000}"
       PGID: "${PGID:-1000}"
 
       # ── Auth ──────────────────────────────────────────────────────────────
-      # Optional: set QOBUZ_USER_AUTH_TOKEN / QOBUZ_USER_ID in .env, or just
-      # use the Settings page in the web UI. Empty = use the Settings page.
+      # Optional: set QOBUZ_USER_AUTH_TOKEN / QOBUZ_USER_ID in .env, or use
+      # the Settings page in the web UI. Empty = use the Settings page.
       QOBUZ_USER_AUTH_TOKEN: "${QOBUZ_USER_AUTH_TOKEN:-}"
       QOBUZ_USER_ID:         "${QOBUZ_USER_ID:-}"
       # To keep the token out of the container environment (and `docker
-      # inspect`), point this at a file holding just the token — e.g. a Docker
-      # secret — instead of setting QOBUZ_USER_AUTH_TOKEN above:
+      # inspect`), point this at a file containing only the token (e.g. a Docker
+      # secret) instead of setting QOBUZ_USER_AUTH_TOKEN above:
       #   QOBUZ_USER_AUTH_TOKEN_FILE: /run/secrets/qobuz_token
       # (add the matching `secrets:` block + a top-level `secrets:` definition).
       QOBUZ_USER_AUTH_TOKEN_FILE: "${QOBUZ_USER_AUTH_TOKEN_FILE:-}"
@@ -56,16 +52,14 @@ services:
       STAGING_DIR:          /staging
       DATA_DIR:             /data
       UPGRADE_BACKUP_DIR:   /upgrade_backups
-      # One-time Migrate tool: source library + destination folder as seen
-      # INSIDE the container. Mount both as volumes below, then set the matching
-      # container paths in .env. Leave unset unless you're migrating.
-      QL_MIGRATE_SRC:       "${QL_MIGRATE_SRC:-}"
-      QL_MIGRATE_DEST:      "${QL_MIGRATE_DEST:-}"
+      # One-time Migrate tool. Leave unset unless you have mounted source and
+      # destination folders for migration; see docs/existing-libraries.md.
+      MIGRATE_SRC:          "${MIGRATE_SRC:-}"
+      MIGRATE_DEST:         "${MIGRATE_DEST:-}"
 
-      # beets (bundled — no separate container needed)
+      # beets (bundled, no separate container needed)
       BEETS_CONFIG_DIR:     /config/beets
       BEETS_DB_PATH:        /config/beets/musiclibrary.db
-      BEETS_STAGING_INSIDE: /staging
       # Optional folder/file naming. Empty = use the fully-editable
       # /config/beets/config.yaml. beets path syntax ($albumartist, $album,
       # $year, $track, $title, ...). Set in .env (escape $ as $$ if needed).
@@ -74,7 +68,7 @@ services:
       BEETS_PATH_COMP:      "${BEETS_PATH_COMP:-}"
       # Comma-separated list of beets plugins. Empty = honour /config/beets/
       # config.yaml (seeded with `fetchart` and `inline`; this REPLACES that list,
-      # so keep `inline` — it drives the multi-disc `Disc N/` folder field).
+      # so keep `inline`; it drives the multi-disc `Disc N/` folder field).
       # Useful extras: lastgenre, replaygain, scrub, edit, embedart.
       BEETS_PLUGINS: "${BEETS_PLUGINS:-}"
 
@@ -86,16 +80,16 @@ services:
       WEB_PORT: "8666"
       # Login. Unset (or any value other than "none") = the UI prompts you to
       # set a username/password on first visit and requires sign-in after.
-      # "none" turns the login off entirely — only safe on a trusted network or
+      # "none" turns the login off entirely; only safe on a trusted network or
       # behind your own authenticating reverse proxy.
       WEB_AUTH: "${WEB_AUTH:-}"
       # Optionally seed the login from .env instead of the first-visit setup
-      # screen — provide BOTH (they also act as a password reset on restart).
+      # screen; provide BOTH (they also act as a password reset on restart).
       # Empty = use the setup screen. An env value is visible to `docker inspect`.
       WEB_AUTH_USER:     "${WEB_AUTH_USER:-}"
       WEB_AUTH_PASSWORD: "${WEB_AUTH_PASSWORD:-}"
       # Or keep the password out of the environment by pointing this at a file
-      # holding just the password (e.g. a Docker secret), mirroring the Qobuz
+      # containing only the password (e.g. a Docker secret), mirroring the Qobuz
       # token file. Empty = use the values above / the setup screen.
       WEB_AUTH_PASSWORD_FILE: "${WEB_AUTH_PASSWORD_FILE:-}"
       # Behind a reverse proxy, set this to the proxy's IP(s) so the failed-login
@@ -103,27 +97,24 @@ services:
       FORWARDED_ALLOW_IPS: "${FORWARDED_ALLOW_IPS:-127.0.0.1}"
       # Refuse downloads/scans at startup if /music or /staging aren't writable
       # by the container user (typical on a NAS with the wrong PUID/PGID).
-      QL_CHECK_VOLUMES: "1"
-      # Terminal-first mode: set QL_CLI_ONLY=1 in .env to start handed-off to
-      # the CLI (web UI serves but its downloads stay paused). Empty = web app.
+      # Set QL_CHECK_VOLUMES=0 in .env for a read-only (:ro) /music share.
+      QL_CHECK_VOLUMES: ${QL_CHECK_VOLUMES:-1}
+      # Terminal-first mode: set QL_CLI_ONLY=1 in .env to start in terminal
+      # mode (web UI serves but its downloads stay paused). Empty = web app.
       # Or hand off case-by-case from Settings → Mode in the web UI.
       QL_CLI_ONLY: "${QL_CLI_ONLY:-}"
-      # Optional: shell command run after every terminal job. The job state
-      # (id/status/title/artist/error/finished_at) is piped to it as JSON on
-      # stdin. Useful for desktop notifications, ntfy/Apprise, etc.
-      # POST_JOB_HOOK: "curl -sX POST https://ntfy.sh/your-topic -d @-"
-
       # ── Qobuz API ─────────────────────────────────────────────────────────
       QOBUZ_API_BASE: https://www.qobuz.com/api.json/0.2
       QOBUZ_APP_ID:   "798273057"
 
-      # ── Tuning (defaults are sensible; uncomment to override) ─────────────
-      # RIP_TIMEOUT:               "900"   # per-album rip subprocess timeout (s)
-      # DELAY_BETWEEN:             "1.0"   # pause between consecutive album downloads (s)
-      # ARTIST_API_DELAY:          "0.0"   # pause between Qobuz API calls during library walks (s)
-      # SEARCH_LIMIT:              "25"    # search results per query
-      # ARTIST_CATALOG_LIMIT:      "1000"  # max albums fetched per artist
-      # MISSING_ALBUMS_MIN_TRACKS: "4"     # hide singles / very short EPs in the missing-albums step
+      # ── Tuning (override in .env; the values here are the defaults) ─────────
+      RIP_TIMEOUT:               "${RIP_TIMEOUT:-900}"            # per-album rip subprocess timeout (s)
+      DELAY_BETWEEN:             "${DELAY_BETWEEN:-1.0}"          # pause between consecutive album downloads (s)
+      ARTIST_API_DELAY:          "${ARTIST_API_DELAY:-0.0}"      # pause between Qobuz API calls during library walks (s)
+      ARTIST_SCAN_WORKERS:       "${ARTIST_SCAN_WORKERS:-4}"     # parallel artist lookups during a library scan (1-16)
+      SEARCH_LIMIT:              "${SEARCH_LIMIT:-25}"           # search results per query
+      ARTIST_CATALOG_LIMIT:      "${ARTIST_CATALOG_LIMIT:-1000}" # max albums fetched per artist
+      MISSING_ALBUMS_MIN_TRACKS: "${MISSING_ALBUMS_MIN_TRACKS:-4}"  # hide singles / very short EPs in the missing-albums step
 
       # ── Download quality ──────────────────────────────────────────────────
       # streamrip quality: 2=CD/16-bit lossless, 3=24-bit ≤96kHz,
@@ -132,8 +123,8 @@ services:
       STREAMRIP_QUALITY: "${STREAMRIP_QUALITY:-4}"
 
       # ── Lyrics ────────────────────────────────────────────────────────────
-      # Synced lyrics are fetched on every import by default. Set "false" to
-      # disable. LYRICS_FORMAT: embed = FLAC tag · sidecar = .lrc · both.
+      # Lyrics are fetched on every import by default. Set "false" to disable.
+      # LYRICS_FORMAT: embed (FLAC tag), sidecar (.lrc file), or both.
       # LYRICS_PROVIDERS: comma list in preferred order; empty = built-in.
       LYRICS_ENABLED: "${LYRICS_ENABLED:-true}"
       LYRICS_FORMAT: "${LYRICS_FORMAT:-embed}"
@@ -152,16 +143,16 @@ services:
       ARTWORK: "${ARTWORK:-sidecar}"
 
       # ── New releases ──────────────────────────────────────────────────────
-      # First launch auto-runs a library scan — it lists your missing albums
-      # AND establishes the new-release baseline (resuming if interrupted).
-      # "false" skips the automatic scan; a manual library scan still seeds it.
+      # First launch offers a baseline library scan. It lists missing albums and
+      # establishes the new-release baseline (resuming if interrupted). "false"
+      # skips the offer; a manual library scan still seeds the baseline.
       AUTO_LIBRARY_SCAN: "${AUTO_LIBRARY_SCAN:-true}"
       # Auto-check for new releases by your library's artists this often
       # (seconds), surfaced on the dashboard once the baseline's set. 0 = off.
       # Also tunable on the Settings page.
       NEW_RELEASE_CHECK_INTERVAL: "${NEW_RELEASE_CHECK_INTERVAL:-86400}"
-      # Only flag albums released within this many days as "new" (0 = any catalog
-      # newcomer counts, including back-catalogue Qobuz just added). Default 365.
+      # Only flag albums released within this many days as "new" (0 = any catalogue
+      # newcomer counts, including older releases Qobuz recently added). Default 365.
       NEW_RELEASE_MAX_AGE_DAYS: "${NEW_RELEASE_MAX_AGE_DAYS:-365}"
       # How long (seconds) a gap scan reuses a fetched discography before
       # re-fetching. The new-release check always fetches fresh regardless.
@@ -172,37 +163,36 @@ services:
       # Upgrade walk works regardless of this; this only affects normal walks.
       AUTO_UPGRADE_ENABLED: "${AUTO_UPGRADE_ENABLED:-false}"
       UPGRADE_BACKUP_RETENTION_DAYS: "${UPGRADE_BACKUP_RETENTION_DAYS:-7}"
-      # Let the Upgrade walk also re-rip tracks grabbed as singles (off = leave
+      # Let the Upgrade walk also re-rip tracks downloaded as singles (off = leave
       # deliberate one-off singles alone).
       UPGRADE_SINGLES_ENABLED: "${UPGRADE_SINGLES_ENABLED:-false}"
       # How long (days) to remember that Qobuz delivered a partial hi-res for
       # an album before retrying it in the upgrade walk.
-      # CAPPED_RETENTION_DAYS: "90"
+      CAPPED_RETENTION_DAYS: "${CAPPED_RETENTION_DAYS:-90}"
       # Downsample hi-res FLACs to 44.1/48 kHz before import to save space.
       # Leave false to keep whatever Qobuz delivers (CD quality is fine).
       DOWNSAMPLE_HIRES_ENABLED: "${DOWNSAMPLE_HIRES_ENABLED:-false}"
 
-      # ── Matching thresholds (advanced; defaults are well-tested) ──────────
+      # ── Matching thresholds (advanced) ──────────────────────────────────
       # Similarity score (0–1) for fuzzy directory-name matching.
       # Lower = more permissive, more false positives.
-      # FUZZY_DIR_THRESH:           "0.78"
-      # ARTIST_NAME_THRESH:         "0.85"
-      # ARTIST_DIR_MATCH_THRESH:    "0.65"
-      # DB_ALBUM_THRESH:            "0.85"
-      # CONSOLIDATE_THRESH:         "0.70"
-      # AUTO_SAFE_TITLE_SIM_THRESH: "0.85"
+      FUZZY_DIR_THRESH:           "${FUZZY_DIR_THRESH:-0.78}"
+      ARTIST_NAME_THRESH:         "${ARTIST_NAME_THRESH:-0.85}"
+      ARTIST_DIR_MATCH_THRESH:    "${ARTIST_DIR_MATCH_THRESH:-0.65}"
+      CONSOLIDATE_THRESH:         "${CONSOLIDATE_THRESH:-0.70}"
+      AUTO_SAFE_TITLE_SIM_THRESH: "${AUTO_SAFE_TITLE_SIM_THRESH:-0.85}"
 
-      # ── Advanced overrides (defaults match the app; change via .env) ──────
+      # ── Advanced overrides ──────────────────────────────────────────────
       # beets import guard: seconds of no-output before a stalled import is
       # killed and quarantined, retry count, and pause between attempts.
       BEETS_TIMEOUT:         "${BEETS_TIMEOUT:-600}"
       BEETS_MAX_ATTEMPTS:    "${BEETS_MAX_ATTEMPTS:-2}"
       BEETS_RETRY_PAUSE:     "${BEETS_RETRY_PAUSE:-30}"
-      # Polite-API cooldown (seconds) after Qobuz rate-limits us.
+      # Cooldown (seconds) after Qobuz rate-limits the account.
       RATE_LIMIT_COOLDOWN:   "${RATE_LIMIT_COOLDOWN:-30}"
       # Parallel ffmpeg workers for the on-demand downsample (CPU-bound).
       RESAMPLE_WORKERS:      "${RESAMPLE_WORKERS:-4}"
-      # Free-space floor (MB) checked before each album download — turns a
+      # Free-space floor (MB) checked before each album download; turns a
       # near-full staging area into a clean disk-full stop. 0 disables it.
       MIN_FREE_STAGING_MB:   "${MIN_FREE_STAGING_MB:-500}"
       # Repair scan: minimum gap (s) between live Qobuz ISRC lookups, and the
@@ -214,15 +204,17 @@ services:
       EXCLUDE_LIVE_ALBUMS:   "${EXCLUDE_LIVE_ALBUMS:-false}"
       # Log verbosity: DEBUG | INFO | WARNING | ERROR.
       LOG_LEVEL:             "${LOG_LEVEL:-INFO}"
-      # Optional command run after every job (job state as JSON on stdin);
+      # Optional command run after every job; the job state
+      # (id/status/title/artist/error/finished_at) is piped to it as JSON on stdin
+      # (e.g. POST_JOB_HOOK='curl -sX POST https://ntfy.sh/your-topic -d @-').
       # POST_JOB_HOOK_TIMEOUT caps a slow webhook.
       POST_JOB_HOOK:         "${POST_JOB_HOOK:-}"
       POST_JOB_HOOK_TIMEOUT: "${POST_JOB_HOOK_TIMEOUT:-10}"
 
       # ── Web request budgets ───────────────────────────────────────────────
       # Per-request timeout (seconds) for the web UI's Qobuz API calls.
-      # WEB_FETCH_TIMEOUT bounds album/track fetches and the search box;
-      # WEB_TEST_AUTH_TIMEOUT bounds the startup + Settings token probe.
+      # QL_WEB_FETCH_TIMEOUT bounds album/track fetches and the search box;
+      # QL_WEB_TEST_AUTH_TIMEOUT bounds the startup + Settings token probe.
       QL_WEB_FETCH_TIMEOUT:     "${QL_WEB_FETCH_TIMEOUT:-12.0}"
       QL_WEB_TEST_AUTH_TIMEOUT: "${QL_WEB_TEST_AUTH_TIMEOUT:-8.0}"
 

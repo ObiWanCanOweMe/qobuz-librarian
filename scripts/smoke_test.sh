@@ -70,7 +70,6 @@ check /library                200
 check /upgrade                200
 check /downsample             200
 check /repair                 200
-check /audit                  308   # legacy alias; redirects to /repair
 check /lyrics                 200
 check /migrate                200
 check /queue                  200

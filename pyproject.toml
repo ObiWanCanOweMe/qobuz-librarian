@@ -66,8 +66,8 @@ target-version = "py312"
 line-length = 100
 
 [tool.ruff.lint]
-# Default selection plus pyflakes; intentionally relaxed to keep the
-# lint job a smoke test, not a style police.
+# Default selection plus pyflakes; intentionally relaxed so linting stays
+# focused on correctness and maintainability.
 select = ["E", "F", "W", "I"]
 ignore = [
     "E501",  # line length — handled by formatter, not lint
