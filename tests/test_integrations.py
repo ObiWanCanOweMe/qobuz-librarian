@@ -339,3 +339,33 @@ def _make_silent_flac(path):
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
          "-i", "anullsrc=r=44100:cl=stereo", "-t", "1", "-c:a", "flac", str(path)],
         check=True)
+
+
+def test_import_override_yaml_round_trips_through_parser(monkeypatch):
+    # The beets override is written by a hand-rolled single-quoted YAML emitter.
+    # Feed it a path template with an apostrophe (the one metacharacter it has to
+    # escape) and confirm a real parser reads every key back intact.
+    import yaml
+
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.integrations import beets
+
+    monkeypatch.setattr(cfg, "BEETS_DB_PATH", "/config/beets/musiclibrary.db")
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", "/music")
+    monkeypatch.setattr(cfg, "BEETS_PATH_DEFAULT", "$albumartist's picks/$album %aunique{}")
+    monkeypatch.setattr(cfg, "BEETS_PATH_SINGLETON", "Singles/$artist - $title")
+    monkeypatch.setattr(cfg, "BEETS_PATH_COMP", "")
+    monkeypatch.setattr(cfg, "BEETS_PLUGINS", [])
+    monkeypatch.setattr(cfg, "ARTWORK", "embed")
+
+    parsed = yaml.safe_load(beets._build_import_override_yaml())
+
+    assert parsed["library"] == "/config/beets/musiclibrary.db"
+    assert parsed["directory"] == "/music"
+    assert parsed["import"]["move"] is True
+    assert parsed["import"]["autotag"] is False
+    assert parsed["import"]["duplicate_action"] == "merge"
+    # the apostrophe survived the single-quote doubling
+    assert parsed["paths"]["default"] == "$albumartist's picks/$album %aunique{}"
+    assert parsed["paths"]["singleton"] == "Singles/$artist - $title"
+    assert "fetchart" in parsed["plugins"] and "embedart" in parsed["plugins"]

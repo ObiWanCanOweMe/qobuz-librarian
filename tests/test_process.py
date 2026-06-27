@@ -11,7 +11,7 @@ import pytest
 def _args(**over):
     base = dict(force=False, yes=True, no_import=False, dry_run=False,
                 verbose=False, consolidate=False, no_upgrade=False,
-                no_compress=True, migrate_multi_artist=False,
+                no_downsample=True, migrate_multi_artist=False,
                 auto_upgrade=False, prefer_hires=False)
     base.update(over)
     return SimpleNamespace(**base)

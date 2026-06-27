@@ -55,6 +55,31 @@ except Exception as _e:  # missing deps shouldn't crash the ingest pipeline
 DEFAULT_PROVIDERS  = ["Lrclib", "NetEase", "Musixmatch"]
 DEFAULT_STATE_FILE = Path(__file__).resolve().parent / ".lyric_fetch_state.json"
 
+# Per-file outcome codes are internal vocabulary; the lyrics pass shows its log
+# to the user, so map them to plain phrases (a raw "write-error" or a
+# "{'cached-synced': 4}" dict in the activity log reads like debug output).
+_OUTCOME_LABELS = {
+    "synced": "added synced lyrics", "plain": "added lyrics",
+    "fetched": "added lyrics",
+    "already-synced": "already had synced lyrics",
+    "already-plain": "already had lyrics",
+    "cached-synced": "already had synced lyrics",
+    "cached-plain": "already had lyrics",
+    "kept-existing-plain": "kept existing lyrics",
+    "not_found": "no lyrics found", "not-found": "no lyrics found",
+    "none": "no lyrics found",
+    "providers-unavailable": "lyric providers unavailable",
+    "write-error": "couldn't write lyrics",
+    "error": "error", "exception": "error",
+    "skipped": "skipped", "skipped-long": "skipped (too long)",
+    "skipped-tags": "skipped (missing tags)",
+}
+
+
+def _outcome_label(outcome):
+    return _OUTCOME_LABELS.get(
+        outcome, (outcome or "").replace("-", " ").replace("_", " "))
+
 SYNCED_RE = re.compile(r"\[\d{1,2}:\d{2}(?:\.\d{1,3})?\]")
 LRC_TS_RE = re.compile(r"\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]")
 
@@ -807,7 +832,7 @@ def fetch_for_paths(
             outcome = run_one(fp)
             completed += 1
             counts[outcome] += 1
-            log.info("[%d/%d] %s — %s", completed, total, outcome, fp.name)
+            log.info("[%d/%d] %s — %s", completed, total, _outcome_label(outcome), fp.name)
             if progress_cb:
                 progress_cb(completed, total, fp.name)
             if completed % save_every == 0:
@@ -829,7 +854,7 @@ def fetch_for_paths(
                     try:
                         completed += 1
                         counts[outcome] += 1
-                        log.info("[%d/%d] %s — %s", completed, total, outcome, fp.name)
+                        log.info("[%d/%d] %s — %s", completed, total, _outcome_label(outcome), fp.name)
                         if progress_cb:
                             progress_cb(completed, total, fp.name)
                         if completed % save_every == 0:
@@ -961,8 +986,7 @@ def index_existing(
                 now = time.monotonic()
                 rate = progress_every / max(0.001, now - last_log)
                 last_log = now
-                log.info("[%d/%d] %.0f files/s — %s",
-                         completed, total, rate, dict(counts))
+                log.info("[%d/%d] · %.0f tracks/s", completed, total, rate)
             if completed % save_every == 0:
                 checkpoint()
     else:
@@ -985,8 +1009,7 @@ def index_existing(
                         now = time.monotonic()
                         rate = progress_every / max(0.001, now - last_log)
                         last_log = now
-                        log.info("[%d/%d] %.0f files/s — %s",
-                                 completed, total, rate, dict(counts))
+                        log.info("[%d/%d] · %.0f tracks/s", completed, total, rate)
                     if completed % save_every == 0:
                         checkpoint()
                     if should_stop and should_stop():

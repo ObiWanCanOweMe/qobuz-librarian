@@ -5,8 +5,8 @@ so a `pytest -q` run doesn't write a real lock file / lyric-state file /
 fetch log under ``~/.local/share/qobuz-librarian/`` on the dev machine.
 
 Individual tests still monkeypatch specific paths via ``tmp_path`` for
-finer-grained control; this fixture only covers the global side effects
-of importing the package and running the web lifespan in a TestClient.
+finer-grained control; this fixture covers the global side effects of
+importing the package and exercising web routes in tests.
 """
 import os
 import tempfile
@@ -115,9 +115,8 @@ def _isolate_data_dir():
             os.environ.pop(k, None)
         else:
             os.environ[k] = v
-    # Clean up the session tempdir, best-effort. The lock file may still
-    # be held briefly by a TestClient lifespan that's tearing down;
-    # ignore_errors=True keeps the test exit clean either way.
+    # Clean up the session tempdir, best-effort. ignore_errors=True keeps
+    # the test exit clean if a background worker is still tearing down.
     import shutil
     shutil.rmtree(tmp_root, ignore_errors=True)
 

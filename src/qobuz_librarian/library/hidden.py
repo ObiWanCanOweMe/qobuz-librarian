@@ -18,7 +18,7 @@ Hides are scoped so the two walks don't cross-contaminate: a "missing" hide
 hide (don't offer to re-rip this album I own at higher quality). Restoring one
 scope never touches the other.
 
-The single-artist Artist page does NOT consult this store — typing a name is a
+Explicit single-artist scans do NOT consult this store — typing a name is a
 conscious request to see everything by that artist. Only the bulk walks filter
 on it.
 """
@@ -39,7 +39,7 @@ log = logging.getLogger("qobuz_librarian")
 SCOPE_MISSING = "missing"
 SCOPE_UPGRADE = "upgrade"
 SCOPE_DOWNSAMPLE = "downsample"
-# A deliberately-grabbed single track: the album folder is left partial on
+# A deliberately downloaded single track: the album folder is left partial on
 # purpose. Unlike the dismissal scopes above this isn't "reviewed and declined"
 # but "I only wanted this track", so it has its own writers (mark/unmark) that
 # also store the Qobuz album id, and it drives the "collecting" signal — an
@@ -273,10 +273,10 @@ def count(scope, store=None):
     return len((store if store is not None else load()).get(scope) or {})
 
 
-# ── Singles — a deliberately-grabbed track, not a gap ──────────────────────────
+# ── Singles — a deliberately downloaded track, not a gap ───────────────────────
 
 def is_single(artist, title, store):
-    """True when (artist, title) is marked as a deliberately-grabbed single, so
+    """True when (artist, title) is marked as a deliberately downloaded single, so
     its partial folder isn't read as a gap. `store` is preloaded by load()."""
     fp = album_fingerprint(artist, title)
     if fp is None:
@@ -284,19 +284,8 @@ def is_single(artist, title, store):
     return fp in (store.get(SCOPE_SINGLE) or {})
 
 
-def n_singles_for(artist, store):
-    """How many of an artist's albums are marked single. An artist is 'collected'
-    (and so surfaced by the bulk walks) only when they own more album folders than
-    this — i.e. at least one album that isn't just a grabbed single."""
-    a = normalize(artist or "")
-    if not a:
-        return 0
-    return sum(1 for e in (store.get(SCOPE_SINGLE) or {}).values()
-               if normalize(e.get("artist") or "") == a)
-
-
 def mark_single(artist, title, year, album_id):
-    """Record that the user grabbed a single from this album. Idempotent; keeps
+    """Record that the user downloaded a single from this album. Idempotent; keeps
     the original timestamp on a repeat. Returns True if a mark now exists."""
     fp = album_fingerprint(artist, title)
     if fp is None:

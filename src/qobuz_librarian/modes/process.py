@@ -169,7 +169,7 @@ def _upgrade_replacement_verified(album, album_dir, backup_path):
 
     The success gate clears `flac -t` per file, which proves each file decodes
     but not that the matcher kept every track or that a re-rip didn't land
-    short. A dropped track or a truncated-but-decodable one both show up here
+    short. A dropped track or a truncated-but-decodable one is reported here
     as missing tracks/seconds. Anything that can't be confirmed (folder not
     found, unreadable) returns False, so the caller keeps the backup rather
     than deleting the only full copy."""
@@ -399,7 +399,7 @@ def process_album(album, args, *, allow_force=True, label=None,
     upgrade_existing_label = None  # before-quality label, set in the auto-upgrade branch
 
     # Quality-upgrade replace path. This is opt-in: it only runs when
-    # AUTO_UPGRADE_ENABLED is set (env/Settings), or when the user invokes
+    # AUTO_UPGRADE_ENABLED is set via env, or when the user invokes
     # the explicit Upgrade action (which turns the flag on for its run).
     # A plain gap-fill just fills the missing tracks and leaves the rest of
     # the album alone — it does NOT wipe-and-redownload an album to a
@@ -813,9 +813,9 @@ def process_album(album, args, *, allow_force=True, label=None,
             return {"result": "partial", "imported": False,
                     "n_ok": n_ok, "n_fail": n_fail, "n_lossy": n_lossy}
 
-        # ── Pre-import: compress + lyrics on STAGING ─────────────────────────────
-        # compress + lyric_fetch run on staging BEFORE beets imports.
-        # Beets's `move: yes` then transfers already-compressed,
+        # ── Pre-import: downsample + lyrics on STAGING ──────────────────────────
+        # Downsampling and lyric_fetch run on staging BEFORE beets imports.
+        # Beets's `move: yes` then transfers already-downsampled,
         # already-lyriced FLACs into the library in one shot, so a media
         # server only ever sees the final state and never serves stale
         # metadata (wrong sample rate, missing lyrics) to its clients

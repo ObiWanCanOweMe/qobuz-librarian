@@ -85,14 +85,13 @@ def _staged_album_dirs(item):
 
 
 def _run_pre_import_hooks_for_dirs(album_dirs, args):
-    """Run compress + lyric hooks scoped to ``album_dirs``. Returns the
+    """Run downsample + lyric hooks scoped to ``album_dirs``. Returns the
     aggregated lyric-signature list so the post-import resolver can map them
     to library paths once beets has moved the files. Raises KeyboardInterrupt
     after logging if either hook is interrupted."""
     sigs = []
     if (cfg.DOWNSAMPLE_HIRES_ENABLED and HAVE_DOWNSAMPLE
-            and not getattr(args, "no_downsample",
-                            getattr(args, "no_compress", False))):
+            and not getattr(args, "no_downsample", False)):
         for d in album_dirs:
             try:
                 downsample_dir(d, verbose=True, base_dir=d, log=log.info)
@@ -127,7 +126,7 @@ def _run_pre_import_hooks_for_dirs(album_dirs, args):
 
 
 def _pre_import_staging_hooks(args):
-    """Whole-staging pre-import hooks (back-compat).
+    """Whole-staging pre-import hooks for single-album runs.
 
     Used by the single-album process path (``modes/process.py``) where
     staging holds exactly one album at hook time, so scoping to the whole
@@ -597,10 +596,25 @@ def _resolve_queue_item(item, args, imported_globally):
     }
 
 
+def _sleep_unless_cancelled(seconds, cancel_check, step=0.5):
+    """Sleep up to ``seconds``, but wake the moment a cancel lands. The inter-album
+    cooldown after a rate-limited rip is RATE_LIMIT_COOLDOWN (30s by default), and
+    a plain sleep would swallow a Stop for that whole window. Returns True if cut
+    short by a cancel."""
+    deadline = time.monotonic() + seconds
+    while True:
+        if cancel_check():
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(step, remaining))
+
+
 def _execute_download_queue(queue, args, token, *, on_progress=None):
     """Flush a batch of pre-confirmed download decisions, one album at a time.
 
-    Each item runs through its own pipeline — download → compress → lyrics →
+    Each item runs through its own pipeline — download → downsample → lyrics →
     beets import (with retry on idle-timeout) → backup resolution — so a
     single broken or hung album in a large batch loses only itself instead of
     the whole import. Albums that exhaust ``BEETS_MAX_ATTEMPTS`` are parked
@@ -880,9 +894,10 @@ def _execute_download_queue(queue, args, token, *, on_progress=None):
                     f"    ⏳ Qobuz rate-limit detected — cooling down "
                     f"{int(cooldown)}s before the next album "
                     f"(set RATE_LIMIT_COOLDOWN=0 to disable)."))
-                time.sleep(cooldown)
+                if _sleep_unless_cancelled(cooldown, is_cancel_requested):
+                    cancelled = True  # next album short-circuits at the loop top
             else:
-                time.sleep(cfg.DELAY_BETWEEN)
+                _sleep_unless_cancelled(cfg.DELAY_BETWEEN, is_cancel_requested)
 
     # ── Post-batch: consolidate duplicate albums once if anything landed.
     # The fold is a library-wide pass, so running it per-album would waste

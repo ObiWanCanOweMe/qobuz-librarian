@@ -666,8 +666,8 @@ def run_artist_mode(artist_name, args, token):
         vlog(f"  Library: {artist_dir}")
 
         # fresh=True: an explicit single-artist run should see just-released
-        # albums, matching the web Artist page. (The library walk reuses these
-        # functions without it, so the bulk path keeps its cached catalog.)
+        # albums. The library walk reuses these functions without it, so the
+        # bulk path keeps its cached catalog.
         (gap_fill_results, owned_titles, handled_ids, resolved_dirs,
          artist_id, catalog) = run_artist_gap_fill(artist_name, artist_dir, args, token,
                                                    fresh=True)

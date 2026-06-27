@@ -159,12 +159,19 @@ def resolve_artist(query, token):
     return aid, aname
 
 
-def resolve_artist_dir(artist_query):
+def resolve_artist_dir(artist_query, candidates=None):
     """Fuzzy-find an artist's directory in MUSIC_ROOT. Returns Path or None.
-    Handles 'The X' / 'X' equivalence."""
+    Handles 'The X' / 'X' equivalence.
+
+    Pass ``candidates`` (a list_library_artists() result) to match many artists
+    against one directory listing. The search-ownership annotation resolves the
+    artist of every result; left to itself this re-walks MUSIC_ROOT once per
+    result, turning an O(library) listing into O(results × library) — slow
+    enough on a large library to trip the caller's timeout and drop every mark."""
     if not artist_query:
         return None
-    candidates = list_library_artists()
+    if candidates is None:
+        candidates = list_library_artists()
     if not candidates:
         return None
 
@@ -261,7 +268,7 @@ class DiscoveryResult:
     artist_name: str | None
     gaps: list = field(default_factory=list)          # AlbumGap (partials + fully-missing)
     complete: list = field(default_factory=list)      # {dir, qobuz_album, existing}
-    singles: list = field(default_factory=list)       # {dir, qobuz_album, present, missing} — grabbed singles, not gaps
+    singles: list = field(default_factory=list)       # {dir, qobuz_album, present, missing} — downloaded singles, not gaps
     skipped: list = field(default_factory=list)       # {dir, reason, qobuz_title, ...}
     unmatched_dirs: list = field(default_factory=list)  # folders no Qobuz album matched
     catalog: list = field(default_factory=list)       # the fetched catalog (callers may reuse)
@@ -334,12 +341,12 @@ def _is_single(single_store, artist_name, album):
 def _collecting(single_store, artist_name, album_dirs):
     """An artist is 'collected' — surfaced by the bulk catalog walk and the
     new-release check — only when they own at least one album folder that isn't
-    just a grabbed single. No single store (an explicit single-artist request)
+    just a downloaded single. No single store (an explicit single-artist request)
     means show everything."""
     if single_store is None:
         return True
     # Derive per-folder, not by count: an artist is collecting if ANY owned
-    # folder isn't a grabbed single (is_single normalises the folder name to the
+    # folder isn't a downloaded single (is_single normalises the folder name to the
     # mark's fingerprint). A bare folder-count-vs-mark-count comparison drifts —
     # a mark whose folder was deleted, or extra non-single folders, flips the
     # suppression both ways.
@@ -442,9 +449,9 @@ def discover_fully_missing(artist_name, catalog, opts, *, hidden=None,
     for album, _n_versions in pairs:
         if album.get("id") in handled_ids:
             continue
-        # A deliberately-grabbed single from this album: the owned pass suppresses
+        # A deliberately downloaded single from this album: the owned pass suppresses
         # it, but this fully-missing pass would otherwise re-offer it as a gap.
-        # (single_store is None for the single-artist Artist mode, which shows
+        # (single_store is None for explicit single-artist scans, which show
         # everything by design.)
         if _is_single(single_store, artist_name, album):
             continue
@@ -552,7 +559,7 @@ def find_missing_for_artist(query, *, token, opts=None, artist_dir=None,
         classify_owned_match(result, m, hidden, single_store, artist_name,
                              handled_ids, resolved_dirs)
 
-    # Skip the catalog walk for an artist you own only grabbed singles by — they
+    # Skip the catalog walk for an artist you own only downloaded singles by — they
     # aren't one you're collecting, so their back catalogue shouldn't surface.
     # hidden is None on an explicit single-artist request, which always sees all.
     if want_missing and (hidden is None
@@ -703,7 +710,7 @@ def classify_owned_match(result, m, hidden, single_store, artist_name,
         return
     if m.status == "partial":
         if _is_single(single_store, artist_name, m.qobuz_album):
-            # A track the user grabbed on purpose. Its album id is already in
+            # A track the user downloaded on purpose. Its album id is already in
             # handled_ids (added above), so the missing pass won't re-offer it.
             result.singles.append({"dir": ad, "qobuz_album": m.qobuz_album,
                                    "present": m.present, "missing": m.missing})

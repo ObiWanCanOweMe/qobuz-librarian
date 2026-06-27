@@ -2,7 +2,7 @@
 
 Wires ``library.migrate`` (the planning/copy engine) to the terminal: resolve
 and validate the source and destination, build the plan, show a real preview,
-confirm, then copy. Local-only — it reorganizes files on disk and never needs a
+confirm, then copy. Local-only — it reorganises files on disk and never needs a
 Qobuz login.
 """
 from pathlib import Path
@@ -30,13 +30,13 @@ def _resolve_paths(args):
     src = (getattr(args, "migrate_src", "") or config.MIGRATE_SRC).strip()
     dest = (getattr(args, "migrate_dest", "") or config.MIGRATE_DEST).strip()
     if not src:
-        src = _prompt_path("  Source library to organize: ")
+        src = _prompt_path("  Source library to organise: ")
     if not dest:
-        dest = _prompt_path("  Destination for the organized copy: ")
+        dest = _prompt_path("  Destination for the organised copy: ")
     if not src or not dest:
         log.info(fmt(C.RED,
             "  ✗  Need both a source and a destination.\n"
-            "     Set QL_MIGRATE_SRC and QL_MIGRATE_DEST, or pass "
+            "     Set MIGRATE_SRC and MIGRATE_DEST, or pass "
             "--migrate-src / --migrate-dest."))
         return None, None
 
@@ -104,7 +104,7 @@ def _print_preview(plan, verbose: bool, in_place: bool) -> None:
 
 
 def run_migrate_mode(args):
-    section("Library migration — organize an existing collection")
+    section("Library migration — organise an existing collection")
 
     if not HAVE_MUTAGEN:
         log.info(fmt(C.RED,

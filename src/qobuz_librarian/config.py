@@ -171,13 +171,13 @@ def _sibling_of_music(name: str) -> Path:
 
 STAGING_DIR = _env_path("STAGING_DIR", _sibling_of_music(".staging"))
 
-# Library migration (the one-time "organize an existing collection" tool).
-# Source = the messy library to read; destination = where the organized copy
+# Library migration (the one-time "organise an existing collection" tool).
+# Source = the library to read; destination = where the organised copy
 # is built. Read from the environment so both can be mounted into the
 # container; the CLI's --migrate-src / --migrate-dest override them. Empty
 # means "unset" — the tool then prompts (or errors with how to set them).
-MIGRATE_SRC  = os.environ.get("QL_MIGRATE_SRC", "").strip()
-MIGRATE_DEST = os.environ.get("QL_MIGRATE_DEST", "").strip()
+MIGRATE_SRC  = os.environ.get("MIGRATE_SRC", "").strip()
+MIGRATE_DEST = os.environ.get("MIGRATE_DEST", "").strip()
 
 # Beets — bundled inside the container (compose.yaml sets these to
 # /config/beets). The fallback is beets' own standard config location, so
@@ -190,8 +190,6 @@ BEETS_DB_PATH = _env_path(
     "BEETS_DB_PATH",
     BEETS_CONFIG_DIR / "musiclibrary.db",
 )
-# Used by beets.py when writing the import override config.
-BEETS_STAGING_INSIDE = os.environ.get("BEETS_STAGING_INSIDE", str(STAGING_DIR))
 
 # Optional beets path/naming overrides. Empty = leave beets to its own
 # config.yaml (fully editable in the /config volume) / built-in defaults.
@@ -272,7 +270,8 @@ ARTIST_RESOLVE_CACHE_FILE = DATA_DIR / ".artist_resolve_cache.json"
 LYRIC_FETCH_STATE_FILE = DATA_DIR / ".lyric_fetch_state.json"
 # Web UI login: username + password hash + session secret, written 0600
 # (it holds a credential). Lives in DATA_DIR with the rest of the state so
-# one volume covers it. WEB_AUTH below is the on/off knob.
+# one volume covers it. WEB_AUTH=none is the opt-out knob, checked live in
+# web/auth.py.
 WEB_AUTH_FILE = DATA_DIR / ".qobuz_web_auth.json"
 
 # Lock file lives in DATA_DIR so the web container and a `docker compose
@@ -290,13 +289,6 @@ UPGRADE_BACKUP_DIR = _env_path(
 # ── Web UI ────────────────────────────────────────────────────────────────────
 WEB_HOST = os.environ.get("WEB_HOST", "0.0.0.0")
 WEB_PORT = _env("WEB_PORT", 8666)
-
-# Built-in login. WEB_AUTH=none turns it off entirely (no setup screen, no
-# login prompt). Any other value — including blank or unset — leaves auth ON,
-# so it can only be disabled by a deliberate opt-out, never by an empty field.
-# The live check is web/auth.py:auth_disabled(); this constant just documents
-# the knob and is read fresh from the env there so it stays test-overridable.
-WEB_AUTH = os.environ.get("WEB_AUTH", "").strip().lower()
 
 # ── Versioned file schemas ────────────────────────────────────────────────────
 PENDING_QUEUE_VERSION = 1
@@ -479,7 +471,6 @@ SSE_HEARTBEAT_TICKS  = _env_num_min("SSE_HEARTBEAT_TICKS", 30, 1)
 # ── Fuzzy-match thresholds ────────────────────────────────────────────────────
 FUZZY_DIR_THRESH           = _env_unit_float("FUZZY_DIR_THRESH",           0.78)
 FUZZY_DIR_MIN_COVERAGE     = _env_unit_float("FUZZY_DIR_MIN_COVERAGE",     0.75)
-DB_ALBUM_THRESH            = _env_unit_float("DB_ALBUM_THRESH",            0.85)
 CONSOLIDATE_THRESH         = _env_unit_float("CONSOLIDATE_THRESH",         0.70)
 ARTIST_NAME_THRESH         = _env_unit_float("ARTIST_NAME_THRESH",         0.85)
 ARTIST_DIR_MATCH_THRESH    = _env_unit_float("ARTIST_DIR_MATCH_THRESH",    0.65)
@@ -510,35 +501,16 @@ AUTO_UPGRADE_ENABLED = _env_bool("AUTO_UPGRADE_ENABLED", False)
 UPGRADE_SINGLES_ENABLED = _env_bool("UPGRADE_SINGLES_ENABLED", False)
 # Off by default: most people want the file Qobuz delivers. Opt in if you
 # prefer to grab hi-res mixes and downsample them to 44.1/48 kHz to save space.
-# DOWNSAMPLE_HIRES_ENABLED is the canonical name; COMPRESS_ENABLED is the
-# legacy alias kept so existing .env files / settings files keep working.
-# Read both at startup: an explicit COMPRESS_ENABLED=1 still wins, but new
-# users should reach for the clearer name.
-def _resolve_downsample_flag():
-    # Route through _env_bool so a typo'd value ('banana') warns instead of
-    # silently degrading to False — same contract as every other bool knob.
-    # An explicit DOWNSAMPLE_HIRES_ENABLED wins; otherwise check the legacy
-    # COMPRESS_ENABLED alias so existing .env files keep working.
-    if os.environ.get("DOWNSAMPLE_HIRES_ENABLED") is not None:
-        return _env_bool("DOWNSAMPLE_HIRES_ENABLED", False)
-    if os.environ.get("COMPRESS_ENABLED") is not None:
-        return _env_bool("COMPRESS_ENABLED", False)
-    return False
+DOWNSAMPLE_HIRES_ENABLED = _env_bool("DOWNSAMPLE_HIRES_ENABLED", False)
 
-
-DOWNSAMPLE_HIRES_ENABLED = _resolve_downsample_flag()
-# Legacy alias retained so older code paths and on-disk settings files keep
-# resolving to the same value. Both names always refer to the same flag.
-COMPRESS_ENABLED = DOWNSAMPLE_HIRES_ENABLED
-
-# Album-version / library-structure preferences. CLI and web both read these
-# so behaviour is identical across interfaces; override via env or Settings.
+# Album-version / library-structure preferences. CLI and web both read these,
+# so shared options behave the same across interfaces.
 #   PREFER_HIRES         pick the hi-res master when an album has several versions
 #   CONSOLIDATE          after import, merge sibling/duplicate album folders
 #   MIGRATE_MULTI_ARTIST move "Primary, Other/<album>" into "Primary/<album>"
 # CONSOLIDATE defaults off: it moves/merges folders, which is opinionated for
 # someone else's library layout. It's CLI-only and prompts per folder anyway;
-# turn it on (env or Settings) if you want it.
+# turn it on via env or CLI if you want it.
 PREFER_HIRES         = _env_bool("PREFER_HIRES",         True)
 CONSOLIDATE          = _env_bool("CONSOLIDATE",          False)
 MIGRATE_MULTI_ARTIST = _env_bool("MIGRATE_MULTI_ARTIST", False)

@@ -25,7 +25,7 @@ def run_downsample_walk_mode(args):
     NO; --dry-run lists what would shrink and changes nothing.
     """
     clear_scan_caches()
-    banner("Downsample — shrink hi-res library files to CD rate")
+    banner("Downsample — bring hi-res library files down to CD rate")
 
     if not HAVE_DOWNSAMPLE:
         log.info(fmt(C.YELLOW,
@@ -123,7 +123,7 @@ def run_downsample_walk_mode(args):
     log.info("")
     log.info(fmt(C.GREEN, "  ✓  Downsample walk complete."))
     log.info(fmt(C.GRAY,
-        f"     Scanned {plural(n_scanned, 'artist')} — shrank "
+        f"     Scanned {plural(n_scanned, 'artist')} — downsampled "
         f"{plural(n_albums_done, 'album')}, reclaimed {format_size(total_saved)}."))
     if total_errors:
         log.info(fmt(C.YELLOW,

@@ -260,8 +260,7 @@ def test_executor_per_album_isolation_one_album_failure_keeps_others(monkeypatch
                         })
 
     args = Namespace(dry_run=False, no_import=False, no_downsample=True,
-                     no_compress=True, migrate_multi_artist=False,
-                     consolidate=False)
+                     migrate_multi_artist=False, consolidate=False)
     results, drained = executor._execute_download_queue(items, args, token=None)
 
     assert seen == ["A", "B", "C"]
@@ -319,7 +318,7 @@ def test_executor_keeps_only_failed_downloads_for_retry(monkeypatch, tmp_path):
 
     saves = []
     args = Namespace(dry_run=False, no_import=False, no_downsample=True,
-                     no_compress=True, migrate_multi_artist=False, consolidate=False)
+                     migrate_multi_artist=False, consolidate=False)
     results, drained = executor._execute_download_queue(
         queue, args, token=None, on_progress=lambda: saves.append(list(queue)))
 
@@ -434,3 +433,19 @@ def test_queue_runs_post_download_truncation_recheck_on_success(monkeypatch, tmp
 
     assert results and results[0]["result"] == "downloaded"
     assert rechecked == [(post_dir, "tok", "Album")]
+
+
+def test_cooldown_sleep_wakes_on_cancel():
+    # The inter-album cooldown after a rate-limited rip can be 30s+; a Stop must
+    # cut it short instead of leaving the worker blocked for the whole window.
+    import time as _t
+
+    from qobuz_librarian.queue import executor
+
+    start = _t.monotonic()
+    assert executor._sleep_unless_cancelled(30, lambda: True, step=0.05) is True
+    assert _t.monotonic() - start < 1.0
+
+    start = _t.monotonic()
+    assert executor._sleep_unless_cancelled(0.1, lambda: False, step=0.02) is False
+    assert _t.monotonic() - start >= 0.1

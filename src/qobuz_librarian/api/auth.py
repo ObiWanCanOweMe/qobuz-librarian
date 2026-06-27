@@ -209,9 +209,11 @@ def write_streamrip_creds(user_id, auth_token) -> bool:
         target = config.STREAMRIP_CONFIG
         fd, tmp = tempfile.mkstemp(dir=str(target.parent),
                                    prefix=".streamrip.", suffix=".tmp")
+        fd_owned = False
         try:
             os.fchmod(fd, 0o600)  # holds the account token — keep it owner-only
             with os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd_owned = True
                 f.write(tomlkit.dumps(doc))
                 f.flush()
                 os.fsync(f.fileno())
@@ -228,6 +230,11 @@ def write_streamrip_creds(user_id, auth_token) -> bool:
             except OSError:
                 pass
         finally:
+            if not fd_owned:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             if os.path.exists(tmp):
                 try:
                     os.unlink(tmp)

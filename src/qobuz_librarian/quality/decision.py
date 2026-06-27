@@ -297,7 +297,7 @@ def scan_artist_for_upgrades(artist_name, artist_dir, token, args, capped=None):
         # Key the single check on the matched Qobuz artist name — that's what
         # mark_single stored. The folder name (artist_name) can differ from it
         # ("Beatles" on disk vs "The Beatles" on Qobuz), which would miss the
-        # mark and leak the grabbed single into the upgrade scan.
+        # mark and leak the downloaded single into the upgrade scan.
         # Only skip when the album is still partial (has missing tracks) — a
         # fully-present album should graduate out of the single marker and remain
         # eligible for a quality upgrade, matching discovery.py semantics.
@@ -323,7 +323,7 @@ def scan_artist_for_upgrades(artist_name, artist_dir, token, args, capped=None):
         # try to find an alternate Qobuz edition that covers everything
         # on disk. Auto-promote a perfect match (no new extras, still an
         # upgrade) silently — upgrade walk has no per-album picker by
-        # design. Critical for libraries built from messy partial-edition
+        # design. Critical for libraries assembled from partial-edition
         # rips, where one stray track from a different edition currently
         # blocks the entire upgrade.
         extras = find_extras_in_existing(qobuz_tracks, existing)

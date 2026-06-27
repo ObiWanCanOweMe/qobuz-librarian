@@ -174,8 +174,8 @@ def _prepare_staging_tags(roots=None):
     Without mutagen every read fails; rather than quarantine the whole download
     as "untagged" and hand beets an empty dir, leave the files untouched.
 
-    ``roots`` scopes the scan to those directories; None means the whole
-    STAGING_DIR (back-compat for the preflight-driven full-batch import).
+    ``roots`` scopes the scan to those directories; None scans the whole
+    STAGING_DIR for the preflight-driven full-batch import.
     """
     moved = []
     if not HAVE_MUTAGEN:
@@ -470,7 +470,7 @@ def _count_audio_under(paths):
 
 def _beets_direct(override_path, cleanup_fn, paths=None):
     """Call ``beet import`` as a direct subprocess (bundled mode), scoped to
-    the given paths (default: whole STAGING_DIR for back-compat). Returns
+    the given paths (default: whole STAGING_DIR). Returns
     ``(ok: bool, kind: str)`` where kind is ``"ok"`` / ``"timeout"`` /
     ``"error"`` so the caller can distinguish a retry-worthy idle-timeout
     from a permanent failure."""
@@ -992,8 +992,7 @@ def staging_preflight(args):
             HAVE_DOWNSAMPLE,
             downsample_dir,
         )
-        if HAVE_DOWNSAMPLE and not getattr(args, "no_downsample",
-                                           getattr(args, "no_compress", False)):
+        if HAVE_DOWNSAMPLE and not getattr(args, "no_downsample", False):
             try:
                 downsample_dir(cfg.STAGING_DIR, verbose=True, base_dir=cfg.STAGING_DIR, log=log.info)
             except (KeyboardInterrupt, Exception) as _ce:

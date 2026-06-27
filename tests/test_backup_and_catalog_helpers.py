@@ -1,10 +1,7 @@
-"""Tests for backup/restore safety, beets-DB-after-move sync, and the
-consolidation helpers. These mostly cover the cross-filesystem / interrupted-
-operation paths that have actually bit us — the gnarly parts."""
+"""Tests for backup/restore safety and consolidation helpers."""
 import errno
 import os
 import shutil
-import sqlite3
 from unittest.mock import patch
 
 import pytest
@@ -19,7 +16,6 @@ from qobuz_librarian.library.backup import (
 from qobuz_librarian.library.catalog import (
     _MERGE_MAX_DEPTH,
     _merge_album_dirs,
-    _sync_beets_db_after_move,
 )
 from qobuz_librarian.modes.consolidate import (
     execute_consolidation,
@@ -412,45 +408,6 @@ def test_merge_album_dirs_caps_depth_and_keeps_dst_on_replace_failure(tmp_path, 
     monkeypatch.setattr(prompts_mod, "confirm", lambda *a, **kw: True)
     _merge_album_dirs(src, dst)
     assert (dst / "track.flac").read_bytes() == b"dst-audio"
-
-
-# ── _sync_beets_db_after_move + _after_merge ───────────────────────────────
-
-def _setup_beets_db(tmp_path, monkeypatch, rows):
-    music_root = tmp_path / "music"
-    music_root.mkdir()
-    db = tmp_path / "beets.db"
-    with sqlite3.connect(str(db)) as conn:
-        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, path BLOB)")
-        for i, p in enumerate(rows, 1):
-            conn.execute("INSERT INTO items (id, path) VALUES (?, ?)", (i, p))
-        conn.commit()
-    monkeypatch.setattr("qobuz_librarian.library.catalog.config.BEETS_DB_PATH", str(db))
-    monkeypatch.setattr("qobuz_librarian.library.catalog.config.MUSIC_ROOT", music_root)
-    return music_root, db
-
-
-def _read_beets_paths(db):
-    with sqlite3.connect(str(db)) as conn:
-        return [r[0] for r in conn.execute("SELECT path FROM items ORDER BY id")]
-
-
-def test_sync_beets_db_after_move_repoints_paths_and_leaves_others_alone(tmp_path, monkeypatch):
-    music_root, db = _setup_beets_db(tmp_path, monkeypatch, [
-        b"Atlas & Oracle, Foxing Day/Christmas Treat (2023)/01 - track.flac",
-        b"Atlas & Oracle, Foxing Day/Christmas Treat (2023)/02 - other.flac",
-        b"The Beatles/Abbey Road (1969)/01 - Come Together.flac",
-    ])
-    old = music_root / "Atlas & Oracle, Foxing Day" / "Christmas Treat (2023)"
-    new = music_root / "Atlas & Oracle" / "Christmas Treat (2023)"
-    old.mkdir(parents=True)
-    new.mkdir(parents=True)
-    _sync_beets_db_after_move(old, new)
-    rows = _read_beets_paths(db)
-    assert b"Atlas & Oracle/Christmas Treat (2023)/01 - track.flac" in rows
-    assert b"Atlas & Oracle/Christmas Treat (2023)/02 - other.flac" in rows
-    # Unrelated row left intact.
-    assert b"The Beatles/Abbey Road (1969)/01 - Come Together.flac" in rows
 
 
 # ── consolidation helpers ──────────────────────────────────────────────────

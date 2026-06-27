@@ -80,9 +80,9 @@ def acquire_run_lock():
         die(fmt(C.RED,
             f"\n✗  Another Qobuz Librarian run is in progress (pid {busy.pid}).\n"
             f"   Lock file: {cfg.LOCK_FILE}\n\n"
-            f"   The web app is probably holding the lock. Either:\n"
+            f"   The web app may be holding the lock. Either:\n"
             f"     1. In the web UI (http://<host>:{cfg.WEB_PORT}), open Settings → Mode\n"
-            f"        and click 'Hand off to terminal', then re-run this command.\n"
+            f"        and switch to terminal mode, then re-run this command.\n"
             f"        (Or just use the web UI — every CLI mode is also a web action.)\n"
             f"     2. Stop the web container instead:  docker compose stop {_svc}\n"
             f"        then re-run, then `docker compose start {_svc}`.\n\n"
@@ -186,11 +186,11 @@ def parse_args():
             "  qobuz-librarian                                  # interactive menu\n"
             "  qobuz-librarian https://open.qobuz.com/album/abc # one album by URL\n"
             "  qobuz-librarian \"radiohead in rainbows\"          # search and download\n"
-            "  qobuz-librarian --artist \"Stars of the Lid\"      # fill artist gaps\n"
+            "  qobuz-librarian --artist \"Paysage d'Hiver\"       # fill artist gaps\n"
             "  qobuz-librarian --upgrade-walk --auto-safe       # unattended upgrade pass\n"
             "  qobuz-librarian --dry-run --artist Beatles       # preview without downloading\n\n"
             "Credentials: set them on the web UI Settings page first (browse to\n"
-            "http://<host>:8666/settings on a fresh install), or via\n"
+            f"http://<host>:{cfg.WEB_PORT}/settings on a fresh install), or via\n"
             "QOBUZ_USER_AUTH_TOKEN / QOBUZ_USER_ID env vars.\n\n"
             "Exit codes:\n"
             "  0   success\n"
@@ -208,8 +208,8 @@ def parse_args():
                    help="Scan every artist for quality upgrades. Per-artist "
                         "confirm (enter=yes), auto-advance.")
     p.add_argument("--downsample-walk", action="store_true",
-                   help="Scan the library for hi-res files and shrink them to "
-                        "CD rate in place (per-artist confirm; --dry-run lists "
+                   help="Scan the library for hi-res files and downsample them "
+                        "to CD rate in place (per-artist confirm; --dry-run lists "
                         "only). Local — no Qobuz login needed.")
     p.add_argument("--check-new-releases", dest="check_new_releases",
                    action="store_true",
@@ -245,7 +245,7 @@ def parse_args():
                    help="auto-confirm download/import prompts "
                         "(destructive prompts still ask)")
     p.add_argument("--verbose",      action="store_true", help="show detection details")
-    # Default from config (CONSOLIDATE, env/Settings overridable).
+    # Default from config (CONSOLIDATE, env/CLI overridable).
     p.add_argument("--consolidate",  dest="consolidate",
                    action=argparse.BooleanOptionalAction,
                    default=cfg.CONSOLIDATE,
@@ -273,22 +273,18 @@ def parse_args():
                    action="store_true",
                    help="force-skip pre-import downsampling for this run "
                         "(only relevant when DOWNSAMPLE_HIRES_ENABLED is on)")
-    # Legacy name kept so existing shell aliases / cron jobs don't break.
-    p.add_argument("--no-compress", dest="no_compress",
-                   action="store_true",
-                   help=argparse.SUPPRESS)
     p.add_argument("--migrate-multi-artist", dest="migrate_multi_artist",
                    action=argparse.BooleanOptionalAction,
                    default=cfg.MIGRATE_MULTI_ARTIST,
                    help="after import, merge 'Primary, Other' folders into 'Primary'")
     p.add_argument("--migrate", action="store_true",
-                   help="one-time setup: reorganize an existing library into the "
+                   help="one-time setup: reorganise an existing library into the "
                         "Artist/Album layout (local-only; no Qobuz login needed)")
     p.add_argument("--migrate-src", dest="migrate_src", metavar="PATH", default="",
-                   help="migration source library to read (overrides QL_MIGRATE_SRC)")
+                   help="migration source library to read (overrides MIGRATE_SRC)")
     p.add_argument("--migrate-dest", dest="migrate_dest", metavar="PATH", default="",
-                   help="where migration builds the organized copy "
-                        "(overrides QL_MIGRATE_DEST)")
+                   help="where migration builds the organised copy "
+                        "(overrides MIGRATE_DEST)")
     p.add_argument("--in-place", dest="in_place", action="store_true",
                    help="migration: MOVE files into place instead of copying "
                         "(default copies, leaving originals untouched)")
@@ -296,12 +292,9 @@ def parse_args():
                    help="migration: fingerprint files whose tags can't place them "
                         "(slower, needs network; no key required)")
     args = p.parse_args()
-    # --no-compress is the legacy spelling of --no-downsample; mirror them so
-    # callers can read whichever name they're used to.
-    args.no_compress = args.no_downsample = args.no_compress or args.no_downsample
     # Per-run override of cfg.AUTO_UPGRADE_ENABLED. Defaults to the global
     # so plain gap-fills behave the same as before; the explicit upgrade
-    # walk flips this without mutating the cfg the web Settings page reads.
+    # walk flips this without mutating the shared cfg value.
     args.auto_upgrade = cfg.AUTO_UPGRADE_ENABLED
     # The walk / migrate / reset modes are whole-library or local-only runs that
     # read none of the album- or artist-scan flags below, so naming one of those
@@ -452,7 +445,7 @@ def main():
             log.info(fmt(C.GRAY, "  No walk-seen state to clear."))
         return
 
-    # Library migration is local-only: it reorganizes files on disk and never
+    # Library migration is local-only: it reorganises files on disk and never
     # touches Qobuz. Handle it here, before the credential check and the
     # download-oriented setup below, so it runs on a fresh box with no token.
     if args.migrate:

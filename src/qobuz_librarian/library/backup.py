@@ -720,7 +720,7 @@ def restore_upgrade_backup(backup_path: Path, original_path: Path) -> bool:
     the backup (the backup is the only intact copy). Returns True on success.
 
     Compares backup vs partial on TOTAL BYTES, not file count: a partial
-    download might have grabbed the single largest track first (1 huge
+    download might have written the single largest track first (1 huge
     file) while the legitimate backup holds the rest (many smaller
     files). File-count alone would call the backup "bigger" and wipe the
     intact track. Bytes-based is what actually matters for "more data

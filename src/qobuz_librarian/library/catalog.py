@@ -1078,70 +1078,8 @@ def _merge_album_dirs(src: Path, dst: Path, _depth: int = 0) -> bool:
     return True
 
 
-def _sync_beets_db_after_move(old_dir: Path, new_dir: Path) -> None:
-    """Update beets' items.path after a directory move performed outside
-    beets' control. Without this, the next `beet update` marks every
-    track under old_dir as deleted because the relative path stored in
-    items.path still points at the pre-move location.
-
-    Failures are surfaced but never raised — a sync slip is recoverable
-    (`beet update`), an exception here would unwind the migration and
-    leave the disk and DB in worse drift than before.
-    """
-    db_path = getattr(config, "BEETS_DB_PATH", None)
-    if not db_path:
-        return
-    db_path = Path(str(db_path))
-    if not db_path.exists():
-        return
-    music_root = Path(str(config.MUSIC_ROOT))
-    try:
-        old_rel = old_dir.resolve().relative_to(music_root.resolve())
-        new_rel = new_dir.resolve().relative_to(music_root.resolve())
-    except (ValueError, OSError):
-        # Not under MUSIC_ROOT — beets doesn't track these.
-        return
-    # os.fsencode (not UTF-8) to match how beets stores items.path — a
-    # UTF-8 prefix never matches a non-UTF-8 filename's BLOB, silently leaving
-    # the DB pointing at the pre-move path. Same convention as the sibling syncs.
-    old_prefix = os.fsencode(str(old_rel)) + b"/"
-    new_prefix = os.fsencode(str(new_rel)) + b"/"
-    import sqlite3
-    try:
-        with sqlite3.connect(str(db_path)) as conn:
-            # items.path is BLOB, relative to beets `directory`. Replace
-            # only the prefix; keep the per-disc/per-track suffix intact.
-            # `||` coerces BLOB → TEXT, so wrap the concat in CAST AS BLOB
-            # to preserve the byte-string type beets expects.
-            conn.execute(
-                "UPDATE items SET path = CAST(? || SUBSTR(path, ?) AS BLOB) "
-                "WHERE SUBSTR(path, 1, ?) = ?",
-                (new_prefix, len(old_prefix) + 1, len(old_prefix), old_prefix),
-            )
-            # albums.artpath uses the same MUSIC_ROOT-relative BLOB convention
-            # and the cover moves with the folder, so repoint it too — otherwise
-            # albums.artpath dangles at the pre-move folder. Best-effort and
-            # isolated: a DB shape without the albums table/column must not roll
-            # back the items update above.
-            try:
-                conn.execute(
-                    "UPDATE albums SET artpath = "
-                    "CAST(? || SUBSTR(artpath, ?) AS BLOB) "
-                    "WHERE artpath IS NOT NULL AND SUBSTR(artpath, 1, ?) = ?",
-                    (new_prefix, len(old_prefix) + 1, len(old_prefix), old_prefix),
-                )
-            except sqlite3.Error:
-                pass
-            conn.commit()
-    except (sqlite3.Error, OSError, ValueError) as e:
-        log.info(fmt(C.YELLOW,
-            f"  ⚠  beets DB path sync failed ({e}). "
-            "Run `beet update` to re-scan."))
-
-
 def _sync_beets_db_after_merge(old_dir: Path, new_dir: Path) -> None:
-    """Like _sync_beets_db_after_move, but for the merge path where new_dir
-    already holds rows. Repoint each source row to its new path — except where a
+    """Repoint each source row to its new path after a folder merge, except where a
     row already exists at that path (a file collision the merge resolved), where
     the source row is dropped instead. A blind prefix rewrite would otherwise
     leave two items rows pointing at one file and break the next `beet update`.
@@ -1207,8 +1145,7 @@ def _sync_beets_db_after_merge(old_dir: Path, new_dir: Path) -> None:
 def _sync_beets_db_after_file_move(old_file: Path, new_file: Path) -> None:
     """Update beets' items.path for one file moved outside beets' control.
 
-    Same rationale as _sync_beets_db_after_move, but matches a single exact
-    path rather than a directory prefix — used when a repaired track beets
+    Matches a single exact path rather than a directory prefix; used when a repaired track beets
     filed under its tag-derived album is relocated into the folder actually
     being repaired.
     """
@@ -1228,7 +1165,7 @@ def _sync_beets_db_after_file_move(old_file: Path, new_file: Path) -> None:
     try:
         # os.fsencode (not UTF-8) to match how beets stores items.path, so a
         # non-UTF-8 filename's row is actually matched. Same as the sibling
-        # _sync_beets_db_after_merge / _after_move.
+        # merge sync.
         with sqlite3.connect(str(db_path)) as conn:
             conn.execute(
                 "UPDATE items SET path = ? WHERE path = ?",

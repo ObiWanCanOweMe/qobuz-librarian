@@ -1,4 +1,4 @@
-"""Library migration — reorganize a messy collection into this tool's layout.
+"""Library migration — reorganise an existing collection into this tool's layout.
 
 The job is to take an arbitrary, possibly-untagged music folder and produce the
 two-level ``<Artist>/<Album> (<Year>)/`` tree the scanner expects, matching the
@@ -7,10 +7,10 @@ exact folder shape the downloader itself writes (see ``docker/beets-default.yaml
 
 Three rules drive every decision here:
 
-* **Copy, never move.** The default builds the organized library as a copy at a
-  separate destination; the source is read but never altered or deleted.
-  In-place mode is a separate, explicit opt-in and even then only relocates a
-  file once a verified copy exists.
+* **Copy unless explicitly moving.** The default builds the organised library
+  as a copy at a separate destination; the source is read but not altered or
+  deleted. In-place mode is a separate, explicit opt-in and even then only
+  relocates a file once a verified copy exists.
 * **Decide, then act.** ``build_plan`` produces the entire set of
   source→destination decisions up front (a pure function over extracted
   metadata). The preview renders that plan; ``execute_plan`` carries out exactly
@@ -265,8 +265,8 @@ def album_components(meta: dict) -> tuple:
     year = meta.get("year") or 0
     album = meta["album"]
     if year:
-        # Strip any year the album tag already carries (messy libraries bake it
-        # into the name) so we don't end up with "Album (2010) (2010)".
+        # Strip any year the album tag already carries so we don't end up with
+        # "Album (2010) (2010)".
         album_folder = f"{strip_year_decoration(album)} ({year})"
     else:
         album_folder = album
@@ -609,9 +609,10 @@ def _carry_companion_files(plan: "MigrationPlan", result: "ExecResult", *,
     destination folder(s) that received its audio.
 
     Always a copy (never a move), even in in-place mode: the same cover can fan
-    out to several destinations (AcoustID splitting a messy folder), the source
-    folder may still hold audio that failed/skipped, and a duplicated cover image
-    is harmless. Best-effort — a companion failure is logged, never fatal.
+    out to several destinations (for example, AcoustID splitting one source
+    folder), the source folder may still hold audio that failed/skipped, and a
+    duplicated cover image is harmless. Best-effort — a companion failure is
+    logged, never fatal.
     Same-folder layout only (cover beside the tracks); an album-level cover a
     level above per-disc track folders is intentionally not chased."""
     folder_map: dict = {}
