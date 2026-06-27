@@ -1,43 +1,52 @@
 {% extends "base.html" %}
 {% set is_upgrade = scope == 'upgrade' %}
 {% set is_downsample = scope == 'downsample' %}
-{% set noun = 'upgrade' if is_upgrade else 'album' %}
+{% set noun = 'upgrade' if is_upgrade else ('album' if is_downsample else 'item') %}
+{% set heading = 'Dismissed upgrades' if is_upgrade else ('Kept hi-res' if is_downsample else 'Dismissed albums and gaps') %}
+{% set kept_label = 'albums kept hi-res' if is_downsample else ('dismissed upgrades' if is_upgrade else 'dismissed albums and gaps') %}
+{% set restore_all_label = 'album kept hi-res' if is_downsample else noun %}
+{% set restore_all_label_plural = 'albums kept hi-res' if is_downsample else noun ~ 's' %}
 {% set back_label = 'Upgrade' if is_upgrade else ('Downsample' if is_downsample else 'Library') %}
-{% block title %}Hidden {{ noun }}s — Qobuz Librarian{% endblock %}
+{% block title %}{{ heading }} — Qobuz Librarian{% endblock %}
+{% block content_max %}max-w-4xl{% endblock %}
 {% block content %}
 
-<div class="flex items-center justify-between gap-3 mb-2">
-  <h1 class="text-2xl font-bold">Hidden {{ noun }}s</h1>
-  <a href="{{ back_url }}" class="btn btn-ghost btn-sm">Back to {{ back_label }}</a>
+<div class="mb-6 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+  <div class="min-w-0">
+    <h1 class="text-2xl font-bold">{{ heading }}</h1>
+    <p class="mt-3 text-base-content/60">
+      {% if is_upgrade %}Upgrades you've dismissed. A higher-quality Qobuz copy won't be suggested for these again.
+      {% elif is_downsample %}Albums kept in hi-res will not be suggested for downsampling again.
+      {% else %}Missing albums and track gaps you've dismissed. They won't be suggested again.{% endif %}
+      Nothing here is deleted; restore an entry to bring it back.
+    </p>
+  </div>
+  {% if groups %}
+  <a href="{{ back_url }}" class="btn btn-outline btn-sm w-full sm:w-auto">Back to {{ back_label }}</a>
+  {% endif %}
 </div>
-<p class="text-base-content/60 mb-6">
-  {% if is_upgrade %}Upgrades you've dismissed — Qobuz won't be suggested as a better copy
-  again until you restore them. Nothing here changes the files you already have.
-  {% elif is_downsample %}Albums you've kept hi-res — they won't be suggested for
-  downsampling again until you restore them. Nothing here changes the files you already have.
-  {% else %}Albums you've dismissed from the library scan — they won't be suggested again
-  until you restore them. Nothing here is deleted from your library or from Qobuz.{% endif %}
-</p>
 
 {% if groups %}
-<p class="text-base-content/70 mb-3">{{ groups | length }} artist{% if groups | length != 1 %}s{% endif %} with hidden {{ noun }}s</p>
+<p class="text-base-content/70 mb-3">{{ groups | length }} artist{% if groups | length != 1 %}s{% endif %} with {{ kept_label }}</p>
 
 <div class="space-y-2 mb-4">
   {% for g in groups %}
-  <div class="block bg-base-200 border border-base-300/70 rounded-lg shadow-sm px-3 py-2.5 transition-colors hover:border-base-300">
-    <div class="flex flex-col gap-1.5 sm:flex-row sm:items-center sm:gap-3">
-      <span class="font-medium min-w-0 truncate sm:flex-1">{{ g.artist }}</span>
-      <div class="flex items-center flex-wrap gap-x-3 gap-y-1 shrink-0">
+  <div class="ql-review-group px-3 py-2.5">
+    <div class="flex flex-col gap-2 sm:flex-row sm:items-start sm:gap-3">
+      <div class="min-w-0 sm:flex-1">
+        <span class="block font-medium truncate">{{ g.artist }}</span>
         <span class="text-base-content/50 text-sm">{{ g.albums | length }} {{ noun }}{% if g.albums | length != 1 %}s{% endif %}</span>
+      </div>
+      <div class="flex w-full flex-wrap items-center gap-2 sm:w-auto sm:justify-end">
         {% if not is_upgrade and not is_downsample %}
-        <a href="/artist?artist={{ g.artist | urlencode }}" class="link link-hover text-xs">Check for new releases</a>
+        <a href="/?kind=artist&q={{ g.artist | urlencode }}" class="btn btn-outline btn-sm sm:btn-xs">Search artist</a>
         {% endif %}
         <form action="{{ restore_action }}" method="post">
           <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
           <input type="hidden" name="artist" value="{{ g.artist }}">
-          <button type="submit" class="btn btn-ghost btn-xs"
-                  data-confirm="Restore every hidden {{ noun }} by {{ g.artist }}?"
-                  aria-label="Restore all hidden {{ noun }}s by {{ g.artist }}">Restore all</button>
+          <button type="submit" class="btn btn-outline btn-sm sm:btn-xs"
+                  data-confirm="Restore every {{ restore_all_label }} by {{ g.artist }}?"
+                  aria-label="Restore all {{ restore_all_label_plural }} by {{ g.artist }}">Restore all</button>
         </form>
       </div>
     </div>
@@ -48,7 +57,7 @@
         <form action="{{ restore_action }}" method="post" class="shrink-0">
           <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
           <input type="hidden" name="fingerprint" value="{{ a.fp }}">
-          <button type="submit" class="btn btn-ghost btn-xs"
+          <button type="submit" class="btn btn-outline btn-sm sm:btn-xs"
                   aria-label="Restore {{ a.title }} by {{ g.artist }}">Restore</button>
         </form>
       </li>
@@ -58,9 +67,9 @@
   {% endfor %}
 </div>
 {% else %}
-<div class="text-center py-12 text-base-content/60">
-  <p class="font-medium">Nothing hidden.</p>
-  <p class="text-sm mt-1">{{ back_label }} {{ noun }}s you dismiss show up here so you can bring them back.</p>
+<div class="ql-empty-state text-base-content/60">
+  <p class="text-base font-semibold text-base-content/75">{% if is_downsample %}No hi-res albums kept.{% elif is_upgrade %}No dismissed upgrades.{% else %}No dismissed albums or gaps.{% endif %}</p>
+  <p class="mx-auto mt-1 max-w-md text-sm">{% if is_downsample %}Albums you keep hi-res appear here so you can downsample them later.{% elif is_upgrade %}Dismissed upgrades appear here so you can restore them.{% else %}Dismissed albums and track gaps appear here so you can restore them.{% endif %}</p>
   <a href="{{ back_url }}" class="btn btn-primary w-full sm:w-auto mt-4">Go to {{ back_label }}</a>
 </div>
 {% endif %}

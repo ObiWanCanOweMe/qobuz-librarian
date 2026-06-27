@@ -1,44 +1,48 @@
 {% extends "base.html" %}
 {% block title %}Downsample — Qobuz Librarian{% endblock %}
+{% block content_max %}max-w-5xl{% endblock %}
 {% block content %}
 
 {% set active_tab = 'downsample' %}
 {% include "_quality_tabs.html" %}
 
-<h1 class="text-2xl font-bold mb-2">Downsample to CD rate</h1>
-<p class="text-base-content/60 mb-2">
-  Shrinks hi-res FLACs above CD rate down to 44.1 / 48&nbsp;kHz to reclaim space — most playback gear can't tell the difference.
-</p>
-{% if creds_ok %}
-<p class="text-base-content/40 text-sm mb-2">
-  Just one artist? <a href="/artist" class="link">Run a focused artist scan</a>.
-</p>
-{% endif %}
-<div class="ql-notice ql-notice-warning mb-3 p-3 text-sm">
-  <span><strong>This can't be undone.</strong> Files are rewritten in place and the hi-res original isn't kept.</span>
-</div>
-<p class="text-base-content/40 text-sm mb-3">
-  {% if last_run %}Last downsample scan {{ last_run }}.{% else %}No downsample scan has finished yet.{% endif %}
-</p>
-{% if hidden_count %}
-<p class="mb-6">
-  <a href="/downsample/hidden" class="link link-hover text-sm">
-    {{ hidden_count }} album{% if hidden_count != 1 %}s{% endif %} kept hi-res — manage</a>
-</p>
-{% else %}
-<div class="mb-6"></div>
-{% endif %}
+<section class="ql-tool-panel mx-auto max-w-3xl">
+  <div class="ql-tool-panel-body">
+    <div class="mb-5">
+      <h1 class="text-2xl font-bold mb-2">Downsample hi-res</h1>
+      <p class="text-base-content/65">
+        Find local hi-res FLAC albums that can be reduced to 44.1 or 48&nbsp;kHz.
+      </p>
+    </div>
 
-{% if have_downsample %}
-<form action="/downsample" method="post" data-busy-submit>
-  <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-  <button type="submit" class="btn btn-primary w-full sm:w-auto"
-          data-confirm="Scan the library for hi-res files? You review and pick what to shrink before anything changes.">Start downsample scan</button>
-</form>
-{% else %}
-<div class="alert alert-warning">
-  <span>Downsampling isn't available on this server (the resample helper is missing).</span>
-</div>
-{% endif %}
+    <div class="ql-tool-status mb-4">
+      <span>
+        {% if last_run %}Last downsample scan {{ last_run }}.{% else %}No downsample scan has finished yet.{% endif %}
+      </span>
+      {% if hidden_count %}
+      <a href="/downsample/hidden" class="link link-hover ml-0 sm:ml-auto">
+        {{ hidden_count }} album{% if hidden_count != 1 %}s{% endif %} kept hi-res
+      </a>
+      {% endif %}
+    </div>
+
+    <div class="ql-tool-note ql-tool-note-warning mb-5">
+      <p class="font-semibold">Review before changes</p>
+      <p>The scan only lists albums. Selected albums are rewritten in place; hi-res originals are not kept.</p>
+    </div>
+
+    {% if have_downsample %}
+    <form action="/downsample" method="post" data-busy-submit>
+      <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+      <button type="submit" class="btn btn-primary w-full sm:w-auto"
+              data-confirm="Scan the library for local hi-res albums? You review and choose what to downsample before anything changes.">Start downsample scan</button>
+    </form>
+    {% else %}
+    <div class="alert alert-warning">
+      <span>Downsampling is not available on this server (the resample helper is missing).</span>
+    </div>
+    {% endif %}
+  </div>
+</section>
 
 {% endblock %}

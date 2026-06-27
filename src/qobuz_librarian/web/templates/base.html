@@ -9,9 +9,6 @@
   <link rel="apple-touch-icon" href="/static/icon-192.png">
   <link rel="manifest" href="/static/manifest.json">
   <meta name="theme-color" content="#1d232a">
-  <!-- Pick the theme before first paint: a saved choice wins, else the OS
-       preference, else dark. Runs here (head) so there's no flash of the wrong
-       theme before the toggle's script would otherwise apply it. -->
   <script nonce="{{ request.state.csp_nonce }}">
     (function () {
       try {
@@ -29,29 +26,19 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="Qobuz Librarian">
-  <!-- Vendored locally so the UI works on air-gapped / offline NAS boxes.
-       Pinned versions; refresh from upstream when bumping. -->
-  <!-- ?v= a content hash of the assets, so any change to the CSS/JS busts a
-       returning visitor's cache (between releases too), and an unchanged asset
-       stays cached across a release. -->
   <link rel="preload" href="/static/vendor/inter/inter-latin.woff2" as="font" type="font/woff2" crossorigin>
   <link href="/static/dist/app.css?v={{ asset_version }}" rel="stylesheet">
   <script src="/static/vendor/htmx-1.9.12.min.js"></script>
   <script nonce="{{ request.state.csp_nonce }}">
-    // HTMX POSTs go through the CSRF middleware; lift the token from the
-    // meta tag and attach it as a header so non-form-submit AJAX calls
-    // (Test Connection, etc.) pass the check.
+    // Attach the CSRF token to htmx requests.
     document.addEventListener('htmx:configRequest', function(evt) {
       var m = document.querySelector('meta[name="csrf-token"]');
       if (m) evt.detail.headers['X-CSRF-Token'] = m.content;
     });
   </script>
-  <!-- CSP-safe htmx event handlers — see web/static/app.js. Replaces the
-       inline-attribute style htmx 1.9 evaluates via new Function, which
-       the page CSP correctly forbids ('unsafe-eval' not allowed). -->
   <script src="/static/app.js?v={{ asset_version }}"></script>
 </head>
-<body class="min-h-screen bg-base-100 flex flex-col">
+<body class="ql-app-body min-h-screen bg-base-100">
 
   <a href="#main-content"
      class="sr-only focus:not-sr-only focus:absolute focus:z-50 focus:top-3 focus:left-3 btn btn-primary btn-sm">
@@ -65,153 +52,160 @@
     </div>
   </noscript>
 
-  <!-- Navbar -->
-  <nav class="navbar ql-header px-4">
-    <div class="flex-1 min-w-0 pr-2">
-      <a href="/" class="inline-flex max-w-full min-w-0 items-center gap-2 text-lg font-bold text-primary">
-        <img src="/static/icon.png" alt="" class="h-8 w-8 rounded-lg shrink-0">
-        <span class="ql-brand-full min-w-0 truncate">Qobuz Librarian</span>
-        <span class="ql-brand-short hidden">Qobuz</span>
-      </a>
-    </div>
-    {% if health_token_invalid or health_lock_busy %}
-    {# Standing health, surfaced on every page so a paused/broken state isn't
-       only visible on the dashboard. Links straight to the fix. #}
-    {% set _hmsg = "Your Qobuz token was rejected — reconnect it in Settings" if health_token_invalid
-                   else "Another instance holds the download lock, so downloads are paused" %}
-    <a href="{{ '/settings' if health_token_invalid else '/' }}" title="{{ _hmsg }}" aria-label="{{ _hmsg }}"
-       class="shrink-0 mr-1 sm:mr-3 inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-semibold transition-colors
-              {% if health_token_invalid %}bg-error/20 text-error hover:bg-error/30{% else %}bg-warning/20 text-warning hover:bg-warning/30{% endif %}">
-      <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M5 19h14a2 2 0 0 0 1.84-2.75L13.74 4a2 2 0 0 0-3.5 0L3.18 16.25A2 2 0 0 0 5 19z"/>
-      </svg>
-      <span class="hidden sm:inline">{% if health_token_invalid %}Reconnect Qobuz{% else %}Downloads paused{% endif %}</span>
-    </a>
-    {% endif %}
-    <button id="theme-toggle" type="button" class="btn btn-ghost btn-circle btn-sm shrink-0"
-            aria-label="Toggle light and dark theme" title="Toggle light / dark theme">
-      <svg class="theme-when-dark h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v2m0 14v2m9-9h-2M5 12H3m15.36 6.36l-1.42-1.42M6.34 6.34L4.93 4.93m12.73 0l-1.42 1.42M6.34 17.66l-1.42 1.42M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0z"/>
-      </svg>
-      <svg class="theme-when-light h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
-      </svg>
-    </button>
-    {% set _tools_pages = ('upgrade', 'downsample', 'repair', 'lyrics', 'migrate') %}
-    <div class="hidden lg:flex">
-      <ul class="menu menu-horizontal gap-1 px-1">
-        <li><a href="/"        class="{% if page=='dashboard' %}active{% endif %}">Dashboard</a></li>
-        <li><a href="/search"  class="{% if page=='search' %}active{% endif %}">Search</a></li>
-        <li><a href="/artist"  class="{% if page=='artist' %}active{% endif %}">Artist</a></li>
-        <li><a href="/library" class="{% if page=='library' %}active{% endif %}">Library</a></li>
-        <li>
-          <details>
-            <summary class="{% if page in _tools_pages %}active{% endif %}">Tools</summary>
-            <ul class="z-[1] min-w-max bg-base-200 rounded-box shadow-lg">
-              <li><a href="/upgrade" class="{% if page in ('upgrade', 'downsample') %}active{% endif %}">Upgrade / Downsample</a></li>
-              <li><a href="/repair"  class="{% if page=='repair' %}active{% endif %}">Repair</a></li>
-              <li><a href="/lyrics"  class="{% if page=='lyrics' %}active{% endif %}">Lyrics</a></li>
+  {% set _tools_pages = ('upgrade', 'downsample', 'repair', 'lyrics', 'migrate') %}
+  {% set _qbadge = pending_job_count or 0 %}
+  {% set _show_token = health_token_invalid %}
+  {% set _status_msg = "Your Qobuz token was rejected. Reconnect it in Settings" if _show_token
+                       else "Another Qobuz Librarian run is active, so downloads are paused" %}
+
+  <div class="ql-app-shell">
+    <aside class="ql-sidebar hidden lg:flex" aria-label="Primary navigation">
+      <div class="ql-sidebar-top">
+        <a href="/" class="ql-sidebar-brand">
+          <img src="/static/icon.png" alt="" class="ql-brand-mark">
+          <span>Qobuz Librarian</span>
+        </a>
+
+        <nav class="ql-sidebar-nav" aria-label="Main">
+          <a href="/" class="ql-nav-link {% if page=='dashboard' %}is-active{% endif %}">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5A1.5 1.5 0 0 1 5.5 4h13A1.5 1.5 0 0 1 20 5.5v13a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 18.5v-13Zm1.5 0v5.75h13V5.5h-13Zm0 7.25v5.75h5.75v-5.75H5.5Zm7.25 0v5.75h5.75v-5.75h-5.75Z"/></svg>
+            Dashboard
+          </a>
+          <a href="/library" class="ql-nav-link {% if page=='library' %}is-active{% endif %}">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.75 5A2.75 2.75 0 0 1 7.5 2.25h9A2.75 2.75 0 0 1 19.25 5v14A2.75 2.75 0 0 1 16.5 21.75h-9A2.75 2.75 0 0 1 4.75 19V5Zm2.75-1.25A1.25 1.25 0 0 0 6.25 5v14A1.25 1.25 0 0 0 7.5 20.25h9A1.25 1.25 0 0 0 17.75 19V5A1.25 1.25 0 0 0 16.5 3.75h-9Zm1.25 4A.75.75 0 0 1 9.5 7h5a.75.75 0 0 1 0 1.5h-5a.75.75 0 0 1-.75-.75Zm0 4A.75.75 0 0 1 9.5 11h5a.75.75 0 0 1 0 1.5h-5a.75.75 0 0 1-.75-.75Z"/></svg>
+            Library
+          </a>
+          <a href="/queue" class="ql-nav-link {% if page=='queue' %}is-active{% endif %}">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.75 6.5A.75.75 0 0 1 7.5 5.75h13a.75.75 0 0 1 0 1.5h-13a.75.75 0 0 1-.75-.75Zm0 5.5a.75.75 0 0 1 .75-.75h13a.75.75 0 0 1 0 1.5h-13A.75.75 0 0 1 6.75 12Zm0 5.5a.75.75 0 0 1 .75-.75h13a.75.75 0 0 1 0 1.5h-13a.75.75 0 0 1-.75-.75ZM3.25 6.5A1.25 1.25 0 1 1 5.75 6.5 1.25 1.25 0 0 1 3.25 6.5Zm0 5.5A1.25 1.25 0 1 1 5.75 12 1.25 1.25 0 0 1 3.25 12Zm0 5.5a1.25 1.25 0 1 1 2.5 0 1.25 1.25 0 0 1-2.5 0Z"/></svg>
+            Queue
+            <span class="js-queue-badge ql-queue-badge {% if queue_has_running %}is-warning{% endif %}{% if not _qbadge %} hidden{% endif %}">{% if _qbadge %}{% if _qbadge > 99 %}99+{% else %}{{ _qbadge }}{% endif %}{% endif %}</span>
+          </a>
+          <div class="ql-nav-group" aria-label="Tools">
+            <span class="ql-nav-group-title">Tools</span>
+            <a href="/upgrade" class="ql-nav-link {% if page=='upgrade' %}is-active{% endif %}">Upgrade</a>
+            <a href="/downsample" class="ql-nav-link {% if page=='downsample' %}is-active{% endif %}">Downsample</a>
+            <a href="/repair" class="ql-nav-link {% if page=='repair' %}is-active{% endif %}">Repair</a>
+            <a href="/lyrics" class="ql-nav-link {% if page=='lyrics' %}is-active{% endif %}">Lyrics</a>
+            <a href="/migrate" class="ql-nav-link {% if page=='migrate' %}is-active{% endif %}">Migrate</a>
+          </div>
+          <a href="/settings" class="ql-nav-link {% if page=='settings' %}is-active{% endif %}">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.25a3.75 3.75 0 1 1 0 7.5 3.75 3.75 0 0 1 0-7.5Zm0 1.5a2.25 2.25 0 1 0 0 4.5 2.25 2.25 0 0 0 0-4.5Zm7.03 1.5.02.75-.02.75 1.63 1.27a.75.75 0 0 1 .19.95l-1.64 2.84a.75.75 0 0 1-.92.33l-1.92-.77c-.39.28-.8.52-1.25.72l-.3 2.04a.75.75 0 0 1-.74.64h-3.28a.75.75 0 0 1-.74-.64l-.3-2.04a7.6 7.6 0 0 1-1.25-.72l-1.92.77a.75.75 0 0 1-.92-.33L4.03 15.47a.75.75 0 0 1 .19-.95l1.63-1.27-.02-.75.02-.75-1.63-1.27a.75.75 0 0 1-.19-.95l1.64-2.84a.75.75 0 0 1 .92-.33l1.92.77c.39-.28.8-.52 1.25-.72l.3-2.04a.75.75 0 0 1 .74-.64h3.28a.75.75 0 0 1 .74.64l.3 2.04c.45.2.86.44 1.25.72l1.92-.77a.75.75 0 0 1 .92.33l1.64 2.84a.75.75 0 0 1-.19.95l-1.63 1.27Z"/></svg>
+            Settings
+          </a>
+        </nav>
+      </div>
+
+      <div class="ql-sidebar-bottom">
+        {% if _show_token or health_lock_busy %}
+        <a href="{{ '/settings' if _show_token else '/' }}" class="ql-sidebar-alert">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5c.74 0 1.42.4 1.78 1.05l7.31 13.2A2.05 2.05 0 0 1 19.31 20.8H4.69a2.05 2.05 0 0 1-1.78-3.05l7.31-13.2A2.03 2.03 0 0 1 12 3.5Zm0 1.5a.53.53 0 0 0-.47.28l-7.31 13.2a.55.55 0 0 0 .47.82h14.62a.55.55 0 0 0 .47-.82l-7.31-13.2A.53.53 0 0 0 12 5Zm0 4.25c.41 0 .75.34.75.75v4a.75.75 0 0 1-1.5 0v-4c0-.41.34-.75.75-.75Zm0 7.75a1 1 0 1 1 0 2 1 1 0 0 1 0-2Z"/></svg>
+          <span>{{ _status_msg }}</span>
+        </a>
+        {% endif %}
+        <button id="theme-toggle" type="button" class="ql-sidebar-action"
+                aria-label="Toggle light and dark theme" title="Toggle light / dark theme">
+          <svg class="theme-when-dark" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.75a.75.75 0 0 1 .75.75v2a.75.75 0 0 1-1.5 0v-2a.75.75 0 0 1 .75-.75Zm0 14a4.75 4.75 0 1 0 0-9.5 4.75 4.75 0 0 0 0 9.5Zm0-1.5a3.25 3.25 0 1 1 0-6.5 3.25 3.25 0 0 1 0 6.5Zm8.5-4a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h2Zm-15 0a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h2Zm12.4-6.21a.75.75 0 0 1 1.06 1.06l-1.42 1.42a.75.75 0 1 1-1.06-1.06l1.42-1.42ZM7.52 16.48a.75.75 0 0 1 0 1.06L6.1 18.96a.75.75 0 0 1-1.06-1.06l1.42-1.42a.75.75 0 0 1 1.06 0Zm11.44 1.42a.75.75 0 1 1-1.06 1.06l-1.42-1.42a.75.75 0 0 1 1.06-1.06l1.42 1.42ZM7.52 6.46a.75.75 0 0 1-1.06 1.06L5.04 6.1A.75.75 0 1 1 6.1 5.04l1.42 1.42Z"/></svg>
+          <svg class="theme-when-light" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.86 13.59a.75.75 0 0 1 .1.71 9.25 9.25 0 1 1-11.26-11.26.75.75 0 0 1 .9.99 7.75 7.75 0 0 0 9.37 9.37.75.75 0 0 1 .89.19Zm-2.04 1.7A9.25 9.25 0 0 1 8.71 5.18a7.75 7.75 0 1 0 10.11 10.11Z"/></svg>
+          <span>Theme</span>
+        </button>
+        {% if auth_active() %}
+        <button type="submit" form="logout-form" class="ql-sidebar-action">Log out</button>
+        {% endif %}
+      </div>
+    </aside>
+
+    <div class="ql-app-content">
+      <header class="ql-mobilebar lg:hidden">
+        <a href="/" class="ql-mobile-brand">
+          <img src="/static/icon.png" alt="" class="ql-brand-mark">
+          <span class="ql-brand-full">Qobuz Librarian</span>
+          <span class="ql-brand-short hidden">Qobuz</span>
+        </a>
+        <div class="ql-mobile-actions">
+          {% if _show_token or health_lock_busy %}
+          <a href="{{ '/settings' if _show_token else '/' }}" title="{{ _status_msg }}" aria-label="{{ _status_msg }}"
+             class="ql-icon-button {% if _show_token %}is-error{% else %}is-warning{% endif %}">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5c.74 0 1.42.4 1.78 1.05l7.31 13.2A2.05 2.05 0 0 1 19.31 20.8H4.69a2.05 2.05 0 0 1-1.78-3.05l7.31-13.2A2.03 2.03 0 0 1 12 3.5Zm0 1.5a.53.53 0 0 0-.47.28l-7.31 13.2a.55.55 0 0 0 .47.82h14.62a.55.55 0 0 0 .47-.82l-7.31-13.2A.53.53 0 0 0 12 5Zm0 4.25c.41 0 .75.34.75.75v4a.75.75 0 0 1-1.5 0v-4c0-.41.34-.75.75-.75Zm0 7.75a1 1 0 1 1 0 2 1 1 0 0 1 0-2Z"/></svg>
+          </a>
+          {% endif %}
+          <button type="button" class="ql-icon-button" data-theme-toggle
+                  aria-label="Toggle light and dark theme" title="Toggle light / dark theme">
+            <svg class="theme-when-dark" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.75a.75.75 0 0 1 .75.75v2a.75.75 0 0 1-1.5 0v-2a.75.75 0 0 1 .75-.75Zm0 14a4.75 4.75 0 1 0 0-9.5 4.75 4.75 0 0 0 0 9.5Zm0-1.5a3.25 3.25 0 1 1 0-6.5 3.25 3.25 0 0 1 0 6.5Zm8.5-4a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h2Zm-15 0a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h2Zm12.4-6.21a.75.75 0 0 1 1.06 1.06l-1.42 1.42a.75.75 0 1 1-1.06-1.06l1.42-1.42ZM7.52 16.48a.75.75 0 0 1 0 1.06L6.1 18.96a.75.75 0 0 1-1.06-1.06l1.42-1.42a.75.75 0 0 1 1.06 0Zm11.44 1.42a.75.75 0 1 1-1.06 1.06l-1.42-1.42a.75.75 0 0 1 1.06-1.06l1.42 1.42ZM7.52 6.46a.75.75 0 0 1-1.06 1.06L5.04 6.1A.75.75 0 1 1 6.1 5.04l1.42 1.42Z"/></svg>
+            <svg class="theme-when-light" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.86 13.59a.75.75 0 0 1 .1.71 9.25 9.25 0 1 1-11.26-11.26.75.75 0 0 1 .9.99 7.75 7.75 0 0 0 9.37 9.37.75.75 0 0 1 .89.19Zm-2.04 1.7A9.25 9.25 0 0 1 8.71 5.18a7.75 7.75 0 1 0 10.11 10.11Z"/></svg>
+          </button>
+          <details class="dropdown dropdown-end ql-mobile-dropdown">
+            <summary class="ql-icon-button list-none" aria-label="Menu" aria-haspopup="menu" aria-expanded="false">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 6.75a.75.75 0 0 1 .75-.75h13.5a.75.75 0 0 1 0 1.5H5.25a.75.75 0 0 1-.75-.75Zm0 5.25a.75.75 0 0 1 .75-.75h13.5a.75.75 0 0 1 0 1.5H5.25A.75.75 0 0 1 4.5 12Zm0 5.25a.75.75 0 0 1 .75-.75h13.5a.75.75 0 0 1 0 1.5H5.25a.75.75 0 0 1-.75-.75Z"/></svg>
+            </summary>
+            <ul id="mobile-menu" class="ql-mobile-menu menu">
+              <li><a href="/" class="{% if page=='dashboard' %}active{% endif %}">Dashboard</a></li>
+              <li><a href="/library" class="{% if page=='library' %}active{% endif %}">Library</a></li>
+              <li><a href="/queue" class="{% if page=='queue' %}active{% endif %}">
+                Queue
+                <span class="js-queue-badge ql-queue-badge {% if queue_has_running %}is-warning{% endif %}{% if not _qbadge %} hidden{% endif %}">{% if _qbadge %}{% if _qbadge > 99 %}99+{% else %}{{ _qbadge }}{% endif %}{% endif %}</span>
+              </a></li>
+              <li class="ql-mobile-menu-title">Tools</li>
+              <li><a href="/upgrade" class="{% if page=='upgrade' %}active{% endif %}">Upgrade</a></li>
+              <li><a href="/downsample" class="{% if page=='downsample' %}active{% endif %}">Downsample</a></li>
+              <li><a href="/repair" class="{% if page=='repair' %}active{% endif %}">Repair</a></li>
+              <li><a href="/lyrics" class="{% if page=='lyrics' %}active{% endif %}">Lyrics</a></li>
               <li><a href="/migrate" class="{% if page=='migrate' %}active{% endif %}">Migrate</a></li>
+              <li><a href="/settings" class="{% if page=='settings' %}active{% endif %}">Settings</a></li>
+              {% if auth_active() %}
+              <li><button type="submit" form="logout-form">Log out</button></li>
+              {% endif %}
             </ul>
           </details>
-        </li>
-        <li><a href="/queue"   class="{% if page=='queue' %}active{% endif %}">
-          Queue
-          {% set _qbadge = pending_job_count or 0 %}
-          <span class="js-queue-badge badge badge-sm {% if queue_has_running %}badge-warning{% else %}badge-primary{% endif %}{% if not _qbadge %} hidden{% endif %}">{% if _qbadge %}{% if _qbadge > 99 %}99+{% else %}{{ _qbadge }}{% endif %}{% endif %}</span>
-        </a></li>
-        <li><a href="/settings" class="{% if page=='settings' %}active{% endif %}">Settings</a></li>
-        {% if auth_active() %}
-        <li><button type="submit" form="logout-form">Log out</button></li>
-        {% endif %}
-      </ul>
-    </div>
-    <div class="lg:hidden">
-      <!-- Mobile menu -->
-      <details class="dropdown dropdown-end">
-        <summary class="btn btn-ghost btn-circle list-none" aria-label="Menu">
-          <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/>
-          </svg>
-        </summary>
-        <ul id="mobile-menu" class="menu menu-sm dropdown-content mt-3 z-[1] p-2 shadow bg-base-200 rounded-box min-w-max">
-          <li><a href="/" class="{% if page=='dashboard' %}active{% endif %}">Dashboard</a></li>
-          <li><a href="/search" class="{% if page=='search' %}active{% endif %}">Search</a></li>
-          <li><a href="/artist" class="{% if page=='artist' %}active{% endif %}">Artist</a></li>
-          <li><a href="/library" class="{% if page=='library' %}active{% endif %}">Library</a></li>
-          <li><a href="/queue" class="{% if page=='queue' %}active{% endif %}">
-            Queue
-            {% set _qbadge = pending_job_count or 0 %}
-            <span class="js-queue-badge badge badge-sm {% if queue_has_running %}badge-warning{% else %}badge-primary{% endif %}{% if not _qbadge %} hidden{% endif %}">{% if _qbadge %}{% if _qbadge > 99 %}99+{% else %}{{ _qbadge }}{% endif %}{% endif %}</span>
-          </a></li>
-          <li class="menu-title pt-2">Tools</li>
-          <li><a href="/upgrade" class="{% if page in ('upgrade', 'downsample') %}active{% endif %}">Upgrade / Downsample</a></li>
-          <li><a href="/repair" class="{% if page=='repair' %}active{% endif %}">Repair</a></li>
-          <li><a href="/lyrics" class="{% if page=='lyrics' %}active{% endif %}">Lyrics</a></li>
-          <li><a href="/migrate" class="{% if page=='migrate' %}active{% endif %}">Migrate</a></li>
-          <li class="pt-2"><a href="/settings" class="{% if page=='settings' %}active{% endif %}">Settings</a></li>
-          {% if auth_active() %}
-          <li><button type="submit" form="logout-form">Log out</button></li>
-          {% endif %}
-        </ul>
-      </details>
-    </div>
-  </nav>
+        </div>
+      </header>
 
-  {% if auth_active() %}
-  <form id="logout-form" action="/logout" method="post" class="hidden">
-    <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-  </form>
-  {% endif %}
+      {% if auth_active() %}
+      <form id="logout-form" action="/logout" method="post" class="hidden">
+        <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+      </form>
+      {% endif %}
 
-  {% if cli_mode %}
-  <div class="bg-warning text-warning-content px-4 py-2 text-sm text-center">
-    Terminal (CLI) mode is on — downloads and scans here are paused while the
-    terminal has control.
-    <a href="/settings" class="underline font-semibold">Resume web app</a>
+      {% if cli_mode %}
+      <div class="ql-cli-banner">
+        Terminal (CLI) mode is on. Downloads and scans here are paused while the
+        terminal has control.
+        <a href="/settings">Resume web app</a>
+      </div>
+      {% endif %}
+
+      <main id="main-content" class="ql-main {% block content_max %}max-w-5xl{% endblock %}">
+        {% block content %}{% endblock %}
+      </main>
+
+      <footer class="ql-footer">
+        <div class="ql-footer-inner {% block footer_max %}max-w-5xl{% endblock %}">
+          <span>Qobuz Librarian <span class="font-mono">v{{ app_version }}</span></span>
+          <a href="{{ repo_url }}" target="_blank" rel="noopener">
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38
+                       0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13
+                       -.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66
+                       .07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15
+                       -.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0
+                       1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82
+                       1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01
+                       1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/>
+            </svg>
+            GitHub
+          </a>
+        </div>
+      </footer>
+    </div>
   </div>
-  {% endif %}
 
-  <!-- Main content -->
-  <main id="main-content" class="container mx-auto px-4 py-6 max-w-5xl flex-1 w-full">
-    {% block content %}{% endblock %}
-  </main>
-
-  <!-- Download confirmation lands here. Kept outside the search-results swap
-       region so queuing an album and then searching again doesn't wipe the
-       "added to queue" message before it's read. -->
   <div id="download-toast" class="toast toast-end z-50" aria-live="polite"></div>
-
-  <!-- Footer -->
-  <footer class="border-t border-base-300 mt-8">
-    <div class="container mx-auto px-4 py-4 max-w-5xl flex items-center justify-between
-                text-xs text-base-content/40">
-      <span>Qobuz Librarian <span class="font-mono">v{{ app_version }}</span></span>
-      <a href="{{ repo_url }}" target="_blank" rel="noopener"
-         class="inline-flex items-center gap-1.5 hover:text-base-content/70 transition-colors">
-        <svg viewBox="0 0 16 16" class="h-4 w-4" fill="currentColor" aria-hidden="true">
-          <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38
-                   0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13
-                   -.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66
-                   .07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15
-                   -.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0
-                   1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82
-                   1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01
-                   1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/>
-        </svg>
-        GitHub
-      </a>
-    </div>
-  </footer>
 
   <script nonce="{{ request.state.csp_nonce }}">
     if ('serviceWorker' in navigator) {
-      // ?v= the asset content hash so changed assets invalidate the SW + caches.
+      // The content hash invalidates the service-worker cache.
       navigator.serviceWorker.register('/sw.js?v={{ asset_version }}');
     }
-    // Keep the nav Queue badge in sync without a reload — it's otherwise rendered
-    // once per page, so it could read "1" next to an empty Queue after a job
-    // finished while you were on another page. Polls a tiny count endpoint.
+    // Keep the nav Queue badge in sync without a page reload.
     (function () {
       var badges = document.querySelectorAll('.js-queue-badge');
       if (!badges.length) return;
@@ -220,8 +214,7 @@
           if (!n) { b.classList.add('hidden'); b.textContent = ''; return; }
           b.classList.remove('hidden');
           b.textContent = n > 99 ? '99+' : String(n);
-          b.classList.toggle('badge-warning', !!running);
-          b.classList.toggle('badge-primary', !running);
+          b.classList.toggle('is-warning', !!running);
         });
       }
       function refresh() {
@@ -233,18 +226,6 @@
       refresh();
       setInterval(refresh, 12000);
     })();
-    // Close the mobile nav dropdown when a link inside it is tapped — daisyUI
-    // otherwise keeps it open until focus drops, which feels broken on slow
-    // navigations.
-    document.addEventListener('click', e => {
-      const link = e.target.closest('.dropdown-content a, .dropdown-content button');
-      if (!link) return;
-      // Close the <details>-based mobile dropdown after a link/button tap.
-      const details = link.closest('details.dropdown');
-      if (details) details.removeAttribute('open');
-      // Dropping focus from the tapped item closes any focus-based daisyUI dropdown.
-      if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
-    });
     // Global keyboard shortcuts. "/" focuses the search box; Esc dismisses
     // any visible alert and blurs the focused input; "g s/q/h" navigate.
     (function() {
@@ -254,16 +235,11 @@
         const tag = (document.activeElement && document.activeElement.tagName) || '';
         const inField = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
         if (e.key === '/' && !inField) {
-          const q = document.querySelector('input[name="q"], input[name="artist"]');
+          const q = document.querySelector('input[name="q"]');
           if (q) { e.preventDefault(); q.focus(); q.select && q.select(); }
         } else if (e.key === 'Escape') {
-          // Esc dismisses flash banners (transient, any severity), closes an
-          // open nav menu (the Tools disclosure), and blurs a focused field.
-          // Permanent alerts — a missing-credentials notice, a failed-job error
-          // panel — carry no data-flash and must stay put. qlDismissAllFlashes
-          // animates them out, matching auto-dismiss.
           if (window.qlDismissAllFlashes) window.qlDismissAllFlashes();
-          document.querySelectorAll('nav details[open]').forEach(function (d) { d.removeAttribute('open'); });
+          if (window.qlCloseDropdowns) window.qlCloseDropdowns();
           if (inField) document.activeElement.blur();
         } else if (e.key === 'g' && !inField) {
           gPending = true;

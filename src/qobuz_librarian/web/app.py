@@ -5,11 +5,12 @@ import hashlib
 import html
 import threading
 import time
+import tomllib
 import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Form, HTTPException, Query, Request
+from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -42,7 +43,7 @@ _RUN_LOCK_HANDLE = None
 _LOCK_BUSY_PID = None
 # True when the web app has deliberately released the run-lock so the terminal
 # (CLI) can use it — set by the Settings "Mode" toggle, or at startup when
-# QL_CLI_ONLY is set. Distinct from _LOCK_BUSY_PID (another process grabbed the
+# QL_CLI_ONLY is set. Distinct from _LOCK_BUSY_PID (another process holds the
 # lock unexpectedly): in CLI mode the web holds no lock on purpose and pauses
 # its own download/scan endpoints so the two can't race over /staging.
 _CLI_MODE = False
@@ -57,15 +58,12 @@ def _lock_busy_response(request):
     """Return a 503 response if the run-lock is busy OR a critical volume
     was unwritable at startup, else None."""
     if _CLI_MODE:
-        msg = ("Terminal (CLI) mode is on — the web app has handed the run-lock "
-               "to the terminal, so downloads and scans are paused here. Run "
-               "your CLI commands, then switch back on Settings → Mode "
-               "(Resume web app).")
+        msg = ("Terminal (CLI) mode is on, so downloads and scans are paused "
+               "here. Resume on Settings → Mode (Resume web app).")
     elif _LOCK_BUSY_PID is not None:
-        msg = (f"Another Qobuz Librarian instance holds the run-lock "
-               f"(pid {_LOCK_BUSY_PID}). Stop that invocation first "
-               f"(likely a `docker compose run` CLI session left open), "
-               f"then restart this container to reacquire the lock.")
+        msg = ("Another Qobuz Librarian run is active. Downloads and scans are "
+               "paused so only one process writes to the library at a time. "
+               "Stop the other run first, then restart Qobuz Librarian.")
     elif _UNWRITABLE_VOLUMES:
         msg = (f"Required volume(s) not writable: "
                f"{', '.join(_UNWRITABLE_VOLUMES)}. On a NAS, set "
@@ -213,7 +211,7 @@ async def _lifespan(_app: FastAPI):
             await asyncio.sleep(30)
             # The lock state can change during the sleep: set_mode('cli') hands
             # the lock to the terminal (sets _CLI_MODE, clears _LOCK_BUSY_PID).
-            # Re-check before acquiring, or we'd grab the lock back in CLI mode
+            # Re-check before acquiring, or we'd take the lock back in CLI mode
             # and wedge both the web app and the CLI until restart.
             if _LOCK_BUSY_PID is None or _CLI_MODE:
                 return
@@ -362,12 +360,9 @@ def _qobuz_ready() -> bool:
 
 
 def _recent_empty_hint() -> str:
-    creds_ok = bool(_read_creds().get("auth_token"))
-    if creds_ok and _TOKEN_VALID is False:
-        return "Reconnect Qobuz before searching."
-    if not creds_ok:
+    if not _read_creds().get("auth_token"):
         return "Set up Qobuz before searching."
-    return "Search above to find an album or artist."
+    return "Search above to find an artist, album, or track."
 
 
 async def _probe_token():
@@ -414,18 +409,57 @@ app.add_middleware(StripServerHeaderMiddleware)
 _here = Path(__file__).parent
 templates = Jinja2Templates(directory=str(_here / "templates"))
 
+
+def _app_version() -> str:
+    """Prefer source-checkout metadata so stale editable installs don't lie."""
+    for parent in _here.parents:
+        pyproject = parent / "pyproject.toml"
+        if pyproject.exists():
+            try:
+                data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+                version = data.get("project", {}).get("version")
+                if version:
+                    return str(version)
+            except (OSError, tomllib.TOMLDecodeError):
+                break
+    try:
+        from importlib.metadata import version as _pkg_version
+        return _pkg_version("qobuz-librarian")
+    except Exception:
+        # Only reached on a broken / non-installed run; "unknown" is honest,
+        # a hardcoded number here just goes stale on the next bump.
+        return "unknown"
+
+
 try:
-    from importlib.metadata import version as _pkg_version
-    _APP_VERSION = _pkg_version("qobuz-librarian")
+    _APP_VERSION = _app_version()
 except Exception:
-    # Only reached on a broken / non-installed editable run; "unknown" is
-    # honest, a hardcoded number here just goes stale on the next bump.
     _APP_VERSION = "unknown"
 templates.env.globals["app_version"] = _APP_VERSION
 templates.env.globals["repo_url"] = "https://github.com/jarynclouatre/qobuz-librarian"
 # Server epoch at render, so a live elapsed clock can tick from a client-side
 # baseline instead of trusting the browser's wall clock against a server epoch.
 templates.env.globals["now_ts"] = time.time
+
+
+def _fmt_clock(ts):
+    from datetime import datetime
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else ""
+
+
+def _fmt_elapsed(seconds):
+    seconds = int(seconds or 0)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m"
+
+
+templates.env.globals["fmt_clock"] = _fmt_clock
+templates.env.globals["fmt_elapsed"] = _fmt_elapsed
 # Whether to show a Log out control — true only when auth is on and set up.
 templates.env.globals["auth_active"] = web_auth.auth_active
 
@@ -530,7 +564,7 @@ async def login_submit(request: Request, username: str = Form(""),
     if not has_session and not web_auth.check_login_rate_limit(ip, username):
         return templates.TemplateResponse(
             request=request, name="login.html",
-            context={"error": "Too many failed attempts — wait an hour and try again."},
+            context={"error": "Too many failed attempts. Wait an hour and try again."},
             status_code=429)
     # Offload the 600k-round PBKDF2 to a thread so one login attempt can't stall
     # the single-worker event loop (health, API and SSE all freeze during a KDF
@@ -602,7 +636,7 @@ async def setup_submit(request: Request, username: str = Form(""),
     if not web_auth.set_credentials(user, password):
         return templates.TemplateResponse(
             request=request, name="setup.html",
-            context={"error": "Couldn't save the login — the data volume "
+            context={"error": "Couldn't save the login: the data volume "
                               "isn't writable. Check PUID/PGID and volume "
                               "permissions.", "username": user},
             status_code=500)
@@ -646,6 +680,80 @@ def _is_htmx(request):
     return request.headers.get("HX-Request") == "true"
 
 
+async def _initial_artist_search_html(request: Request, query: str) -> str:
+    """Render artist-name search results for dashboard links with ?kind=artist&q=."""
+    query = str(query or "").strip()[:200]
+    if not query:
+        return ""
+    artist_results = []
+    error = None
+    try:
+        from qobuz_librarian.api.auth import AuthLost, QobuzError, QobuzUnavailable
+        from qobuz_librarian.api.client import call_within
+        from qobuz_librarian.api.search import search_artists
+        token = _get_token()
+        loop = asyncio.get_running_loop()
+        artist_raw = await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                lambda: call_within(
+                    cfg.WEB_FETCH_TIMEOUT,
+                    search_artists,
+                    query,
+                    token,
+                    limit=cfg.ARTIST_LOOKUP_LIMIT,
+                ),
+            ),
+            timeout=cfg.WEB_FETCH_TIMEOUT,
+        )
+        for a in artist_raw:
+            if not a.get("id"):
+                continue
+            img = a.get("image") or {}
+            cover = ""
+            if isinstance(img, dict):
+                cover = img.get("small") or img.get("thumbnail") or ""
+            albums_count = a.get("albums_count")
+            if isinstance(albums_count, dict):
+                albums_count = albums_count.get("total")
+            artist_results.append({
+                "id": a.get("id"),
+                "name": a.get("name") or "?",
+                "albums_count": albums_count,
+                "cover": cover if str(cover).startswith(
+                    "https://static.qobuz.com/") else "",
+            })
+    except (SystemExit, NoCredsError):
+        error = "No Qobuz credentials set. Visit Settings."
+    except AuthLost:
+        error = "Token is expired or invalid. Update it in Settings."
+    except QobuzUnavailable:
+        error = ("Qobuz is temporarily unavailable (network or rate limit). "
+                 "Try again shortly.")
+    except asyncio.TimeoutError:
+        error = "Timed out reaching the Qobuz API."
+    except QobuzError:
+        error = "Search failed. Try again."
+    except Exception:
+        import logging
+        logging.getLogger("qobuz_librarian").exception(
+            "initial artist search failed for %r", query)
+        error = "Search failed. Try again."
+    return templates.env.get_template("_search_results.html").render(
+        request=request,
+        q=query,
+        results=[],
+        album_groups=[],
+        artist_results=artist_results,
+        selected_artist=None,
+        error=error,
+        kind="artist",
+        creds_ok=bool(_read_creds().get("auth_token")),
+        qobuz_ready=_qobuz_ready(),
+        page="search",
+    )
+
+
 @app.exception_handler(StarletteHTTPException)
 async def _http_exception_handler(request: Request, exc: StarletteHTTPException):
     """Render a styled page for a mistyped/stale URL instead of a bare
@@ -655,11 +763,29 @@ async def _http_exception_handler(request: Request, exc: StarletteHTTPException)
         return _tr(request, "error.html", {
             "code": 404,
             "title": "Page not found",
-            "msg": "That page doesn't exist — the link may have moved or been "
+            "msg": "That page doesn't exist. The link may have moved or been "
                    "mistyped.",
         }, status_code=404)
     return JSONResponse({"detail": exc.detail}, status_code=exc.status_code,
                         headers=getattr(exc, "headers", None))
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    """An uncaught route error renders the styled page for browser paths instead
+    of FastAPI's bare JSON 500. API routes keep JSON. The detail is logged, never
+    shown, since it can carry internals."""
+    import logging
+    logging.getLogger("qobuz_librarian").exception(
+        "Unhandled error on %s", request.scope.get("path", "?"))
+    if not request.scope["path"].startswith("/api/"):
+        return _tr(request, "error.html", {
+            "code": 500,
+            "title": "Something went wrong",
+            "msg": "An unexpected error happened on the server. Try again, or "
+                   "check the container logs if it keeps happening.",
+        }, status_code=500)
+    return JSONResponse({"detail": "internal server error"}, status_code=500)
 
 
 # Serialises the dedupe-check-then-submit in queue_download: the network
@@ -668,10 +794,14 @@ async def _http_exception_handler(request: Request, exc: StarletteHTTPException)
 _DOWNLOAD_SUBMIT_LOCK = threading.Lock()
 
 
-def _find_job_touching_album(album_id: str):
+def _find_job_touching_album(album_id: str, skip_single_track: bool = False):
     """Return a pending/running/awaiting-review job that already covers
-    album_id, either as its direct subject or as one of its candidates."""
+    album_id, either as its direct subject or as one of its candidates.
+    ``skip_single_track`` ignores one-track downloads, so a full-album download
+    doesn't fold onto a job that only downloaded one track from the album."""
     for j in job_mgr.registry.pending_and_running():
+        if skip_single_track and (getattr(j, "single", None) or {}).get("track_id"):
+            continue
         if j.album_id == album_id:
             return j
         # Snapshot: a SCANNING job appends to candidates from the worker thread,
@@ -684,6 +814,25 @@ def _find_job_touching_album(album_id: str):
             if qa.get("id") == album_id:
                 return j
     return None
+
+
+def _duplicate_download_job(album_id: str, track_id: str = "",
+                            as_new_edition: bool = False):
+    """The already-active job a new /download should fold onto, or None to let it
+    queue. Matched by intent, not album id alone: "get this edition too" is a
+    deliberate extra copy and never folds; a single-track download folds only onto an
+    identical one; a normal full-album download folds onto another full-album job
+    (or a scan candidate the user is about to review), but not onto a one-track
+    download from the same album."""
+    if as_new_edition:
+        return None
+    if track_id:
+        for j in job_mgr.registry.pending_and_running():
+            s = getattr(j, "single", None) or {}
+            if s.get("album_id") == album_id and s.get("track_id") == str(track_id):
+                return j
+        return None
+    return _find_job_touching_album(album_id, skip_single_track=True)
 
 
 def _staging_album_count() -> int:
@@ -800,17 +949,31 @@ def _maybe_auto_check_new_releases():
         _start_new_release_check()
 
 
-def _active_scan(*kinds, statuses=("pending", "scanning")):
+_ANY_TARGET = object()
+
+
+def _scan_target(job) -> str:
+    """The slice of the library a scan covers: a single artist (the per-artist
+    routes set ``job.artist``) or "" for a whole-library sweep. Dedup compares on
+    this so re-scanning one artist folds onto / supersedes only that artist's own
+    in-flight scan or parked review — never a different artist's, and never the
+    whole-library pass. Case/whitespace-folded so "Bonobo" re-scans "bonobo"."""
+    return (getattr(job, "artist", "") or "").strip().casefold()
+
+
+def _active_scan(*kinds, statuses=("pending", "scanning"), target=_ANY_TARGET):
     """A job of one of the given execute_kinds in one of ``statuses``, or None —
     used to fold a double-submitted pass onto the one already in flight instead
     of stacking duplicate work. Defaults to the scan phase: a scan keeps its
     execute_kind through the post-review download (which runs as ``running``),
     so matching only pending/scanning lets a deliberate re-scan still queue
     behind a batch that's downloading. Run-to-completion jobs with no review
-    (lyrics) pass their own running phase instead."""
+    (lyrics) pass their own running phase instead. ``target`` restricts the match
+    to one artist's scan (or the whole-library pass); the default matches any."""
     for j in job_mgr.registry.pending_and_running():
         if getattr(j, "execute_kind", "") in kinds and j.status.value in statuses:
-            return j
+            if target is _ANY_TARGET or _scan_target(j) == target:
+                return j
     return None
 
 
@@ -881,16 +1044,19 @@ def _submit_scan_deduped(job, scan_fn, execute_fn, *kinds, statuses=("pending", 
     landing with a manual click) both pass the check and stack duplicate scans.
     Returns the job to redirect to — the new one, or the in-flight duplicate."""
     with _auto_check_lock:
-        existing = _active_scan(*kinds, statuses=statuses)
+        target = _scan_target(job)
+        existing = _active_scan(*kinds, statuses=statuses, target=target)
         if existing is not None:
             return existing
-        # A re-scan supersedes a stale parked review of the same kind instead of
-        # stacking a second one. The fresh scan re-derives its candidates from the
-        # current library, so the old awaiting-review result is obsolete — and
-        # parked reviews never self-clear, so without this they pile up forever.
+        # A re-scan supersedes the same artist's stale parked review (or the
+        # whole-library pass's) instead of stacking a second one: the fresh scan
+        # re-derives that target's candidates, so the old awaiting-review result
+        # is obsolete, and parked reviews never self-clear so without this they
+        # pile up forever. Scoping to the same target is what stops one artist's
+        # scan from throwing away a different artist's un-reviewed candidates.
         # A running download isn't touched (only pending/scanning gate above).
         for old in job_mgr.registry.awaiting_review():
-            if getattr(old, "execute_kind", "") in kinds:
+            if getattr(old, "execute_kind", "") in kinds and _scan_target(old) == target:
                 job_mgr.cancel_review(old)
         job_mgr.submit_scan(job, scan_fn, execute_fn)
         return job
@@ -909,8 +1075,7 @@ def _library_scan_state():
             "ready": False,
             "count": 0,
             "message": (
-                f"Music library folder {root} does not exist. Set MUSIC_ROOT "
-                "to the folder that contains your artist folders."
+                f"{root} does not exist. Choose the location that contains your artist folders."
             ),
         }
     if not root.is_dir():
@@ -918,8 +1083,7 @@ def _library_scan_state():
             "ready": False,
             "count": 0,
             "message": (
-                f"MUSIC_ROOT points at {root}, but it is not a folder. Set "
-                "MUSIC_ROOT to the folder that contains your artist folders."
+                f"{root} is not a folder. Choose the location that contains your artist folders."
             ),
         }
     from qobuz_librarian.library.scanner import list_library_artists
@@ -929,8 +1093,7 @@ def _library_scan_state():
             "ready": False,
             "count": 0,
             "message": (
-                "No artist folders with audio were found under MUSIC_ROOT. "
-                "Expected layout: MUSIC_ROOT/Artist/Album (Year)/track.flac."
+                f"No artist folders with audio were found in {root}. Choose the location that contains your artist folders."
             ),
         }
     return {"ready": True, "count": len(artists), "message": ""}
@@ -952,7 +1115,7 @@ def _start_library_scan(partial_only=False):
         if existing is not None:
             return existing
         from qobuz_librarian.web import flows
-        title = "Library album-fill scan" if partial_only else "Library gap scan"
+        title = "Gap-fill scan" if partial_only else "Missing-albums scan"
         job = job_mgr.Job(title=title)
         job.execute_kind = "library"
         job_mgr.submit_scan(
@@ -963,15 +1126,14 @@ def _start_library_scan(partial_only=False):
         return job
 
 
-def _maybe_auto_first_scan():
-    """On first run, auto-start a library scan so the new-release baseline gets
-    established (and missing albums surface); also resume an interrupted one.
+def _maybe_resume_library_scan():
+    """Resume an interrupted library scan when the app is idle, driving it to
+    completion across restarts.
 
-    A fresh first scan is started once (so cancelling it doesn't relaunch it on
-    every load); an interrupted scan leaves a checkpoint and is resumed whenever
-    the app is idle, driving it to completion across restarts. Off via
-    AUTO_LIBRARY_SCAN — a manual scan still resumes the checkpoint and seeds the
-    baseline.
+    A FRESH first scan is NOT auto-started — the dashboard offers it as a choice
+    (see ``offer_baseline``) so a brand-new user isn't hit with a long,
+    network-heavy job unprompted. Once they start one and it gets interrupted, it
+    leaves a checkpoint and resumes from here. Off entirely via AUTO_LIBRARY_SCAN.
     """
     if (not cfg.AUTO_LIBRARY_SCAN or _CLI_MODE or _LOCK_BUSY_PID is not None
             or _UNWRITABLE_VOLUMES):
@@ -988,13 +1150,10 @@ def _maybe_auto_first_scan():
         cp = scan_checkpoint.pending()
         if cp is not None:
             _start_library_scan(partial_only=(cp["kind"] == "partial"))
-        elif not new_releases.auto_scan_attempted():
-            new_releases.note_auto_scan_attempted()
-            _start_library_scan()
 
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request):
+async def dashboard(request: Request, q: str = "", kind: str = "artist"):
     from qobuz_librarian import config as _cfg
     active_jobs = [j for j in job_mgr.registry.pending_and_running()
                    if j.status.value in ('running', 'scanning')]
@@ -1008,13 +1167,18 @@ async def dashboard(request: Request):
         from qobuz_librarian.library import new_releases, scan_checkpoint
         from qobuz_librarian.ui_cli.prompts import _read_fetch_log
         # These read state files and may submit a background job, so they run
-        # here (off the event loop) alongside the other disk work. First-scan
-        # first (establishes the baseline); the check is gated on that baseline.
-        _maybe_auto_first_scan()
+        # here (off the event loop) alongside the other disk work. Resume an
+        # interrupted scan first (the new-release check is gated on the baseline).
+        _maybe_resume_library_scan()
         _maybe_auto_check_new_releases()
         library_scan_state = _library_scan_state()
         return {
             "new_release_review": _new_release_review(),
+            # First run offers the baseline scan as a Run/Skip choice rather than
+            # auto-starting it; suppress the offer once the user skips it (the
+            # dismiss marker) or turns it off via AUTO_LIBRARY_SCAN.
+            "offer_baseline": (cfg.AUTO_LIBRARY_SCAN
+                               and not new_releases.auto_scan_attempted()),
             # First-run setup banner: shown until a full library scan has seeded
             # the new-release baseline. setup_scanning = a library scan is now
             # pending/running — re-queried here (not from the pre-trigger
@@ -1031,8 +1195,17 @@ async def dashboard(request: Request):
                                and _active_library_scan() is None else None)(
                                    scan_checkpoint.pending()),
             # tail-only read so a long-running install with a multi-MB fetch log
-            # doesn't slurp the whole file on every dashboard load.
-            "recent": list(reversed(_read_fetch_log(limit_tail=8))),
+            # doesn't slurp the whole file on every dashboard load. Hide the
+            # no-op results (already complete / already best / skipped / no
+            # change) so this lists actual downloads, not scans that found
+            # nothing to fetch.
+            "recent": list(reversed([
+                e for e in _read_fetch_log(limit_tail=60)
+                if e.get("result") not in {
+                    "already_complete", "skipped_already_higher_quality",
+                    "skipped_has_extras", "nothing_landed",
+                }
+            ]))[:8],
             # First-run nudge: a fresh install has no creds, so every search/scan
             # would fail cryptically — surface it up front. Filesystem-only.
             "creds_ok": bool(_read_creds().get("auth_token")),
@@ -1047,12 +1220,22 @@ async def dashboard(request: Request):
 
     loop = asyncio.get_running_loop()
     disk = await loop.run_in_executor(None, _gather_disk_state)
+    search_kind = str(kind or "").strip().lower()
+    if search_kind not in ("artist", "album", "track"):
+        search_kind = "artist"
+    search_q = str(q or "").strip()[:200]
+    initial_search_results = ""
+    if search_kind == "artist" and search_q:
+        initial_search_results = await _initial_artist_search_html(request, search_q)
     return _tr(request, "index.html", {
         "active_jobs": active_jobs,
         "pending": job_mgr.registry.pending_and_running(),
         "review": job_mgr.registry.awaiting_review(),
         "creds_token_valid": _TOKEN_VALID,
         "lock_busy_pid": _LOCK_BUSY_PID,
+        "search_q": search_q,
+        "search_kind": search_kind,
+        "initial_search_results": initial_search_results,
         "page": "dashboard",
         **disk,
     })
@@ -1073,30 +1256,35 @@ async def lyric_retry(request: Request):
     from qobuz_librarian.web import flows
     job = job_mgr.Job(title="Lyric retry")
     job.execute_kind = "lyrics"
-    job_mgr.submit(job, lambda j: flows.run_lyric_retry(j, _get_token()))
+    job_mgr.submit(job, lambda j: flows.run_lyric_retry(j))
     return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
 
 
-@app.get("/search", response_class=HTMLResponse)
-async def search_page(request: Request, q: str = Query("", max_length=500),
-                      kind: str = Query("album")):
-    if q.strip():
-        return await do_search(request, q=q, kind=kind)
-    creds_ok = bool(_read_creds().get("auth_token"))
-    return _tr(request, "search.html", {
-        "q": "", "results": [], "error": None,
-        "kind": "track" if kind == "track" else "album",
-        "creds_ok": creds_ok, "qobuz_ready": _qobuz_ready(), "page": "search",
-    })
+@app.get("/search")
+async def search_page():
+    # Search lives on the dashboard now (it leads with the search bar), so this
+    # path redirects to the current search surface instead of serving a second
+    # page with no nav home.
+    return RedirectResponse(url="/", status_code=307)
 
 
 @app.post("/search", response_class=HTMLResponse)
 async def do_search(request: Request, q: str = Form("", max_length=500),
-                    kind: str = Form("album")):
+                    kind: str = Form("album"),
+                    artist_id: str = Form(""),
+                    artist_name: str = Form("")):
     results = []
+    album_groups = []
+    artist_results = []
+    selected_artist = None
     error = None
     query = q.strip()
-    kind = "track" if str(kind).strip().lower() == "track" else "album"
+    kind_raw = str(kind).strip().lower()
+    kind = kind_raw if kind_raw in ("artist", "track") else "album"
+    artist_id = str(artist_id or "").strip()
+    artist_name = str(artist_name or "").strip()
+    if not _is_htmx(request):
+        return RedirectResponse(url="/", status_code=303)
     if query:
         # Imported before the try so the except clauses below can always name
         # them, even if a failure happens before the request reaches the API.
@@ -1105,21 +1293,18 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
             token = _get_token()
             from qobuz_librarian.api.search import (
                 get_album,
+                get_artist_albums,
                 get_track,
                 search_albums,
+                search_artists,
                 search_tracks,
             )
             from qobuz_librarian.cli import parse_qobuz_url
             from qobuz_librarian.library.catalog import (
                 album_quality_label,
                 album_year,
-                filter_owned_albums,
+                find_album_dir_filesystem,
             )
-            from qobuz_librarian.library.discovery import (
-                owned_album_titles,
-                resolve_artist_dir,
-            )
-            from qobuz_librarian.library.scanner import list_artist_album_dirs
 
             # If the user pasted a Qobuz URL, the placeholder says we
             # handle it — actually do so by fetching the album directly
@@ -1140,8 +1325,10 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
                 # An album URL only resolves in Albums mode; in Tracks mode it
                 # would fetch the album and then be dropped as not-a-track,
                 # leaving a blank "No results". Point the user at the toggle.
-                error = ("That's an album URL — switch to Albums to download it, "
-                         "or paste a single track to grab one song.")
+                error = ("That's an album URL. Switch to Albums to download it, "
+                         "or paste a single track to download one song.")
+            elif parsed and parsed[0] == "album" and kind == "artist":
+                error = "That's an album URL. Switch to Albums to download it."
             elif parsed and parsed[0] == "album":
                 try:
                     raw = [await asyncio.wait_for(
@@ -1156,16 +1343,15 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
                 except (AuthLost, QobuzUnavailable):
                     raise
                 except QobuzError:
-                    error = "Couldn't fetch that album — check the URL."
+                    error = "Couldn't fetch that album. Check the URL."
                 except Exception:
                     import logging
                     logging.getLogger("qobuz_librarian").exception(
                         "album fetch failed for %r", query)
-                    error = "Couldn't fetch that album — check the URL."
+                    error = "Couldn't fetch that album. Check the URL."
             elif parsed and parsed[0] == "track" and kind == "track":
-                # Tracks mode: resolve the pasted track URL to that one track —
-                # the track-results loop below then renders it for a one-song
-                # grab (this is exactly what Tracks mode exists for).
+                # Tracks mode: resolve the pasted track URL to that one track;
+                # the track-results loop below renders it for a one-song download.
                 try:
                     _t = await asyncio.wait_for(
                         loop.run_in_executor(None, lambda: call_within(
@@ -1173,28 +1359,91 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
                         timeout=cfg.WEB_FETCH_TIMEOUT)
                     raw = [_t] if _t else []
                     if not raw:
-                        error = "Couldn't fetch that track — check the URL."
+                        error = "Couldn't fetch that track. Check the URL."
                 except asyncio.TimeoutError:
                     error = "Timed out reaching the Qobuz API."
                 except (AuthLost, QobuzUnavailable):
                     raise
                 except QobuzError:
-                    error = "Couldn't fetch that track — check the URL."
+                    error = "Couldn't fetch that track. Check the URL."
             elif parsed and parsed[0] == "track":
                 # Albums mode: a track URL — point the user at the Tracks toggle
                 # instead of the old (now false) "works on albums" message.
-                error = ("That's a track URL — switch to Tracks to grab one "
+                error = ("That's a track URL. Switch to Tracks to download one "
                          "song, or paste the album URL in Albums mode.")
             elif parsed:
                 # Parsed as some other Qobuz URL kind (artist/playlist).
-                error = ("Only Qobuz album URLs are supported here. "
-                         "Paste an album URL, or search by name.")
+                if kind == "artist":
+                    error = "Search artists by name. Paste album or track URLs only."
+                else:
+                    error = ("Only Qobuz album and track URLs are supported. "
+                             "Search for an artist by name instead.")
             elif is_qobuz_url:
                 # URL looks like qobuz.com but isn't a recognised format
                 # (e.g. artist/interpreter or playlist page). Text-searching
                 # the URL string returns nothing and confuses the user.
-                error = ("Only Qobuz album URLs are supported here. "
-                         "Paste an album URL, or search by artist/title.")
+                if kind == "artist":
+                    error = "Search artists by name. Paste album or track URLs only."
+                else:
+                    error = ("Only Qobuz album and track URLs are supported. "
+                             "Search for an artist by name instead.")
+            elif kind == "artist" and artist_id:
+                try:
+                    raw, artist_total = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            lambda: call_within(
+                                cfg.WEB_FETCH_TIMEOUT,
+                                get_artist_albums,
+                                artist_id,
+                                token,
+                                limit=cfg.ARTIST_CATALOG_LIMIT,
+                            ),
+                        ),
+                        timeout=cfg.WEB_FETCH_TIMEOUT,
+                    )
+                    selected_artist = {
+                        "id": artist_id,
+                        "name": artist_name or query,
+                        "total": artist_total,
+                        "shown": len(raw),
+                    }
+                except asyncio.TimeoutError:
+                    error = "Timed out reaching the Qobuz API."
+            elif kind == "artist":
+                try:
+                    artist_raw = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            lambda: call_within(
+                                cfg.WEB_FETCH_TIMEOUT,
+                                search_artists,
+                                query,
+                                token,
+                                limit=cfg.ARTIST_LOOKUP_LIMIT,
+                            ),
+                        ),
+                        timeout=cfg.WEB_FETCH_TIMEOUT,
+                    )
+                    for a in artist_raw:
+                        if not a.get("id"):
+                            continue
+                        img = a.get("image") or {}
+                        cover = ""
+                        if isinstance(img, dict):
+                            cover = img.get("small") or img.get("thumbnail") or ""
+                        albums_count = a.get("albums_count")
+                        if isinstance(albums_count, dict):
+                            albums_count = albums_count.get("total")
+                        artist_results.append({
+                            "id": a.get("id"),
+                            "name": a.get("name") or "?",
+                            "albums_count": albums_count,
+                            "cover": cover if str(cover).startswith(
+                                "https://static.qobuz.com/") else "",
+                        })
+                except asyncio.TimeoutError:
+                    error = "Timed out reaching the Qobuz API."
             else:
                 _search_fn = search_tracks if kind == "track" else search_albums
                 try:
@@ -1234,7 +1483,7 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
                         "https://static.qobuz.com/") else "",
                 })
             _album_raws = []
-            for a in (raw if kind == "album" else []):
+            for a in (raw if kind == "album" or selected_artist else []):
                 if not a.get("id"):
                     continue
                 _bd = a.get("maximum_bit_depth") or 0
@@ -1254,6 +1503,7 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
                     "quality": _qual,
                     "hires":   _bd >= 24,
                     "lossy":   _bd == 0,
+                    "bit_depth": _bd,
                     "cover":   _cover if _cover.startswith(
                         "https://static.qobuz.com/") else "",
                     "owned":   False,
@@ -1264,61 +1514,143 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
             # Download on an album you own — the app is gap-fill, so that would
             # contradict its own purpose. Reuse the scans' owned-title match,
             # resolving each artist's folder once, off the event loop.
-            if results and kind == "album":
+            if _album_raws:
                 def _annotate_owned():
-                    owned_by_artist: dict = {}
+                    # Mark owned with the SAME filesystem resolver the download
+                    # and scan paths use, so the badge agrees with them.
+                    # find_album_dir_filesystem expands artist variants — incl.
+                    # the comma-split for collaboration folders ("John Lennon,
+                    # Yoko Ono") and diacritic folds — so an album filed under a
+                    # collab or otherwise-named folder is still recognised.
+                    # For an owned album also note the on-disk year:
+                    # the year picks the user's pressing as the row (so the rest
+                    # show as "other versions") while Search stays out of
+                    # upgrade decisions.
+                    from qobuz_librarian.library.catalog import _dir_year
                     for res, alb in zip(results, _album_raws):
-                        name = (alb.get("artist") or {}).get("name") or ""
-                        if name not in owned_by_artist:
-                            ad = resolve_artist_dir(name)
-                            owned_by_artist[name] = (
-                                owned_album_titles(list_artist_album_dirs(ad))
-                                if ad else {})
-                        titles = owned_by_artist[name]
-                        if titles:
-                            res["owned"] = not filter_owned_albums(
-                                [(alb, 1)], titles, name)
+                        try:
+                            folder = find_album_dir_filesystem(alb)
+                            if folder is None:
+                                continue
+                            res["owned"] = True
+                            res["disk_year"] = _dir_year(folder.name)
+                        except Exception:
+                            pass
                 try:
+                    # Local disk work, not a Qobuz call — give it a generous
+                    # bound of its own (the single listing keeps the real cost
+                    # ~1s) and LOG if it ever trips, so an empty In-library
+                    # column leaves a trace instead of looking like the feature
+                    # vanished. Ownership is a nicety; search still returns.
+                    _own_timeout = 20
                     await asyncio.wait_for(
                         loop.run_in_executor(None, _annotate_owned),
-                        timeout=cfg.WEB_FETCH_TIMEOUT)
+                        timeout=_own_timeout)
+                except asyncio.TimeoutError:
+                    import logging
+                    logging.getLogger("qobuz_librarian").warning(
+                        "ownership annotation timed out (%ss) for %r — results "
+                        "shown without In-library marks", _own_timeout, query)
                 except Exception:
-                    pass  # ownership is a nicety; never fail search over it
+                    import logging
+                    logging.getLogger("qobuz_librarian").exception(
+                        "ownership annotation failed for %r", query)
+
+            # Collapse the flat result list into one row per album: a remaster,
+            # deluxe, and box set of the same record group together with the
+            # alternates tucked under the main row, instead of the same album
+            # scattering down the page. The edition Qobuz ranked first is the
+            # row; the rest become its "other versions".
+            if _album_raws:
+                from qobuz_librarian.library.discovery import _is_live_release
+                from qobuz_librarian.library.tags import (
+                    normalize,
+                    strip_album_decorations,
+                    strip_leading_article,
+                )
+                by_key = {}
+                for res, alb in zip(results, _album_raws):
+                    ver = alb.get("version") or ""
+                    # A live/session take is a different recording, not an edition
+                    # of the studio album — key it on its own so it stays its own
+                    # row instead of hiding under the studio album's "other
+                    # versions". (A remaster/deluxe shares the base title and does
+                    # group, which is what we want.)
+                    if _is_live_release(res["title"]) or _is_live_release(ver):
+                        base = normalize(res["title"] + " " + ver)
+                    else:
+                        base = normalize(strip_leading_article(
+                            strip_album_decorations(res["title"])))
+                    key = (normalize(res["artist"]), base)
+                    g = by_key.get(key)
+                    if g is None:
+                        g = dict(res, editions=[])
+                        by_key[key] = g
+                        album_groups.append(g)
+                    g["owned"] = g["owned"] or res["owned"]
+                    if res.get("disk_year"):
+                        g["disk_year"] = res["disk_year"]
+                    g["editions"].append({
+                        "id": res["id"],
+                        "version": (alb.get("version") or "").strip(),
+                        "year": res["year"], "tracks": res["tracks"],
+                        "quality": res["quality"], "hires": res["hires"],
+                        "lossy": res["lossy"], "bit_depth": res["bit_depth"],
+                        "cover": res["cover"],
+                    })
+                for g in album_groups:
+                    eds = g["editions"]
+                    # Float the pressing you actually own to the top (matched by
+                    # the on-disk year) so it's the row and the rest read as
+                    # "other versions" instead of offering you your own copy.
+                    if g["owned"] and g.get("disk_year"):
+                        for i, e in enumerate(eds):
+                            if str(e["year"]) == str(g["disk_year"]):
+                                if i:
+                                    eds.insert(0, eds.pop(i))
+                                break
+                    rep = eds[0]
+                    for f in ("id", "year", "tracks", "quality",
+                              "hires", "lossy", "cover", "version"):
+                        g[f] = rep[f]
+                    g["others"] = eds[1:]
         except (SystemExit, NoCredsError):
-            error = "No Qobuz credentials set — visit Settings."
+            error = "No Qobuz credentials set. Visit Settings."
         except AuthLost:
-            error = "Qobuz auth lost. Check Settings."
+            error = "Token is expired or invalid. Update it in Settings."
         except QobuzUnavailable:
             error = ("Qobuz is temporarily unavailable (network or rate "
-                     "limit) — try again shortly.")
+                     "limit). Try again shortly.")
         except QobuzError:
-            error = "Search failed — try again."
+            error = "Search failed. Try again."
         except Exception:
             import logging
             logging.getLogger("qobuz_librarian").exception(
                 "search failed for %r", query)
-            error = "Search failed — try again."
+            error = "Search failed. Try again."
     creds_ok = bool(_read_creds().get("auth_token"))
-    ctx = {"q": query, "results": results, "error": error, "kind": kind,
+    ctx = {"q": query, "results": results, "album_groups": album_groups,
+           "artist_results": artist_results, "selected_artist": selected_artist,
+           "error": error, "kind": kind,
            "creds_ok": creds_ok, "qobuz_ready": _qobuz_ready(), "page": "search"}
     if _is_htmx(request):
         return _tr(request, "_search_results.html", ctx)
-    return _tr(request, "search.html", ctx)
+    return RedirectResponse(url="/", status_code=303)
 
 
 _DOWNLOAD_SUMMARY_LABELS = {
-    "already_complete": "Album already complete — nothing to download.",
-    "skipped_already_higher_quality": "Skipped — you already own higher quality.",
-    "skipped_has_extras": "Skipped — your copy has tracks the catalogue doesn't.",
+    "already_complete": "Album already complete. Nothing to download.",
+    "skipped_already_higher_quality": "Skipped: the library already has higher quality.",
+    "skipped_has_extras": "Skipped: the library copy includes extra tracks.",
     "upgrade_only_no_op": "Already at or above the target quality.",
-    "dry_run": "Dry run — nothing downloaded.",
+    "dry_run": "Dry run. Nothing downloaded.",
     "user_skipped": "Skipped at confirmation.",
-    "lossy_only": "Qobuz only had lossy versions — nothing downloaded.",
+    "lossy_only": "Qobuz only had lossy versions. Nothing downloaded.",
     "no_tracks": "Qobuz returned no tracks for this album.",
-    "cancelled": "Cancelled — the partial download was discarded.",
-    "upgrade_aborted_backup_failed": "Upgrade aborted — couldn't back up the original.",
-    "partial": "Re-download came back incomplete — kept your original.",
-    "not_imported": "Downloaded, but the import didn't land — library unchanged.",
+    "cancelled": "Cancelled. The partial download was discarded.",
+    "upgrade_aborted_backup_failed": "Upgrade aborted: couldn't back up the original.",
+    "partial": "Re-download came back incomplete; kept your original.",
+    "not_imported": "Downloaded, but the import didn't land. Library unchanged.",
 }
 
 
@@ -1346,7 +1678,7 @@ def _summarize_download_result(r):
     if n_lossy:
         parts.append(f"{n_lossy} lossy-dropped")
     if r.get("upgrade_unverified"):
-        parts.append("upgrade couldn't be verified — original kept")
+        parts.append("upgrade couldn't be verified; original kept")
     elif r.get("auto_upgrade"):
         parts.append("auto-upgrade verified")
     return ", ".join(parts) + "."
@@ -1372,21 +1704,21 @@ def _make_download_run(album, token, *, treat_as_new=False):
         if r.get("result") not in benign and not r.get("imported"):
             j.status = job_mgr.JobStatus.FAILED
             if r.get("n_fail"):
-                j.error = f"{plural(r['n_fail'], 'track')} failed — see job log"
+                j.error = f"{plural(r['n_fail'], 'track')} failed. See job log."
             elif r.get("n_ok"):
-                j.error = "Downloaded, but the import failed — see job log"
+                j.error = "Downloaded, but the import failed. See job log."
             else:
-                j.error = ("No tracks were retrieved — Qobuz may be rate-limiting "
+                j.error = ("No tracks were retrieved. Qobuz may be rate-limiting "
                            "you, or the release is unavailable. Try again shortly.")
         elif r.get("imported") and r.get("n_fail", 0) > 0:
-            j.error = f"{plural(r['n_fail'], 'track')} failed — see job log"
+            j.error = f"{plural(r['n_fail'], 'track')} failed. See job log."
         # Surface a one-line outcome here so the /jobs page tells the user what
         # happened without expanding the log.
         summary = _summarize_download_result(r)
         if summary:
             j.summary = summary
         # Claiming/completing the album the normal way graduates it out of the
-        # "grabbed single" state, so the rest stops being suppressed in scans.
+        # "downloaded single" state, so the rest stops being suppressed in scans.
         if r.get("imported"):
             from qobuz_librarian.library import hidden as hidden_mod
             hidden_mod.unmark_single(
@@ -1396,10 +1728,10 @@ def _make_download_run(album, token, *, treat_as_new=False):
 
 
 def _make_single_track_run(album, track, token):
-    """Run a single-track grab: download just ``track`` via the per-track queue
-    path (the same isolation repair uses — never a whole-album rip), then mark
-    the album as a deliberately-grabbed single so scans leave the partial folder
-    — and a sample-only artist's catalogue — alone."""
+    """Run a single-track download: download just ``track`` via the per-track
+    queue path (the same isolation repair uses — never a whole-album rip), then
+    mark the album as a deliberate single so scans leave the partial folder —
+    and a sample-only artist's catalogue — alone."""
     def run(j):
         from qobuz_librarian.library import hidden as hidden_mod
         from qobuz_librarian.library.catalog import (
@@ -1421,7 +1753,7 @@ def _make_single_track_run(album, track, token):
         # Already own this exact track? Don't re-rip it — that just lands a beets
         # ".1.flac" duplicate beside the copy you have — and don't mark anything.
         if str(track.get("id")) not in missing_ids:
-            j.summary = f"You already have “{t_title}” — nothing downloaded."
+            j.summary = f"You already have “{t_title}”. Nothing downloaded."
             return
         qi = _build_queue_item(
             album=album, album_dir=album_dir,
@@ -1438,28 +1770,28 @@ def _make_single_track_run(album, track, token):
             if qi.get("n_fail"):
                 j.error = f"{plural(qi.get('n_fail', 1), 'track')} failed"
             elif qi.get("n_ok"):
-                j.error = "Downloaded, but the import failed — see job log"
+                j.error = "Downloaded, but the import failed. See job log."
             else:
-                j.error = ("Couldn't retrieve the track — Qobuz may be rate-limiting "
+                j.error = ("Couldn't retrieve the track. Qobuz may be rate-limiting "
                            "you, or it's unavailable. Try again shortly.")
             return
-        # Only mark it a single if the album is still partial after this grab. If
+        # Only mark it a single if the album is still partial after this download. If
         # this was the album's last missing track, you now own the whole thing —
         # that's a normal complete album, not a single, so leave it unmarked.
         marked = len(missing) > 1
         if marked:
             hidden_mod.mark_single(artist, title, album_year(album), album.get("id"))
-            j.summary = (f"Got “{t_title}” — filed under {artist} / {title}. "
-                         "The rest of the album stays out of your scans.")
+            j.summary = (f"Got “{t_title}”, filed under {artist} / {title}. "
+                         "The rest of the album stays out of scans.")
         else:
-            # This grab completed the album — it's a normal full album now, so
-            # clear any single mark an earlier partial grab of it left behind.
+            # This download completed the album — it's a normal full album now, so
+            # clear any single mark an earlier partial download left behind.
             # Without this the stale mark keeps the artist out of bulk scans and
             # the new-release check even though nothing is partial any more.
             hidden_mod.unmark_single(artist, title)
-            j.summary = (f"Got “{t_title}” — that completed {title}, so it's "
+            j.summary = (f"Got “{t_title}”; that completed {title}, so it's "
                          "filed as a full album.")
-        # Record what this grab added so /undo can cleanly reverse it.
+        # Record which track was added so /undo can cleanly reverse it.
         j.single = {
             "album_id": str(album.get("id") or ""),
             "track_id": str(track.get("id") or ""),
@@ -1492,23 +1824,25 @@ async def queue_download(request: Request, album_id: str = Form(""),
                 f'<div class="alert alert-error" data-flash>{msg}</div>')
         return RedirectResponse(url="/queue?error=" + urllib.parse.quote(msg),
                                 status_code=303)
-    # Refuse duplicates — same album already active or pending. Includes
-    # scan-flow jobs awaiting review that have the album as one of their
-    # candidates, so a search-then-download for an album the user just
-    # approved in an artist scan still hits the dedupe guard.
-    existing = _find_job_touching_album(album_id)
-    if existing:
-        if _is_htmx(request):
-            return HTMLResponse(
-                f'<div class="alert alert-warning" data-flash>Already queued — '
-                f'<a href="/jobs/{existing.id}" class="link">view job</a>.</div>')
-        return RedirectResponse(url=f"/jobs/{existing.id}", status_code=303)
     # "Get this edition too" — download a different edition of an album the user
     # already owns, as a separate album. Bypasses the owned-check and treats it
     # as brand-new so it lands in its own (year) folder beside the existing copy
     # rather than being skipped or replacing it.
     download_as_new_edition = str(as_new_edition).strip().lower() in (
         "1", "true", "yes", "on")
+    # Refuse true duplicates — same album already active or pending — but only of
+    # the SAME intent (see _duplicate_download_job). Includes scan-flow jobs
+    # awaiting review that have the album as one of their candidates, so a
+    # search-then-download for an album the user just approved in an artist scan
+    # still folds. A deliberate new-edition copy or a single-track download is its own
+    # request and isn't swallowed by an unrelated job for the same album.
+    existing = _duplicate_download_job(album_id, track_id, download_as_new_edition)
+    if existing:
+        if _is_htmx(request):
+            return HTMLResponse(
+                f'<div class="alert alert-warning" data-flash>Already queued. '
+                f'<a href="/jobs/{existing.id}" class="link">view job</a>.</div>')
+        return RedirectResponse(url=f"/jobs/{existing.id}", status_code=303)
     try:
         token = _get_token()
         from qobuz_librarian.api.client import call_within
@@ -1550,27 +1884,30 @@ async def queue_download(request: Request, album_id: str = Form(""),
             # so keep it off the event loop — otherwise a large library stalls
             # every other request while this one request blocks.
             if await loop.run_in_executor(None, _already_complete):
-                msg = "You already own a version of this album."
+                msg = "This album is already in your library."
                 if _is_htmx(request):
                     # Offer the deliberate second-edition path instead of a dead
                     # end: a remaster or a different mix can be kept alongside the
                     # owned copy (it imports into its own (year) folder). The form
                     # re-posts with as_new_edition so the owned-check is skipped.
+                    # A quiet card with the action stacked below the text, so the
+                    # button never gets squeezed into a wrapped column on a phone.
                     aid = html.escape(album_id)
                     return HTMLResponse(
-                        f'<div class="alert alert-warning">'
-                        f'<div><p>{html.escape(msg)}</p>'
-                        f'<p class="text-xs text-base-content/60 mt-1">A different '
-                        f'edition — a remaster or a new mix — can be kept alongside '
-                        f'it; it downloads into its own folder. (If it shares the '
-                        f'same release year as your copy, your player may merge '
-                        f'them.)</p></div>'
+                        f'<div class="rounded-lg border border-base-300 '
+                        f'bg-base-200 p-3 text-sm space-y-2">'
+                        f'<div><p class="font-medium">{html.escape(msg)}</p>'
+                        f'<p class="text-xs text-base-content/60 mt-0.5">A remaster '
+                        f'or different mix downloads into its own folder, kept '
+                        f'alongside the existing library copy; same-year editions '
+                        f'may merge in your player.</p></div>'
                         f'<form hx-post="/download" hx-target="#download-toast" '
-                        f'hx-swap="innerHTML" class="mt-2">'
+                        f'hx-swap="innerHTML">'
                         f'<input type="hidden" name="album_id" value="{aid}">'
                         f'<input type="hidden" name="as_new_edition" value="1">'
-                        f'<button type="submit" class="btn btn-sm btn-primary">'
-                        f'Download this edition too</button></form></div>')
+                        f'<button type="submit" class="btn btn-sm btn-primary '
+                        f'w-full sm:w-auto whitespace-nowrap">'
+                        f'Download this edition anyway</button></form></div>')
                 return RedirectResponse(
                     url="/queue?error=" + urllib.parse.quote(msg),
                     status_code=303)
@@ -1595,18 +1932,18 @@ async def queue_download(request: Request, album_id: str = Form(""),
             artist=artist, album_id=album_id)
         if single_track:
             # Flagging it now (before the run fills in the undo details) is what
-            # tells the UI to hide Cancel on this job — a one-track grab is done
+            # tells the UI to hide Cancel on this job — a one-track download is done
             # before you could catch it.
             job.single = {"album_id": album_id, "track_id": str(track_id)}
 
         # Re-check under the lock right before submitting: closes the race with
         # a concurrent /download for the same album across the get_album await.
         with _DOWNLOAD_SUBMIT_LOCK:
-            dup = _find_job_touching_album(album_id)
+            dup = _duplicate_download_job(album_id, track_id, download_as_new_edition)
             if dup:
                 if _is_htmx(request):
                     return HTMLResponse(
-                        f'<div class="alert alert-warning" data-flash>Already queued — '
+                        f'<div class="alert alert-warning" data-flash>Already queued. '
                         f'<a href="/jobs/{dup.id}" class="link">view job</a>.</div>')
                 return RedirectResponse(url=f"/jobs/{dup.id}", status_code=303)
             # Re-check the run-lock right before submitting. The album fetch
@@ -1629,7 +1966,7 @@ async def queue_download(request: Request, album_id: str = Form(""),
         # Land on the new job's page so the user sees their download starting.
         return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
     except (SystemExit, NoCredsError):
-        msg = "No Qobuz credentials set — visit Settings."
+        msg = "No Qobuz credentials set. Visit Settings."
         if _is_htmx(request):
             return HTMLResponse(
                 f'<div class="alert alert-error" data-flash>{msg}</div>')
@@ -1642,22 +1979,22 @@ async def queue_download(request: Request, album_id: str = Form(""),
             friendly_qobuz_error,
         )
         if isinstance(e, asyncio.TimeoutError):
-            user_msg = "Timed out reaching the Qobuz API — try again."
+            user_msg = "Timed out reaching the Qobuz API. Try again."
         elif isinstance(e, QobuzUnavailable):
             user_msg = ("Qobuz is temporarily unavailable (network or rate "
-                        "limit) — try again shortly.")
+                        "limit). Try again shortly.")
         elif isinstance(e, AuthLost):
-            user_msg = "Token is expired or invalid — update it in Settings."
+            user_msg = "Token is expired or invalid. Update it in Settings."
         elif isinstance(e, QobuzError):
             cleaned = friendly_qobuz_error(e)
             if cleaned.startswith("HTTP 404"):
-                user_msg = ("No album with that id — check the URL "
+                user_msg = ("No album with that id. Check the URL "
                             "or use Search.")
             else:
-                user_msg = ("Couldn't reach the Qobuz API — "
-                            "check the container's network.")
+                user_msg = ("Couldn't reach the Qobuz API. "
+                            "Check the container's network.")
         else:
-            user_msg = "Couldn't queue download — check your token and try again."
+            user_msg = "Couldn't queue download. Check your token and try again."
         if _is_htmx(request):
             return HTMLResponse(
                 f'<div class="alert alert-error" data-flash>{html.escape(user_msg)}</div>')
@@ -1665,34 +2002,33 @@ async def queue_download(request: Request, album_id: str = Form(""),
         return RedirectResponse(url=f"/queue?error={msg}", status_code=303)
 
 
-@app.get("/artist", response_class=HTMLResponse)
-async def artist_page(request: Request, error: str = "", artist: str = ""):
-    creds_ok = bool(_read_creds().get("auth_token"))
-    # `artist` pre-fills the box (e.g. the Hidden view's "check for new releases"
-    # link). Strip angle brackets/NULs so it can't break out of the value attr.
+@app.get("/artist")
+async def artist_page(request: Request, artist: str = ""):
+    # The public UI no longer has a separate Artist jobs page. Preserve old
+    # direct links by landing on dashboard search in Artist mode.
     prefill = "".join(c for c in artist if c not in "<>\x00").strip()[:200]
-    return _tr(request, "artist.html", {
-        "creds_ok": creds_ok, "error": error[:200], "page": "artist",
-        "prefill": prefill,
-    })
+    params = {"kind": "artist"}
+    if prefill:
+        params["q"] = prefill
+    return RedirectResponse(url="/?" + urllib.parse.urlencode(params),
+                            status_code=303)
 
 
 def _clean_artist_name(artist):
     """Strip + length-cap + reject control chars. Returns (name, error_redirect).
 
-    error_redirect is None on success, or a RedirectResponse back to the
-    Artist page with a flash. Used by the artist scan + the 4 per-artist tool
-    routes so they all reject the same way."""
+    error_redirect is None on success, or a RedirectResponse back to dashboard
+    artist search. Used by the artist scan + the per-artist power routes so
+    they all reject the same way."""
     name = (artist or "").strip()[:200]
     if not name:
         return None, RedirectResponse(
-            url="/artist?error=" + urllib.parse.quote("Artist name is required."),
+            url="/?kind=artist",
             status_code=303,
         )
     if any(c in name for c in ("<", ">", "\x00")):
         return None, RedirectResponse(
-            url="/artist?error=" + urllib.parse.quote(
-                "Artist name contains forbidden characters."),
+            url="/?kind=artist",
             status_code=303,
         )
     return name, None
@@ -1734,7 +2070,7 @@ async def library_page(request: Request):
                       else None)
     from qobuz_librarian.library import new_releases
     return _tr(request, "library.html", {
-        "creds_ok": creds_ok, "page": "library",
+        "creds_ok": creds_ok, "qobuz_ready": _qobuz_ready(), "page": "library",
         "library_resume": library_resume,
         "library_scan_state": _library_scan_state(),
         "error": request.query_params.get("error", ""),
@@ -1802,6 +2138,16 @@ async def library_scan(request: Request, mode: str = Form("missing_albums")):
     return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
 
 
+@app.post("/library/skip-setup")
+async def skip_baseline_setup(request: Request):
+    """Dismiss the first-run baseline-scan offer on the dashboard. The scan stays
+    available any time from the Library page; this just stops the dashboard from
+    offering it on every load."""
+    from qobuz_librarian.library import new_releases
+    new_releases.note_auto_scan_attempted()
+    return RedirectResponse(url="/", status_code=303)
+
+
 def _hidden_view(request, scope, *, page, restore_action, back_url):
     from qobuz_librarian.library import hidden as hidden_mod
     return _tr(request, "hidden.html", {
@@ -1845,7 +2191,7 @@ async def upgrade_page(request: Request):
     from qobuz_librarian.library import hidden as hidden_mod
     creds_ok = bool(_read_creds().get("auth_token"))
     return _tr(request, "upgrade.html", {
-        "creds_ok": creds_ok, "page": "upgrade",
+        "creds_ok": creds_ok, "qobuz_ready": _qobuz_ready(), "page": "upgrade",
         "last_run": _tool_last_run_age("upgrade"),
         "hidden_count": hidden_mod.count(hidden_mod.SCOPE_UPGRADE)})
 
@@ -1919,10 +2265,6 @@ async def upgrade_scan_artist(request: Request, artist: str = Form("")):
 async def downsample_page(request: Request):
     from qobuz_librarian.integrations.downsample_engine import HAVE_DOWNSAMPLE
     from qobuz_librarian.library import hidden as hidden_mod
-    # creds_ok gates the "Just one artist?" hint — /artist hides its whole
-    # form when no Qobuz creds are set, so promising a per-artist downsample
-    # there would be a dead link for a no-creds user (downsample itself is
-    # credential-free, so they CAN still use the whole-library button here).
     return _tr(request, "downsample.html", {
         "page": "downsample",
         "have_downsample": HAVE_DOWNSAMPLE,
@@ -1997,7 +2339,8 @@ async def repair_page(request: Request, page: int = 1):
     # review is never hidden behind a "Start scan" button (clicking which would
     # silently discard those results via the rescan dedup).
     rjob = _repair_current_job()
-    ctx = {"creds_ok": creds_ok, "page": "repair", "repair_job": rjob,
+    ctx = {"creds_ok": creds_ok, "qobuz_ready": _qobuz_ready(),
+           "page": "repair", "repair_job": rjob,
            "JobStatus": job_mgr.JobStatus}
     if rjob is not None:
         ctx["queue_wait"] = _queue_wait(rjob)
@@ -2009,6 +2352,7 @@ async def repair_page(request: Request, page: int = 1):
         ctx["repair_resume"] = (
             {"done": len(cp["scanned"]), "found": len(cp["candidates"])}
             if cp is not None else None)
+        ctx["last_run"] = _tool_last_run_age("repair")
     return _tr(request, "repair.html", ctx)
 
 
@@ -2083,15 +2427,18 @@ async def repair_history(request: Request):
 async def lyrics_page(request: Request):
     from qobuz_librarian.integrations.lyric_fetch import AVAILABLE
     providers = ", ".join(cfg.LYRICS_PROVIDERS) or "Lrclib, NetEase, Musixmatch"
-    # creds_ok gates the "Just one artist?" hint — see downsample_page for the
-    # full story: /artist hides its form without creds, so the hint would be
-    # a dead link there for a no-creds user.
+    lyrics_format = (cfg.LYRICS_FORMAT or "embed").lower()
+    lyrics_format_label = {
+        "embed": "Embedded tags",
+        "sidecar": ".lrc sidecar files",
+        "both": "Embedded tags and .lrc files",
+    }.get(lyrics_format, lyrics_format)
     return _tr(request, "lyrics.html", {
         "page": "lyrics",
         "have_lyrics": AVAILABLE,
         "creds_ok": bool(_read_creds().get("auth_token")),
         "last_run": _tool_last_run_age("lyrics"),
-        "lyrics_format": (cfg.LYRICS_FORMAT or "embed").lower(),
+        "lyrics_format": lyrics_format_label,
         "providers": providers,
     })
 
@@ -2110,7 +2457,7 @@ async def lyrics_scan(request: Request):
     if existing is not None:
         return RedirectResponse(url=f"/jobs/{existing.id}", status_code=303)
     from qobuz_librarian.web import flows
-    job = job_mgr.Job(title="Lyrics backfill")
+    job = job_mgr.Job(title="Lyrics scan")
     job.execute_kind = "lyrics"
     job_mgr.submit(
         job,
@@ -2136,7 +2483,7 @@ async def lyrics_scan_artist(request: Request, artist: str = Form("")):
     if existing is not None:
         return RedirectResponse(url=f"/jobs/{existing.id}", status_code=303)
     from qobuz_librarian.web import flows
-    job = job_mgr.Job(title="Lyrics backfill", artist=name)
+    job = job_mgr.Job(title="Lyrics scan", artist=name)
     job.execute_kind = "lyrics"
     job_mgr.submit(
         job,
@@ -2166,7 +2513,7 @@ def _migrate_checks(src, dest):
                                "detail": f"{p} (will be created under {anc})"})
             elif is_dest:
                 checks.append({"label": label, "ok": False,
-                               "detail": f"{p} can't be created — nearest existing "
+                               "detail": f"{p} can't be created. Nearest existing "
                                          f"folder {anc or p.anchor} is not writable"})
             else:
                 checks.append({"label": label, "ok": False, "detail": f"{p} does not exist"})
@@ -2195,7 +2542,7 @@ async def migrate_page(request: Request):
 
 @app.post("/migrate")
 async def migrate_scan(request: Request):
-    # No credential check: migration only reads and reorganizes local files.
+    # No credential check: migration only reads and reorganises local files.
     busy = _lock_busy_response(request)
     if busy is not None:
         return busy
@@ -2206,8 +2553,8 @@ async def migrate_scan(request: Request):
     in_place = form.get("in_place") == "on"
     allow_low_space = form.get("allow_low_space") == "on"
     if not src or not dest:
-        err = ("Set QL_MIGRATE_SRC and QL_MIGRATE_DEST — the folder to read and "
-               "the folder to build the organized copy into — then try again.")
+        err = ("Set MIGRATE_SRC and MIGRATE_DEST: the source library and "
+               "the destination for the organised copy, then try again.")
     else:
         err = engine.validate_paths(Path(src), Path(dest), in_place=in_place)
     if err:
@@ -2233,22 +2580,9 @@ async def migrate_scan(request: Request):
         "migration")
     return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
 
-
-# Backwards-compatible /audit redirects, in case anyone bookmarked the
-# old name during the early-access period. Safe to remove later.
-@app.get("/audit", response_class=HTMLResponse)
-async def audit_redirect():
-    return RedirectResponse(url="/repair", status_code=308)
-
-
-@app.post("/audit")
-async def audit_redirect_post():
-    return RedirectResponse(url="/repair", status_code=308)
-
-
 @app.get("/jobs/{job_id}", response_class=HTMLResponse)
 async def job_page(request: Request, job_id: str, approved: bool = False,
-                   stale: bool = False, page: int = 1):
+                   stale: bool = False, noselection: bool = False, page: int = 1):
     job = job_mgr.registry.get(job_id)
     historical = False
     if not job:
@@ -2257,7 +2591,7 @@ async def job_page(request: Request, job_id: str, approved: bool = False,
             return RedirectResponse(url="/queue", status_code=303)
         historical = True
     ctx = {"job": job, "page": "queue",
-           "approved": approved, "stale": stale,
+           "approved": approved, "stale": stale, "noselection": noselection,
            "historical": historical,
            "queue_wait": _queue_wait(job),
            "JobStatus": job_mgr.JobStatus}
@@ -2292,11 +2626,14 @@ async def job_content(request: Request, job_id: str, page: int = 1):
     this in when the SSE stream reports the job finished, so the terminal
     view has one render path — the server's — instead of a faked-up bar."""
     job = job_mgr.registry.get(job_id)
+    historical = False
     if not job:
         job = job_mgr.load_historical_job(job_id)
         if job is None:
             return HTMLResponse("", status_code=404)
+        historical = True
     ctx = {"job": job, "JobStatus": job_mgr.JobStatus,
+           "historical": historical,
            "queue_wait": _queue_wait(job)}
     ctx.update(_review_context(job, page))
     return _tr(request, "_job_body.html", ctx)
@@ -2326,6 +2663,17 @@ async def job_approve(request: Request, job_id: str):
     job = job_mgr.registry.get(job_id)
     if not job:
         return RedirectResponse(url="/queue", status_code=303)
+    # Repair stays on its single surface (/repair) through the repairing phase;
+    # every other kind keeps using the job page.
+    dest = "/repair" if job.execute_kind == "repair" else f"/jobs/{job_id}"
+    # Guard a zero-selection approve: with nothing ticked, approving would flip
+    # the job to done over an empty set and flash success while quietly
+    # discarding the whole review. The submit button is disabled client-side, but
+    # a direct POST or a stale page can still reach here — keep it in review and
+    # say so instead.
+    if job.status == job_mgr.JobStatus.AWAITING_REVIEW and not any(
+            c.get("selected") for c in job.candidates):
+        return RedirectResponse(url=f"{dest}?noselection=1", status_code=303)
     # Selection is saved server-side as the user ticks (the paginated review no
     # longer carries every checkbox in the form), so approve runs against the
     # saved flags — passing None keeps them as-is rather than reading the form.
@@ -2336,9 +2684,6 @@ async def job_approve(request: Request, job_id: str):
     loop = asyncio.get_running_loop()
     approved = await loop.run_in_executor(None, lambda: job_mgr.approve(job, None))
     flag = "approved=1" if approved else "stale=1"
-    # Repair stays on its single surface (/repair) through the repairing phase;
-    # every other kind keeps using the job page.
-    dest = "/repair" if job.execute_kind == "repair" else f"/jobs/{job_id}"
     return RedirectResponse(url=f"{dest}?{flag}", status_code=303)
 
 
@@ -2366,7 +2711,7 @@ def _hide_scope(execute_kind):
 # Artist groups per review page. A huge gap scan can surface thousands of
 # albums; rendering them all is what made the review page tank, so the server
 # pages by whole artist groups (an album never splits across a page).
-REVIEW_PAGE_ARTISTS = 25
+REVIEW_PAGE_ARTISTS = 40
 
 
 def _artist_sort_key(name: str) -> str:
@@ -2396,9 +2741,9 @@ def _review_artist_groups(job, query=""):
             if q not in hay.lower():
                 continue
         groups.setdefault(artist, []).append(c)
-    # Sort groups by artist (case-insensitive), tracks by their stable seq.
+    # Sort groups by music-library order, tracks by their stable seq.
     ordered = []
-    for artist in sorted(groups, key=lambda a: a.casefold()):
+    for artist in sorted(groups, key=_artist_sort_key):
         items = sorted(groups[artist], key=lambda c: c.get("seq", 0))
         ordered.append((artist, items))
     return ordered
@@ -2529,9 +2874,10 @@ async def job_hide(request: Request, job_id: str):
     return HTMLResponse("")
 
 
-@app.post("/jobs/{job_id}/hide-artists")
-async def job_hide_artists(request: Request, job_id: str):
-    """Hide unselected albums for several marked artists in one review action."""
+@app.post("/jobs/{job_id}/dismiss-rest")
+async def job_dismiss_rest(request: Request, job_id: str):
+    """Dismiss every album the user didn't pick: durable-hide all unselected
+    candidates across the whole review at once, leaving just the keepers."""
     job = _get_reviewable_job(job_id)
     if not job:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -2540,26 +2886,30 @@ async def job_hide_artists(request: Request, job_id: str):
         return JSONResponse({"error": "not reviewable"}, status_code=404)
 
     from qobuz_librarian.web import flows
-    form = await request.form()
-    artists = []
-    seen = set()
-    for artist in form.getlist("artist"):
-        artist = (artist or "").strip()
-        if artist in seen:
-            continue
-        seen.add(artist)
-        artists.append(artist)
-
-    hidden_count = 0
     scope = _hide_scope(job.execute_kind)
-    for artist in artists[:1000]:
-        hidden_count += flows.dismiss_albums(job, artist, scope=scope)
+    # Snapshot the artists that still have an unticked album. dismiss_albums
+    # re-reads each artist's saved ticks, so a tick that lands after this
+    # snapshot is still honoured and its album isn't dropped.
+    with job._lock:
+        artists, seen = [], set()
+        for c in job.candidates:
+            if c.get("selected"):
+                continue
+            name = c.get("artist") or ""
+            if name not in seen:
+                seen.add(name)
+                artists.append(name)
+
+    # Offload: this can touch the whole review (a hidden-store write per artist
+    # plus a persist), which would block the event loop and stall every SSE
+    # stream for a large scan.
+    loop = asyncio.get_running_loop()
+    hidden_count = await loop.run_in_executor(
+        None, lambda: sum(flows.dismiss_albums(job, a, scope=scope) for a in artists))
     if hidden_count:
         job.notify_review_changed()
     payload = _selection_payload(job)
     payload["hidden"] = hidden_count
-    # If that cleared the last candidate, complete the review so the caller can
-    # reload to the finished view instead of an empty "awaiting review".
     payload["review_done"] = job_mgr.finalize_review_if_empty(job)
     return JSONResponse(payload)
 
@@ -2604,8 +2954,8 @@ async def job_retry(request: Request, job_id: str):
             busy = _lock_busy_response(request)
             if busy is not None:
                 return busy
-            # A failed single-track grab carries job.album_id (so Retry shows up),
-            # but _make_download_run would re-grab the WHOLE album. Rebuild it as
+            # A failed single-track download carries job.album_id (so Retry shows up),
+            # but _make_download_run would download the whole album. Rebuild it as
             # the same one-track run instead.
             single = getattr(job, "single", None)
             track = None
@@ -2619,11 +2969,11 @@ async def job_retry(request: Request, job_id: str):
                 new_job.single = dict(single)
                 job_mgr.submit(new_job, _make_single_track_run(album, track, token))
             elif single and single.get("track_id"):
-                # The original was a single-track grab but that track is no
+                # The original was a single-track download but that track is no
                 # longer on Qobuz — do NOT silently re-download the whole album.
                 return RedirectResponse(
                     url="/queue?error=" + urllib.parse.quote(
-                        "That track is no longer on Qobuz — nothing to retry."),
+                        "That track is no longer on Qobuz. Nothing to retry."),
                     status_code=303)
             else:
                 job_mgr.submit(new_job, _make_download_run(album, token))
@@ -2632,20 +2982,20 @@ async def job_retry(request: Request, job_id: str):
         return RedirectResponse(url="/settings?error=creds", status_code=303)
     except Exception:
         return RedirectResponse(
-            url="/queue?error=" + urllib.parse.quote("Retry failed — check your token."),
+            url="/queue?error=" + urllib.parse.quote("Retry failed. Check your token."),
             status_code=303,
         )
 
 
 @app.post("/jobs/{job_id}/undo")
 async def job_undo(request: Request, job_id: str):
-    """Reverse a single-track grab: delete the track it added, drop the beets row
-    for it, undo the single mark, and remove a folder the grab created if it's
+    """Reverse a single-track download: delete the track it added, drop the beets row
+    for it, undo the single mark, and remove a folder the download created if it's
     now empty. Available while the job is still in memory."""
     # Undo deletes files and touches the beets DB, so it needs the same run-lock
     # gate every other mutating route has — the in-process staging lock below
-    # can't keep it off the library while a CLI session holds the cross-process
-    # lock (handed-off mode, or another instance).
+    # can't keep it off the library while a CLI session or another instance
+    # holds the cross-process lock.
     busy = _lock_busy_response(request)
     if busy is not None:
         if _is_htmx(request):
@@ -2683,7 +3033,7 @@ async def job_undo(request: Request, job_id: str):
                 # No ISRC to match on: fall back to the track number. A multi-disc
                 # album can carry that same per-disc number on another disc, so
                 # require the recorded disc to match — undo must remove the track
-                # the grab added, never its twin. A record from before the disc
+                # the download added, never its twin. A record from before the disc
                 # was captured only deletes when the number is unique in the folder.
                 numbered = [et for et in tracks
                             if et.get("tracknumber") == track_no]
@@ -2706,7 +3056,7 @@ async def job_undo(request: Request, job_id: str):
             forget_beets_entries([removed])
             if info.get("marked"):
                 hidden_mod.unmark_single(info.get("artist") or "", info.get("album") or "")
-        # If the grab created a brand-new folder and it now holds no audio, take
+        # If the download created a brand-new folder and it now holds no audio, take
         # it back out so a one-off sample doesn't leave an empty album dir behind.
         try:
             if (info.get("new_folder") and d.is_dir()
@@ -2744,10 +3094,10 @@ async def job_undo(request: Request, job_id: str):
         dir_gone = not _Path(info["dir"]).exists()
         if dir_gone:
             job.single = {**info, "removed": True}
-            job.summary = f"“{info.get('title')}” was already gone — cleared the single mark."
+            job.summary = f"“{info.get('title')}” was already gone; cleared the single mark."
         else:
-            job.summary = (f"Couldn't find “{info.get('title')}” by ISRC/track number "
-                           "— check the folder manually and delete the file if needed.")
+            job.summary = (f"Couldn't find “{info.get('title')}” by ISRC/track number. "
+                           "Delete it manually if needed.")
     if _is_htmx(request):
         return _tr(request, "_job_body.html", {"job": job})
     return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
@@ -2759,18 +3109,20 @@ async def job_cancel(request: Request, job_id: str):
     if not job:
         return RedirectResponse(url="/queue", status_code=303)
     was_review = job.status == job_mgr.JobStatus.AWAITING_REVIEW
+    was_pending = job.status == job_mgr.JobStatus.PENDING
     # Offload: cancelling a parked review runs cancel_review -> persist (a
     # json.dumps of the full candidate list + SQLite commit), which would block
     # the event loop and stall every SSE stream for a large review.
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, lambda: job_mgr.request_cancel(job))
     # Repair stays on its single surface either way (idle start form once the
-    # cancel lands). Otherwise: a review discard is instant → queue; a
-    # running/scanning job stops cooperatively → keep them on the job page.
+    # cancel lands). A queued job vanishes the instant it's cancelled, and a
+    # review discard is instant too → back to the queue; a running/scanning job
+    # stops cooperatively → keep them on the job page to watch it wind down.
     if job.execute_kind == "repair":
         dest = "/repair"
     else:
-        dest = "/queue" if was_review else f"/jobs/{job_id}"
+        dest = "/queue" if (was_review or was_pending) else f"/jobs/{job_id}"
     return RedirectResponse(url=dest, status_code=303)
 
 
@@ -2816,9 +3168,14 @@ async def queue_history(request: Request, p: int = 1):
 
     loop = asyncio.get_running_loop()
     total, pages, p, rows = await loop.run_in_executor(None, lambda: _load_page(p))
+    retryable_ids = [
+        j.id for j in job_mgr.registry.all()
+        if j.status == job_mgr.JobStatus.FAILED and j.album_id
+    ]
     return _tr(request, "history.html", {
         "page": "queue", "active_tab": "history",
         "jobs": rows, "cur_page": p, "pages": pages, "total": total,
+        "retryable_ids": retryable_ids,
     })
 
 
@@ -2858,8 +3215,8 @@ def _diagnostics():
             return
         if want_writable and not os.access(p, os.W_OK):
             checks.append({"label": label, "ok": False,
-                           "detail": f"{p} is not writable by the container user — "
-                           "on a NAS, set PUID/PGID in .env to your media-share owner"})
+                           "detail": f"{p} is not writable by the container user. "
+                           "On a NAS, set PUID/PGID in .env to your media-share owner"})
             return
         try:
             n = sum(1 for _ in p.iterdir())
@@ -2870,8 +3227,8 @@ def _diagnostics():
         checks.append({"label": label, "ok": True,
                        "detail": f"{p} — {n} entr{'y' if n == 1 else 'ies'}"})
 
-    _dir_check("Music library (MUSIC_ROOT)", cfg.MUSIC_ROOT, want_writable=True)
-    _dir_check("Staging (STAGING_DIR)", cfg.STAGING_DIR, want_writable=True)
+    _dir_check("Music library", cfg.MUSIC_ROOT, want_writable=True)
+    _dir_check("Staging area", cfg.STAGING_DIR, want_writable=True)
 
     beets_db = Path(cfg.BEETS_DB_PATH)
     if beets_db.exists():
@@ -2890,8 +3247,8 @@ def _diagnostics():
         found = _sh.which(binary)
         checks.append({"label": f"`{binary}` binary",
                        "ok": bool(found),
-                       "detail": found or f"{binary} not on PATH — "
-                       "rebuild the image (docker compose build)"})
+                       "detail": found or f"{binary} not on PATH. "
+                       "Rebuild the image (docker compose build)"})
 
     stranded = []
     if cfg.UPGRADE_BACKUP_DIR.exists():
@@ -2905,7 +3262,7 @@ def _diagnostics():
     if stranded:
         checks.append({"label": "Stranded upgrade backups", "ok": False,
                        "detail": f"{len(stranded)} found in "
-                                 f"{cfg.UPGRADE_BACKUP_DIR} — manual cleanup needed"})
+                                 f"{cfg.UPGRADE_BACKUP_DIR}; manual cleanup needed"})
     else:
         checks.append({"label": "Stranded upgrade backups", "ok": True,
                        "detail": "none"})
@@ -3186,7 +3543,7 @@ async def set_mode(request: Request, target: str = Form("")):
         # the CLI over /staging once we release the lock below.
         _CLI_MODE = True
         if job_mgr.registry.pending_and_running():
-            _CLI_MODE = False  # nothing handed off — stay in web mode
+            _CLI_MODE = False  # no transfer happened; stay in web mode
             return RedirectResponse(url="/settings?error=" + urllib.parse.quote(
                 "Finish or cancel the active download before handing off to the "
                 "terminal."), status_code=303)
@@ -3210,7 +3567,7 @@ async def set_mode(request: Request, target: str = Form("")):
         except run_lock.LockBusy:
             # A CLI session still holds the lock — can't take it back yet.
             return RedirectResponse(url="/settings?error=" + urllib.parse.quote(
-                "The terminal is still using it — finish your CLI command, then "
+                "The terminal is still using it. Finish your CLI command, then "
                 "resume."), status_code=303)
     return RedirectResponse(url="/settings", status_code=303)
 
@@ -3233,13 +3590,14 @@ async def api_diagnostics(request: Request):
     checks = await loop.run_in_executor(None, _diagnostics)
     rows = []
     for d in checks:
-        icon = "✓" if d["ok"] else "✗"
-        cls = "badge-success" if d["ok"] else "badge-error"
-        detail = f'<div class="font-mono text-xs text-base-content/60 break-all">{html.escape(d.get("detail") or "")}</div>' if d.get("detail") else ""
+        icon = "OK" if d["ok"] else "!"
+        cls = "ql-diagnostic-status-ok" if d["ok"] else "ql-diagnostic-status-error"
+        aria = "OK" if d["ok"] else "Needs attention"
+        detail = f'<div class="ql-diagnostic-detail">{html.escape(d.get("detail") or "")}</div>' if d.get("detail") else ""
         rows.append(
-            f'<div class="flex items-start gap-3">'
-            f'<span class="shrink-0 mt-0.5"><span class="badge badge-sm {cls}">{icon}</span></span>'
-            f'<div class="min-w-0"><div class="text-sm">{html.escape(d["label"])}</div>{detail}</div>'
+            f'<div class="ql-diagnostic-row">'
+            f'<span class="ql-diagnostic-status {cls}" aria-label="{aria}">{icon}</span>'
+            f'<div class="min-w-0"><div class="ql-diagnostic-label">{html.escape(d["label"])}</div>{detail}</div>'
             f'</div>'
         )
     return HTMLResponse("\n".join(rows))
@@ -3496,10 +3854,9 @@ def _last_new_release_check_age() -> str | None:
 
 
 def _tool_last_run_age(execute_kind: str) -> str | None:
-    """Human-readable age of the last clean run of a tool scan (upgrade /
-    downsample / lyrics), or None if it's never completed. Lets each tool page
-    show a 'Last scan: 3 days ago / Never run' line so a visit isn't
-    indistinguishable from the first — read from the durable job archive."""
+    """Age of the last clean run of a tool scan, or None if it's never
+    finished — so a tool page can show "Last scan 3 days ago" instead of
+    looking identical to a first visit."""
     from qobuz_librarian.web import job_persistence
     ts = job_persistence.last_finished_at(execute_kind)
     return _format_age(ts) if ts is not None else None
@@ -3509,8 +3866,8 @@ def _no_creds_response(request):
     """Return a 303 redirect (or htmx fragment) when no credentials are set."""
     if _is_htmx(request):
         return HTMLResponse(
-            '<div class="alert alert-error" data-flash>No Qobuz credentials set — '
-            'visit <a href="/settings" class="link">Settings</a>.</div>',
+            '<div class="alert alert-error" data-flash>No Qobuz credentials set. '
+            'Visit <a href="/settings" class="link">Settings</a>.</div>',
             status_code=200)
     return RedirectResponse(url="/settings?error=creds", status_code=303)
 

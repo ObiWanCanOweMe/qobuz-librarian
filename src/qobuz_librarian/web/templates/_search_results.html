@@ -4,100 +4,187 @@
 </div>
 {% endif %}
 
-{% if results and not error %}
-<div class="card bg-base-200 shadow">
-  <div class="card-body p-0">
-    <div class="divide-y divide-base-300">
+{% if (results or artist_results or album_groups) and not error %}
+<div class="ql-results-panel">
+  <div class="ql-result-list">
+      {% if kind == 'artist' and artist_results %}
+      {% for a in artist_results %}
+      <div class="ql-result-row sm:items-center">
+        <div class="flex min-w-0 flex-1 items-center gap-3">
+          {% if a.cover %}
+          <img src="{{ a.cover }}" alt="" loading="lazy" width="48" height="48"
+               class="shrink-0 w-12 h-12 rounded object-cover bg-base-300">
+          {% endif %}
+          <div class="min-w-0 flex-1">
+            <p class="font-semibold ql-clamp-2 ql-sm-truncate">{{ a.name }}</p>
+            <p class="text-sm text-base-content/55">
+              {% if a.albums_count %}{{ a.albums_count }} album{{ 's' if a.albums_count != 1 else '' }} on Qobuz{% else %}Artist{% endif %}
+            </p>
+          </div>
+        </div>
+        <form method="post" action="/search"
+              hx-post="/search" hx-target="#search-results" hx-swap="innerHTML"
+              hx-disabled-elt="find button[type=submit]" class="sm:shrink-0">
+          <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+          <input type="hidden" name="kind" value="artist">
+          <input type="hidden" name="q" value="{{ q }}">
+          <input type="hidden" name="artist_id" value="{{ a.id }}">
+          <input type="hidden" name="artist_name" value="{{ a.name }}">
+          <button type="submit" class="btn btn-sm btn-primary w-full sm:w-auto">View albums</button>
+        </form>
+      </div>
+      {% endfor %}
+
+      {% elif kind == 'track' %}
       {% for r in results %}
-      {% if kind == 'track' %}
-      <div class="flex flex-col sm:flex-row sm:items-center gap-3 sm:gap-4 px-4 py-3">
-        <div class="flex items-center gap-3 min-w-0 flex-1">
+      <div class="ql-result-row sm:items-center">
+        <div class="flex min-w-0 flex-1 items-center gap-3">
           {% if r.cover %}
           <img src="{{ r.cover }}" alt="" loading="lazy" width="48" height="48"
                class="shrink-0 w-12 h-12 rounded object-cover bg-base-300">
           {% endif %}
           <div class="min-w-0 flex-1">
-            <p class="font-semibold truncate">{{ r.title }}{% if r.version %} <span class="font-normal text-base-content/50">({{ r.version }})</span>{% endif %}</p>
-            <p class="text-sm text-base-content/60 truncate">
+            <p class="font-semibold ql-clamp-2 ql-sm-truncate">{{ r.title }}{% if r.version %} <span class="font-normal text-base-content/50">({{ r.version }})</span>{% endif %}</p>
+            <p class="text-sm text-base-content/60 ql-clamp-2 ql-sm-truncate">
               {{ r.artist }}
               <span class="text-base-content/40">· {{ r.album_title }}{% if r.year and r.year != '?' %} ({{ r.year }}){% endif %}{% if r.track_n != '?' and r.total != '?' %} · track {{ r.track_n }} of {{ r.total }}{% endif %}</span>
             </p>
           </div>
         </div>
-        <div class="shrink-0 flex items-center gap-2 self-end sm:self-auto">
+        <div class="flex w-full items-center justify-between gap-2 sm:w-auto sm:shrink-0 sm:justify-end">
           {% if r.hires %}<span class="badge badge-sm quality-hires border border-current">Hi-Res</span>
           {% elif r.lossy %}<span class="badge badge-sm quality-lossy border border-current">Lossy</span>
           {% else %}<span class="badge badge-sm quality-cd border border-current">CD</span>{% endif %}
           <form method="post" action="/download" hx-post="/download" hx-target="#download-toast"
                 hx-swap="innerHTML" hx-disabled-elt="find button[type=submit]"
-                hx-confirm='Get just "{{ r.title }}" by {{ r.artist }}? The rest of the album stays out of your scans.'
+                hx-confirm='Download "{{ r.title }}" by {{ r.artist }}?'
                 data-queue-button>
             <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
             <input type="hidden" name="album_id" value="{{ r.album_id }}">
             <input type="hidden" name="track_id" value="{{ r.track_id }}">
-            <button type="submit" class="btn btn-sm btn-primary">Get track</button>
+            <button type="submit" class="btn btn-sm btn-primary"
+                    aria-label="Download {{ r.title }} by {{ r.artist }}">Download</button>
           </form>
         </div>
       </div>
+      {% endfor %}
+
       {% else %}
-      <div class="flex flex-col sm:flex-row sm:items-center gap-3 sm:gap-4 px-4 py-3">
-        <div class="flex items-center gap-3 min-w-0 flex-1">
-          {% if r.cover %}
-          <img src="{{ r.cover }}" alt="" loading="lazy" width="48" height="48"
+      {% if selected_artist %}
+      <div class="ql-result-section">
+        <p class="text-sm font-semibold">Albums by {{ selected_artist.name }}</p>
+        <p class="text-xs text-base-content/50">
+          {{ selected_artist.shown }} album{{ 's' if selected_artist.shown != 1 else '' }} from Qobuz{% if selected_artist.total and selected_artist.total > selected_artist.shown %} shown{% endif %}
+        </p>
+      </div>
+      {% endif %}
+      {% for g in album_groups %}
+      <div class="{% if g.others %}ql-version-group{% endif %}">
+      <div class="ql-result-row sm:items-start">
+        <div class="flex min-w-0 flex-1 items-start gap-3">
+          {% if g.cover %}
+          <img src="{{ g.cover }}" alt="" loading="lazy" width="48" height="48"
                class="shrink-0 w-12 h-12 rounded object-cover bg-base-300">
           {% endif %}
           <div class="min-w-0 flex-1">
-            <p class="font-semibold truncate">{{ r.title }}</p>
-            <p class="text-sm text-base-content/60 truncate">
-              {{ r.artist }}
-              <span class="text-base-content/40">· {{ r.year }} · {{ r.tracks }} track{{ 's' if r.tracks != 1 else '' }}</span>
+            <p class="font-semibold ql-clamp-2 ql-sm-truncate">{{ g.title }}{% if g.version and not g.others %} <span class="font-normal text-base-content/50">({{ g.version }})</span>{% endif %}</p>
+            <p class="text-sm text-base-content/60 ql-clamp-2 ql-sm-truncate">
+              {{ g.artist }}
+              <span class="text-base-content/40">· {{ g.year }} · {{ g.tracks }} track{{ 's' if g.tracks != 1 else '' }}</span>
             </p>
           </div>
         </div>
-        <div class="shrink-0 flex items-center gap-2 self-end sm:self-auto">
-          {% if r.owned %}
-          <span class="badge badge-sm badge-success whitespace-nowrap shrink-0" title="Already in your library">In library</span>
-          {% endif %}
-          {% if r.hires %}
-          <span class="badge badge-sm quality-hires border border-current">Hi-Res</span>
-          {% elif r.lossy %}
-          <span class="badge badge-sm quality-lossy border border-current"
-                title="Only a lossy version is available on Qobuz for this release">Lossy</span>
-          {% else %}
-          <span class="badge badge-sm quality-cd border border-current">CD</span>
-          {% endif %}
-          {% if r.quality %}<span class="text-xs text-base-content/40 hidden sm:block">{{ r.quality }}</span>{% endif %}
-          <form method="post" action="/download"
-                hx-post="/download"
-                hx-target="#download-toast"
-                hx-swap="innerHTML"
-                hx-disabled-elt="find button[type=submit]"
-                hx-confirm='{% if r.owned %}You already have "{{ r.title }}" by {{ r.artist }} in your library. Download it again anyway?{% else %}Download "{{ r.title }}" by {{ r.artist }} ({{ r.tracks }} track{{ 's' if r.tracks != 1 else '' }})?{% endif %}'
-                data-queue-button>
-            <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-            <input type="hidden" name="album_id" value="{{ r.id }}">
-            <button type="submit" class="btn btn-sm {% if r.owned %}btn-ghost{% else %}btn-primary{% endif %}">
-              <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
-              </svg>
-              {% if r.owned %}Download again{% else %}Download{% endif %}
+        <div class="flex w-full flex-col gap-2 sm:w-auto sm:shrink-0 sm:flex-row sm:items-center sm:justify-end">
+          <div class="flex min-w-0 flex-wrap items-center gap-1.5">
+            {% if g.owned %}
+            <span class="inline-flex items-center gap-1 text-xs font-medium text-success whitespace-nowrap" title="Already in your library">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
+              In library
+            </span>
+            {% else %}
+            {% if g.hires %}<span class="badge badge-sm quality-hires border border-current">Hi-Res</span>
+            {% elif g.lossy %}<span class="badge badge-sm quality-lossy border border-current">Lossy</span>
+            {% else %}<span class="badge badge-sm quality-cd border border-current">CD</span>{% endif %}
+            {% endif %}
+          </div>
+          <div class="flex shrink-0 items-center justify-between gap-2 sm:justify-end">
+            {% if g.others %}
+            <button type="button" class="ql-version-button"
+                    data-version-toggle
+                    data-show-label="Show {{ g.others | length }} other version{{ 's' if g.others | length != 1 else '' }}"
+                    data-hide-label="Hide other version{{ 's' if g.others | length != 1 else '' }}"
+                    aria-expanded="false"
+                    aria-controls="search-versions-{{ loop.index0 }}"
+                    aria-label="{{ g.others | length }} other version{{ 's' if g.others | length != 1 else '' }} for {{ g.title }}">
+              <span data-version-label>Show {{ g.others | length }} other version{{ 's' if g.others | length != 1 else '' }}</span>
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 shrink-0" data-version-icon fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
             </button>
-          </form>
+            {% endif %}
+            {% if not g.owned %}
+            <form method="post" action="/download" hx-post="/download" hx-target="#download-toast"
+                  hx-swap="innerHTML" hx-disabled-elt="find button[type=submit]"
+                  hx-confirm='Download "{{ g.title }}" by {{ g.artist }}?' data-queue-button>
+              <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+              <input type="hidden" name="album_id" value="{{ g.id }}">
+              <button type="submit" class="btn btn-sm btn-primary"
+                      aria-label="Download {{ g.title }} by {{ g.artist }}">Download</button>
+            </form>
+            {% endif %}
+          </div>
         </div>
       </div>
+      {% if g.others %}
+        <div id="search-versions-{{ loop.index0 }}" class="ql-version-panel hidden">
+          {% for e in g.others %}
+          <div class="ql-version-row">
+            <div class="min-w-0 flex-1">
+              <p class="text-sm font-medium ql-clamp-2 ql-sm-truncate">{{ e.version or ((e.year ~ ' edition · ' ~ ('Hi-Res' if e.hires else ('Lossy' if e.lossy else 'CD'))) if e.year and e.year != '?' else 'Alternate edition') }}</p>
+              <p class="text-xs text-base-content/40">{% if e.year and e.year != '?' %}{{ e.year }} · {% endif %}{{ e.tracks }} track{{ 's' if e.tracks != 1 else '' }}</p>
+            </div>
+            <div class="flex w-full items-center justify-between gap-2 sm:w-auto sm:shrink-0 sm:justify-end">
+              {% if e.hires %}<span class="badge badge-sm quality-hires border border-current shrink-0">Hi-Res</span>
+              {% elif e.lossy %}<span class="badge badge-sm quality-lossy border border-current shrink-0">Lossy</span>
+              {% else %}<span class="badge badge-sm quality-cd border border-current shrink-0">CD</span>{% endif %}
+              <form method="post" action="/download" hx-post="/download" hx-target="#download-toast"
+                    hx-swap="innerHTML" hx-disabled-elt="find button[type=submit]"
+                    hx-confirm='{% if g.owned %}Download this version of "{{ g.title }}" as a separate copy alongside the one in your library?{% else %}Download this version of "{{ g.title }}"?{% endif %}'
+                    data-queue-button>
+                <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+                <input type="hidden" name="album_id" value="{{ e.id }}">
+                {% if g.owned %}<input type="hidden" name="as_new_edition" value="1">{% endif %}
+                <button type="submit" class="btn btn-sm sm:btn-xs btn-primary shrink-0"
+                        aria-label="Download this version of {{ g.title }}">Download</button>
+              </form>
+            </div>
+          </div>
+          {% endfor %}
+        </div>
       {% endif %}
+      </div>
       {% endfor %}
-    </div>
+      {% endif %}
   </div>
 </div>
 
 {% elif q and not error %}
 <div class="text-center py-12 text-base-content/40">
-  <p class="text-lg">No results for "{{ q }}".</p>
-  <p class="text-sm mt-1">Try a different query or paste a Qobuz URL directly.</p>
+  <p class="text-lg">
+    {% if kind == 'artist' and selected_artist %}No albums found for {{ selected_artist.name }}.
+    {% elif kind == 'artist' %}No artists found for "{{ q }}".
+    {% else %}No results for "{{ q }}".{% endif %}
+  </p>
+  <p class="text-sm mt-1">
+    {% if kind == 'artist' %}Try a different artist name.
+    {% elif kind == 'track' %}Try a different song title.
+    {% else %}Try a different album title.{% endif %}
+  </p>
 </div>
 {% elif not q and not error %}
 <div class="text-center py-12 text-base-content/40">
-  <p class="text-sm">Type an artist, album, or URL above to search.</p>
+  <p class="text-sm">
+    {% if kind == 'artist' %}Type an artist name above to search.
+    {% elif kind == 'track' %}Type a song title above to search.
+    {% else %}Type an album title above to search.{% endif %}
+  </p>
 </div>
 {% endif %}

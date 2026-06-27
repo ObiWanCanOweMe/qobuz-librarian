@@ -3,49 +3,55 @@
 {% block content %}
 
 {% set active_tab = 'history' %}
-{% include "_queue_tabs.html" %}
+<div class="mb-6 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+  <div class="min-w-0">
+    <h1 class="text-2xl font-bold">History</h1>
+    <p class="mt-2 text-sm text-base-content/55">Finished jobs stay here after they leave the queue.</p>
+  </div>
+  <div class="w-full sm:w-96">
+    {% include "_queue_tabs.html" %}
+  </div>
+</div>
 
 {% if jobs %}
 <div class="flex items-center justify-between mb-3 gap-2 flex-wrap">
   <p class="text-sm text-base-content/50">{{ total }} finished job{% if total != 1 %}s{% endif %}</p>
   <form action="/queue/clear" method="post">
     <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-    <button type="submit" class="btn btn-sm btn-ghost"
-            data-confirm="Clear the entire job history? This permanently removes the record of every finished job and can't be undone.">Clear history</button>
+    <button type="submit" class="btn btn-sm btn-outline btn-error"
+            data-confirm="Clear all {{ total }} finished job{% if total != 1 %}s{% endif %} from history? This permanently removes the records and cannot be undone.">Clear history</button>
   </form>
 </div>
 
 <div class="space-y-2">
   {% for job in jobs %}
-  <div class="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-3 bg-base-200 rounded-lg">
+  <div class="ql-queue-card flex flex-wrap items-center gap-x-3 gap-y-1">
     <div class="shrink-0">
       {% if job.status == 'done' %}
-        <span class="badge badge-sm badge-success gap-1">✓ Done</span>
+        <span class="ql-status-chip is-success">Done</span>
       {% elif job.status == 'canceled' %}
-        <span class="badge badge-sm badge-ghost gap-1">⊘ Cancelled</span>
+        <span class="ql-status-chip is-neutral">Cancelled</span>
       {% else %}
-        <span class="badge badge-sm badge-error gap-1">✗ Failed</span>
+        <span class="ql-status-chip is-error">Failed</span>
       {% endif %}
     </div>
     <div class="min-w-0 flex-1">
-      <p class="font-medium truncate"><a href="/jobs/{{ job.id }}" class="link link-hover">{% if job.artist %}{{ job.artist }} — {% endif %}{{ job.title }}</a></p>
+      <p class="font-medium break-words line-clamp-2 sm:truncate"><a href="/jobs/{{ job.id }}" class="link link-hover">{% if job.artist %}{{ job.artist }} — {% endif %}{{ job.title }}</a></p>
       {% if job.error %}
-      <p class="text-xs text-error/80 truncate">{{ job.error }}</p>
+      <p class="text-xs text-error/80 break-words line-clamp-2 sm:truncate">{{ job.error }}</p>
       {% elif job.summary %}
-      <p class="text-xs text-base-content/50 line-clamp-2 sm:truncate">{{ job.summary }}</p>
+      <p class="text-xs text-base-content/50 break-words line-clamp-2 sm:truncate">{{ job.summary }}</p>
       {% endif %}
     </div>
-    {# Timestamp + actions wrap to their own right-aligned line on a phone so a
-       long title isn't crushed. #}
     <div class="flex items-center gap-2 w-full sm:w-auto justify-end">
       <span class="text-xs text-base-content/40 tabular-nums">{{ job.when }}</span>
-      {% if job.status == 'failed' and job.album_id %}
+      {% if job.status == 'failed' and job.album_id and job.id in retryable_ids %}
       <form action="/jobs/{{ job.id }}/retry" method="post" class="shrink-0">
         <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-        <button type="submit" class="btn btn-xs btn-ghost" title="Retry download">Retry</button>
+        <button type="submit" class="btn btn-sm sm:btn-xs btn-outline ql-secondary-action" title="Retry">Retry</button>
       </form>
       {% endif %}
-      <a href="/jobs/{{ job.id }}" class="btn btn-xs btn-ghost">Open</a>
+      <a href="/jobs/{{ job.id }}" class="btn btn-sm sm:btn-xs btn-outline ql-secondary-action">Open</a>
     </div>
   </div>
   {% endfor %}
@@ -54,26 +60,26 @@
 {% if pages > 1 %}
 <div class="flex items-center justify-center gap-3 mt-6">
   {% if cur_page > 1 %}
-  <a href="/queue/history?p={{ cur_page - 1 }}" class="btn btn-sm btn-ghost">← Newer</a>
+  <a href="/queue/history?p={{ cur_page - 1 }}" class="btn btn-sm btn-outline ql-secondary-action">Newer</a>
   {% else %}
-  <span class="btn btn-sm btn-ghost btn-disabled">← Newer</span>
+  <span class="btn btn-sm btn-outline ql-secondary-action btn-disabled">Newer</span>
   {% endif %}
   <span class="text-sm text-base-content/50 tabular-nums">Page {{ cur_page }} of {{ pages }}</span>
   {% if cur_page < pages %}
-  <a href="/queue/history?p={{ cur_page + 1 }}" class="btn btn-sm btn-ghost">Older →</a>
+  <a href="/queue/history?p={{ cur_page + 1 }}" class="btn btn-sm btn-outline ql-secondary-action">Older</a>
   {% else %}
-  <span class="btn btn-sm btn-ghost btn-disabled">Older →</span>
+  <span class="btn btn-sm btn-outline ql-secondary-action btn-disabled">Older</span>
   {% endif %}
 </div>
 {% endif %}
 
 {% else %}
-<div class="text-center py-12 text-base-content/40">
-  <svg xmlns="http://www.w3.org/2000/svg" class="h-12 w-12 mx-auto mb-3 opacity-30" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+<div class="ql-empty-state">
+  <svg xmlns="http://www.w3.org/2000/svg" class="h-12 w-12 mx-auto mb-3 text-base-content/40 opacity-30" fill="none" viewBox="0 0 24 24" stroke="currentColor">
     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 8v4l3 3m6-3a9 9 0 1 1-18 0 9 9 0 0 1 18 0z"/>
   </svg>
   <p class="font-medium text-base-content/60">No finished jobs yet.</p>
-  <p class="text-sm mt-1">Completed downloads, scans, and reviews show up here.</p>
+  <p class="text-sm mt-1 text-base-content/40">Completed downloads, scans, and reviews appear here.</p>
   <div class="mt-4">
     <a href="/queue" class="btn btn-outline w-full sm:w-auto">Back to queue</a>
   </div>

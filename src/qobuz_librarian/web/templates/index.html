@@ -1,353 +1,345 @@
 {% extends "base.html" %}
 {% block title %}Qobuz Librarian{% endblock %}
+{% block content_max %}max-w-6xl{% endblock %}
+{% block footer_max %}max-w-6xl{% endblock %}
 {% block content %}
 
+{% import "_job_labels.html" as labels %}
 
-{% if lock_busy_pid %}
-<!-- The web process couldn't take the single-instance run-lock at startup.
-     Another invocation (a forgotten `docker compose run ... cli`, or a
-     second compose stack) holds it. Downloads/scans are refused with 503
-     until this container restarts and reacquires it. -->
-<div class="alert alert-error mb-6">
-  <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0" fill="none"
-       viewBox="0 0 24 24" stroke="currentColor">
-    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-          d="M12 9v2m0 4h.01M5 19h14a2 2 0 0 0 1.84-2.75L13.74 4a2 2 0 0 0-3.5 0L3.18 16.25A2 2 0 0 0 5 19z"/>
-  </svg>
-  <span class="min-w-0 break-words">
-    <strong>Another instance holds the run-lock (pid {{ lock_busy_pid }}).</strong>
-    Downloads and scans are paused so two writers can't corrupt
-    <code>/staging</code>. Stop the other run first (likely a
-    <code>docker compose run</code> CLI session), then restart this container
-    so it can take the lock.
-  </span>
-</div>
-{% endif %}
-
-{% if creds_ok and creds_token_valid == False %}
-<div class="ql-notice ql-notice-warning mb-6 flex items-start gap-3 p-4">
-  <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0 text-warning" fill="none"
-       viewBox="0 0 24 24" stroke="currentColor">
-    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-          d="M12 9v2m0 4h.01M5 19h14a2 2 0 0 0 1.84-2.75L13.74 4a2 2 0 0 0-3.5 0L3.18 16.25A2 2 0 0 0 5 19z"/>
-  </svg>
-  <span class="min-w-0 flex-1 text-sm">Your saved token isn't authenticating against Qobuz any more —
-    re-paste it on the <a href="/settings" class="link">Settings page</a>.</span>
-</div>
-{% endif %}
-
-{% if lyric_retry_count %}
-<!-- Lyric retry manifest present — surface it so web-only users don't miss it -->
-<div class="ql-notice ql-notice-info mb-6 flex items-start flex-wrap gap-3 p-4">
-  <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0 text-info" fill="none"
-       viewBox="0 0 24 24" stroke="currentColor">
-    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-          d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
-  </svg>
-  <span class="min-w-0 flex-1 text-sm">
-    <strong>{{ lyric_retry_count }} track{{ 's' if lyric_retry_count != 1 }} need{{ 's' if lyric_retry_count == 1 }} a lyric retry</strong>
-    — providers were unavailable or rate-limited during the last import.
-  </span>
-  <form action="/lyric-retry" method="post" class="ml-auto shrink-0">
-    <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-    <button type="submit" class="btn btn-sm btn-primary">Retry now</button>
-  </form>
-</div>
-{% endif %}
-
-{% if staging_album_count %}
-<!-- Files left in staging by an interrupted import — the CLI warns about
-     these at startup; the web had no equivalent signal. Suppressed while a
-     job is running (those files are mid-import, not stranded). -->
-<div class="ql-notice ql-notice-warning mb-6 flex items-start gap-3 p-4">
-  <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0 text-warning" fill="none"
-       viewBox="0 0 24 24" stroke="currentColor">
-    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-          d="M12 9v2m0 4h.01M5 19h14a2 2 0 0 0 1.84-2.75L13.74 4a2 2 0 0 0-3.5 0L3.18 16.25A2 2 0 0 0 5 19z"/>
-  </svg>
-  <span class="min-w-0 flex-1 text-sm">
-    <strong>{{ staging_album_count }} album folder{{ 's' if staging_album_count != 1 }} left in staging</strong>
-    from an interrupted import — they'll be imported with your next download.
-  </span>
-</div>
-{% endif %}
-
-{% if qobuz_ready and not baseline_complete %}
-<!-- First-run setup: until a full library scan has seeded the new-release
-     baseline, frame what's happening rather than leaving the user guessing. -->
-<div class="ql-notice {% if not setup_scanning and not library_scan_state.ready %}ql-notice-warning{% else %}ql-notice-info{% endif %} mb-6 flex items-start flex-wrap gap-3 p-4">
-  <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0 {% if not setup_scanning and not library_scan_state.ready %}text-warning{% else %}text-info{% endif %}" fill="none"
-       viewBox="0 0 24 24" stroke="currentColor">
-    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-          d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 0 0-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 0 0 3.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 0 0 3.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 0 0-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 0 0-2.456-2.456L14.25 6l1.035-.259a3.375 3.375 0 0 0 2.456-2.456L18 2.25l.259 1.035a3.375 3.375 0 0 0 2.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 0 0-2.456 2.456z"/>
-  </svg>
-  <span class="min-w-0 flex-1 text-sm">
-    {% if setup_scanning %}
-    <strong>Setting up your library…</strong> Your first scan is running — finding the albums you're missing and switching on new-release alerts once it finishes.
-    {% elif not library_scan_state.ready %}
-    <strong>Library folder is not ready:</strong> {{ library_scan_state.message }}
-    {% else %}
-    <strong>One-time setup:</strong> new-release alerts stay off until a library scan finishes once. It finds the albums you're missing, and picks up where it left off if interrupted.
+<div class="ql-dashboard">
+  <div class="ql-dashboard-title">
+    <h1>Dashboard</h1>
+    {% if last_library_scan or last_new_release_check %}
+    <p>
+      {%- if last_library_scan %}Library scanned {{ last_library_scan }}{% endif -%}
+      {%- if last_library_scan and last_new_release_check %} · {% endif -%}
+      {%- if last_new_release_check %}New releases checked {{ last_new_release_check }}{% endif -%}
+    </p>
     {% endif %}
-  </span>
-  {% if not setup_scanning and library_scan_state.ready %}
-  <form action="/library" method="post" class="w-full shrink-0 sm:ml-auto sm:w-auto">
-    <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-    <input type="hidden" name="mode" value="missing_albums">
-    <button type="submit" class="btn btn-sm btn-primary w-full sm:w-auto">{% if scan_resumable %}Resume scan{% else %}Run library scan{% endif %}</button>
-  </form>
-  {% elif not setup_scanning %}
-  <a href="/settings" class="btn btn-sm btn-primary w-full shrink-0 sm:ml-auto sm:w-auto">Open Settings</a>
-  {% endif %}
-</div>
-{% endif %}
-
-{% if qobuz_ready and baseline_complete and library_resume %}
-<!-- A gap scan was interrupted AFTER the baseline was already established. The
-     setup banner above only fires before the first scan completes, so without
-     this an interrupted scan would surface solely on /library — exactly the
-     "the homepage never told me a scan wasn't finished" gap. Resume routes to
-     /library, which restores the right scan kind from the checkpoint. -->
-<div class="ql-notice ql-notice-info mb-6 flex items-start flex-wrap gap-3 p-4">
-  <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0 text-info" fill="none"
-       viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-          d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
-  </svg>
-  <span class="min-w-0 flex-1 text-sm">
-    <strong>A library scan was interrupted</strong> — {{ library_resume.done }} artist{{ 's' if library_resume.done != 1 }} already checked. Resume to finish it.
-  </span>
-  {# Resume in one tap: POST the checkpoint's own mode straight to /library, which
-     picks the saved checkpoint up and continues from artist N+1 — no second
-     "pick a mode and press Start" page. Same mechanism the first-run setup
-     banner's Resume uses. #}
-  <form action="/library" method="post" class="ml-auto shrink-0" data-busy-submit>
-    <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-    <input type="hidden" name="mode" value="{{ 'partial_fill' if library_resume.kind == 'partial' else 'missing_albums' }}">
-    <button type="submit" class="btn btn-sm btn-primary">Resume scan</button>
-  </form>
-</div>
-{% endif %}
-
-{% if new_release_review and new_release_review.count %}
-<!-- The automatic (or manual) new-release check found albums you don't own and
-     parked them for review. Surfaced up front so new releases come to you.
-     Gated on a non-zero count so a fully-dismissed check never shows "0 new". -->
-<div class="ql-notice ql-notice-success mb-6 flex items-start flex-wrap gap-3 p-4">
-  <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0 text-success" fill="none"
-       viewBox="0 0 24 24" stroke="currentColor">
-    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-          d="M9 18V6l10-2v12M9 18a2 2 0 1 1-4 0 2 2 0 0 1 4 0zm10-2a2 2 0 1 1-4 0 2 2 0 0 1 4 0z"/>
-  </svg>
-  <span class="min-w-0 flex-1 text-sm">
-    <strong>{{ new_release_review.count }} new release{{ 's' if new_release_review.count != 1 }}</strong>
-    by artists in your library — review and pick what to download.
-  </span>
-  <a href="/jobs/{{ new_release_review.id }}" class="btn btn-sm btn-primary ml-auto shrink-0">Review</a>
-</div>
-{% endif %}
-
-<!-- Search-first: the navbar already carries the wordmark and links to every
-     mode, so the dashboard leads straight with search (or the connect prompt) —
-     no marketing tagline on a tool you open daily, and no second copy of the nav
-     rendered as tiles below. -->
-<section class="text-center pt-2 pb-8">
-  {% if not creds_ok %}
-  <h1 class="text-xl font-semibold mb-1">Connect your Qobuz account</h1>
-  <p class="text-base-content/60 mb-5 max-w-md mx-auto">Paste your Qobuz token to start finding and filling in your library.</p>
-  <a href="/settings" class="btn btn-primary btn-lg">Set up your Qobuz account</a>
-  {% elif creds_token_valid == False %}
-  <h1 class="text-xl font-semibold mb-1">Reconnect Qobuz</h1>
-  <p class="text-base-content/60 mb-5 max-w-md mx-auto">Your saved token was rejected — reconnect it to keep searching and downloading.</p>
-  <a href="/settings" class="btn btn-primary btn-lg">Reconnect Qobuz</a>
-  {% else %}
-  <form action="/search" method="post"
-        hx-post="/search" hx-target="#search-results" hx-swap="innerHTML"
-        hx-indicator="#dashboard-search-spinner"
-        class="flex flex-col gap-2 mt-2 max-w-2xl mx-auto">
-    <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-    <div class="join self-center" role="group" aria-label="Search for">
-      <label class="join-item btn btn-sm has-[:checked]:btn-primary">
-        <input type="radio" name="kind" value="album" class="hidden" checked
-               hx-post="/search" hx-target="#search-results" hx-swap="innerHTML" hx-include="closest form">
-        Albums
-      </label>
-      <label class="join-item btn btn-sm has-[:checked]:btn-primary">
-        <input type="radio" name="kind" value="track" class="hidden"
-               hx-post="/search" hx-target="#search-results" hx-swap="innerHTML" hx-include="closest form">
-        Tracks
-      </label>
-    </div>
-    <div class="join w-full">
-      <input type="text" name="q" aria-label="Search Qobuz" placeholder="Artist, album, or URL"
-             inputmode="search" enterkeyhint="search" autocapitalize="off" spellcheck="false" maxlength="500"
-             class="input input-bordered input-lg join-item min-w-0 flex-1" autocomplete="off">
-      <button type="submit" class="btn btn-primary btn-lg join-item gap-2">
-        <span id="dashboard-search-spinner"
-              class="loading loading-spinner loading-sm htmx-indicator"></span>
-        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-4.35-4.35M17 11A6 6 0 1 1 5 11a6 6 0 0 1 12 0z"/>
-        </svg>
-        <span>Search</span>
-      </button>
-    </div>
-  </form>
-  {% endif %}
-</section>
-
-<div id="search-results" aria-live="polite"></div>
-
-
-<!-- Scans waiting for your review. Only the one new-release check shown in the
-     banner above is excluded (by id), so a second one can't go unlisted. -->
-{% set _banner_id = new_release_review.id if new_release_review else '' %}
-{% set other_review = review | rejectattr('id', 'equalto', _banner_id) | list %}
-{% if other_review %}
-<div class="card bg-base-200 border border-base-300/60 shadow mb-6">
-  <div class="card-body">
-    <h2 class="card-title text-info text-base">Waiting for your review</h2>
-    <div class="space-y-2 mt-1">
-      {% for job in other_review %}
-      {% set _n = job.candidates | length %}
-      {% set _is_repair = job.execute_kind == 'repair' %}
-      <div class="flex items-center justify-between gap-3">
-        <div class="min-w-0">
-          <p class="font-medium truncate">{% if _is_repair %}Repair results ready{% else %}{% if job.artist %}{{ job.artist }} — {% endif %}{{ job.title }}{% endif %}</p>
-          <p class="text-xs text-base-content/50">{{ _n }} {% if _is_repair %}damaged album{% else %}candidate{% endif %}{% if _n != 1 %}s{% endif %}{% if _is_repair %} to repair{% endif %}</p>
-        </div>
-        <a href="{{ '/repair' if _is_repair else '/jobs/' ~ job.id }}" class="btn btn-sm btn-primary shrink-0">{% if _is_repair %}Review damaged albums{% else %}Review{% endif %}</a>
-      </div>
-      {% endfor %}
-    </div>
   </div>
-</div>
-{% endif %}
 
-<!-- Active job(s): live progress cards. Always rendered as #dashboard-active
-     so SSE-driven swaps land on a stable target even when the list goes empty. -->
-<div id="dashboard-active" class="{% if active_jobs %}space-y-3 mb-6{% endif %}">
-  {% if active_jobs %}
-  {% for j in active_jobs %}
-  {% set _is_scan = j.status.value == 'scanning' %}
-  {% set _downloadish = j.execute_kind in ('album', 'library', 'new_releases', 'upgrade') %}
-  {% set _fallback_activity = 'Scanning' if _is_scan else ('Downloading' if _downloadish else 'Working') %}
-  {% set _activity = j.progress_phase or _fallback_activity %}
-  <div class="card bg-base-200 border border-warning shadow relative hover:bg-base-300/30 transition-colors"
-       data-job-card data-job-id="{{ j.id }}" data-job-surface="dashboard"
-       data-job-status="{{ j.status.value }}">
-    {# The whole card opens the job; the cancel button below sits above this. #}
-    <a href="/jobs/{{ j.id }}" class="absolute inset-0" aria-label="Open this job"></a>
-    <div class="card-body py-4">
-      <div class="flex items-start justify-between gap-3">
-        <div class="min-w-0 flex-1">
-          <div class="flex items-center gap-2 mb-1 flex-wrap">
-            <span class="loading loading-spinner loading-xs text-warning"></span>
-            {% if _is_scan %}
-            <span class="badge badge-info badge-sm">Scanning</span>
-            {% elif _downloadish %}
-            <span class="badge badge-warning badge-sm">Downloading</span>
-            {% else %}
-            <span class="badge badge-warning badge-sm">Working</span>
-            {% endif %}
-            <span id="dash-reconnect-{{ j.id }}" class="badge badge-warning badge-sm hidden">connection lost — reconnecting…</span>
-          </div>
-          <p class="font-semibold truncate">{% if j.artist %}{{ j.artist }} — {% endif %}{{ j.title }}</p>
-          <p id="dash-prog-{{ j.id }}" class="text-sm text-base-content/60 mt-1 truncate">
-            {%- if j.progress_total > 0 -%}
-            {{ _activity }} {{ j.progress_current }} / {{ j.progress_total }}{% if j.progress_unit %} {{ j.progress_unit }}{{ 's' if j.progress_total != 1 }}{% endif %}
-            {%- elif j.progress_phase -%}
-            {{ j.progress_phase }}
-            {%- else -%}
-            {{ _fallback_activity }}…
-            {%- endif -%}
-          </p>
-        </div>
-        <form action="/jobs/{{ j.id }}/cancel" method="post" class="relative z-10 shrink-0">
+  <div class="ql-dashboard-notices">
+    {% if lock_busy_pid %}
+    <div class="ql-notice ql-notice-warning flex items-start gap-3 p-4">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0 text-warning" fill="none"
+           viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M12 9v2m0 4h.01M5 19h14a2 2 0 0 0 1.84-2.75L13.74 4a2 2 0 0 0-3.5 0L3.18 16.25A2 2 0 0 0 5 19z"/>
+      </svg>
+      <span class="min-w-0 break-words text-sm">
+        <strong>Another Qobuz Librarian run is active.</strong>
+        Downloads and scans are paused so only one process writes to the library at a time.
+        Stop the other run first, then restart this one.
+      </span>
+    </div>
+    {% endif %}
+
+    {% if lyric_retry_count %}
+    <div class="ql-notice ql-notice-info flex items-start flex-wrap gap-3 p-4">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0 text-info" fill="none"
+           viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+      </svg>
+      <span class="min-w-0 flex-1 text-sm">
+        <strong>Lyrics retry pending for {{ lyric_retry_count }} track{{ 's' if lyric_retry_count != 1 }}.</strong>
+        Providers were unavailable or rate-limited during the last import.
+      </span>
+      <form action="/lyric-retry" method="post" class="ml-auto shrink-0">
+        <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+        <button type="submit" class="btn btn-sm btn-primary">Retry now</button>
+      </form>
+    </div>
+    {% endif %}
+
+    {% if staging_album_count %}
+    <div class="ql-notice ql-notice-warning flex items-start gap-3 p-4">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0 text-warning" fill="none"
+           viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M12 9v2m0 4h.01M5 19h14a2 2 0 0 0 1.84-2.75L13.74 4a2 2 0 0 0-3.5 0L3.18 16.25A2 2 0 0 0 5 19z"/>
+      </svg>
+      <span class="min-w-0 flex-1 text-sm">
+        <strong>{{ staging_album_count }} album folder{{ 's' if staging_album_count != 1 }} left in staging.</strong>
+        Review staging before starting another download; leftover folders may be imported with the next run.
+      </span>
+    </div>
+    {% endif %}
+
+    {% if qobuz_ready and not baseline_complete and (setup_scanning or not library_scan_state.ready or offer_baseline) %}
+    <div class="ql-notice {% if not setup_scanning and not library_scan_state.ready %}ql-notice-warning{% else %}ql-notice-info{% endif %} flex items-start flex-wrap gap-3 p-4">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0 {% if not setup_scanning and not library_scan_state.ready %}text-warning{% else %}text-info{% endif %}" fill="none"
+           viewBox="0 0 24 24" stroke="currentColor">
+        {% if not setup_scanning and not library_scan_state.ready %}
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M12 9v3.5m0 3h.01M5.07 19h13.86c1.54 0 2.5-1.67 1.73-3L13.73 4c-.77-1.33-2.69-1.33-3.46 0L3.34 16c-.77 1.33.19 3 1.73 3z"/>
+        {% else %}
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+        {% endif %}
+      </svg>
+      <span class="min-w-0 flex-1 text-sm">
+        {% if setup_scanning %}
+        <strong>Library scan running.</strong> Checking for missing albums and track gaps.
+        {% elif not library_scan_state.ready %}
+        <strong>Music library unavailable.</strong> {{ library_scan_state.message }}
+        {% else %}
+        <strong>Library scan needed.</strong> Scan once to find missing albums and track gaps.
+        {% endif %}
+      </span>
+      {% if setup_scanning %}
+      {% elif not library_scan_state.ready %}
+      <a href="/settings" class="btn btn-sm btn-primary w-full shrink-0 sm:ml-auto sm:w-auto">Open Settings</a>
+      {% else %}
+      <div class="flex gap-2 w-full shrink-0 sm:ml-auto sm:w-auto">
+        <form action="/library" method="post" class="flex-1 sm:flex-none">
           <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-          {% set _cancel_label = 'Cancel job' %}
-          <button type="submit" class="btn btn-sm btn-ghost btn-square min-h-[44px] min-w-[44px]"
-                  title="{{ _cancel_label }}" aria-label="{{ _cancel_label }}">×</button>
+          <input type="hidden" name="mode" value="missing_albums">
+          <button type="submit" class="btn btn-sm btn-primary w-full">Scan library</button>
+        </form>
+        <form action="/library/skip-setup" method="post" class="flex-1 sm:flex-none">
+          <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+          <button type="submit" class="btn btn-sm btn-outline ql-secondary-action w-full">Not now</button>
         </form>
       </div>
-    </div>
-  </div>
-  {% endfor %}
-  {% endif %}
-</div>
-
-<!-- Pending-only summary (non-review pending, none active) -->
-{% set queued_only = pending | rejectattr('status.value', 'equalto', 'awaiting_review') | list %}
-{% if queued_only and not active_jobs %}
-<div class="alert alert-info mb-6">
-  <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
-  </svg>
-  <span>{{ queued_only | length }} job{{ 's' if queued_only|length != 1 }} queued — <a href="/queue" class="link">view queue</a></span>
-</div>
-{% endif %}
-
-<!-- Recent downloads -->
-{% if creds_ok %}
-<div class="card bg-base-200 border border-base-300/60 shadow-sm">
-  <div class="card-body">
-    <div class="flex flex-col gap-1 mb-3 sm:flex-row sm:items-baseline sm:justify-between">
-      <h2 class="ql-eyebrow">Recent downloads</h2>
-      {% if last_library_scan or last_new_release_check %}
-      <span class="readout text-xs text-base-content/40">
-        {%- if last_library_scan %}Library scanned {{ last_library_scan }}{% endif -%}
-        {%- if last_library_scan and last_new_release_check %} · {% endif -%}
-        {%- if last_new_release_check %}Auto-checked for new releases {{ last_new_release_check }}{% endif -%}
-      </span>
       {% endif %}
     </div>
-    {% if recent %}
-    <div class="divide-y divide-base-300">
-      {% for entry in recent %}
-      <div class="py-2 flex items-center justify-between gap-3">
-        <div class="min-w-0">
-          <p class="font-medium truncate">{{ entry.get('artist') or 'Unknown artist' }} — {{ entry.get('title') or 'Unknown title' }}</p>
-          <p class="text-xs text-base-content/50">{{ (entry.get('ts') or '')[:16].replace('T', ' ') }}</p>
-        </div>
-        <div class="shrink-0">
-          {% set result = entry.get('result') or '' %}
-          {% if result == 'already_complete' %}
-            <span class="badge badge-ghost badge-sm">complete</span>
-          {% elif result == 'downloaded' %}
-            <span class="badge badge-success badge-sm">+{{ entry.get('tracks_downloaded') or 0 }}</span>
-          {% elif result == 'partial' %}
-            {% set td = entry.get('tracks_downloaded') or 0 %}
-            {% set tf = entry.get('tracks_failed') or 0 %}
-            <span class="badge badge-warning badge-sm" title="{{ tf }} track{{ 's' if tf != 1 }} failed">~{{ td }}</span>
-          {% elif result == 'failed' %}
-            <span class="badge badge-error badge-sm">failed</span>
-          {% elif result == 'skipped_already_higher_quality' %}
-            <span class="badge badge-ghost badge-sm">already best</span>
-          {% elif result == 'skipped_has_extras' %}
-            <span class="badge badge-ghost badge-sm">skipped</span>
-          {% elif result == 'upgrade_aborted_backup_failed' %}
-            <span class="badge badge-warning badge-sm">backup failed</span>
-          {% elif result == 'nothing_landed' %}
-            <span class="badge badge-ghost badge-sm">no change</span>
-          {% else %}
-            <span class="badge badge-ghost badge-sm">{{ result.replace('_', ' ') }}</span>
-          {% endif %}
-        </div>
-      </div>
-      {% endfor %}
-    </div>
-    {% else %}
-    <div class="flex flex-col items-center text-center py-10 gap-2">
-      <svg xmlns="http://www.w3.org/2000/svg" class="h-10 w-10 text-base-content/20"
-           fill="none" viewBox="0 0 24 24" stroke="currentColor">
-        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
-              d="M9 18V6l10-2v12M9 18a2 2 0 1 1-4 0 2 2 0 0 1 4 0zm10-2a2 2 0 1 1-4 0 2 2 0 0 1 4 0z"/>
+    {% endif %}
+
+    {% if qobuz_ready and baseline_complete and library_resume %}
+    <div class="ql-notice ql-notice-info flex items-start flex-wrap gap-3 p-4">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0 text-info" fill="none"
+           viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
       </svg>
-      <p class="font-medium text-base-content/60">Nothing downloaded yet.</p>
-      <p class="text-xs text-base-content/40">{{ recent_empty_hint }}</p>
+      <span class="min-w-0 flex-1 text-sm">
+        <strong>A library scan was interrupted.</strong> {{ library_resume.done }} artist{{ 's' if library_resume.done != 1 }} already checked. Resume to finish it.
+      </span>
+      <form action="/library" method="post" class="ml-auto shrink-0" data-busy-submit>
+        <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+        <input type="hidden" name="mode" value="{{ 'partial_fill' if library_resume.kind == 'partial' else 'missing_albums' }}">
+        <button type="submit" class="btn btn-sm btn-primary">Resume scan</button>
+      </form>
     </div>
     {% endif %}
   </div>
+
+  <div class="ql-dashboard-grid">
+    <section class="ql-panel ql-search-panel">
+      {% if not creds_ok %}
+      <div class="ql-panel-header">
+        <h2>Connect Qobuz</h2>
+        <p>Add your Qobuz details to search and download.</p>
+      </div>
+      <div class="ql-panel-actions">
+        <a href="/settings" class="btn btn-primary">Connect Qobuz</a>
+        <div class="ql-local-links">
+          <a href="/migrate">Migrate library</a>
+          <a href="/downsample">Downsample</a>
+          <a href="/lyrics">Lyrics</a>
+        </div>
+      </div>
+      {% elif creds_token_valid == False %}
+      <div class="ql-panel-header">
+        <h2>Reconnect Qobuz</h2>
+        <p>Your saved token was rejected.</p>
+      </div>
+      <div class="ql-panel-actions">
+        <a href="/settings" class="btn btn-primary">Reconnect Qobuz</a>
+      </div>
+      {% else %}
+      <div class="ql-panel-header">
+        <h2>Search Qobuz</h2>
+        <p>Find artists, albums, and tracks.</p>
+      </div>
+      <form action="/search" method="post"
+            hx-post="/search" hx-target="#search-results" hx-swap="innerHTML"
+            hx-indicator="#dashboard-search-spinner"
+            class="ql-search-form">
+        <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+        <div class="ql-segmented" role="group" aria-label="Search for">
+          <label>
+            <input type="radio" name="kind" value="artist" class="sr-only" {% if search_kind == 'artist' %}checked{% endif %}
+                   hx-post="/search" hx-target="#search-results" hx-swap="innerHTML" hx-include="closest form">
+            <span>Artists</span>
+          </label>
+          <label>
+            <input type="radio" name="kind" value="album" class="sr-only" {% if search_kind == 'album' %}checked{% endif %}
+                   hx-post="/search" hx-target="#search-results" hx-swap="innerHTML" hx-include="closest form">
+            <span>Albums</span>
+          </label>
+          <label>
+            <input type="radio" name="kind" value="track" class="sr-only" {% if search_kind == 'track' %}checked{% endif %}
+                   hx-post="/search" hx-target="#search-results" hx-swap="innerHTML" hx-include="closest form">
+            <span>Tracks</span>
+          </label>
+        </div>
+        <div class="ql-search-row">
+          <input type="text" name="q"
+                 aria-label="{% if search_kind == 'track' %}Song title{% elif search_kind == 'album' %}Album title{% else %}Artist name{% endif %}"
+                 value="{{ search_q }}"
+                 placeholder="{% if search_kind == 'track' %}Song title{% elif search_kind == 'album' %}Album title{% else %}Artist name{% endif %}"
+                 inputmode="search" enterkeyhint="search" autocapitalize="off" spellcheck="false" maxlength="500"
+                 class="input input-bordered ql-search-input" autocomplete="off">
+          <button type="submit" class="btn btn-primary ql-search-button">
+            <span id="dashboard-search-spinner"
+                  class="loading loading-spinner loading-sm htmx-indicator"></span>
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-4.35-4.35M17 11A6 6 0 1 1 5 11a6 6 0 0 1 12 0z"/>
+            </svg>
+            <span>Search</span>
+          </button>
+        </div>
+      </form>
+      {% endif %}
+    </section>
+
+    <div id="search-results" class="ql-search-results" aria-live="polite">{{ initial_search_results | safe }}</div>
+
+    <div id="dashboard-work" class="contents">
+    {% set _banner_id = new_release_review.id if new_release_review else '' %}
+    {% set other_review = review | rejectattr('id', 'equalto', _banner_id) | list %}
+    <section class="ql-panel ql-review-panel">
+      <div class="ql-panel-header ql-panel-header-row">
+        <div>
+          <h2>Needs review</h2>
+          <p>Scans wait here until you choose what to run.</p>
+        </div>
+        {% if new_release_review and new_release_review.count %}
+        <a href="/jobs/{{ new_release_review.id }}" class="btn btn-sm btn-primary">Review</a>
+        {% endif %}
+      </div>
+      <div class="ql-list">
+        {% if new_release_review and new_release_review.count %}
+        <div class="ql-row">
+          <div class="ql-row-main">
+            <p class="ql-row-title">New-release check</p>
+            <p class="ql-row-meta">{{ new_release_review.count }} new release{{ 's' if new_release_review.count != 1 }} found</p>
+          </div>
+        </div>
+        {% endif %}
+        {% for job in other_review %}
+        {% set _n = job.candidates | length %}
+        {% set _is_repair = job.execute_kind == 'repair' %}
+        <div class="ql-row">
+          <div class="ql-row-main">
+            <p class="ql-row-title">{{ labels.review_title(job) }}{% if job.artist %} · {{ job.artist }}{% endif %}</p>
+            <p class="ql-row-meta">{{ labels.review_detail(job, _n) }}</p>
+          </div>
+          <a href="{{ '/repair' if _is_repair else '/jobs/' ~ job.id }}" class="btn btn-sm btn-primary shrink-0">{% if _is_repair %}Review{% else %}Review{% endif %}</a>
+        </div>
+        {% endfor %}
+        {% if not (new_release_review and new_release_review.count) and not other_review %}
+        <div class="ql-empty-line">No scans waiting for review.</div>
+        {% endif %}
+      </div>
+    </section>
+
+    {% set queued_jobs = pending | selectattr('status.value', 'equalto', 'pending') | list %}
+    <section id="dashboard-active" class="ql-panel">
+      <div class="ql-panel-header ql-panel-header-row">
+        <div>
+          <h2>Running and queued</h2>
+          <p>Active work and waiting jobs.</p>
+        </div>
+        {% if active_jobs or queued_jobs %}
+        <a href="/queue" class="btn btn-sm btn-outline">Open queue</a>
+        {% endif %}
+      </div>
+      <div class="ql-list">
+        {% for j in active_jobs %}
+        {% set _activity = j.progress_phase or labels.job_activity(j) %}
+        <div class="ql-job-row"
+             data-job-card data-job-id="{{ j.id }}" data-job-surface="dashboard"
+             data-job-status="{{ j.status.value }}" data-job-kind="{{ j.execute_kind or j.kind }}">
+          <div class="ql-row-main">
+            <div class="ql-row-status">
+              <span class="ql-status-chip">{{ labels.job_activity(j) }}</span>
+              <span id="dash-reconnect-{{ j.id }}" class="ql-status-chip is-warning hidden">Reconnecting</span>
+            </div>
+            <a href="{{ '/repair' if j.execute_kind == 'repair' else '/jobs/' ~ j.id }}" class="ql-row-title ql-row-link">
+              {% if j.artist %}{{ j.artist }} · {% endif %}{{ j.title }}
+            </a>
+            <p id="dash-prog-{{ j.id }}" class="ql-row-meta">
+              {%- if j.progress_total > 0 -%}
+              {{ _activity }} {{ j.progress_current }} / {{ j.progress_total }}{% if j.progress_unit %} {{ j.progress_unit }}{{ 's' if j.progress_total != 1 }}{% endif %}
+              {%- elif j.progress_phase -%}
+              {{ j.progress_phase }}
+              {%- else -%}
+              {{ labels.job_activity(j) }}…
+              {%- endif -%}
+            </p>
+          </div>
+          <form action="/jobs/{{ j.id }}/cancel" method="post" class="ql-row-action">
+            <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+            <button type="submit" class="btn btn-sm btn-outline btn-error"
+                    title="Cancel job" aria-label="Cancel job"
+                    data-confirm="Cancel this job? It will stop after the current safe step.">Cancel</button>
+          </form>
+        </div>
+        {% endfor %}
+        {% if queued_jobs %}
+        <div class="ql-row">
+          <div class="ql-row-main">
+            <p class="ql-row-title">{{ queued_jobs | length }} job{{ 's' if queued_jobs|length != 1 }} queued</p>
+            <p class="ql-row-meta">Starts after the current job finishes.</p>
+          </div>
+          <a href="/queue" class="btn btn-sm btn-outline shrink-0">View queue</a>
+        </div>
+        {% endif %}
+        {% if not active_jobs and not queued_jobs %}
+        <div class="ql-empty-line">Nothing running or queued.</div>
+        {% endif %}
+      </div>
+    </section>
+    </div>
+
+    {% if creds_ok %}
+    <section class="ql-panel">
+      <div class="ql-panel-header">
+        <h2>Recent downloads</h2>
+        <p>Latest completed downloads.</p>
+      </div>
+      {% if recent %}
+      <div class="ql-list">
+        {% for entry in recent %}
+        <div class="ql-row ql-recent-row">
+          <div class="ql-row-main">
+            {% set downloaded_at = (entry.get('ts') or '')[:16].replace('T', ' ') %}
+            <p class="ql-row-title">{{ entry.get('title') or 'Title not recorded' }}</p>
+            <p class="ql-row-meta">
+              {{ entry.get('artist') or 'Artist not recorded' }}{% if downloaded_at %} · {{ downloaded_at }}{% endif %}
+            </p>
+          </div>
+          <div class="ql-result-label">
+            {% set result = entry.get('result') or '' %}
+            {% if result == 'downloaded' %}
+              {% set td = entry.get('tracks_downloaded') or 0 %}
+              {{ td }} track{{ 's' if td != 1 }}
+            {% elif result == 'partial' %}
+              {% set td = entry.get('tracks_downloaded') or 0 %}
+              {% set tf = entry.get('tracks_failed') or 0 %}
+              {{ td }} of {{ td + tf }} tracks
+            {% elif result == 'failed' %}
+              Failed
+            {% elif result == 'upgrade_aborted_backup_failed' %}
+              Backup failed
+            {% else %}
+              {{ result.replace('_', ' ') }}
+            {% endif %}
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="ql-empty-line">
+        No downloads yet{% if creds_token_valid != False %}. {{ recent_empty_hint }}{% endif %}
+      </div>
+      {% endif %}
+    </section>
+    {% endif %}
+  </div>
 </div>
-{% endif %}
 
 {% endblock %}

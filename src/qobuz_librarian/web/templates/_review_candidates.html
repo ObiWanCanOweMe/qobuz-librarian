@@ -1,69 +1,80 @@
 <div id="review-candidates"
+     class="ql-review-candidates"
      data-job-id="{{ job.id }}"
      data-review-total="{{ review_counts.total }}"
-     data-review-selected="{{ review_counts.selected }}">
+     data-review-selected="{{ review_counts.selected }}"
+     data-review-item-singular="{{ labels.review_item_singular(job) }}"
+     data-review-item-plural="{{ labels.review_item_plural(job) }}"
+     data-review-dismiss-singular="{% if job.execute_kind == 'upgrade' %}upgrade{% elif job.execute_kind == 'library' %}album or track gap{% else %}album{% endif %}"
+     data-review-dismiss-plural="{% if job.execute_kind == 'upgrade' %}upgrades{% elif job.execute_kind == 'library' %}albums and track gaps{% else %}albums{% endif %}">
   {% set triage = job.execute_kind in ('library', 'upgrade', 'new_releases', 'downsample') %}
   {% set preselected = job.execute_kind in ('repair', 'migration') %}
   {% set _hidden_url = '/upgrade/hidden' if job.execute_kind == 'upgrade'
                        else '/downsample/hidden' if job.execute_kind == 'downsample'
                        else '/library/hidden' %}
+  {% set _hidden_label = 'Kept hi-res' if job.execute_kind == 'downsample'
+                         else ('Dismissed upgrades' if job.execute_kind == 'upgrade'
+                               else ('Dismissed albums and gaps' if job.execute_kind == 'library' else 'Dismissed albums')) %}
+  {% set _triage_note = 'Kept hi-res albums can be restored later.' if job.execute_kind == 'downsample'
+                        else 'Dismissed upgrades can be restored later.' if job.execute_kind == 'upgrade'
+                        else 'Dismissed albums and track gaps can be restored later.' %}
   <div id="review-summary-row"
-       class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between mb-3{% if not review_counts.total %} hidden{% endif %}">
-    <p class="text-base-content/70">
-      <span data-summary-count>{{ review_counts.total }} album{% if review_counts.total != 1 %}s{% endif %} across {{ review_counts.artists }} artist{% if review_counts.artists != 1 %}s{% endif %}</span> —
-      {% if job.execute_kind == 'new_releases' %}new since your last check — flagged for review but left un-ticked, so tick the ones you want, or hide one to stop it resurfacing.
-      {% elif job.execute_kind == 'downsample' %}tick the albums to shrink to CD rate, or hide one to keep it hi-res.<span data-downsample-total class="font-semibold ml-1">{% if review_reclaimable_label %} · ~{{ review_reclaimable_label }} reclaimable{% endif %}</span>
-      {% elif triage %}tick the albums you want, or hide an artist you don't.
-      {% elif preselected %}everything's selected by default; untick anything to skip.
-      {% else %}tick the albums you want.{% endif %}
-    </p>
-    <div class="flex flex-wrap gap-2 shrink-0">
-      <button type="button" class="btn btn-xs" aria-label="Select every album across all pages"
-              data-select-all="1">All</button>
-      <button type="button" class="btn btn-xs" aria-label="Deselect every album across all pages"
-              data-select-all="0">None</button>
-      <button type="button" class="btn btn-xs" aria-label="Select every album on this page"
-              data-select-page="1">This page</button>
-      {% if triage %}
-      <button type="button" class="btn btn-xs btn-ghost" data-hide-marked disabled>
-        Hide marked artists
-      </button>
+       class="ql-review-summary-row sticky z-10 -mx-4 mb-3 flex flex-col gap-2 border-b border-base-300/40 bg-base-100 px-4 py-2 sm:flex-row sm:items-center sm:justify-between{% if not review_counts.total %} hidden{% endif %}">
+    <div class="ql-review-summary-copy">
+      <p>
+        <span data-summary-count>{{ labels.review_summary_count(job, review_counts.total, review_counts.artists) }}</span>{% if job.execute_kind == 'downsample' %}<span data-downsample-total class="font-semibold ml-1">{% if review_reclaimable_label %} · ~{{ review_reclaimable_label }} reclaimable{% endif %}</span>{% endif %}
+      </p>
+      {% if job.execute_kind == 'new_releases' %}
+      <p>New to your saved baseline.</p>
+      {% elif preselected %}
+      <p>All selected; untick anything you want to skip.</p>
       {% endif %}
+      {% if job.execute_kind in ('library', 'upgrade', 'new_releases', 'downsample') %}
+      <a href="{{ _hidden_url }}" class="link link-hover">{{ _hidden_label }}</a>
+      {% endif %}
+    </div>
+    <div class="flex flex-wrap gap-2 shrink-0">
+      <button type="button" class="btn btn-outline btn-sm ql-secondary-action" aria-label="Select every {{ labels.review_item_singular(job) }} across all pages"
+              data-select-all="1">Select all</button>
+      {% if review_pages > 1 %}
+      <button type="button" class="btn btn-outline btn-sm ql-secondary-action" aria-label="Select every {{ labels.review_item_singular(job) }} on this page only"
+              data-select-page="1">Select page</button>
+      {% endif %}
+      <button type="button" class="btn btn-outline btn-sm ql-secondary-action" aria-label="Deselect every {{ labels.review_item_singular(job) }}"
+              data-select-all="0">Deselect all</button>
     </div>
   </div>
 
   {% if triage and review_counts.total %}
   <p class="text-xs text-base-content/40 mb-3">
-    This review is saved — tick albums to keep, mark artists to dismiss, then hide their unselected albums.
+    Selections are saved automatically. {{ _triage_note }}
   </p>
   {% endif %}
-  {# Filter spans the WHOLE result set (server-side), not just the page on
-     screen, so a ticked album stays selected and still downloads even when
-     filtered out of view. app.js reveals this once there are enough artists. #}
   <div id="review-filter-row" class="{% if review_counts.artists < 4 %}hidden {% endif %}mb-3">
     <input type="search" id="review-filter" autocomplete="off"
-           placeholder="Filter by artist or album…"
-           aria-label="Filter the whole review list by artist or album"
+           placeholder="{% if job.execute_kind == 'migration' %}Filter by artist or folder…{% elif job.execute_kind == 'upgrade' %}Filter by artist or upgrade…{% elif job.execute_kind == 'library' %}Filter by artist, album, or gap…{% else %}Filter by artist or album…{% endif %}"
+           aria-label="{% if job.execute_kind == 'migration' %}Filter the whole review list by artist or folder{% elif job.execute_kind == 'upgrade' %}Filter the whole review list by artist or upgrade{% elif job.execute_kind == 'library' %}Filter the whole review list by artist, album, or gap{% else %}Filter the whole review list by artist or album{% endif %}"
            class="input input-bordered input-sm w-full sm:max-w-xs">
   </div>
 
   {% if job.execute_kind == 'downsample' %}
   <div class="alert alert-warning mb-3 text-sm">
-    <span>Shrinking rewrites each file in place — the hi-res original is not kept
-      and there's no undo. Each file is verified to decode cleanly before it
-      replaces the original.</span>
+    <span><strong>This cannot be undone.</strong> Downsampling rewrites each file in
+      place and hi-res originals are not kept. Each file is verified to decode
+      cleanly before it replaces the original.</span>
   </div>
   {% endif %}
 
-  {# The paginated page (groups + pager) — swapped wholesale by app.js on
-     Prev/Next, filter, and hide so only this inner block re-renders. #}
   <div id="review-page">
     {% include "_review_page.html" %}
   </div>
 
   <div id="review-empty" class="text-center py-8 text-base-content/60{% if review_counts.total %} hidden{% endif %}">
     <p class="font-medium">Nothing left to review.</p>
-    <p class="text-sm mt-1">Everything here has been queued or hidden.
-      <a href="{{ _hidden_url }}" class="link">Manage hidden albums</a>.</p>
+    <p class="text-sm mt-1">{% if job.execute_kind == 'upgrade' %}No upgrade choices remain in this review.
+      <a href="{{ _hidden_url }}" class="link">Dismissed upgrades</a>.{% elif job.execute_kind == 'downsample' %}No downsample choices remain in this review.
+      <a href="{{ _hidden_url }}" class="link">Kept hi-res</a>.{% elif job.execute_kind == 'repair' %}No repair choices remain in this review.{% elif job.execute_kind == 'migration' %}No migration choices remain in this preview.{% elif job.execute_kind == 'library' %}No missing-album or track-gap choices remain in this review.
+      <a href="{{ _hidden_url }}" class="link">Dismissed albums and gaps</a>.{% else %}No choices remain in this review.
+      <a href="{{ _hidden_url }}" class="link">Dismissed albums</a>.{% endif %}</p>
   </div>
 </div>

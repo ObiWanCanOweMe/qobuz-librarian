@@ -137,8 +137,8 @@ def init() -> None:
             # jobs ADD COLUMN ...")` block here (SQLite ADD COLUMN is online-safe).
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             if version < _SCHEMA_VERSION:
-                # v2: persist Job.single (single-track-grab undo info) so a restart
-                # doesn't drop the Undo affordance on a completed one-track grab.
+                # v2: persist Job.single (single-track download undo info) so a restart
+                # doesn't drop the Undo affordance on a completed one-track download.
                 # _SCHEMA already adds the column for a fresh db (CREATE TABLE), so
                 # only ALTER an existing table that predates it. ADD COLUMN is
                 # online-safe and the DEFAULT backfills old rows with '{}'.

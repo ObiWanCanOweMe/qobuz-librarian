@@ -174,9 +174,11 @@ def set_credentials(username: str, password: str) -> bool:
         cfg.WEB_AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(cfg.WEB_AUTH_FILE.parent),
                                    prefix=".qobuz_web_auth.", suffix=".tmp")
+        fd_owned = False
         try:
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd_owned = True
                 json.dump(payload, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
@@ -193,6 +195,11 @@ def set_credentials(username: str, password: str) -> bool:
             except OSError:
                 pass
         finally:
+            if not fd_owned:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             if os.path.exists(tmp):
                 os.unlink(tmp)
     except OSError:
@@ -205,9 +212,9 @@ def set_credentials(username: str, password: str) -> bool:
 
 def _env_password() -> str:
     """WEB_AUTH_PASSWORD from the env, or WEB_AUTH_PASSWORD_FILE (Docker-secret
-    form) when the env var is unset — so the admin password can stay out of
-    `docker inspect` and the process environment, exactly like
-    QOBUZ_USER_AUTH_TOKEN_FILE does for the Qobuz token."""
+    form) when the env var is unset, so the admin password can stay out of
+    `docker inspect` and the process environment. This matches
+    QOBUZ_USER_AUTH_TOKEN_FILE for the Qobuz token."""
     pw = os.environ.get("WEB_AUTH_PASSWORD", "")
     if pw:
         return pw
@@ -266,13 +273,6 @@ def verify_login(username: str, password: str) -> bool:
     user_ok = _constant_time_eq(username, d.get("username") or "")
     pass_ok = _verify_hash(stored_hash, password)
     return user_ok and pass_ok
-
-
-def session_value() -> str:
-    """The persisted per-credential session secret. No longer the cookie value
-    (sessions carry per-login tokens now), but still written by set_credentials
-    and rotated on a password change, so it doubles as the 'configured' marker."""
-    return _read().get("session_secret") or ""
 
 
 def mint_session() -> str:

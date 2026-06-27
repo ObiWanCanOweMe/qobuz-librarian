@@ -25,27 +25,18 @@ _pending_lock = threading.Lock()
 
 # (key, label, help) — display order on the Settings page.
 BEHAVIOR_FIELDS = [
-    ("PREFER_HIRES", "Prefer Hi-Res",
-     "When an album comes in several editions, ON picks the standard album at "
-     "the best available quality (may be remastered). OFF picks the original "
-     "release (may already be Hi-Res). Mainly affects which version the "
-     "library and artist scans suggest."),
-    ("CONSOLIDATE", "Consolidate duplicate folders (CLI only)",
-     "After import, merge sibling/duplicate album folders into one. "
-     "Consolidation needs interactive per-folder confirmation and only "
-     "runs from the CLI; this toggle has no effect on web downloads."),
+    ("PREFER_HIRES", "Prefer hi-res editions",
+     "When several editions are available, choose the highest quality allowed "
+     "by your download quality setting. Turn this off to favour the original "
+     "edition."),
     ("MIGRATE_MULTI_ARTIST", "Migrate multi-artist folders",
-     "When an album folder is named after several artists "
-     "('Louis Prima, Sam Butera/'), file it under just the main artist "
-     "('Louis Prima/') after import."),
-    ("AUTO_UPGRADE_ENABLED", "Offer upgrades during walks",
-     "Let ordinary gap-fill walks also surface quality upgrades. The "
-     "explicit Upgrade scan always works regardless of this."),
-    ("DOWNSAMPLE_HIRES_ENABLED", "Downsample hi-res before import",
-     "Resample hi-res FLACs down to 44.1 or 48 kHz (whichever fits the "
-     "source) to save space."),
+     "After import, file albums credited to multiple artists under the primary "
+     "album artist instead of a combined artist folder."),
+    ("DOWNSAMPLE_HIRES_ENABLED", "Downsample new hi-res downloads",
+     "Before import, reduce newly downloaded hi-res FLACs to 44.1 or 48 kHz. "
+     "The hi-res files are not kept."),
     ("LYRICS_ENABLED", "Fetch lyrics",
-     "Fetch and save synced/plain lyrics on import."),
+     "Fetch lyrics during import, using synced lyrics when providers have them."),
 ]
 BEHAVIOR_KEYS = [k for k, _, _ in BEHAVIOR_FIELDS]
 
@@ -63,8 +54,7 @@ LYRICS_PROVIDER_CHOICES = [
 # is validated against them; choices=None means any entry is accepted.
 TEXT_FIELDS = [
     ("STREAMRIP_QUALITY", "Download quality",
-     "Sets the maximum quality to request. Qobuz serves the best it has for "
-     "each album up to this — hi-res isn't available for everything.",
+     "Maximum quality to request. Qobuz serves the best it has up to this.",
      "enum", ["4", "3", "2"], ""),
     ("LYRICS_FORMAT", "Lyrics format",
      "How lyrics are written when fetched.",
@@ -80,8 +70,7 @@ TEXT_FIELDS = [
      "list", LYRICS_PROVIDER_CHOICES, "e.g. Lrclib, NetEase"),
     ("BEETS_PATH_DEFAULT", "beets path: default",
      "Folder/file naming for normal albums (beets path syntax). "
-     "Empty = use whatever is in beets/config.yaml "
-     "(check /config/beets/config.yaml to see the current value).",
+     "Empty = use beets/config.yaml.",
      "text", None, "e.g. $albumartist/$album ($year)/$track - $title"),
     ("BEETS_PATH_SINGLETON", "beets path: singleton",
      "Naming for singleton tracks. Empty = beets default.",
@@ -90,23 +79,17 @@ TEXT_FIELDS = [
      "Naming for compilations / Various Artists. Empty = beets default.",
      "text", None, "e.g. Various Artists/$album ($year)/$track - $title"),
     ("BEETS_PLUGINS", "beets plugins",
-     "Comma-separated list of beets plugins to enable. Replaces the list "
-     "in /config/beets/config.yaml entirely. Empty = honour that file "
-     "(seeded with fetchart and inline). Names that aren't installed here are "
-     "dropped (and called out) so a typo can't break every import. "
-     "Examples: lastgenre, replaygain, scrub, edit.",
+     "beets plugins to enable (replaces the config.yaml list). "
+     "Empty = use that file. Unknown names are dropped and flagged. "
+     "e.g. lastgenre, replaygain, scrub, edit.",
      "list", None, "fetchart,lastgenre,replaygain"),
     ("ARTIST_CATALOG_CACHE_TTL", "Album-list freshness",
-     "How long the library and artist gap scans reuse a fetched discography "
-     "before asking Qobuz again. The new-release check always fetches fresh "
-     "regardless, so this only trades gap-scan speed against how current its "
-     "album lists are.",
+     "How long gap scans reuse a fetched discography before refetching. "
+     "(New-release checks always fetch fresh.)",
      "enum", ["86400", "259200", "604800", "2592000"], ""),
     ("NEW_RELEASE_CHECK_INTERVAL", "Auto-check for new releases",
-     "When you open the app and it's been at least this long since the last "
-     "check (and nothing's already scanning), it quietly looks for new releases "
-     "in the background and shows them on the dashboard to review. It never "
-     "downloads on its own. Off = only the manual buttons.",
+     "How often to auto-check for new releases on app open. Results go to the "
+     "dashboard to review; nothing downloads. Off = manual only.",
      "enum", ["0", "21600", "43200", "86400", "604800"], ""),
 ]
 TEXT_KEYS = [k for k, *_ in TEXT_FIELDS]
@@ -122,6 +105,16 @@ ENUM_OPTION_LABELS = {
         "4": "24-bit ≤192 kHz",
         "3": "24-bit ≤96 kHz",
         "2": "16-bit / 44.1 kHz",
+    },
+    "LYRICS_FORMAT": {
+        "embed": "Embed in tags",
+        "sidecar": "Sidecar .lrc files",
+        "both": "Embed and sidecar",
+    },
+    "ARTWORK": {
+        "sidecar": "Cover file",
+        "embed": "Embed in tags",
+        "both": "Cover file and tags",
     },
     "ARTIST_CATALOG_CACHE_TTL": {
         "86400": "1 day",
@@ -219,8 +212,7 @@ def _dropped_warning(key, dropped):
                 f"Known providers are {', '.join(LYRICS_PROVIDER_CHOICES)}.")
     if key == "BEETS_PLUGINS":
         return (f"Ignored beets plugin(s) not installed on this server: {names}. "
-                "They were dropped so imports keep working — check the spelling, "
-                "or install them and add them back.")
+                "Check the spelling, or install them and add them back.")
     return f"Ignored unrecognised value(s) for {key}: {names}."
 
 
@@ -236,15 +228,6 @@ def current() -> dict:
     """
     with _pending_lock:
         out = {k: bool(getattr(cfg, k)) for k in BEHAVIOR_KEYS}
-        # DOWNSAMPLE_HIRES_ENABLED replaced COMPRESS_ENABLED but the
-        # legacy attribute still gets set directly by older callers and
-        # tests. Surface whichever side is currently True so the Settings
-        # page reflects user intent across both names.
-        if "DOWNSAMPLE_HIRES_ENABLED" in out:
-            out["DOWNSAMPLE_HIRES_ENABLED"] = bool(
-                out.get("DOWNSAMPLE_HIRES_ENABLED")
-                or getattr(cfg, "COMPRESS_ENABLED", False)
-            )
         for key, _, _, kind, _, _ in TEXT_FIELDS:
             out[key] = _field_str(getattr(cfg, key, ""), kind)
         if _pending_apply:
@@ -258,22 +241,9 @@ def current() -> dict:
 
 
 def _apply(values: dict):
-    # Accept either DOWNSAMPLE_HIRES_ENABLED (the canonical name) or the
-    # legacy COMPRESS_ENABLED key from on-disk settings files. Whichever
-    # the user supplied wins; both cfg attributes get set so old and new
-    # call sites see the same value.
-    if ("DOWNSAMPLE_HIRES_ENABLED" not in values
-            and "COMPRESS_ENABLED" in values):
-        values = dict(values)
-        values["DOWNSAMPLE_HIRES_ENABLED"] = bool(values["COMPRESS_ENABLED"])
     for k in BEHAVIOR_KEYS:
         if k in values:
             setattr(cfg, k, bool(values[k]))
-    # Mirror the downsample flag onto its legacy attribute so code paths
-    # that still read cfg.COMPRESS_ENABLED keep seeing the right value.
-    if "DOWNSAMPLE_HIRES_ENABLED" in values:
-        setattr(cfg, "COMPRESS_ENABLED",
-                bool(values["DOWNSAMPLE_HIRES_ENABLED"]))
     for key, _, _, kind, choices, _ in TEXT_FIELDS:
         if key not in values:
             continue
@@ -399,11 +369,6 @@ def save(values: dict):
 def _save_locked(values: dict):
     merged = current()
     warnings = []
-    # Map the legacy COMPRESS_ENABLED key onto the canonical name so
-    # callers passing the old key still flip the flag.
-    if "COMPRESS_ENABLED" in values and "DOWNSAMPLE_HIRES_ENABLED" not in values:
-        values = dict(values)
-        values["DOWNSAMPLE_HIRES_ENABLED"] = bool(values["COMPRESS_ENABLED"])
     for k in BEHAVIOR_KEYS:
         if k in values:
             merged[k] = bool(values[k])

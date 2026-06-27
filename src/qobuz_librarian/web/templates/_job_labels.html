@@ -1,0 +1,179 @@
+{% macro review_title(job) -%}
+  {%- if job.execute_kind == 'new_releases' -%}
+    New-release check
+  {%- elif job.execute_kind == 'upgrade' -%}
+    Quality upgrade scan
+  {%- elif job.execute_kind == 'downsample' -%}
+    Downsample scan
+  {%- elif job.execute_kind == 'repair' -%}
+    Repair scan
+  {%- elif job.execute_kind == 'migration' -%}
+    Library migration
+  {%- elif job.execute_kind == 'library' -%}
+    {{ job.title }}
+  {%- elif job.execute_kind == 'album' -%}
+    Missing albums scan
+  {%- else -%}
+    {{ job.title }}
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro review_detail(job, n) -%}
+  {%- if job.execute_kind == 'new_releases' -%}
+    {{ n }} new release{{ 's' if n != 1 }} found
+  {%- elif job.execute_kind == 'upgrade' -%}
+    {{ n }} quality upgrade{{ 's' if n != 1 }} found
+  {%- elif job.execute_kind == 'downsample' -%}
+    {{ n }} album{{ 's' if n != 1 }} can be downsampled
+  {%- elif job.execute_kind == 'repair' -%}
+    {{ n }} repair option{{ 's' if n != 1 }} found
+  {%- elif job.execute_kind == 'migration' -%}
+    Migration preview ready
+  {%- elif job.title == 'Gap-fill scan' -%}
+    {{ n }} album{{ ' has' if n == 1 else 's have' }} missing tracks
+  {%- elif job.execute_kind == 'library' -%}
+    {{ n }} missing album{{ 's' if n != 1 }} or track gap{{ 's' if n != 1 }} found
+  {%- elif job.execute_kind == 'album' -%}
+    {{ n }} missing album{{ 's' if n != 1 }} found
+  {%- else -%}
+    {{ n }} result{{ 's' if n != 1 }} found
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro review_item_singular(job) -%}
+  {%- if job.execute_kind == 'upgrade' -%}
+    upgrade
+  {%- elif job.execute_kind == 'downsample' -%}
+    album to downsample
+  {%- elif job.execute_kind == 'repair' -%}
+    repair
+  {%- elif job.execute_kind == 'migration' -%}
+    folder
+  {%- elif job.title == 'Gap-fill scan' -%}
+    track gap
+  {%- elif job.execute_kind == 'library' -%}
+    missing album or track gap
+  {%- elif job.execute_kind in ('new_releases', 'album') -%}
+    album
+  {%- else -%}
+    result
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro review_item_plural(job) -%}
+  {%- if job.execute_kind == 'upgrade' -%}
+    upgrades
+  {%- elif job.execute_kind == 'downsample' -%}
+    albums to downsample
+  {%- elif job.execute_kind == 'repair' -%}
+    repairs
+  {%- elif job.execute_kind == 'migration' -%}
+    folders
+  {%- elif job.title == 'Gap-fill scan' -%}
+    track gaps
+  {%- elif job.execute_kind == 'library' -%}
+    missing albums or track gaps
+  {%- elif job.execute_kind in ('new_releases', 'album') -%}
+    albums
+  {%- else -%}
+    results
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro review_count(job, n) -%}
+  {{ n }} {{ review_item_singular(job) if n == 1 else review_item_plural(job) }}
+{%- endmacro %}
+
+{% macro review_summary_count(job, total, artists) -%}
+  {{ review_count(job, total) }} across {{ artists }} artist{{ 's' if artists != 1 }}
+{%- endmacro %}
+
+{% macro review_empty_label(job) -%}
+  {%- if job.execute_kind == 'upgrade' -%}
+    Select upgrades to run
+  {%- elif job.execute_kind == 'repair' -%}
+    Select repairs to run
+  {%- elif job.execute_kind == 'migration' -%}
+    Select folders to {{ job.review_verb|lower }}
+  {%- elif job.execute_kind == 'downsample' -%}
+    Select albums to downsample
+  {%- elif job.execute_kind == 'library' -%}
+    Select albums or gaps to {{ job.review_verb|lower }}
+  {%- else -%}
+    Select albums to {{ job.review_verb|lower }}
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro progress_item_singular(job) -%}
+  {%- if job.execute_kind == 'upgrade' -%}
+    upgrade
+  {%- elif job.execute_kind == 'downsample' -%}
+    album to downsample
+  {%- elif job.execute_kind == 'repair' -%}
+    repair
+  {%- elif job.execute_kind == 'new_releases' -%}
+    new release
+  {%- elif job.title == 'Gap-fill scan' -%}
+    track gap
+  {%- elif job.execute_kind == 'library' -%}
+    missing album or track gap
+  {%- else -%}
+    album
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro progress_item_plural(job) -%}
+  {%- if job.execute_kind == 'upgrade' -%}
+    upgrades
+  {%- elif job.execute_kind == 'downsample' -%}
+    albums to downsample
+  {%- elif job.execute_kind == 'repair' -%}
+    repairs
+  {%- elif job.execute_kind == 'new_releases' -%}
+    new releases
+  {%- elif job.title == 'Gap-fill scan' -%}
+    track gaps
+  {%- elif job.execute_kind == 'library' -%}
+    missing albums or track gaps
+  {%- else -%}
+    albums
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro discard_review_label(job) -%}
+  {%- if job.execute_kind == 'migration' -%}
+    migration preview
+  {%- elif job.execute_kind == 'repair' -%}
+    repair review
+  {%- elif job.execute_kind == 'upgrade' -%}
+    upgrade review
+  {%- elif job.execute_kind == 'downsample' -%}
+    downsample review
+  {%- elif job.execute_kind == 'new_releases' -%}
+    new-release review
+  {%- elif job.execute_kind == 'album' -%}
+    missing-albums review
+  {%- else -%}
+    library review
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro job_activity(job) -%}
+  {%- if job.status.value == 'scanning' -%}
+    Scanning
+  {%- elif job.execute_kind == 'upgrade' -%}
+    Upgrading
+  {%- elif job.execute_kind == 'downsample' -%}
+    Downsampling
+  {%- elif job.execute_kind == 'repair' -%}
+    Repairing
+  {%- elif job.execute_kind == 'lyrics' -%}
+    Fetching lyrics
+  {%- elif job.execute_kind == 'migration' -%}
+    Migrating
+  {%- elif job.kind == 'download' or job.execute_kind in ('album', 'library', 'new_releases') -%}
+    Downloading
+  {%- else -%}
+    Running
+  {%- endif -%}
+{%- endmacro %}

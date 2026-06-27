@@ -1,53 +1,64 @@
 {% extends "base.html" %}
 {% block title %}Lyrics — Qobuz Librarian{% endblock %}
+{% block content_max %}max-w-5xl{% endblock %}
 {% block content %}
 
-<h1 class="text-2xl font-bold mb-2">Lyrics</h1>
-<p class="text-base-content/60 mb-2">
-  Fetches lyrics for tracks in your library that are missing them — timed where available, plain otherwise.
-</p>
-{% if creds_ok %}
-<p class="text-base-content/40 text-sm mb-2">
-  Just one artist? <a href="/artist" class="link">Run a focused artist scan</a>.
-</p>
-{% endif %}
-<p class="text-base-content/40 text-sm mb-1">
-  Writing <span class="readout">{{ lyrics_format }}</span> via {{ providers }} — <a href="/settings" class="link">change in Settings</a>.
-</p>
-<p class="text-base-content/40 text-sm mb-6">
-  {% if last_run %}Last lyrics pass {{ last_run }}.{% else %}No lyrics pass has finished yet.{% endif %}
-</p>
+<section class="ql-tool-panel mx-auto max-w-3xl">
+  <div class="ql-tool-panel-body">
+    <div class="mb-5">
+      <h1 class="text-2xl font-bold mb-2">Lyrics</h1>
+      <p class="text-base-content/65">
+        Write missing lyrics in your configured format. Synced lyrics are preferred when available.
+      </p>
+    </div>
 
-{% if have_lyrics %}
-<form action="/lyrics" method="post" data-busy-submit>
-  <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-  <div class="space-y-4 mb-6 max-w-xl">
-    <div class="flex items-start gap-3">
-      <input type="checkbox" name="synced_only" id="cb-synced" class="toggle toggle-primary mt-1">
-      <div>
-        <label for="cb-synced" class="font-medium cursor-pointer">Synced lyrics only</label>
-        <div class="text-sm text-base-content/50">
-          Only write timed lyrics that scroll with the song; skip plain text.
-        </div>
-      </div>
+    <div class="ql-tool-status mb-5">
+      <span>
+        {% if last_run %}Last lyrics scan {{ last_run }}.{% else %}No lyrics scan has finished yet.{% endif %}
+      </span>
+      {% if have_lyrics %}
+      <span class="text-base-content/45 sm:ml-auto">
+        Output: {{ lyrics_format }}. Providers: {{ providers }}.
+        <a href="/settings" class="link">Change</a>
+      </span>
+      {% endif %}
     </div>
-    <div class="flex items-start gap-3">
-      <input type="checkbox" name="rescan" id="cb-rescan" class="toggle toggle-primary mt-1">
-      <div>
-        <label for="cb-rescan" class="font-medium cursor-pointer">Re-check everything</label>
-        <div class="text-sm text-base-content/50">
-          Re-query every track, ignoring the saved state.
-        </div>
+
+    {% if have_lyrics %}
+    <form action="/lyrics" method="post" data-busy-submit>
+      <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+      <div class="space-y-3 mb-5">
+        <label for="cb-synced" class="ql-option-row">
+          <input type="checkbox" name="synced_only" id="cb-synced" class="toggle toggle-primary mt-1">
+          <span>
+            <span class="block font-medium">Synced lyrics only</span>
+            <span class="block text-sm text-base-content/50">
+              Only write timed lyrics that scroll with the song; skip plain text.
+            </span>
+          </span>
+        </label>
+        <label for="cb-rescan" class="ql-option-row">
+          <input type="checkbox" name="rescan" id="cb-rescan" class="toggle toggle-primary mt-1">
+          <span>
+            <span class="block font-medium">Re-check everything</span>
+            <span class="block text-sm text-base-content/50">
+              Check every track again, including tracks already scanned.
+            </span>
+          </span>
+        </label>
       </div>
+      <button type="submit" class="btn btn-primary w-full sm:w-auto"
+              data-confirm="Start a library-wide lyrics scan? This can take a while on a large library.">Start lyrics scan</button>
+    </form>
+    {% else %}
+    <div class="ql-tool-note ql-tool-note-warning">
+      <p class="font-medium">Lyrics support is not installed.</p>
+      <p class="mt-1 text-base-content/70">
+        Install Qobuz Librarian with lyrics support, then restart the app.
+      </p>
     </div>
+    {% endif %}
   </div>
-  <button type="submit" class="btn btn-primary w-full sm:w-auto"
-          data-confirm="Start a library-wide lyrics pass? This can take a while on a large library.">Fetch missing lyrics</button>
-</form>
-{% else %}
-<div class="alert alert-warning">
-  <span>Lyric fetching isn't available in this build.</span>
-</div>
-{% endif %}
+</section>
 
 {% endblock %}

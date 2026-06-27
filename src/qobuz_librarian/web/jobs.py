@@ -133,11 +133,11 @@ class Job:
     title: str        = ""
     artist: str       = ""
     album_id: str     = ""
-    # Single-track-grab undo info, set by the Get-track flow: the resolved album
-    # dir, the grabbed track's isrc/number, and whether it marked the album a
+    # Single-track download undo info, set by the Get-track flow: the resolved
+    # album dir, the downloaded track's isrc/number, and whether it marked the album a
     # single / created a new folder — enough for /undo to cleanly reverse it.
     # Empty for every other job; its presence is also how the UI knows to hide
-    # Cancel (a one-track grab finishes before you could catch it) and show Undo.
+    # Cancel (a one-track download finishes before you could catch it) and show Undo.
     single: dict      = field(default_factory=dict)
     kind: str         = "download"          # download | scan
     status: JobStatus = JobStatus.PENDING
@@ -380,7 +380,7 @@ class Job:
                 cid = f"c{seq}"
         if capped:  # log once, outside the lock (push_line takes it itself)
             self.push_line(
-                f"Reached the {self.CANDIDATE_CAP:,}-result cap — further "
+                f"Reached the {self.CANDIDATE_CAP:,}-result cap. Further "
                 "finds aren't listed. Narrow the scan (scan by artist) to "
                 "see the rest.")
         return cid
@@ -604,25 +604,25 @@ def _friendly_job_error(exc, fallback: str) -> str:
         QobuzUnavailable,
     )
     if isinstance(exc, NoCredsError):
-        return "No Qobuz credentials set — visit Settings."
+        return "No Qobuz credentials set. Visit Settings."
     if isinstance(exc, AuthLost):
-        return "Token is expired or invalid — update it in Settings."
+        return "Token is expired or invalid. Update it in Settings."
     if isinstance(exc, QobuzUnavailable):
-        return "Qobuz is temporarily unavailable (network or rate limit) — try again shortly."
+        return "Qobuz is temporarily unavailable (network or rate limit). Try again shortly."
     if isinstance(exc, QobuzError):
-        return "Couldn't reach the Qobuz API — check the container's network."
+        return "Couldn't reach the Qobuz API. Check the container's network."
     if isinstance(exc, FileNotFoundError):
         # job.error is rendered through Jinja autoescape, so don't escape here
         # too (that double-encodes characters like & in a path).
         fname = str(exc.filename) if exc.filename else "see log"
-        return f"Required tool or path missing — see log ({fname})."
+        return f"Required tool or path missing; see log ({fname})."
     if isinstance(exc, OSError):
         import errno
         if exc.errno == errno.ENOSPC:
-            return "Out of disk space — free space and retry."
+            return "Out of disk space. Free space and retry."
         if exc.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
-            return ("Permission denied writing to the staging or music dir — "
-                    "check PUID/PGID match the volume owner.")
+            return ("Permission denied writing to the staging or music dir. "
+                    "Check PUID/PGID match the volume owner.")
     return fallback
 
 
@@ -754,18 +754,26 @@ def _worker_loop(work_queue: "queue.Queue"):
         # Sole worker thread — catching BaseException ensures one
         # crashed job can't take down the whole queue.
         try:
-            job.status = JobStatus.RUNNING
-            if job.started_at is None:
-                job.started_at = time.time()
-            job_persistence.persist(job)
-            _run_task(job, fn)
+            if job.cancel_requested or job.status in TERMINAL:
+                # Cancelled while still queued — drop it instead of flipping
+                # PENDING→RUNNING and running it. request_cancel finalizes such a
+                # job; if the cancel landed in the enqueue→dequeue gap it's still
+                # PENDING here, so finalize it now rather than start it.
+                if job.status not in TERMINAL:
+                    _mark_canceled(job)
+            else:
+                job.status = JobStatus.RUNNING
+                if job.started_at is None:
+                    job.started_at = time.time()
+                job_persistence.persist(job)
+                _run_task(job, fn)
         except BaseException as e:  # noqa: BLE001 - must not die
             try:
                 if job.status not in TERMINAL:
                     job.status = JobStatus.FAILED
                     import traceback as _tb
                     summary = _tb.format_exception_only(type(e), e)[-1].strip()
-                    job.error = f"Worker crash: {summary} — restart the job."
+                    job.error = f"Worker crash: {summary}. Restart the job."
                 logging.getLogger("qobuz_librarian").exception(
                     "worker: job %s crashed hard", job.id)
             except Exception:
@@ -829,7 +837,7 @@ def submit_scan(job: Job, scan_fn, execute_fn):
         if j.selected_candidates() or j.candidates:
             j.status = JobStatus.AWAITING_REVIEW
         else:
-            j.push_line("Nothing to do — no candidates found.")
+            j.push_line("Nothing to do. No candidates found.")
             j.status = JobStatus.DONE
 
     _scan_queue.put((job, _scan))
@@ -849,7 +857,10 @@ def finalize_review_if_empty(job: Job) -> bool:
         if job.status != JobStatus.AWAITING_REVIEW or job.candidates:
             return False
         job.status = JobStatus.DONE
-        job.summary = "All candidates reviewed — the ones you didn't keep were dismissed."
+        if job.execute_kind == "downsample":
+            job.summary = "All albums reviewed. Albums kept hi-res can be restored later."
+        else:
+            job.summary = "All albums reviewed. Dismissed items can be restored later."
     job_persistence.persist(job)
     return True
 
@@ -900,7 +911,7 @@ def approve(job: Job, selected_ids=None) -> bool:
         with j._lock:
             chosen = j.selected_candidates()
         if not chosen:
-            j.push_line("No candidates selected — nothing to do.")
+            j.push_line("No candidates selected. Nothing to do.")
             j.status = JobStatus.DONE
             return
         j._execute_fn(j, chosen)
@@ -982,8 +993,22 @@ def restore_jobs(execute_registry: dict) -> None:
         )
         if status in (JobStatus.PENDING, JobStatus.RUNNING):
             job.status = JobStatus.FAILED
-            job.error = ("Interrupted by a container restart — submit this "
-                         "job again to retry.")
+            # Only an album download / single-track download carries an album_id, and
+            # only those get a Retry button on the job + history pages. Point every
+            # other kind at the page it re-runs from instead of telling the user to
+            # "submit it again" — there's no control on a failed lyrics/migration/
+            # library job to do that, so the generic message promised a dead end.
+            restart = "Interrupted by a container restart. "
+            if job.album_id:
+                job.error = restart + "Use Retry to download it again."
+            elif job.execute_kind == "lyrics":
+                job.error = restart + "Start it again from the Lyrics page."
+            elif job.execute_kind == "migration":
+                job.error = restart + "Start it again from the Migrate page."
+            elif job.execute_kind == "library":
+                job.error = restart + "Start the scan again from the Library page."
+            else:
+                job.error = restart + "Run it again to retry."
             job.finished_at = time.time()
             interrupted += 1
             job_persistence.persist(job)
@@ -996,13 +1021,13 @@ def restore_jobs(execute_registry: dict) -> None:
             # opens; the whole-library repair sweep also checkpoints but only
             # picks up when its scan is started again; every other kind restarts.
             if job.execute_kind == "library":
-                job.summary = ("Interrupted by a restart — it resumes from where "
+                job.summary = ("Interrupted by a restart. It resumes from where "
                                "it left off the next time you open the app.")
             elif job.execute_kind == "repair":
-                job.summary = ("Interrupted by a restart — start the repair scan "
+                job.summary = ("Interrupted by a restart. Start the repair scan "
                                "again and it continues from where it left off.")
             else:
-                job.summary = "Interrupted by a restart — run the scan again to retry."
+                job.summary = "Interrupted by a restart. Run the scan again to retry."
             job.finished_at = time.time()
             interrupted += 1
             job_persistence.persist(job)
@@ -1011,7 +1036,7 @@ def restore_jobs(execute_registry: dict) -> None:
             if factory is None:
                 job.status = JobStatus.FAILED
                 job.error = ("Couldn't restore this job's executor across "
-                             "the restart — re-run the original scan.")
+                             "the restart. Re-run the original scan.")
                 job.finished_at = time.time()
                 interrupted += 1
                 job_persistence.persist(job)
@@ -1068,6 +1093,17 @@ def load_historical_job(job_id: str) -> Optional[Job]:
     )
 
 
+def _mark_canceled(job: Job) -> None:
+    """Finalize a job to CANCELED with the same bookkeeping _run_task's finally
+    does on a terminal transition: stamp the finish time, persist the row, close
+    any open SSE stream."""
+    job.status = JobStatus.CANCELED
+    job.finished_at = time.time()
+    if registry.get(job.id) is not None:
+        job_persistence.persist(job)
+    job.end_stream()
+
+
 def request_cancel(job: Job) -> bool:
     """Stop a job from the UI, whatever phase it's in.
 
@@ -1075,8 +1111,8 @@ def request_cancel(job: Job) -> bool:
     - scanning/running → cooperative: the flag is set and the scan/execute
       loops bail at their next iteration (so a long library scan can be
       stopped without restarting the container)
-    - pending          → flagged; it'll cancel as soon as the worker picks
-      it up
+    - pending          → finalized on the spot; it hasn't started, so there's
+      nothing to unwind and it leaves the queue at once
 
     Returns False only if the job is already finished.
     """
@@ -1088,4 +1124,11 @@ def request_cancel(job: Job) -> bool:
     if job.status in TERMINAL:
         return False
     job.cancel_requested = True
+    if job.status == JobStatus.PENDING:
+        # A queued job hasn't run yet, so cancel it now instead of waiting for
+        # the worker to reach it — which can be a whole library scan away, the
+        # worker being busy with the job ahead of it. Deferring left it sitting
+        # as "Queued" the entire time, so the cancel looked ignored. The worker
+        # skips a cancelled job when it dequeues one, so this can't double-run.
+        _mark_canceled(job)
     return True

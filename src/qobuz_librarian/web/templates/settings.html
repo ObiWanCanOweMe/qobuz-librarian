@@ -1,5 +1,7 @@
 {% extends "base.html" %}
+{% from "_secret_toggle.html" import secret_toggle %}
 {% block title %}Settings — Qobuz Librarian{% endblock %}
+{% block content_max %}max-w-5xl{% endblock %}
 {% block content %}
 
 <h1 class="text-2xl font-bold mb-6">Settings</h1>
@@ -7,17 +9,17 @@
 {% if connected %}
 {% if unverified %}
 <div class="alert alert-warning mb-6" data-flash>
-  <span>Saved your token, but Qobuz couldn't be reached just now to check it.
-    Open the <a href="/" class="link">dashboard</a> and try a search — if it
-    works, you're all set.</span>
+  <span>Token saved. Qobuz could not be reached for verification.
+    Open the <a href="/" class="link">dashboard</a> and run a search to confirm
+    access.</span>
 </div>
 {% else %}
 <div class="alert alert-success mb-6" data-flash>
   <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
   </svg>
-  <span>Connected — your Qobuz token works and it's saved.
-    <a href="/" class="link font-semibold">Go to dashboard →</a></span>
+  <span>Connected. Your Qobuz token was saved.
+    <a href="/" class="link font-semibold">Go to dashboard</a></span>
 </div>
 {% endif %}
 {% endif %}
@@ -42,33 +44,29 @@
 
 {% if error == "creds" %}
 <div class="alert alert-error mb-6" data-flash>
-  <span>Couldn't write credentials — the config volume isn't writable.
-  On a NAS, set <code>PUID</code>/<code>PGID</code> and grant that user
-  write access to the config volume.</span>
+  <span>Qobuz Librarian could not save the credentials. Give the config folder
+  write access, then try again.</span>
 </div>
 {% elif error == "rejected" %}
 <div class="alert alert-error mb-6" data-flash>
-  <span>Qobuz rejected this token, so it wasn't saved. Re-grab it from
-  play.qobuz.com — dev tools → Application → Local Storage →
-  <code>localuser</code> → <code>token</code> — and try again.</span>
+  <span>Qobuz rejected this token, so it was not saved. Get a fresh token from
+  play.qobuz.com, then try again.</span>
 </div>
 {% elif error == "empty" %}
 <div class="alert alert-warning mb-6" data-flash>
-  <span>Token can't be empty — paste the <code>user_auth_token</code> from
-  play.qobuz.com (dev tools → Application → Local Storage → <code>localuser</code>
-  → <code>token</code>), or set
-  <code>QOBUZ_USER_AUTH_TOKEN</code> in your environment.</span>
+  <span>Token cannot be empty. Paste the <code>token</code> value from
+  <code>localuser</code> in play.qobuz.com, or configure Qobuz auth in
+  your environment.</span>
 </div>
 {% elif error == "needuser" %}
 <div class="alert alert-warning mb-6" data-flash>
-  <span>Add your User ID / Email as well — a token on its own isn't enough
-  to use the app. Fill in both fields, then save.</span>
+  <span>Enter your Qobuz account email or user ID as well. The token cannot be
+  used by itself.</span>
 </div>
 {% elif error == "persist" %}
 <div class="alert alert-warning mb-6" data-flash>
-  <span>Applied for this session, but couldn't be saved to disk (data
-  volume not writable) — it won't survive a restart. Check volume
-  permissions / <code>PUID</code>/<code>PGID</code>.</span>
+  <span>Applied for this session, but could not be saved. Give the data folder
+  write access or the change will be lost after restart.</span>
 </div>
 {% elif error %}
 <div class="alert alert-warning mb-6" data-flash><span>{{ error }}</span></div>
@@ -76,78 +74,84 @@
 
 {% if mode_changed == "cli" %}
 <div class="alert alert-info mb-6" data-flash>
-  <span>Handed off to the terminal. Downloads and scans here are paused until
-  you resume the web app below.</span>
+  <span>Terminal mode enabled. Web downloads and scans are paused until you
+  resume them below.</span>
 </div>
 {% elif mode_changed == "web" %}
 <div class="alert alert-success mb-6" data-flash><span>Web app resumed.</span></div>
 {% endif %}
 
-<!-- Qobuz auth -->
-<div class="card bg-base-200 shadow mb-6">
-  <div class="card-body">
-    <h2 class="card-title mb-1">Qobuz authentication</h2>
+<div class="ql-settings-stack">
+<section class="ql-tool-panel">
+  <div class="ql-tool-panel-body">
+    <h2 class="text-xl font-semibold mb-1">Qobuz authentication</h2>
     <p class="text-sm text-base-content/60 mb-2">
-      Paste your Qobuz user token below. Qobuz has no public login API, so the
-      app reuses the token your own browser already holds — stored only on your
-      server, never sent anywhere but Qobuz.
+      Save the Qobuz token used for searches, downloads, upgrades, and repair.
+      It stays on this server and is only sent to Qobuz.
     </p>
     <details class="mb-4">
-      <summary class="text-sm text-primary cursor-pointer select-none hover:underline">How do I find my token?</summary>
+      <summary class="ql-disclosure-summary">How do I find my token?</summary>
       <p class="text-sm text-base-content/60 mt-2">
         Sign in at <a href="https://play.qobuz.com" target="_blank" rel="noopener" class="link">play.qobuz.com</a>,
         open dev tools (F12), then go to Local Storage →
         play.qobuz.com (<strong>Chrome/Edge:</strong> Application tab;
         <strong>Firefox:</strong> Storage tab). Click the <code>localuser</code>
-        entry and copy its <code>token</code> value — the <code>id</code> in the
+        entry and copy its <code>token</code> value. The <code>id</code> in the
         same entry is your user ID.
       </p>
     </details>
 
     {% if creds_from_env %}
-    <div class="alert alert-info mb-4">
-      <span>
-        Credentials are being provided by the <code>QOBUZ_USER_AUTH_TOKEN</code> environment
-        variable (set in <code>compose.yaml</code> or <code>.env</code>). Anything you save
-        here is written to the streamrip config file but will be overridden on the next
-        container restart. Unset the env var to manage credentials from this page.
-      </span>
+    <div class="ql-settings-notice mb-5">
+      <p class="font-semibold">Credentials supplied by environment</p>
+      <p class="mt-1 text-sm text-base-content/65">
+        Values from <code>.env</code> or Compose take priority after restart.
+        Remove them to manage the token from this page.
+      </p>
+      <details class="mt-2">
+        <summary class="ql-disclosure-summary">
+          Show details
+        </summary>
+        <p class="mt-2 text-sm text-base-content/65">
+          Remove <code>QOBUZ_USER_AUTH_TOKEN</code> or
+          <code>QOBUZ_USER_AUTH_TOKEN_FILE</code> from <code>.env</code> or
+          <code>compose.yaml</code>.
+        </p>
+      </details>
     </div>
     {% endif %}
 
-    <form action="/settings" method="post">
+    <form action="/settings" method="post" class="ql-credentials-form">
       <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
       <div class="form-control mb-4">
         <label class="label" for="user_id">
-          <span class="label-text">User ID / Email <span class="text-error" aria-hidden="true">*</span></span>
+        <span class="label-text">Email or user ID <span class="text-error" aria-hidden="true">*</span></span>
         </label>
         <input type="text" name="user_id" id="user_id" value="{{ user_id or '' }}"
-               placeholder="your@email.com or numeric user ID"
+               placeholder="name@example.com or numeric ID"
                class="input input-bordered w-full max-w-lg">
         <p class="text-xs text-base-content/40 mt-1">
-          Required — your account email or numeric user ID. The token can search
-          on its own, but downloads need this too.
+          Your Qobuz email or numeric user ID.
         </p>
       </div>
       <div class="form-control mb-4">
-        <label class="label flex-wrap gap-2" for="auth_token">
-          <span class="label-text">Auth Token <span class="text-error" aria-hidden="true">*</span></span>
-          {% if auth_token_set %}
-          <span class="label-text-alt text-success whitespace-nowrap">Token is set — leave blank to keep</span>
-          {% endif %}
+        <label class="label" for="auth_token">
+          <span class="label-text">Auth token <span class="text-error" aria-hidden="true">*</span></span>
         </label>
-        <div class="flex items-center gap-2 max-w-lg">
+        {% if auth_token_set %}
+        <p class="text-xs text-success mb-1">Token saved. Leave this field blank to keep it.</p>
+        {% endif %}
+        <div class="relative max-w-lg">
           <input type="password" name="auth_token" id="auth_token"
                  value="{{ auth_token_prefill | default('') }}"
                  aria-label="Qobuz auth token"
                  autocomplete="off" autocorrect="off" spellcheck="false"
-                 placeholder="{% if auth_token_set %}•••••••• paste new token to replace{% else %}paste the long token string here{% endif %}"
-                 class="input input-bordered min-w-0 flex-1 font-mono text-base sm:text-sm">
-          <button type="button" class="btn btn-ghost btn-sm"
-                  data-toggle-password="auth_token">Show</button>
+                 placeholder="{% if auth_token_set %}{% else %}Paste token{% endif %}"
+                 class="input input-bordered w-full pr-12 font-mono text-base sm:text-sm">
+          {{ secret_toggle("auth_token", "token") }}
         </div>
         <p class="text-xs text-base-content/40 mt-1">
-          The long token string — not your Qobuz password.
+          {% if auth_token_set %}Paste a new token here to replace it.{% else %}Use your Qobuz auth token, not your password.{% endif %}
         </p>
       </div>
 
@@ -156,22 +160,30 @@
       </div>
     </form>
   </div>
-</div>
+</section>
 
-<!-- Mode -->
-<div class="card bg-base-200 shadow mb-6">
-  <div class="card-body">
-    <h2 class="card-title mb-1">Mode</h2>
-    <p class="text-sm text-base-content/60 mb-3">
-      The web app and the command-line tool can't run at the same time — they
-      share one download lock. Hand control to the terminal here, run your CLI
-      commands ({{ "docker exec -it qobuz-librarian qobuz-librarian" }}), then
-      resume. Downloads in the web UI are paused while the terminal has control.
+{% if auth_token_set %}
+<section class="ql-tool-panel">
+  <div class="ql-tool-panel-body">
+    <h2 class="text-xl font-semibold mb-1">Mode</h2>
+    <p class="text-sm text-base-content/60 mb-2">
+      Use terminal mode before running CLI commands. Web scans and
+      downloads pause while terminal mode is active.
     </p>
+    <details class="mb-4">
+      <summary class="ql-disclosure-summary">
+        CLI command
+      </summary>
+      <div class="mt-2 rounded-lg bg-base-300/70 px-3 py-2">
+        <code class="block whitespace-normal break-words font-mono text-xs leading-relaxed">docker compose exec qobuz-librarian qobuz-librarian</code>
+      </div>
+    </details>
     {% if cli_mode %}
-    <div class="flex items-center gap-3 flex-wrap">
-      <span class="badge badge-warning gap-1">Terminal (CLI) mode</span>
-      <span class="text-sm text-base-content/70">Web downloads are paused.</span>
+    <div class="ql-mode-row">
+      <div class="min-w-0">
+        <p class="ql-mode-state">Terminal mode active</p>
+        <p class="text-sm text-base-content/60">Web scans and downloads are paused.</p>
+      </div>
       <form action="/settings/mode" method="post" class="w-full sm:ml-auto sm:w-auto">
         <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
         <input type="hidden" name="target" value="web">
@@ -180,139 +192,138 @@
     </div>
     {% if cli_only_env %}
     <p class="text-xs text-base-content/50 mt-2">
-      <code>QL_CLI_ONLY</code> is set, so this resets to terminal mode on every
-      restart. Remove it to default to the web app.
+      <code>QL_CLI_ONLY</code> is set, so Qobuz Librarian returns to terminal
+      mode after every restart. Remove it to default to the web app.
     </p>
     {% endif %}
     {% else %}
-    <div class="flex items-center gap-3 flex-wrap">
-      <span class="badge badge-success gap-1">Web app active</span>
-      <span class="text-sm text-base-content/70">Command-line tool is paused — this is normal.</span>
+    <div class="ql-mode-row">
+      <div class="min-w-0">
+        <p class="ql-mode-state">Web app active</p>
+        <p class="text-sm text-base-content/60">Scans and downloads can run from the web UI.</p>
+      </div>
       <form action="/settings/mode" method="post" class="w-full sm:ml-auto sm:w-auto">
         <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
         <input type="hidden" name="target" value="cli">
-        <button type="submit" class="btn btn-outline btn-sm w-full sm:w-auto">Hand off to terminal</button>
+        <button type="submit" class="btn btn-outline ql-secondary-action w-full sm:w-auto">Switch to terminal mode</button>
       </form>
     </div>
     {% endif %}
   </div>
-</div>
+</section>
+{% endif %}
 
-<!-- Behaviour -->
-<div class="card bg-base-200 shadow mb-6">
-  <div class="card-body">
-    <h2 class="card-title mb-1">Behaviour</h2>
+<section class="ql-tool-panel">
+  <div class="ql-tool-panel-body">
+    <h2 class="text-xl font-semibold mb-1">Behaviour</h2>
     <p class="text-sm text-base-content/60 mb-4">
-      These take effect on the next job — no restart needed. They override the
-      defaults from <code>compose.yaml</code>.
+      These settings apply to new jobs. Saved values override Compose defaults.
     </p>
     <form action="/settings/behavior" method="post">
       <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
       <input type="hidden" name="form_complete" value="1">
-      <div class="space-y-4 mb-5">
+      <div class="mb-5 divide-y divide-base-300/60">
         {% for key, label, help in behavior_fields %}
-        {% if key == 'CONSOLIDATE' %}
-        <input type="hidden" name="{{ key }}" value="{{ '1' if behavior[key] else '0' }}">
-        <div class="flex items-start gap-3 opacity-70">
-          <span class="badge badge-ghost mt-0.5 whitespace-nowrap">CLI only</span>
-          <div>
-            <p class="font-medium">{{ label.replace(' (CLI only)', '') }}</p>
-            <div class="text-sm text-base-content/50">{{ help }}</div>
+        <div class="py-4">
+          <div class="flex items-center justify-between gap-4">
+            <label for="cb-{{ key }}" class="min-w-0 font-medium leading-6 cursor-pointer">{{ label }}</label>
+            <input type="checkbox" name="{{ key }}" id="cb-{{ key }}"
+                   class="toggle toggle-primary shrink-0"
+                   aria-describedby="help-{{ key }}"
+                   {% if behavior[key] %}checked{% endif %}>
           </div>
+          <div id="help-{{ key }}" class="mt-2 max-w-2xl text-sm leading-6 text-base-content/50">{{ help }}</div>
         </div>
-        {% else %}
-        <div class="flex items-start gap-3">
-          <input type="checkbox" name="{{ key }}" id="cb-{{ key }}"
-                 class="toggle toggle-primary mt-1"
-                 {% if behavior[key] %}checked{% endif %}>
-          <div>
-            <label for="cb-{{ key }}" class="font-medium cursor-pointer">{{ label }}</label>
-            <div class="text-sm text-base-content/50">{{ help }}</div>
-          </div>
-        </div>
-        {% endif %}
         {% endfor %}
       </div>
 
-      <div class="divider text-base-content/30 text-xs">Details</div>
-
-      <div class="space-y-4 mb-5">
-        {% for key, label, help, kind, choices, placeholder in text_fields %}
-        <div class="form-control">
-          <label class="label py-1" for="f-{{ key }}"><span class="label-text font-medium">{{ label }}</span></label>
-          {% if kind == 'enum' %}
-          <select name="{{ key }}" id="f-{{ key }}" class="select select-bordered max-w-xs text-base sm:select-sm sm:text-xs">
-            {% for c in choices %}
-            <option value="{{ c }}" {% if behavior[key] == c %}selected{% endif %}>{{ (option_labels|default({})).get(key, {}).get(c, c) }}</option>
-            {% endfor %}
-          </select>
-          {% else %}
-          <input type="text" name="{{ key }}" id="f-{{ key }}" value="{{ behavior[key] }}"
-                 placeholder="{{ placeholder }}"
-                 class="input input-bordered w-full max-w-lg font-mono text-base sm:input-sm sm:text-xs">
-          {% endif %}
-          <p class="text-xs text-base-content/50 mt-1">{{ help }}</p>
+      <details class="mb-5 border-t border-base-300/60 pt-4">
+        <summary class="ql-disclosure-summary">
+          <span class="inline-flex w-full min-w-0 flex-col gap-1 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+            <span>Download and import defaults</span>
+            <span class="text-xs font-normal text-base-content/45 sm:text-right">Quality, lyrics, artwork, beets</span>
+          </span>
+        </summary>
+        <div class="mt-4 space-y-4">
+          {% for key, label, help, kind, choices, placeholder in text_fields %}
+          <div class="grid gap-2 sm:grid-cols-[12rem_minmax(0,1fr)] sm:items-start sm:gap-4">
+            <label class="pt-0.5 text-sm font-medium leading-6" for="f-{{ key }}">{{ label }}</label>
+            <div class="min-w-0">
+              {% if kind == 'enum' %}
+              <select name="{{ key }}" id="f-{{ key }}" class="select select-bordered w-full text-base sm:max-w-sm sm:select-sm sm:text-xs">
+                {% for c in choices %}
+                <option value="{{ c }}" {% if behavior[key] == c %}selected{% endif %}>{{ (option_labels|default({})).get(key, {}).get(c, c) }}</option>
+                {% endfor %}
+              </select>
+              {% else %}
+              <input type="text" name="{{ key }}" id="f-{{ key }}" value="{{ behavior[key] }}"
+                     placeholder="{{ placeholder }}"
+                     class="input input-bordered w-full font-mono text-base sm:max-w-sm sm:input-sm sm:text-xs">
+              {% endif %}
+              <p class="mt-1 text-xs leading-5 text-base-content/50">{{ help }}</p>
+            </div>
+          </div>
+          {% endfor %}
         </div>
-        {% endfor %}
-      </div>
+      </details>
 
       <button type="submit" class="btn btn-primary w-full sm:w-auto">Save behaviour</button>
     </form>
   </div>
-</div>
+</section>
 
-<!-- Paths (read-only info) -->
-<div class="card bg-base-200 shadow mb-6">
-  <div class="card-body">
-    <h2 class="card-title mb-3">Library paths</h2>
-    <p class="text-sm text-base-content/60 mb-3">
-      Where your data lives on the host. To move any of these, stop the
-      container, change the matching bind mount in <code>compose.yaml</code>,
-      and start it again.
+<section class="ql-tool-panel">
+  <div class="ql-tool-panel-body">
+    <h2 class="text-xl font-semibold mb-3">Library paths</h2>
+    <p class="text-sm text-base-content/60 mb-4">
+      Paths currently in use. Host paths are shown when Docker exposes them;
+      otherwise this shows the container path.
     </p>
-    <dl class="grid grid-cols-1 sm:grid-cols-[max-content_1fr] gap-x-4 gap-y-2 text-sm">
+    <dl class="divide-y divide-base-300/60">
       {% for p in library_paths %}
-        <dt class="text-base-content/60">{{ p.label }}</dt>
-        <dd class="break-all font-mono text-xs">
-          {{ p.host }}
-          {% if not p.resolved %}
-            <span class="text-base-content/40">(in-container path; host source not detectable)</span>
+      <div class="grid gap-1 py-3 first:pt-0 last:pb-0 sm:grid-cols-[8rem_minmax(0,1fr)] sm:gap-4">
+        <dt class="text-sm font-medium">{{ p.label }}</dt>
+        <dd class="min-w-0">
+          {% if p.resolved %}
+          <div class="text-xs font-medium text-base-content/45">Host path</div>
+          <div class="break-words font-mono text-[0.7rem] leading-5 sm:text-xs">{{ p.host }}</div>
+          <div class="mt-1 text-xs font-medium text-base-content/45">Container path</div>
+          <div class="break-words font-mono text-[0.7rem] leading-5 text-base-content/50 sm:text-xs">{{ p.container }}</div>
+          {% else %}
+          <div class="text-xs font-medium text-base-content/45">Container path</div>
+          <div class="break-words font-mono text-[0.7rem] leading-5 sm:text-xs">{{ p.container }}</div>
           {% endif %}
         </dd>
+      </div>
       {% endfor %}
     </dl>
   </div>
-</div>
+</section>
 
-<div class="card bg-base-200 shadow mb-6">
-  <div class="card-body">
+<section class="ql-tool-panel">
+  <div class="ql-tool-panel-body">
     <div class="flex items-center justify-between mb-3">
-      <h2 class="card-title">Diagnostics</h2>
-      <button class="btn btn-xs btn-ghost"
+      <h2 class="text-xl font-semibold">Diagnostics</h2>
+      <button class="btn btn-sm sm:btn-xs btn-outline"
               hx-get="/api/diagnostics"
               hx-target="#diagnostics-list"
               hx-swap="innerHTML"
               hx-indicator="#diag-spinner">Recheck</button>
     </div>
     <p class="text-sm text-base-content/60 mb-3">
-      These run automatically and report from the container's point of
-      view — they catch an unmounted or unwritable volume before your
-      first scan.
+      Checks what the container can see before scans or downloads start.
     </p>
-    <div id="diagnostics-list" class="space-y-2" aria-live="polite">
+    <div id="diagnostics-list" class="ql-diagnostics-list" aria-live="polite">
       {% for d in diagnostics %}
-      <div class="flex items-start gap-3">
-        <span class="shrink-0 mt-0.5">
-          {% if d.ok %}
-          <span class="badge badge-sm badge-success">✓</span>
-          {% else %}
-          <span class="badge badge-sm badge-error">✗</span>
-          {% endif %}
+      <div class="ql-diagnostic-row">
+        <span class="ql-diagnostic-status {% if d.ok %}ql-diagnostic-status-ok{% else %}ql-diagnostic-status-error{% endif %}"
+              aria-label="{% if d.ok %}OK{% else %}Needs attention{% endif %}">
+          {% if d.ok %}OK{% else %}Issue{% endif %}
         </span>
         <div class="min-w-0">
-          <div class="text-sm">{{ d.label }}</div>
+          <div class="ql-diagnostic-label">{{ d.label }}</div>
           {% if d.detail %}
-          <div class="font-mono text-xs text-base-content/60 break-all">{{ d.detail }}</div>
+          <div class="ql-diagnostic-detail">{{ d.detail }}</div>
           {% endif %}
         </div>
       </div>
@@ -320,6 +331,7 @@
     </div>
     <span id="diag-spinner" class="htmx-indicator loading loading-spinner loading-xs mt-2"></span>
   </div>
+</section>
 </div>
 
 {% endblock %}

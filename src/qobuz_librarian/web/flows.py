@@ -48,7 +48,7 @@ def build_args():
     """
     return argparse.Namespace(
         force=False, yes=True, dry_run=False, no_import=False,
-        no_upgrade=False, no_downsample=False, no_compress=False,
+        no_upgrade=False, no_downsample=False,
         prefer_hires=cfg.PREFER_HIRES,
         consolidate=False,
         migrate_multi_artist=cfg.MIGRATE_MULTI_ARTIST,
@@ -57,11 +57,28 @@ def build_args():
         no_catalog=False,
         auto_safe=False,
         # auto_upgrade is request-scoped (the explicit Upgrade flow flips it
-        # to True for one run) so the Settings page can keep reading the
-        # underlying cfg.AUTO_UPGRADE_ENABLED without a mid-job racy flip.
+        # to True for one run) so passive gap scans do not need to mutate
+        # cfg.AUTO_UPGRADE_ENABLED mid-job.
         auto_upgrade=cfg.AUTO_UPGRADE_ENABLED,
         verbose=False,
     )
+
+
+def _set_empty_library_summary(job):
+    job.summary = (
+        "No artist folders were found in the configured music library. "
+        "Check that it contains your artist folders."
+    )
+    log.info("No artist folders found in the configured music library.")
+    log.info("  Expected layout: <music library>/<Artist>/<Album (Year)>/<track>.flac")
+    log.info("  Check the music library path in Settings.")
+
+
+def _album_cover(album):
+    """The album's small cover URL, only if it's a trusted Qobuz CDN link."""
+    img = album.get("image") or {}
+    url = img.get("small") or img.get("thumbnail") or ""
+    return url if url.startswith("https://static.qobuz.com/") else ""
 
 
 def _add_album_candidate(job, album, artist_name, selected=True, is_new=False):
@@ -72,10 +89,11 @@ def _add_album_candidate(job, album, artist_name, selected=True, is_new=False):
                   f"gap-fill: {partial_n} missing of "
                   f"{album.get('tracks_count') or '?'}")
     else:
-        tc = album.get('tracks_count') or '?'
+        tc = album.get('tracks_count')
+        n = int(tc) if str(tc or '').isdigit() else None
         detail = (f"{year or '?'} · {album_quality_label(album)} · "
-                  f"{tc} track{'s' if tc != 1 else ''}")
-    payload = {"album_id": album.get("id"), "year": year}
+                  f"{n if n is not None else '?'} track{'' if n == 1 else 's'}")
+    payload = {"album_id": album.get("id"), "year": year, "cover": _album_cover(album)}
     if is_new:
         payload["is_new"] = True
     job.add_candidate(
@@ -101,7 +119,7 @@ def _cap_note(job) -> str:
     than were actually kept. Empty when nothing was dropped."""
     if not job.candidate_cap_hit:
         return ""
-    return (f" Showing the first {len(job.candidates):,} — the scan hit the "
+    return (f" Showing the first {len(job.candidates):,}; the scan hit the "
             f"{job.CANDIDATE_CAP:,} result cap. Scan a single artist, or raise "
             "JOB_CANDIDATE_CAP, to see the rest.")
 
@@ -253,7 +271,7 @@ def scan_artist(job, query, token):
         new_releases_mod.record_artist_seen(aid, current_ids)
     msg = f"  {plural(len(result.gaps), 'missing album')} found for {result.artist_name}"
     if n_new:
-        msg += f" — {n_new} new since your last check"
+        msg += f", {n_new} new to the saved baseline"
     log.info(msg + ".")
     # Frame the review the way every other scan kind does: say what these are
     # (albums you don't own), not just a bare list. The page shows job.summary
@@ -264,9 +282,9 @@ def scan_artist(job, query, token):
         job.summary = (f"{plural(n, 'album')} {result.artist_name} has on Qobuz "
                        "that aren't in your library")
         if n_new:
-            job.summary += f" — {n_new} new since your last check"
+            job.summary += f", {n_new} new to your saved baseline"
     else:
-        job.summary = (f"No missing albums for {result.artist_name} — your library "
+        job.summary = (f"No missing albums for {result.artist_name}; your library "
                        "already has everything Qobuz lists.")
     flush_resolve_cache()
     _record_last_scan()
@@ -311,11 +329,7 @@ def scan_library(job, token, partial_only=False):
     artists = [d for d in list_library_artists()
                if normalize(d.name) not in VA_NORMALIZED]
     if not artists:
-        job.summary = ("No artist folders found under MUSIC_ROOT — check that "
-                       "MUSIC_ROOT points at your library.")
-        log.info("No artist folders found under MUSIC_ROOT.")
-        log.info("  Expected layout: $MUSIC_ROOT/<Artist>/<Album (Year)>/<track>.flac")
-        log.info("  Check that MUSIC_ROOT in your .env points at the right place.")
+        _set_empty_library_summary(job)
         return
     kind = "partial" if partial_only else "missing"
     # Resume an interrupted scan of this kind: skip the artists already done and
@@ -336,7 +350,7 @@ def scan_library(job, token, partial_only=False):
                 continue
             _readd_candidate(job, c)
             total += 1
-        log.info(f"Resuming — {len(scanned)} artist(s) already scanned, "
+        log.info(f"Resuming. {len(scanned)} artist(s) already scanned, "
                  f"{plural(total, 'album')} found so far.")
     target = "track gaps in owned albums" if partial_only else "missing albums"
     log.info(f"Scanning {plural(len(artists), 'library artist')} for {target}")
@@ -358,7 +372,7 @@ def scan_library(job, token, partial_only=False):
             if job.cancel_requested:
                 for f in futures:
                     f.cancel()
-                log.info("Cancelled — stopping scan.")
+                log.info("Cancelled. Stopping scan.")
                 break
             done += 1
             try:
@@ -418,7 +432,7 @@ def scan_library(job, token, partial_only=False):
             new_releases_mod.seed_baseline(baseline_seen)
         scan_checkpoint.clear(kind)
     if job.cancel_requested:
-        job.summary = (f"Stopped early — {plural(total, 'album')} found so far."
+        job.summary = (f"Stopped early. {plural(total, 'album')} found so far."
                        if total else "Stopped before anything turned up.")
     elif partial_only:
         job.summary = (f"{plural(total, 'album')} with track gaps across the library."
@@ -428,8 +442,7 @@ def scan_library(job, token, partial_only=False):
         job.summary = (f"{plural(total, 'missing album')} across the library."
                        + _cap_note(job)
                        if total else
-                       "No missing albums — your library matches each artist's "
-                       "Qobuz catalog.")
+                       "No missing albums found for artists in your library.")
     log.info(job.summary)
 
 
@@ -445,11 +458,7 @@ def scan_new_releases(job, token):
     artists = [d for d in list_library_artists()
                if normalize(d.name) not in VA_NORMALIZED]
     if not artists:
-        job.summary = ("No artist folders found under MUSIC_ROOT — check that "
-                       "MUSIC_ROOT points at your library.")
-        log.info("No artist folders found under MUSIC_ROOT.")
-        log.info("  Expected layout: $MUSIC_ROOT/<Artist>/<Album (Year)>/<track>.flac")
-        log.info("  Check that MUSIC_ROOT in your .env points at the right place.")
+        _set_empty_library_summary(job)
         return
     state = new_releases_mod.load()
     seen = state.get("seen") or {}
@@ -484,7 +493,7 @@ def scan_new_releases(job, token):
             if job.cancel_requested:
                 for f in futures:
                     f.cancel()
-                log.info("Cancelled — stopping check.")
+                log.info("Cancelled. Stopping check.")
                 break
             done += 1
             try:
@@ -531,24 +540,24 @@ def scan_new_releases(job, token):
     if job.cancel_requested:
         # A cancelled crawl only reached a fraction of the artists, so it can't
         # claim "No new releases" or "First check recorded" definitively.
-        job.summary = ("Stopped early — partial check, "
+        job.summary = ("Stopped early. Partial check, "
                        f"{plural(total, 'new release')} found so far.")
         log.info(job.summary)
         return
     if rebaseline and seen:
-        job.summary = ("Catalog list widened since the last check — re-recorded "
-                       "the baseline. New releases will show from here.")
-        log.info("Re-baselined after a catalog-limit change; nothing surfaced.")
+        job.summary = ("Catalogue limit changed. Recorded a fresh baseline. "
+                       "Future checks will flag new releases.")
+        log.info("Re-baselined after a catalogue-limit change; nothing surfaced.")
     elif total:
         job.summary = f"{plural(total, 'new release')} found across the library."
         log.info(f"Done. {plural(total, 'new release')} across the library.")
     elif not seen:
-        job.summary = ("First check — recorded what each artist has now. "
-                       "From here, new releases will show up here.")
-        log.info("Baseline recorded — future checks will flag new releases.")
+        job.summary = ("First check complete. Recorded the current Qobuz "
+                       "catalogue baseline. Future checks will flag new releases.")
+        log.info("Baseline recorded. Future checks will flag new releases.")
     else:
-        job.summary = "No new releases since your last check."
-        log.info("No new releases since your last check.")
+        job.summary = "No new releases added to your saved baseline."
+        log.info("No new releases added to the saved baseline.")
 
 
 # ── Execute ───────────────────────────────────────────────────────────────────
@@ -610,20 +619,20 @@ def execute_albums(job, chosen, token):
         time.sleep(cfg.ARTIST_API_DELAY)
     job._progress_scope = None
     if job.cancel_requested:
-        job.summary = (f"Stopped early — {ok} downloaded, "
+        job.summary = (f"Stopped early. {ok} downloaded, "
                        f"{len(chosen) - processed} not started.")
         log.info(job.summary)
         return
     parts = [f"{ok}/{plural(len(chosen), 'album')} downloaded and imported"]
     if partial:
         parts.append(f"{plural(partial, 'album')} only partly (some tracks failed)")
-    job.summary = "Finished — " + ", ".join(parts) + "."
-    log.info(f"Finished — {ok}/{plural(len(chosen), 'album')} downloaded and imported.")
+    job.summary = "Finished. " + ", ".join(parts) + "."
+    log.info(f"Finished. {ok}/{plural(len(chosen), 'album')} downloaded and imported.")
     if partial:
         log.info(f"  {plural(partial, 'album')} downloaded only partly "
-                 f"(some tracks failed) — see the log.")
+                 f"(some tracks failed); see the log.")
     if failed:
-        job.error = f"{failed} of {plural(len(chosen), 'album')} didn't finish — see the log."
+        job.error = f"{failed} of {plural(len(chosen), 'album')} didn't finish; see the log."
 
 
 # ── Upgrade flow ──────────────────────────────────────────────────────────────
@@ -647,10 +656,7 @@ def scan_upgrades(job, token):
     artists = [d for d in list_library_artists()
                if normalize(d.name) not in VA_NORMALIZED]
     if not artists:
-        job.summary = ("No artist folders found under MUSIC_ROOT — check that "
-                       "QL_MUSIC_DIR points at your library.")
-        log.info("No artist folders found under MUSIC_ROOT.")
-        log.info("  Check that QL_MUSIC_DIR in your .env points at the right place.")
+        _set_empty_library_summary(job)
         return
     args = build_args()
     capped = load_capped()
@@ -675,7 +681,7 @@ def scan_upgrades(job, token):
             if job.cancel_requested:
                 for f in futures:
                     f.cancel()
-                log.info("Cancelled — stopping scan.")
+                log.info("Cancelled. Stopping scan.")
                 break
             done += 1
             name = futures[fut].name
@@ -710,7 +716,8 @@ def scan_upgrades(job, token):
                     artist=name,
                     detail=f"{c.get('existing_quality_label','?')} → "
                            f"{c.get('target_quality_label','?')}{part}",
-                    payload={"album_id": album.get("id"), "year": album_year(album)},
+                    payload={"album_id": album.get("id"), "year": album_year(album),
+                             "cover": _album_cover(album)},
                     selected=False,
                 )
                 total += 1
@@ -723,12 +730,12 @@ def scan_upgrades(job, token):
     if not job.cancel_requested:
         _flag_new_since_last_scan(job, "upgrade")
     if job.cancel_requested:
-        job.summary = (f"Stopped early — {plural(total, 'album')} found so far."
+        job.summary = (f"Stopped early. {plural(total, 'album')} found so far."
                        if total else "Stopped before anything turned up.")
     else:
         job.summary = (f"{plural(total, 'upgradeable album')} Qobuz can serve "
                        "at higher quality." + _cap_note(job) if total else
-                       "No upgrades — every album is already at the best quality "
+                       "No upgrades; every album is already at the best quality "
                        "Qobuz offers.")
     log.info(job.summary)
 
@@ -771,7 +778,7 @@ def scan_upgrades_for_artist(job, artist_name, token):
         from qobuz_librarian.web.jobs import JobStatus
         log.info(f"  scan failed for {name}: {e}")
         job.error = f"Scan failed: {e}"
-        job.summary = "Scan failed — see the log."
+        job.summary = "Scan failed; see the log."
         job.status = JobStatus.FAILED
         return
     added = 0
@@ -786,7 +793,8 @@ def scan_upgrades_for_artist(job, artist_name, token):
             artist=name,
             detail=f"{c.get('existing_quality_label','?')} → "
                    f"{c.get('target_quality_label','?')}{part}",
-            payload={"album_id": album.get("id"), "year": album_year(album)},
+            payload={"album_id": album.get("id"), "year": album_year(album),
+                     "cover": _album_cover(album)},
             selected=False,
         )
         added += 1
@@ -835,7 +843,7 @@ def execute_upgrades(job, chosen, token):
             failed += 1
             continue
         if not album:
-            log.info(f"  album {album_id} is no longer on Qobuz — skipping.")
+            log.info(f"  album {album_id} is no longer on Qobuz; skipping.")
             failed += 1
             continue
         try:
@@ -873,7 +881,7 @@ def execute_upgrades(job, chosen, token):
                     if post_qual["classification"] in ("all_lower", "mixed_below"):
                         mark_album_capped(album.get("id"), album, post_qual)
                         log.info(f"  upgrade incomplete: {post_qual['n_below']} "
-                                 f"track(s) still below target — marked capped "
+                                 f"track(s) still below target. Marked capped "
                                  f"(Qobuz partial hi-res).")
             except Exception as _e_cap:
                 log.info(f"  post-upgrade cap check failed: {_e_cap}")
@@ -882,18 +890,18 @@ def execute_upgrades(job, chosen, token):
         time.sleep(cfg.ARTIST_API_DELAY)
     job._progress_scope = None
     if job.cancel_requested:
-        job.summary = (f"Stopped early — {ok} upgraded, "
+        job.summary = (f"Stopped early. {ok} upgraded, "
                        f"{len(chosen) - processed} not started.")
         log.info(job.summary)
         return
-    msg = f"Finished — upgraded {ok}/{plural(len(chosen), 'album')}."
+    msg = f"Finished. Upgraded {ok}/{plural(len(chosen), 'album')}."
     if kept:
         msg += (f" {kept} kept the original (upgrade couldn't be verified "
-                f"complete — backup retained).")
+                f"complete; backup retained).")
     job.summary = msg
     log.info(msg)
     if failed:
-        job.error = f"{failed} of {plural(len(chosen), 'album')} couldn't be upgraded — see the log."
+        job.error = f"{failed} of {plural(len(chosen), 'album')} couldn't be upgraded; see the log."
 
 
 # ── Downsample flow ─────────────────────────────────────────────────────────────
@@ -912,10 +920,7 @@ def scan_downsamples(job):
     artists = [d for d in list_library_artists()
                if normalize(d.name) not in VA_NORMALIZED]
     if not artists:
-        job.summary = ("No artist folders found under MUSIC_ROOT — check that "
-                       "QL_MUSIC_DIR points at your library.")
-        log.info("No artist folders found under MUSIC_ROOT.")
-        log.info("  Check that QL_MUSIC_DIR in your .env points at the right place.")
+        _set_empty_library_summary(job)
         return
     hidden = hidden_mod.load()
     log.info(f"Scanning {plural(len(artists), 'artist')} for hi-res files to downsample")
@@ -924,7 +929,7 @@ def scan_downsamples(job):
     n = len(artists)
     for ad in artists:
         if job.cancel_requested:
-            log.info("Cancelled — stopping scan.")
+            log.info("Cancelled. Stopping scan.")
             break
         done += 1
         name = ad.name
@@ -961,13 +966,13 @@ def scan_downsamples(job):
     if not job.cancel_requested:
         _flag_new_since_last_scan(job, "downsample")
     if job.cancel_requested:
-        job.summary = (f"Stopped early — {plural(total, 'album')} found so far."
+        job.summary = (f"Stopped early. {plural(total, 'album')} found so far."
                        if total else "Stopped before anything turned up.")
     else:
         job.summary = (f"{plural(total, 'album')} stored above CD rate."
                        + _cap_note(job)
                        if total else
-                       "No hi-res files — every album is already at CD rate or lower.")
+                       "No hi-res files; every album is already at CD rate or lower.")
     log.info(job.summary)
 
 
@@ -999,7 +1004,7 @@ def scan_downsamples_for_artist(job, artist_name):
         from qobuz_librarian.web.jobs import JobStatus
         log.info(f"  scan failed for {name}: {e}")
         job.error = f"Scan failed: {e}"
-        job.summary = "Scan failed — see the log."
+        job.summary = "Scan failed; see the log."
         job.status = JobStatus.FAILED
         return
     added = 0
@@ -1065,12 +1070,12 @@ def execute_downsamples(job, chosen):
         total_errors += res.get("errors", 0)
     job._progress_scope = None
     if job.cancel_requested:
-        job.summary = (f"Stopped early — shrank {plural(shrunk, 'album')} "
+        job.summary = (f"Stopped early. Downsampled {plural(shrunk, 'album')} "
                        f"({format_size(total_saved)} reclaimed), "
                        f"{len(chosen) - processed} not started.")
         log.info(job.summary)
         return
-    summary = (f"Finished — shrank {plural(shrunk, 'album')}, "
+    summary = (f"Finished. Downsampled {plural(shrunk, 'album')}, "
                f"reclaimed {format_size(total_saved)}.")
     if skipped:
         summary += f" {plural(skipped, 'album')} skipped (no longer on disk)."
@@ -1078,7 +1083,7 @@ def execute_downsamples(job, chosen):
     log.info(summary)
     if total_errors:
         job.error = (f"{plural(total_errors, 'file')} couldn't be downsampled "
-                     "(left unchanged) — see the log.")
+                     "(left unchanged); see the log.")
 
 
 # ── Repair flow ───────────────────────────────────────────────────────────────
@@ -1118,7 +1123,7 @@ def _repair_album_outcome(album_dir, name, token):
             out["specs"].append({
                 "kind": "redownload", "title": album_dir.name, "artist": name,
                 "detail": (f"{plural(len(suspicious), 'damaged file')} can't be "
-                           f"verified by ID — re-download the whole album fresh "
+                           f"verified by ID. Re-download the whole album fresh "
                            f"as “{m_title}” ({m_year})"),
                 "payload": {"album_dir": str(album_dir), "artist_name": name,
                             "album_id": matched.get("id"),
@@ -1128,7 +1133,7 @@ def _repair_album_outcome(album_dir, name, token):
                 out["warns"].append(
                     f"    ⚠ {album_dir.name} — {e.get('title') or '?'}: "
                     f"{e['diagnostic']}; couldn't match this folder to a Qobuz "
-                    "album to re-download — check by hand.")
+                    "album to re-download. Check by hand.")
     return out
 
 
@@ -1209,10 +1214,7 @@ def scan_repairs(job, token):
     clear_scan_caches()
     artists = list_library_artists()
     if not artists:
-        job.summary = ("No artist folders found under MUSIC_ROOT — check that "
-                       "QL_MUSIC_DIR points at your library.")
-        log.info("No artist folders found under MUSIC_ROOT.")
-        log.info("  Check that QL_MUSIC_DIR in your .env points at the right place.")
+        _set_empty_library_summary(job)
         return
     # Resume an interrupted sweep: skip the artists already checked and restore
     # the damaged albums they turned up. A repair scan is one Qobuz call per
@@ -1228,12 +1230,11 @@ def scan_repairs(job, token):
         for c in cp["candidates"]:
             _readd_candidate(job, c)
             total += 1
-        log.info(f"Resuming — {len(scanned)} artist(s) already checked, "
+        log.info(f"Resuming. {len(scanned)} artist(s) already checked, "
                  f"{plural(total, 'album')} flagged so far.")
     log.info(f"Scanning {plural(len(artists), 'artist')} for damaged files. "
-             "Only problems are listed below — healthy albums stay quiet, so a "
-             "long silent stretch is normal; the scan is still working. This "
-             "takes a while on a big library.")
+             "Only problems are listed below; expect long quiet stretches. "
+             "Slow on a big library.")
     todo = [ad for ad in artists if ad.name not in scanned]
     n = len(artists)
     done = len(scanned)
@@ -1262,9 +1263,9 @@ def scan_repairs(job, token):
             if job.cancel_requested:
                 for f in futures:
                     f.cancel()
-                job.summary = (f"Stopped early — {plural(total, 'album')} flagged so far."
+                job.summary = (f"Stopped early. {plural(total, 'album')} flagged so far."
                                if total else "Stopped before anything was flagged.")
-                log.info("Cancelled — stopping scan.")
+                log.info("Cancelled. Stopping scan.")
                 scan_checkpoint.clear("repair")
                 return
             done += 1
@@ -1315,14 +1316,14 @@ def scan_repairs(job, token):
     # and the albums that errored, instead of folding them into a clean total.
     unver = (f" {plural(n_unverified, 'track')} couldn't be decode-checked "
              "(no flac tool)." if n_unverified else "")
-    fail = (f" {plural(n_failed, 'album')} couldn't be scanned — re-run to retry."
+    fail = (f" {plural(n_failed, 'album')} couldn't be scanned; re-run to retry."
             if n_failed else "")
     if total:
         job.summary = (f"{plural(total, 'album')} flagged with damaged files. "
                        f"{plural(n_verified, 'track')} decode-verified clean."
                        + unver + fail)
     else:
-        job.summary = (f"No damaged files found — "
+        job.summary = (f"No damaged files found. "
                        f"{plural(n_verified, 'track')} decode-verified intact."
                        + unver + fail)
     log.info(job.summary)
@@ -1355,7 +1356,7 @@ def scan_repairs_for_artist(job, artist_name, token):
     total = 0
     for i, album_dir in enumerate(album_dirs, 1):
         if job.cancel_requested:
-            log.info("Cancelled — stopping scan.")
+            log.info("Cancelled. Stopping scan.")
             return
         job.push_progress("Checking for damaged files", i, len(album_dirs),
                           album_dir.name, found=total, unit="album")
@@ -1397,9 +1398,8 @@ def _redownload_damaged_album(payload, token):
     album_dir = Path(payload["album_dir"])
     backup = backup_album_dir(album_dir) if album_dir.exists() else None
     if album_dir.exists() and backup is None:
-        log.info("  Couldn't safely move the existing folder out of the way, "
-                 "so leaving this album alone to avoid damaging it. "
-                 "See the log above.")
+        log.info("  Couldn't move the existing folder aside; left this album "
+                 "alone. See the log above.")
         return {"imported": False, "n_ok": 0, "result": "backup_failed"}
     try:
         with staging_lock():
@@ -1421,9 +1421,9 @@ def _redownload_damaged_album(payload, token):
             # damaged original it replaced. Keep the only copy that may hold
             # more rather than deleting it on the old decode-only gate.
             log.info("  Re-download landed but couldn't be verified as complete "
-                     f"as the original — keeping your backup at {backup}.")
+                     f"as the original; keeping your backup at {backup}.")
         else:
-            log.info("  Re-download didn't complete — restoring the original "
+            log.info("  Re-download didn't complete. Restoring the original "
                      "album folder.")
             restore_upgrade_backup(backup, album_dir)
     return result
@@ -1476,17 +1476,17 @@ def execute_repairs(job, chosen, token):
         time.sleep(cfg.ARTIST_API_DELAY)
     job._progress_scope = None
     if job.cancel_requested:
-        job.summary = (f"Stopped early — {fixed} repaired, "
+        job.summary = (f"Stopped early. {fixed} repaired, "
                        f"{len(chosen) - processed} not started.")
         log.info(job.summary)
         return
-    job.summary = f"Finished — repaired {fixed}/{plural(len(chosen), 'album')}."
+    job.summary = f"Finished. Repaired {fixed}/{plural(len(chosen), 'album')}."
     log.info(job.summary)
     if failed:
-        job.error = f"{failed} of {plural(len(chosen), 'album')} couldn't be repaired — see the log."
+        job.error = f"{failed} of {plural(len(chosen), 'album')} couldn't be repaired; see the log."
 
 
-def run_lyric_retry(job, token):
+def run_lyric_retry(job):
     """Retry lyric fetching for tracks queued from a previous failed run."""
     from qobuz_librarian.integrations.lyrics import (
         _refresh_lyric_retry,
@@ -1502,7 +1502,7 @@ def run_lyric_retry(job, token):
         return
 
     if not lyric_fetch.AVAILABLE:
-        job.summary = ("The syncedlyrics library isn't installed — manifest "
+        job.summary = ("The syncedlyrics library isn't installed; manifest "
                        "preserved for a later retry.")
         log.info(job.summary)
         return
@@ -1510,7 +1510,7 @@ def run_lyric_retry(job, token):
     existing = [Path(p) for p in paths if Path(p).exists()]
     dropped = len(paths) - len(existing)
     if dropped:
-        log.info(f"{dropped} queued path(s) no longer on disk — skipping.")
+        log.info(f"{dropped} queued path(s) no longer on disk; skipping.")
     if not existing:
         save_lyric_retry([])
         job.summary = "All queued files are gone from disk; manifest cleared."
@@ -1532,8 +1532,8 @@ def run_lyric_retry(job, token):
                 should_stop=lambda: job.cancel_requested,
             )
     except Exception as e:
-        job.error = f"Lyric retry failed: {e} — manifest preserved."
-        job.summary = "Lyric retry failed — manifest preserved, will retry next time."
+        job.error = f"Lyric retry failed: {e}; manifest preserved."
+        job.summary = "Lyric retry failed. Manifest preserved, will retry next time."
         log.info(job.error)
         return
 
@@ -1541,10 +1541,10 @@ def run_lyric_retry(job, token):
     remaining = load_lyric_retry()
     resolved = len(existing) - len(remaining)
     if job.cancel_requested:
-        job.summary = (f"Stopped — resolved {resolved}, "
+        job.summary = (f"Stopped. Resolved {resolved}, "
                        f"{plural(len(remaining), 'track')} still queued for retry.")
     elif remaining:
-        job.summary = (f"Resolved {resolved} — {plural(len(remaining), 'track')} "
+        job.summary = (f"Resolved {resolved}. {plural(len(remaining), 'track')} "
                        "still unresolved, will retry next time.")
     else:
         job.summary = f"All {plural(len(existing), 'retried track')} resolved."
@@ -1557,7 +1557,7 @@ def run_library_lyrics(job, *, rescan=False, synced_only=False):
     from qobuz_librarian.library.lyrics import run_library_lyrics as engine
 
     if not HAVE_LYRICS:
-        job.summary = "Lyric fetching isn't available — the syncedlyrics library isn't installed."
+        job.summary = "Lyric fetching isn't available; the syncedlyrics library isn't installed."
         log.info(job.summary)
         return
 
@@ -1605,7 +1605,7 @@ def run_lyrics_for_artist(job, artist_name, *, rescan=False, synced_only=False):
     from qobuz_librarian.library.lyrics import run_library_lyrics as engine
 
     if not HAVE_LYRICS:
-        job.summary = "Lyric fetching isn't available — the syncedlyrics library isn't installed."
+        job.summary = "Lyric fetching isn't available; the syncedlyrics library isn't installed."
         log.info(job.summary)
         return
     artist_dir = resolve_artist_dir(artist_name)
@@ -1668,7 +1668,7 @@ def scan_migration(job, src, dest, *, use_acoustid, in_place=False):
         progress=job.push_progress)
     if job.cancel_requested:
         n = len(items) if items else 0
-        job.summary = (f"Stopped early — {plural(n, 'file')} scanned so far."
+        job.summary = (f"Stopped early. {plural(n, 'file')} scanned so far."
                        if n else "Stopped before anything was scanned.")
         return
     plan = engine.build_plan(items, dest)
@@ -1704,10 +1704,10 @@ def scan_migration(job, src, dest, *, use_acoustid, in_place=False):
     if need and free is not None:
         space = f"≈{format_size(need)} to {verb}, {format_size(free)} free at the destination"
         if need > free:
-            space = ("⚠ not enough free space — needs "
+            space = ("⚠ not enough free space: needs "
                      f"≈{format_size(need)} but only {format_size(free)} is free")
             if in_place:
-                space += (" — the in-place move is blocked unless you re-run with "
+                space += (". The in-place move is blocked unless you re-run with "
                           "“proceed even if low on space” checked")
         parts.append(space)
     job.summary = ("; ".join(parts) + ". Unidentified and skipped files stay "
@@ -1727,7 +1727,7 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
             entries.append(engine.PlanEntry(
                 source=Path(src_s), status=engine.PLACE, dest_rel=Path(dest_s)))
     if not entries:
-        job.push_line("Nothing selected — nothing to copy.")
+        job.push_line("Nothing selected. Nothing to copy.")
         return
 
     plan = engine.MigrationPlan(dest_root=dest, entries=entries)
@@ -1741,7 +1741,7 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
     need, free = engine.space_estimate(plan, in_place=in_place)
     if in_place and free is not None and need > free and not allow_low_space:
         job.error = (
-            f"Not enough free space at {dest} — the move needs about "
+            f"Not enough free space at {dest}: the move needs about "
             f"{format_size(need)} but only {format_size(free)} is free. An "
             "in-place move that runs out mid-run would leave your library "
             "half-relocated. Free up space, choose another destination, or "
@@ -1778,11 +1778,11 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
     if result.lingered:
         parts.append(f"{result.lingered} moved but the original couldn't be removed")
     if result.failed:
-        parts.append(f"{result.failed} failed — see the log")
+        parts.append(f"{result.failed} failed; see the log")
         # Set job.error too (not just the prose summary) so a migration with
         # failed copies ends red, like every other execute path, instead of a
         # green DONE that buries "N failed" mid-sentence.
-        job.error = f"{plural(result.failed, 'file')} couldn't be migrated — see the log."
+        job.error = f"{plural(result.failed, 'file')} couldn't be migrated; see the log."
     if pruned:
         parts.append(f"cleared {plural(pruned, 'empty source folder')}")
     if result.cancelled:

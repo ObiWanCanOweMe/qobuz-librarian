@@ -5,9 +5,7 @@
   themes: night --default, winter;
 }
 
-/* Inter, vendored locally (variable, weights 400–700) so the UI keeps its type
-   on an air-gapped NAS — same reason htmx is vendored. latin + latin-ext cover
-   accented artist names (Sigur Rós, Mötley Crüe) without falling back mid-word. */
+/* Vendored UI font for offline installs; latin-ext covers common artist names. */
 @font-face {
   font-family: "Inter";
   font-style: normal;
@@ -37,33 +35,20 @@
 @layer base {
   html {
     font-family: var(--font-sans);
-    /* Inter's contextual alternates + a single-storey 'a' read cleaner at UI
-       sizes; tabular figures keep counts/sizes/timestamps from jittering. */
+    /* Keep counts, sizes, and timestamps stable while text changes. */
     font-feature-settings: "cv11", "ss01";
   }
 }
 
-/* Brand accent. The logo is teal; the stock night theme's accent is blue, so
-   the two fought on every page. Pull primary onto the logo's teal and let the
-   info/success/warning/error hues stay distinct so colour only ever means
-   status. Everything else inherits night's tuned greys. */
+/* Brand accent: use the logo teal as primary and keep status colours distinct. */
 [data-theme="night"] {
   --color-primary: oklch(79% 0.134 182);
   --color-primary-content: oklch(21% 0.035 196);
-  /* Night's stock body text sits around 84% lightness, which left the dimmed
-     (/50–/60) captions well under WCAG AA. Lifting it to 95% crisps the primary
-     text and rides the muted scale up so /50–/60 clear AA (the /40 incidentals —
-     timestamps, version — land at AA-large, the ceiling for opacity-muting on
-     these backgrounds). */
+  /* Lift body text so muted captions remain readable in dark mode. */
   --color-base-content: oklch(95% 0.012 255);
 }
 
-/* Light theme: a clean cool base (winter) pulled onto the same brand teal.
-   The accent is darkened vs the dark theme so white button text and teal links
-   clear AA on a near-white field (~5:1); winter's body text is darkened so the
-   muted captions ride up; and its stock info is a pale cyan that's unreadable
-   as text, so it's pulled to a real blue that works for both text-info and the
-   info badges/buttons. */
+/* Light theme adjustments for the same brand accent and readable status text. */
 [data-theme="winter"] {
   --color-primary: oklch(50% 0.105 187);
   --color-primary-content: oklch(99% 0.01 187);
@@ -72,54 +57,1409 @@
   --color-info-content: oklch(99% 0.01 245);
 }
 
-/* Core surface treatment. Dark mode keeps a little depth; light mode stays flat
-   and closer to the default daisyUI controls. */
+.btn.btn-primary:not(:disabled):not(.btn-disabled) {
+  background-color: var(--color-primary);
+  border-color: var(--color-primary);
+  color: var(--color-primary-content) !important;
+}
 
-/* Subtle fixed background sheen for dark mode. */
+.btn.btn-primary:not(:disabled):not(.btn-disabled):hover {
+  background-color: color-mix(in oklab, var(--color-primary) 88%, var(--color-base-content));
+  border-color: color-mix(in oklab, var(--color-primary) 88%, var(--color-base-content));
+  color: var(--color-primary-content) !important;
+}
+
+/* Flat, readable surfaces; hierarchy comes from spacing and borders. */
 [data-theme="night"] body {
-  background-image: radial-gradient(118% 72% at 50% -12%,
-    oklch(36% 0.034 200 / 0.30), transparent 58%);
-  background-repeat: no-repeat;
-  background-attachment: fixed;
+  background-color: var(--color-base-100);
 }
 
 /* Keep heading metrics predictable across breakpoints. */
 h1, h2, h3 { letter-spacing: 0; }
 
-/* Sticky header with a light separating rule and backdrop blur. */
-.ql-header {
-  position: sticky; top: 0; z-index: 30;
-  box-shadow: none;
-  border-bottom: 1px solid var(--color-base-300);
-  -webkit-backdrop-filter: saturate(1.1) blur(8px);
-  backdrop-filter: saturate(1.1) blur(8px);
-  background-color: color-mix(in oklab, var(--color-base-200) 90%, transparent);
+/* Search result text wraps on phones, then collapses to one-line rows on wider
+   screens where the action buttons sit beside the title. */
+.ql-clamp-2 {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
 }
-[data-theme="night"] .ql-header { border-bottom-color: oklch(100% 0 0 / 0.08); }
+@media (min-width: 640px) {
+  .ql-sm-truncate {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
+/* App shell. */
+.ql-app-body {
+  color: var(--color-base-content);
+}
+.ql-app-shell {
+  min-height: 100vh;
+}
+@media (min-width: 1024px) {
+  .ql-app-shell {
+    display: grid;
+    grid-template-columns: 240px minmax(0, 1fr);
+  }
+}
+.ql-app-content {
+  min-width: 0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+.ql-sidebar {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  flex-direction: column;
+  justify-content: space-between;
+  border-right: 1px solid var(--color-base-300);
+  background-color: var(--color-base-200);
+  padding: 1rem;
+}
+[data-theme="night"] .ql-sidebar {
+  border-right-color: oklch(100% 0 0 / 0.09);
+  background-color: color-mix(in oklab, var(--color-base-200) 82%, var(--color-base-100));
+}
+.ql-sidebar-top,
+.ql-sidebar-bottom {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1rem;
+}
+.ql-sidebar-brand,
+.ql-mobile-brand {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.625rem;
+  color: var(--color-base-content);
+  font-weight: 700;
+  text-decoration: none;
+}
+.ql-brand-mark {
+  width: 2rem;
+  height: 2rem;
+  flex: none;
+  border-radius: 0.5rem;
+}
+.ql-sidebar-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+}
+.ql-nav-link,
+.ql-sidebar-action {
+  display: flex;
+  min-height: 2.25rem;
+  width: 100%;
+  align-items: center;
+  gap: 0.625rem;
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.625rem;
+  color: color-mix(in oklab, var(--color-base-content) 72%, transparent);
+  font-size: 0.875rem;
+  line-height: 1.2;
+  text-decoration: none;
+}
+.ql-nav-link:hover,
+.ql-sidebar-action:hover {
+  background-color: color-mix(in oklab, var(--color-base-content) 7%, transparent);
+  color: var(--color-base-content);
+}
+.ql-nav-link.is-active {
+  background-color: color-mix(in oklab, var(--color-primary) 16%, transparent);
+  color: var(--color-base-content);
+  font-weight: 650;
+}
+.ql-nav-link svg,
+.ql-sidebar-action svg,
+.ql-icon-button svg,
+.ql-sidebar-alert svg,
+.ql-footer svg {
+  width: 1.125rem;
+  height: 1.125rem;
+  flex: none;
+  fill: currentColor;
+}
+.ql-nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid color-mix(in oklab, var(--color-base-content) 9%, transparent);
+}
+.ql-nav-group-title {
+  padding: 0 0.625rem 0.25rem;
+  color: color-mix(in oklab, var(--color-base-content) 50%, transparent);
+  font-size: 0.8125rem;
+  line-height: 1.2;
+}
+.ql-queue-badge {
+  margin-left: auto;
+  min-width: 1.35rem;
+  border-radius: 0.375rem;
+  background-color: color-mix(in oklab, var(--color-primary) 18%, transparent);
+  color: var(--color-base-content);
+  font-size: 0.6875rem;
+  font-weight: 700;
+  line-height: 1.35rem;
+  text-align: center;
+}
+.ql-queue-badge.is-warning {
+  background-color: color-mix(in oklab, var(--color-warning) 24%, transparent);
+}
+.ql-sidebar-alert {
+  display: flex;
+  gap: 0.625rem;
+  border: 1px solid color-mix(in oklab, var(--color-warning) 32%, transparent);
+  border-radius: 0.5rem;
+  padding: 0.625rem;
+  color: var(--color-base-content);
+  font-size: 0.8125rem;
+  line-height: 1.35;
+  text-decoration: none;
+}
+.ql-sidebar-action {
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+.ql-mobilebar {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  display: flex;
+  min-height: 3.875rem;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  border-bottom: 1px solid var(--color-base-300);
+  background-color: var(--color-base-100);
+  padding: 0.75rem 1rem;
+}
+@media (min-width: 1024px) {
+  .ql-mobilebar {
+    display: none;
+  }
+}
+[data-theme="night"] .ql-mobilebar {
+  border-bottom-color: oklch(100% 0 0 / 0.09);
+}
+.ql-mobile-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+.ql-icon-button {
+  display: inline-grid;
+  width: 2.5rem;
+  height: 2.5rem;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 0.5rem;
+  color: var(--color-base-content);
+  background: transparent;
+}
+.ql-icon-button:hover {
+  background-color: color-mix(in oklab, var(--color-base-content) 7%, transparent);
+}
+.ql-icon-button.is-error {
+  color: var(--color-error);
+  background-color: color-mix(in oklab, var(--color-error) 13%, transparent);
+}
+.ql-icon-button.is-warning {
+  color: var(--color-warning);
+  background-color: color-mix(in oklab, var(--color-warning) 14%, transparent);
+}
+.ql-mobile-dropdown {
+  position: relative;
+}
+.ql-mobile-menu {
+  right: 0;
+  z-index: 60;
+  margin-top: 0.625rem;
+  width: min(22rem, calc(100vw - 2rem));
+  border: 1px solid color-mix(in oklab, var(--color-base-content) 12%, transparent);
+  border-radius: 0.5rem;
+  background-color: var(--color-base-100);
+  padding: 0.375rem;
+  box-shadow: 0 2px 8px oklch(0% 0 0 / 0.16);
+  opacity: 1 !important;
+  transform: none !important;
+  transition: none !important;
+  animation: none !important;
+}
+[data-theme="winter"] .ql-mobile-menu {
+  background-color: #ffffff;
+}
+[data-theme="night"] .ql-mobile-menu {
+  border-color: oklch(100% 0 0 / 0.14);
+  background-color: color-mix(in oklab, var(--color-base-200) 82%, var(--color-base-100));
+  box-shadow:
+    0 2px 8px oklch(0% 0 0 / 0.34),
+    inset 0 1px 0 oklch(100% 0 0 / 0.05);
+}
+details.dropdown.ql-mobile-dropdown:not([open]) > .ql-mobile-menu {
+  display: none;
+}
+details.dropdown.ql-mobile-dropdown[open] > .ql-mobile-menu {
+  display: flex;
+  visibility: visible;
+  opacity: 1 !important;
+  transform: none !important;
+}
+@media (max-width: 520px) {
+  .ql-mobile-dropdown .ql-mobile-menu {
+    position: fixed;
+    top: 3.875rem;
+    right: 1rem;
+    left: 1rem;
+    width: auto;
+  }
+}
+.ql-mobile-menu a,
+.ql-mobile-menu button {
+  min-height: 2.5rem;
+  border-radius: 0.375rem;
+  font-weight: 600;
+}
+.ql-mobile-menu :where(a, button).active {
+  background-color: color-mix(in oklab, var(--color-primary) 16%, transparent);
+  color: var(--color-base-content);
+}
+.ql-mobile-menu-title {
+  margin-top: 0.25rem;
+  border-top: 1px solid color-mix(in oklab, var(--color-base-content) 9%, transparent);
+  padding: 0.75rem 0.75rem 0.25rem;
+  color: color-mix(in oklab, var(--color-base-content) 55%, transparent);
+  font-size: 0.8125rem;
+}
+.ql-cli-banner {
+  border-bottom: 1px solid color-mix(in oklab, var(--color-warning) 32%, transparent);
+  background-color: color-mix(in oklab, var(--color-warning) 18%, var(--color-base-100));
+  padding: 0.75rem 1rem;
+  color: var(--color-base-content);
+  font-size: 0.875rem;
+  text-align: center;
+}
+.ql-cli-banner a {
+  font-weight: 700;
+  text-decoration: underline;
+}
+.ql-main {
+  width: 100%;
+  margin-inline: auto;
+  flex: 1;
+  padding: 1.25rem 1rem 2rem;
+}
+@media (min-width: 768px) {
+  .ql-main {
+    padding: 2rem 2rem 2.5rem;
+  }
+}
+.ql-footer {
+  margin-top: auto;
+  border-top: 1px solid var(--color-base-300);
+}
+[data-theme="night"] .ql-footer {
+  border-top-color: oklch(100% 0 0 / 0.08);
+}
+.ql-footer-inner {
+  display: flex;
+  width: 100%;
+  margin-inline: auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem;
+  color: color-mix(in oklab, var(--color-base-content) 46%, transparent);
+  font-size: 0.75rem;
+}
+@media (min-width: 768px) {
+  .ql-footer-inner {
+    padding-inline: 2rem;
+  }
+}
+.ql-footer a {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  text-decoration: none;
+}
+.ql-footer a:hover {
+  color: color-mix(in oklab, var(--color-base-content) 72%, transparent);
+}
+
+/* Dashboard. */
+.ql-dashboard {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+.ql-dashboard-title {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+@media (min-width: 768px) {
+  .ql-dashboard-title {
+    flex-direction: row;
+    align-items: baseline;
+    justify-content: space-between;
+  }
+}
+.ql-dashboard-title h1 {
+  margin: 0;
+  font-size: clamp(1.45rem, 2vw, 1.9rem);
+  font-weight: 720;
+  line-height: 1.15;
+}
+.ql-dashboard-title p {
+  margin: 0;
+  color: color-mix(in oklab, var(--color-base-content) 52%, transparent);
+  font-size: 0.8125rem;
+}
+.ql-dashboard-notices {
+  display: grid;
+  gap: 0.75rem;
+}
+.ql-dashboard-grid {
+  display: grid;
+  gap: 1rem;
+}
+@media (min-width: 980px) {
+  .ql-dashboard-grid {
+    grid-template-columns: minmax(0, 1.35fr) minmax(18rem, 0.85fr);
+    align-items: start;
+  }
+  .ql-search-panel {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .ql-review-panel {
+    grid-column: 2;
+    grid-row: 1;
+  }
+  .ql-search-results {
+    grid-column: 1 / -1;
+  }
+}
+.ql-panel {
+  border: 1px solid var(--color-base-300);
+  border-radius: 0.625rem;
+  background-color: color-mix(in oklab, var(--color-base-100) 96%, var(--color-base-200));
+  padding: 1rem;
+}
+[data-theme="night"] .ql-panel {
+  border-color: oklch(100% 0 0 / 0.10);
+  background-color: color-mix(in oklab, var(--color-base-100) 88%, var(--color-base-200));
+}
+.ql-panel-header {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.2rem;
+  margin-bottom: 0.875rem;
+}
+.ql-panel-header-row {
+  flex-direction: row;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.ql-panel-header h2 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 700;
+  line-height: 1.25;
+}
+.ql-panel-header p {
+  margin: 0;
+  color: color-mix(in oklab, var(--color-base-content) 56%, transparent);
+  font-size: 0.875rem;
+  line-height: 1.35;
+}
+.ql-panel-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.875rem;
+  align-items: flex-start;
+}
+.ql-local-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.625rem 0.875rem;
+  color: color-mix(in oklab, var(--color-base-content) 66%, transparent);
+  font-size: 0.875rem;
+}
+.ql-local-links a {
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+}
+.ql-search-form {
+  display: grid;
+  gap: 0.75rem;
+}
+.ql-segmented {
+  display: inline-flex;
+  width: fit-content;
+  gap: 0.125rem;
+  border: 1px solid color-mix(in oklab, var(--color-base-content) 13%, transparent);
+  border-radius: 0.5rem;
+  padding: 0.1875rem;
+  background-color: color-mix(in oklab, var(--color-base-content) 4%, transparent);
+}
+.ql-segmented span {
+  display: block;
+  min-width: 4.5rem;
+  border-radius: 0.375rem;
+  padding: 0.45rem 0.75rem;
+  color: color-mix(in oklab, var(--color-base-content) 66%, transparent);
+  font-size: 0.875rem;
+  font-weight: 650;
+  line-height: 1;
+  text-align: center;
+  cursor: pointer;
+}
+.ql-segmented label:has(input:checked) span {
+  background-color: var(--color-primary);
+  color: var(--color-primary-content);
+}
+.ql-segmented label:has(input:focus-visible) span {
+  outline: 2px solid color-mix(in oklab, var(--color-primary) 72%, var(--color-base-content));
+  outline-offset: 2px;
+}
+.ql-search-row {
+  display: flex;
+  min-width: 0;
+  gap: 0.5rem;
+}
+.ql-search-input {
+  min-width: 0;
+  flex: 1 1 auto;
+  height: 2.75rem;
+  font-size: 1rem;
+}
+.ql-search-button {
+  min-height: 2.75rem;
+  gap: 0.45rem;
+}
+@media (max-width: 520px) {
+  .ql-search-row {
+    flex-direction: column;
+  }
+  .ql-search-button {
+    width: 100%;
+  }
+}
+.ql-search-results {
+  min-width: 0;
+}
+.ql-results-panel,
+.ql-queue-card,
+.ql-review-group,
+.ql-progress-panel,
+.ql-connect-cta,
+.ql-auth-panel {
+  border: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
+  border-radius: 0.625rem;
+  background-color: color-mix(in oklab, var(--color-base-100) 94%, var(--color-base-200));
+}
+[data-theme="night"] .ql-results-panel,
+[data-theme="night"] .ql-queue-card,
+[data-theme="night"] .ql-review-group,
+[data-theme="night"] .ql-progress-panel,
+[data-theme="night"] .ql-connect-cta,
+[data-theme="night"] .ql-auth-panel {
+  border-color: oklch(100% 0 0 / 0.10);
+  background-color: color-mix(in oklab, var(--color-base-100) 88%, var(--color-base-200));
+}
+.ql-results-panel,
+.ql-review-group {
+  overflow: hidden;
+}
+.ql-result-list > * + *,
+.ql-version-panel {
+  border-top: 1px solid color-mix(in oklab, var(--color-base-content) 9%, transparent);
+}
+.ql-review-group[open]:not(.ql-review-group--triage) > .ql-review-summary,
+.ql-review-group[open] > .ql-review-group-actions {
+  border-bottom: 1px solid color-mix(in oklab, var(--color-base-content) 9%, transparent);
+}
+[data-theme="night"] .ql-result-list > * + *,
+[data-theme="night"] .ql-version-panel {
+  border-top-color: oklch(100% 0 0 / 0.10);
+}
+[data-theme="night"] .ql-review-group[open]:not(.ql-review-group--triage) > .ql-review-summary,
+[data-theme="night"] .ql-review-group[open] > .ql-review-group-actions {
+  border-bottom-color: oklch(100% 0 0 / 0.10);
+}
+.ql-result-row {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 0.875rem 1rem;
+}
+@media (min-width: 640px) {
+  .ql-result-row {
+    flex-direction: row;
+    gap: 1rem;
+  }
+}
+.ql-result-section {
+  padding: 0.75rem 1rem;
+  background-color: color-mix(in oklab, var(--color-base-content) 3%, transparent);
+}
+.ql-version-button {
+  display: inline-flex;
+  min-height: 2rem;
+  align-items: center;
+  gap: 0.25rem;
+  border: 0;
+  border-radius: 0.375rem;
+  padding: 0.35rem 0.2rem;
+  color: color-mix(in oklab, var(--color-primary) 72%, var(--color-base-content));
+  font-size: 0.8125rem;
+  font-weight: 650;
+  line-height: 1;
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+}
+.ql-version-button:hover {
+  color: var(--color-base-content);
+  background-color: color-mix(in oklab, var(--color-base-content) 5%, transparent);
+}
+.ql-version-panel {
+  padding: 0.5rem 1rem 0.875rem;
+  background-color: color-mix(in oklab, var(--color-base-content) 2%, transparent);
+}
+.ql-version-row {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.5rem;
+  border: 1px solid color-mix(in oklab, var(--color-base-content) 9%, transparent);
+  border-radius: 0.5rem;
+  background-color: color-mix(in oklab, var(--color-base-100) 82%, transparent);
+  padding: 0.625rem 0.75rem;
+}
+@media (min-width: 640px) {
+  .ql-version-row {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.75rem;
+  }
+}
+.ql-queue-card {
+  padding: 1rem;
+}
+.ql-queue-card.is-running {
+  border-color: color-mix(in oklab, var(--color-warning) 32%, transparent);
+}
+.ql-queue-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+.ql-queue-maintenance {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  border: 1px solid color-mix(in oklab, var(--color-error) 22%, transparent);
+  border-radius: 0.625rem;
+  background-color: color-mix(in oklab, var(--color-error) 5%, var(--color-base-100));
+  padding: 1rem;
+}
+[data-theme="night"] .ql-queue-maintenance {
+  border-color: color-mix(in oklab, var(--color-error) 28%, transparent);
+  background-color: color-mix(in oklab, var(--color-error) 8%, var(--color-base-100));
+}
+@media (max-width: 520px) {
+  .ql-queue-card-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+  .ql-queue-card-actions .btn {
+    min-width: 5.25rem;
+  }
+  .ql-queue-maintenance {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
+.ql-progress-panel {
+  padding: 1rem;
+}
+.ql-connect-cta {
+  padding: 1.25rem;
+}
+.ql-connect-inline {
+  border-top: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
+  padding-top: 1rem;
+}
+[data-theme="night"] .ql-connect-inline {
+  border-top-color: oklch(100% 0 0 / 0.10);
+}
+.ql-auth-body {
+  padding: 1.5rem;
+}
+.ql-auth-panel {
+  box-shadow: 0 18px 36px -30px oklch(0% 0 0 / 0.45);
+}
+@media (min-width: 640px) {
+  .ql-connect-cta {
+    padding: 1.5rem;
+  }
+}
+.ql-list {
+  display: grid;
+  gap: 0.5rem;
+}
+.ql-row,
+.ql-job-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.875rem;
+  border: 1px solid color-mix(in oklab, var(--color-base-content) 9%, transparent);
+  border-radius: 0.5rem;
+  padding: 0.75rem;
+  background-color: color-mix(in oklab, var(--color-base-content) 2%, transparent);
+}
+.ql-job-row {
+  align-items: flex-start;
+}
+.ql-row-main {
+  min-width: 0;
+}
+.ql-row-title {
+  margin: 0;
+  color: var(--color-base-content);
+  font-size: 0.9375rem;
+  font-weight: 650;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+.ql-row-link {
+  display: inline-block;
+  text-decoration: none;
+}
+.ql-row-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+}
+.ql-row-meta {
+  margin: 0.2rem 0 0;
+  color: color-mix(in oklab, var(--color-base-content) 56%, transparent);
+  font-size: 0.8125rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.ql-row-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+  margin-bottom: 0.35rem;
+}
+.ql-status-chip,
+.ql-result-label {
+  display: inline-flex;
+  width: fit-content;
+  align-items: center;
+  border: 1px solid color-mix(in oklab, var(--color-base-content) 12%, transparent);
+  border-radius: 0.375rem;
+  padding: 0.2rem 0.45rem;
+  color: color-mix(in oklab, var(--color-base-content) 70%, transparent);
+  font-size: 0.75rem;
+  font-weight: 650;
+  line-height: 1.15;
+  white-space: nowrap;
+}
+.ql-status-chip.is-warning {
+  border-color: color-mix(in oklab, var(--color-warning) 32%, transparent);
+  color: var(--color-warning);
+}
+.ql-status-chip.is-success {
+  border-color: color-mix(in oklab, var(--color-success) 34%, transparent);
+  color: var(--color-success);
+}
+.ql-status-chip.is-info {
+  border-color: color-mix(in oklab, var(--color-info) 34%, transparent);
+  color: var(--color-info);
+  background-color: color-mix(in oklab, var(--color-info) 8%, transparent);
+}
+.ql-status-chip.is-neutral {
+  border-color: color-mix(in oklab, var(--color-base-content) 16%, transparent);
+  color: color-mix(in oklab, var(--color-base-content) 58%, transparent);
+}
+.ql-status-chip.is-active {
+  border-color: color-mix(in oklab, var(--color-primary) 38%, transparent);
+  color: color-mix(in oklab, var(--color-primary) 72%, var(--color-base-content));
+  background-color: color-mix(in oklab, var(--color-primary) 9%, transparent);
+}
+.ql-status-chip.is-error {
+  border-color: color-mix(in oklab, var(--color-error) 34%, transparent);
+  color: var(--color-error);
+}
+.ql-status-chip.hidden,
+.ql-result-label.hidden,
+.ql-queue-badge.hidden,
+.badge.hidden {
+  display: none !important;
+}
+[data-theme="winter"] .ql-status-chip.is-warning {
+  border-color: rgb(245 158 11 / 0.42);
+  color: #92400e;
+  background-color: rgb(245 158 11 / 0.11);
+}
+[data-theme="winter"] .ql-status-chip.is-active {
+  color: #0f766e;
+  border-color: rgb(15 118 110 / 0.38);
+  background-color: rgb(15 118 110 / 0.09);
+}
+[data-theme="winter"] .ql-status-chip.is-success {
+  color: #047857;
+  border-color: rgb(4 120 87 / 0.36);
+  background-color: rgb(4 120 87 / 0.08);
+}
+[data-theme="winter"] .ql-status-chip.is-error {
+  color: #dc2626;
+  border-color: rgb(220 38 38 / 0.34);
+  background-color: rgb(220 38 38 / 0.07);
+}
+.ql-job-status {
+  max-width: 100%;
+}
+.ql-tab-count {
+  display: inline-grid;
+  min-width: 1.25rem;
+  height: 1.25rem;
+  place-items: center;
+  border-radius: 0.375rem;
+  padding-inline: 0.35rem;
+  background-color: color-mix(in oklab, var(--color-base-content) 9%, transparent);
+  color: color-mix(in oklab, var(--color-base-content) 72%, transparent);
+  font-size: 0.6875rem;
+  font-weight: 700;
+  line-height: 1;
+}
+.ql-tab-count.is-warning {
+  background-color: color-mix(in oklab, var(--color-warning) 22%, transparent);
+  color: var(--color-warning);
+}
+.ql-row-action {
+  flex: none;
+}
+@media (max-width: 520px) {
+  .ql-recent-row {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 0.625rem;
+  }
+}
+.ql-review-summary-row {
+  top: 0;
+}
+.ql-review-summary-copy {
+  min-width: 0;
+  color: color-mix(in oklab, var(--color-base-content) 70%, transparent);
+  font-size: 0.875rem;
+  line-height: 1.35;
+}
+.ql-review-summary-copy [data-summary-count] {
+  color: var(--color-base-content);
+  font-weight: 650;
+}
+.ql-review-summary-copy > * + * {
+  margin-top: 0.125rem;
+}
+.ql-review-candidates {
+  padding-bottom: 7.5rem;
+}
+@media (max-width: 1023.98px) {
+  .ql-review-summary-row {
+    top: 4rem;
+  }
+}
+@media (min-width: 640px) {
+  .ql-review-candidates {
+    padding-bottom: 5rem;
+  }
+}
+.ql-empty-line {
+  border: 1px solid color-mix(in oklab, var(--color-base-content) 9%, transparent);
+  border-radius: 0.5rem;
+  background-color: color-mix(in oklab, var(--color-base-content) 2%, transparent);
+  padding: 0.875rem;
+  color: color-mix(in oklab, var(--color-base-content) 56%, transparent);
+  font-size: 0.875rem;
+  line-height: 1.35;
+}
+[data-theme="night"] .ql-empty-line {
+  border-color: oklch(100% 0 0 / 0.10);
+  background-color: oklch(100% 0 0 / 0.025);
+}
 
 @media (max-width: 360px) {
   .ql-brand-full { display: none; }
   .ql-brand-short { display: inline; }
 }
 
-/* Dark-mode cards get depth; light-mode cards keep daisyUI's flatter default. */
-[data-theme="night"] .card {
-  box-shadow:
-    inset 0 1px 0 0 oklch(100% 0 0 / 0.05),
-    0 1px 2px oklch(0% 0 0 / 0.22),
-    0 16px 32px -20px oklch(0% 0 0 / 0.62);
+/* Segmented tabs for small two-option switches. */
+.ql-tabs {
+  display: flex;
+  width: 100%;
+  gap: 0.25rem;
+  padding: 0.25rem;
+  border: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
+  border-radius: 0.75rem;
+  background-color: color-mix(in oklab, var(--color-base-200) 72%, transparent);
+}
+.ql-tabs .tab {
+  position: relative;
+  flex: 1 1 0;
+  justify-content: center;
+  min-height: 2.5rem;
+  border-radius: 0.55rem;
+  color: color-mix(in oklab, var(--color-base-content) 68%, transparent);
+  transition: background-color 140ms ease, box-shadow 140ms ease, color 140ms ease;
+}
+.ql-tabs .tab:hover {
+  background-color: color-mix(in oklab, var(--color-base-content) 6%, transparent);
+  color: var(--color-base-content);
+}
+.ql-tabs .tab-active {
+  color: var(--color-primary-content);
+  background-color: var(--color-primary);
+  box-shadow: 0 8px 18px -14px oklch(0% 0 0 / 0.46);
+}
+.ql-tabs .tab-active::after {
+  content: none;
+}
+[data-theme="night"] .ql-tabs {
+  border-color: oklch(100% 0 0 / 0.11);
+  background-color: oklch(100% 0 0 / 0.035);
+}
+[data-theme="night"] .ql-tabs .tab {
+  color: oklch(86% 0.03 255 / 0.78);
+}
+[data-theme="night"] .ql-tabs .tab:hover {
+  color: oklch(96% 0.02 255);
+  background-color: oklch(100% 0 0 / 0.065);
+}
+[data-theme="night"] .ql-tabs .tab-active {
+  color: var(--color-primary-content);
 }
 
-/* Small hover lift for dashboard action tiles. */
-.ql-tile { transition: transform 140ms ease, border-color 140ms ease, background-color 140ms ease; }
-.ql-tile:hover { transform: translateY(-2px); }
-.ql-tile:active { transform: translateY(0); }
-@media (hover: none) { .ql-tile:hover { transform: none; } }
+.ql-secondary-action {
+  border-color: color-mix(in oklab, var(--color-base-content) 36%, transparent);
+  color: var(--color-base-content);
+  background-color: color-mix(in oklab, var(--color-base-content) 3%, transparent);
+  font-weight: 650;
+}
+.ql-secondary-action:hover {
+  border-color: color-mix(in oklab, var(--color-base-content) 50%, transparent);
+  color: var(--color-base-content);
+  background-color: color-mix(in oklab, var(--color-base-content) 7%, transparent);
+}
+[data-theme="night"] .ql-secondary-action {
+  border-color: oklch(100% 0 0 / 0.22);
+  color: oklch(88% 0.03 255 / 0.88);
+  background-color: oklch(100% 0 0 / 0.035);
+}
+[data-theme="night"] .ql-secondary-action:hover {
+  border-color: oklch(100% 0 0 / 0.34);
+  color: oklch(96% 0.02 255);
+  background-color: oklch(100% 0 0 / 0.07);
+}
 
-/* Compact section label. */
-.ql-eyebrow {
-  font-size: 0.6875rem; font-weight: 600; letter-spacing: 0;
-  text-transform: uppercase; opacity: 0.5;
+.ql-empty-state {
+  border: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
+  border-radius: 0.625rem;
+  background-color: color-mix(in oklab, var(--color-base-200) 44%, transparent);
+  padding: 1.25rem;
+  text-align: center;
+}
+[data-theme="night"] .ql-empty-state {
+  border-color: oklch(100% 0 0 / 0.10);
+  background-color: oklch(100% 0 0 / 0.028);
+}
+@media (min-width: 640px) {
+  .ql-empty-state {
+    padding: 1.5rem;
+  }
+}
+
+/* Focused maintenance tools, used where a page has one primary action. */
+.ql-tool-panel {
+  border: 1px solid var(--color-base-300);
+  border-radius: 0.75rem;
+  background-color: color-mix(in oklab, var(--color-base-100) 94%, var(--color-base-200));
+}
+.ql-tool-panel-body {
+  padding: 1.25rem;
+}
+@media (min-width: 640px) {
+  .ql-tool-panel-body {
+    padding: 1.5rem;
+  }
+}
+[data-theme="night"] .ql-tool-panel {
+  border-color: oklch(100% 0 0 / 0.08);
+  background-color: color-mix(in oklab, var(--color-base-100) 84%, var(--color-base-200));
+  box-shadow:
+    inset 0 1px 0 0 oklch(100% 0 0 / 0.04),
+    0 18px 36px -28px oklch(0% 0 0 / 0.7);
+}
+@media (min-width: 640px) {
+  .ql-tool-panel form .btn-primary {
+    min-width: 13rem;
+  }
+}
+.ql-tool-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  border: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
+  border-radius: 0.5rem;
+  background-color: color-mix(in oklab, var(--color-base-content) 2%, transparent);
+  padding: 0.75rem 0.875rem;
+  color: color-mix(in oklab, var(--color-base-content) 60%, transparent);
+  font-size: 0.875rem;
+}
+[data-theme="night"] .ql-tool-status {
+  border-color: oklch(100% 0 0 / 0.10);
+  background-color: oklch(100% 0 0 / 0.028);
+}
+.ql-tool-note {
+  border-radius: 0.625rem;
+  padding: 0.875rem 1rem;
+  font-size: 0.875rem;
+  line-height: 1.45;
+}
+.ql-tool-note-warning {
+  border: 1px solid color-mix(in oklab, var(--color-warning) 36%, transparent);
+  background-color: color-mix(in oklab, var(--color-warning) 12%, transparent);
+}
+.ql-tool-note-info {
+  border: 1px solid color-mix(in oklab, var(--color-info) 34%, transparent);
+  background-color: color-mix(in oklab, var(--color-info) 10%, transparent);
+}
+.ql-tool-action {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1rem;
+  border: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
+  border-radius: 0.625rem;
+  background-color: color-mix(in oklab, var(--color-base-content) 2%, transparent);
+  padding: 1rem;
+}
+.ql-tool-action-title {
+  margin: 0;
+  color: var(--color-base-content);
+  font-size: 1rem;
+  font-weight: 700;
+  line-height: 1.3;
+}
+.ql-tool-action-text {
+  margin: 0.2rem 0 0;
+  color: color-mix(in oklab, var(--color-base-content) 56%, transparent);
+  font-size: 0.875rem;
+  line-height: 1.35;
+}
+@media (min-width: 640px) {
+  .ql-tool-action {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .ql-tool-action form {
+    flex: none;
+  }
+}
+[data-theme="night"] .ql-tool-action {
+  border-color: oklch(100% 0 0 / 0.10);
+  background-color: oklch(100% 0 0 / 0.028);
+}
+
+.ql-settings-stack {
+  display: grid;
+  gap: 1rem;
+}
+@media (min-width: 640px) {
+  .ql-settings-stack {
+    gap: 1.25rem;
+  }
+}
+
+.ql-mode-row {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.875rem;
+  border: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
+  border-radius: 0.625rem;
+  background-color: color-mix(in oklab, var(--color-base-content) 3%, transparent);
+  padding: 0.875rem 1rem;
+}
+.ql-mode-state {
+  margin: 0 0 0.125rem;
+  color: var(--color-base-content);
+  font-weight: 650;
+}
+@media (min-width: 640px) {
+  .ql-mode-row {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+  }
+}
+[data-theme="night"] .ql-mode-row {
+  border-color: oklch(100% 0 0 / 0.11);
+  background-color: oklch(100% 0 0 / 0.035);
+}
+
+.ql-diagnostics-list {
+  display: grid;
+  gap: 0;
+}
+.ql-diagnostic-row {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 1.5rem minmax(0, 1fr);
+  gap: 0.75rem;
+  border-top: 1px solid color-mix(in oklab, var(--color-base-content) 8%, transparent);
+  padding-block: 0.625rem;
+}
+.ql-diagnostic-row:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+.ql-diagnostic-row:last-child {
+  padding-bottom: 0;
+}
+.ql-diagnostic-status {
+  display: inline-grid;
+  min-width: 2.75rem;
+  min-height: 1.375rem;
+  place-items: center;
+  padding-inline: 0.35rem;
+  border-radius: 0.375rem;
+  font-size: 0.625rem;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0;
+}
+.ql-diagnostic-status-ok {
+  background-color: color-mix(in oklab, var(--color-success) 24%, transparent);
+  color: color-mix(in oklab, var(--color-success) 80%, var(--color-base-content));
+}
+.ql-diagnostic-status-error {
+  background-color: color-mix(in oklab, var(--color-error) 20%, transparent);
+  color: color-mix(in oklab, var(--color-error) 82%, var(--color-base-content));
+}
+.ql-diagnostic-label {
+  color: var(--color-base-content);
+  font-size: 0.875rem;
+  font-weight: 650;
+  line-height: 1.35;
+}
+.ql-diagnostic-detail {
+  margin-top: 0.15rem;
+  color: color-mix(in oklab, var(--color-base-content) 58%, transparent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 0.7rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+[data-theme="night"] .ql-diagnostic-row {
+  border-top-color: oklch(100% 0 0 / 0.09);
+}
+
+.ql-action-group {
+  border-top: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
+  padding-top: 1rem;
+}
+.ql-action-group:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+[data-theme="night"] .ql-action-group {
+  border-top-color: oklch(100% 0 0 / 0.10);
+}
+
+.ql-option-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+  border: 1px solid var(--color-base-300);
+  border-radius: 0.625rem;
+  background-color: color-mix(in oklab, var(--color-base-100) 76%, transparent);
+  padding: 0.875rem 1rem;
+  cursor: pointer;
+}
+.ql-option-row:hover {
+  border-color: color-mix(in oklab, var(--color-base-content) 18%, transparent);
+}
+[data-theme="night"] .ql-option-row {
+  border-color: oklch(100% 0 0 / 0.10);
+  background-color: oklch(100% 0 0 / 0.035);
+}
+
+.ql-disclosure-summary {
+  display: flex;
+  min-height: 2.5rem;
+  width: 100%;
+  cursor: pointer;
+  user-select: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  border: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
+  border-radius: 0.5rem;
+  background-color: color-mix(in oklab, var(--color-base-content) 3%, transparent);
+  padding: 0.5rem 0.75rem;
+  color: color-mix(in oklab, var(--color-base-content) 72%, transparent);
+  font-size: 0.875rem;
+  font-weight: 650;
+  line-height: 1.25;
+}
+.ql-disclosure-summary::after {
+  content: "";
+  width: 0.45rem;
+  height: 0.45rem;
+  flex: none;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: rotate(45deg);
+}
+details[open] > .ql-disclosure-summary::after {
+  transform: rotate(225deg);
+}
+.ql-disclosure-summary:hover {
+  background-color: color-mix(in oklab, var(--color-base-content) 6%, transparent);
+  color: var(--color-base-content);
+}
+.ql-disclosure-summary:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+.ql-review-summary {
+  display: flex;
+  cursor: pointer;
+  user-select: none;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0.75rem;
+  padding: 0.75rem 0.875rem;
+  transition: background-color 140ms ease;
+}
+.ql-review-summary:hover {
+  background-color: color-mix(in oklab, var(--color-base-content) 5%, transparent);
+}
+.ql-review-title {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.375rem;
+  overflow: visible;
+}
+.ql-review-title-main {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-weight: 600;
+}
+.ql-review-title-meta {
+  flex: 0 0 auto;
+  font-size: 0.8125rem;
+  color: color-mix(in oklab, var(--color-base-content) 50%, transparent);
+}
+@media (min-width: 640px) {
+  .ql-review-title-meta::before {
+    content: "· ";
+  }
+}
+.ql-review-group-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.625rem;
+  padding: 0.125rem 0.875rem 0.75rem 0.875rem;
+}
+.ql-review-artist-select {
+  display: inline-flex;
+  min-height: 2rem;
+  min-width: 0;
+  cursor: pointer;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8125rem;
+  color: color-mix(in oklab, var(--color-base-content) 65%, transparent);
+}
+@media (max-width: 639px) {
+  .ql-review-group-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .ql-review-group-actions .ql-review-artist-select,
+  .ql-review-group-actions .btn {
+    width: 100%;
+    justify-content: center;
+    min-height: 2rem;
+  }
+}
+.ql-job-summary {
+  border: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
+  border-radius: 0.625rem;
+  background-color: color-mix(in oklab, var(--color-base-100) 82%, var(--color-base-200));
+  color: color-mix(in oklab, var(--color-base-content) 74%, transparent);
+  padding: 0.875rem 1rem;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+[data-theme="night"] .ql-job-summary {
+  border-color: oklch(100% 0 0 / 0.10);
+  background-color: oklch(100% 0 0 / 0.035);
+}
+.ql-review-candidate {
+  display: flex;
+  cursor: pointer;
+  align-items: center;
+  gap: 0.75rem;
+  border: 1px solid color-mix(in oklab, var(--color-base-content) 8%, transparent);
+  border-radius: 0.5rem;
+  background-color: color-mix(in oklab, var(--color-base-100) 82%, transparent);
+  padding: 0.625rem 0.75rem;
+  transition: border-color 140ms ease, background-color 140ms ease;
+}
+.ql-review-candidate:hover {
+  border-color: color-mix(in oklab, var(--color-base-content) 18%, transparent);
+}
+
+.ql-path-checks,
+.ql-definition-list {
+  border-block: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
+}
+[data-theme="night"] .ql-path-checks,
+[data-theme="night"] .ql-definition-list {
+  border-block-color: oklch(100% 0 0 / 0.10);
+}
+.ql-path-check {
+  display: flex;
+  gap: 0.75rem;
+  padding-block: 0.75rem;
+}
+.ql-path-check + .ql-path-check {
+  border-top: 1px solid color-mix(in oklab, var(--color-base-content) 8%, transparent);
+}
+[data-theme="night"] .ql-path-check + .ql-path-check {
+  border-top-color: oklch(100% 0 0 / 0.08);
+}
+.ql-path-check-icon {
+  flex: none;
+  margin-top: 0.125rem;
+}
+.ql-definition-list > div {
+  display: grid;
+  gap: 0.25rem;
+  padding-block: 0.875rem;
+}
+.ql-definition-list > div + div {
+  border-top: 1px solid color-mix(in oklab, var(--color-base-content) 8%, transparent);
+}
+[data-theme="night"] .ql-definition-list > div + div {
+  border-top-color: oklch(100% 0 0 / 0.08);
+}
+.ql-definition-list dt {
+  font-weight: 600;
+}
+.ql-definition-list dd {
+  color: color-mix(in oklab, var(--color-base-content) 58%, transparent);
+  font-size: 0.875rem;
+}
+.ql-step-number {
+  display: inline-flex;
+  width: 1.5rem;
+  height: 1.5rem;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background-color: var(--color-primary);
+  color: var(--color-primary-content);
+  font-size: 0.75rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+/* Quiet explanatory notice for settings that affect saved configuration. */
+.ql-settings-notice {
+  border: 1px solid color-mix(in oklab, var(--color-info) 28%, transparent);
+  border-radius: 0.75rem;
+  background-color: color-mix(in oklab, var(--color-info) 8%, var(--color-base-100));
+  padding: 0.875rem 1rem;
+}
+[data-theme="night"] .ql-settings-notice {
+  border-color: color-mix(in oklab, var(--color-info) 22%, transparent);
+  background-color: color-mix(in oklab, var(--color-info) 10%, var(--color-base-200));
+}
+
+/* Password/token reveal controls live inside the input so they don't squeeze
+   long secret fields on narrow screens. */
+.ql-secret-toggle {
+  position: absolute;
+  inset-block: 0;
+  right: 0;
+  display: grid;
+  width: 3rem;
+  place-items: center;
+  border-radius: 0 0.5rem 0.5rem 0;
+  color: color-mix(in oklab, var(--color-base-content) 62%, transparent);
+}
+.ql-secret-toggle:hover {
+  background-color: color-mix(in oklab, var(--color-base-content) 8%, transparent);
+  color: var(--color-base-content);
+}
+.ql-secret-toggle:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: -2px;
+}
+
+/* Settings credentials use a stacked label/input rhythm at every width. */
+.ql-credentials-form .form-control {
+  display: block;
+}
+.ql-credentials-form .label {
+  display: flex;
+  width: fit-content;
+  padding: 0 0 0.25rem;
+}
+
+/* Form focus should look deliberate, not like the browser default outline. */
+:where(.input, .textarea, .select):focus,
+:where(.input, .textarea, .select):focus-within {
+  border-color: var(--color-primary);
+  outline: 0;
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--color-primary) 34%, transparent);
 }
 
 /* Monospace numeric readouts for counts, sizes, tiers, and progress phases. */
@@ -137,12 +1477,9 @@ h1, h2, h3 { letter-spacing: 0; }
   border-radius: 0.625rem;
 }
 .ql-notice-info    { --ql-seam: var(--color-info); }
-.ql-notice-success { --ql-seam: var(--color-success); }
 .ql-notice-warning { --ql-seam: var(--color-warning); }
 
-/* Log/scan console — a deliberate terminal look. Dark in both themes would read
-   as washed-out on a light page, so it follows the theme: a GitHub-style light
-   code block under winter, the dark console under night. */
+/* Log/scan console follows the active theme. */
 .log-console {
   font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
   font-size: 0.78rem;
@@ -165,14 +1502,43 @@ h1, h2, h3 { letter-spacing: 0; }
 }
 [data-theme="winter"] .log-console:empty::before { color: #8c959f; }
 
-/* Quality badges read as coloured text + border on a transparent badge, so the
-   hues need enough contrast against each theme's surface. */
-.quality-hires { color: #7ee787; }
-.quality-cd    { color: #79c0ff; }
-.quality-lossy { color: #f78166; }
-[data-theme="winter"] .quality-hires { color: #15803d; }
-[data-theme="winter"] .quality-cd    { color: #1d4ed8; }
-[data-theme="winter"] .quality-lossy { color: #c2410c; }
+/* Quality badges use a faint fill so small borders render consistently. */
+.quality-hires {
+  color: #a7f3d0;
+  background-color: rgb(46 160 67 / 0.16);
+  border-color: rgb(126 231 135 / 0.58);
+}
+.quality-cd {
+  color: #9ecbff;
+  background-color: rgb(56 139 253 / 0.15);
+  border-color: rgb(121 192 255 / 0.58);
+}
+.quality-lossy {
+  color: #ffab91;
+  background-color: rgb(247 129 102 / 0.15);
+  border-color: rgb(247 129 102 / 0.58);
+}
+[data-theme="winter"] .quality-hires {
+  color: #166534;
+  background-color: rgb(22 163 74 / 0.11);
+  border-color: rgb(22 163 74 / 0.32);
+}
+[data-theme="winter"] .quality-cd {
+  color: #1e40af;
+  background-color: rgb(37 99 235 / 0.10);
+  border-color: rgb(37 99 235 / 0.30);
+}
+[data-theme="winter"] .quality-lossy {
+  color: #9a3412;
+  background-color: rgb(234 88 12 / 0.10);
+  border-color: rgb(234 88 12 / 0.32);
+}
+[data-version-toggle] [data-version-icon] {
+  transition: transform 140ms ease;
+}
+[data-version-toggle][aria-expanded="true"] [data-version-icon] {
+  transform: rotate(180deg);
+}
 
 /* htmx spinners must not reserve layout while idle — only occupy space during
    an in-flight request. */
@@ -184,21 +1550,11 @@ h1, h2, h3 { letter-spacing: 0; }
 [data-theme="night"] .theme-when-light { display: none; }
 [data-theme="winter"] .theme-when-dark { display: none; }
 
-/* Hiding an artist group fades it while htmx swaps it out; app.js collapses
-   its height in the same window so the rows below slide up to fill the gap
-   instead of the group blinking out. */
+/* Coordinate with app.js when htmx removes an artist group. */
 details[data-artist].htmx-swapping {
   opacity: 0;
   transition: opacity 200ms ease;
 }
-
-/* New artist groups ease in as a running scan turns them up, rather than
-   popping into the list. */
-@keyframes ql-enter {
-  from { opacity: 0; transform: translateY(6px); }
-  to   { opacity: 1; transform: none; }
-}
-.ql-enter { animation: ql-enter 220ms ease both; }
 
 /* Honour a reduced-motion preference everywhere: collapse transitions and
    animations to a hair rather than zero so state changes (a hide, a swap)

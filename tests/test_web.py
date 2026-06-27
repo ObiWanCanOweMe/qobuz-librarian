@@ -5,8 +5,10 @@ hide/restore round-trip, migration move-vs-copy, persist-without-tearing),
 auth/session/CSRF, the run-lock destructive-route guard, settings save/load,
 one search + one approve endpoint, and a few genuinely tricky bits of logic.
 """
+import asyncio
 import time
 
+import httpx
 import pytest
 
 from qobuz_librarian.web import jobs as jm
@@ -113,6 +115,102 @@ def test_late_cancel_does_not_discard_a_parked_review():
     assert len(job.candidates) == 1
 
 
+def test_per_artist_rescan_supersedes_only_that_artists_parked_review():
+    # Two artists each have a scan parked for review. Submitting a *different*
+    # artist's scan of the same kind must leave both parked reviews untouched —
+    # the dedup keys on artist+kind, not kind alone. Keying on kind alone would
+    # silently throw away the first artist's un-reviewed candidates. Re-scanning
+    # the *same* artist still supersedes that artist's now-stale review.
+    from qobuz_librarian.web import app as app_mod
+
+    def _park(artist):
+        j = jm.Job(title="Artist scan", artist=artist)
+        j.execute_kind = "album"
+        j.status = jm.JobStatus.AWAITING_REVIEW
+        jm.registry.add(j)
+        return j
+
+    a = _park("Artist A")
+    b = _park("Artist B")
+    noop_scan, noop_exec = (lambda j: None), (lambda j, chosen: None)
+
+    fresh = jm.Job(title="Artist scan", artist="Artist C")
+    fresh.execute_kind = "album"
+    app_mod._submit_scan_deduped(fresh, noop_scan, noop_exec, "album")
+    assert a.status == jm.JobStatus.AWAITING_REVIEW
+    assert b.status == jm.JobStatus.AWAITING_REVIEW
+
+    rescan = jm.Job(title="Artist scan", artist="Artist A")
+    rescan.execute_kind = "album"
+    app_mod._submit_scan_deduped(rescan, noop_scan, noop_exec, "album")
+    assert a.status == jm.JobStatus.CANCELED
+    assert b.status == jm.JobStatus.AWAITING_REVIEW
+
+
+def test_download_dedup_respects_new_edition_and_single_track_intent():
+    # Folding a /download onto an in-flight job must respect intent, not just the
+    # album id: "get this edition too" is a deliberate extra copy and a one-track
+    # grab is its own thing — neither should be swallowed by an unrelated job for
+    # the same album, and a full-album download must not fold onto a one-track grab.
+    from qobuz_librarian.web import app as app_mod
+
+    full = jm.Job(title="Album X", artist="Artist", album_id="X")
+    full.status = jm.JobStatus.RUNNING
+    jm.registry.add(full)
+
+    assert app_mod._duplicate_download_job("X") is full
+    assert app_mod._duplicate_download_job("X", as_new_edition=True) is None
+    assert app_mod._duplicate_download_job("X", track_id="42") is None
+
+    grab = jm.Job(title="One track", artist="Artist", album_id="Y")
+    grab.single = {"album_id": "Y", "track_id": "7"}
+    grab.status = jm.JobStatus.RUNNING
+    jm.registry.add(grab)
+
+    assert app_mod._duplicate_download_job("Y", track_id="7") is grab
+    assert app_mod._duplicate_download_job("Y", track_id="8") is None
+    assert app_mod._duplicate_download_job("Y") is None
+
+
+def test_cancel_while_queued_finalizes_and_worker_skips_it():
+    # A scan queued behind a busy lane, cancelled before it starts, is finalized
+    # to CANCELED at once (it doesn't linger as "Queued" until the job ahead of
+    # it finishes), and when the lane frees the worker drops it rather than
+    # running it.
+    import threading
+
+    jm.start_worker()
+    release = threading.Event()
+    holding = threading.Event()
+
+    holder = jm.Job(title="lane holder")
+    holder.kind = "scan"
+
+    def _hold(j):
+        holding.set()
+        release.wait(timeout=5)
+
+    jm.registry.add(holder)
+    jm._scan_queue.put((holder, _hold))
+    assert holding.wait(timeout=5)
+
+    ran = threading.Event()
+    queued = jm.Job(title="queued scan")
+    queued.kind = "scan"
+    jm.registry.add(queued)
+    jm._scan_queue.put((queued, lambda j: ran.set()))
+
+    assert queued.status == jm.JobStatus.PENDING
+    assert jm.request_cancel(queued) is True
+    assert queued.status == jm.JobStatus.CANCELED
+    assert queued not in jm.registry.pending_and_running()
+
+    release.set()
+    assert _wait_for(lambda: holder.status == jm.JobStatus.DONE)
+    assert not ran.wait(timeout=0.5)
+    assert queued.status == jm.JobStatus.CANCELED
+
+
 def test_approve_flips_status_then_passes_chosen_to_execute(monkeypatch):
     job = jm.Job(title="scan-approve")
     job.kind = "scan"
@@ -143,13 +241,99 @@ def test_approve_flips_status_then_passes_chosen_to_execute(monkeypatch):
 
 # ── app.py: HTTP routes ───────────────────────────────────────────────────────
 
-@pytest.fixture
-def client():
-    from fastapi.testclient import TestClient
+class _SameThreadASGIClient:
+    """Small sync wrapper around HTTPX's ASGI transport.
 
-    from qobuz_librarian.web.app import app
-    with TestClient(app) as c:
-        c.get("/")
+    Starlette's TestClient uses a cross-thread AnyIO portal. That portal can
+    hang in some local Python environments before the app sees a request, so
+    these route tests drive the async FastAPI routes on the calling thread.
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self.base_url = "http://testserver"
+        self.cookies = httpx.Cookies()
+        self.headers = httpx.Headers()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def request(self, method, url, **kwargs):
+        extra_headers = kwargs.pop("headers", None)
+        headers = httpx.Headers(self.headers)
+        if extra_headers:
+            headers.update(extra_headers)
+        follow_redirects = kwargs.pop("follow_redirects", True)
+
+        async def _send():
+            transport = httpx.ASGITransport(app=self.app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url=self.base_url,
+                cookies=self.cookies,
+                headers=headers,
+                follow_redirects=follow_redirects,
+            ) as ac:
+                response = await ac.request(method, url, **kwargs)
+                self.cookies.update(ac.cookies)
+                return response
+
+        return asyncio.run(_send())
+
+    def get(self, url, **kwargs):
+        return self.request("GET", url, **kwargs)
+
+    def post(self, url, **kwargs):
+        return self.request("POST", url, **kwargs)
+
+    def stream(self, method, url, **kwargs):
+        return _ResponseContext(self.request(method, url, **kwargs))
+
+
+class _ResponseContext:
+    def __init__(self, response):
+        self.response = response
+
+    def __enter__(self):
+        return self.response
+
+    def __exit__(self, *_exc):
+        try:
+            self.response.close()
+        except RuntimeError:
+            pass
+        return False
+
+
+class _InlineExecutorLoop:
+    async def run_in_executor(self, _executor, fn, *args):
+        return fn(*args)
+
+
+class _InlineExecutorAsyncio:
+    def __init__(self, real_asyncio):
+        self._real_asyncio = real_asyncio
+
+    def get_running_loop(self):
+        return _InlineExecutorLoop()
+
+    def __getattr__(self, name):
+        return getattr(self._real_asyncio, name)
+
+
+def _run_web_executors_inline(monkeypatch, app_mod):
+    monkeypatch.setattr(app_mod, "asyncio", _InlineExecutorAsyncio(asyncio))
+
+
+@pytest.fixture
+def client(monkeypatch):
+    from qobuz_librarian.web import app as app_mod
+    _run_web_executors_inline(monkeypatch, app_mod)
+    with _SameThreadASGIClient(app_mod.app) as c:
+        c.get("/queue")
         token = c.cookies.get("qf_csrf")
         c.headers.update({"X-CSRF-Token": token})
         yield c
@@ -170,11 +354,130 @@ def test_search_uses_a_generous_result_limit(client, monkeypatch):
         return []
 
     monkeypatch.setattr(search_mod, "search_albums", fake)
-    r = client.post("/search", data={"q": "Paul McCartney"},
+    r = client.post("/search", data={"q": "Paul McCartney", "kind": "album"},
                     headers={"HX-Request": "true"})
     assert r.status_code == 200
     assert seen.get("limit") == cfg.SEARCH_LIMIT
     assert cfg.SEARCH_LIMIT >= 20
+
+
+def test_artist_search_lists_qobuz_artists(client, monkeypatch):
+    import qobuz_librarian.api.search as search_mod
+    import qobuz_librarian.web.app as app_mod
+    from qobuz_librarian import config as cfg
+
+    monkeypatch.setattr(app_mod, "_get_token", lambda: "tok")
+    seen = {}
+
+    def fake(q, t, limit=None):
+        seen["query"] = q
+        seen["limit"] = limit
+        return [{"id": "artist1", "name": "Paysage d'Hiver", "albums_count": 12}]
+
+    monkeypatch.setattr(search_mod, "search_artists", fake)
+
+    r = client.post("/search", data={"q": "Paysage", "kind": "artist"},
+                    headers={"HX-Request": "true"})
+
+    assert r.status_code == 200
+    assert seen == {"query": "Paysage", "limit": cfg.ARTIST_LOOKUP_LIMIT}
+    assert "Paysage" in r.text
+    assert "View albums" in r.text
+    assert 'name="artist_id" value="artist1"' in r.text
+
+
+def test_artist_search_selected_artist_shows_discography(client, monkeypatch):
+    import qobuz_librarian.api.search as search_mod
+    import qobuz_librarian.library.catalog as catalog_mod
+    import qobuz_librarian.web.app as app_mod
+    from qobuz_librarian import config as cfg
+
+    monkeypatch.setattr(app_mod, "_get_token", lambda: "tok")
+    monkeypatch.setattr(catalog_mod, "find_album_dir_filesystem", lambda _a: None)
+    seen = {}
+
+    def fake_catalog(artist_id, token, limit=None, fresh=False):
+        seen["artist_id"] = artist_id
+        seen["limit"] = limit
+        return ([{
+            "id": "album1",
+            "title": "Das Tor",
+            "artist": {"name": "Paysage d'Hiver"},
+            "year": 2013,
+            "tracks_count": 10,
+            "maximum_bit_depth": 16,
+        }], 1)
+
+    monkeypatch.setattr(search_mod, "get_artist_albums", fake_catalog)
+
+    r = client.post(
+        "/search",
+        data={
+            "q": "Paysage",
+            "kind": "artist",
+            "artist_id": "artist1",
+            "artist_name": "Paysage d'Hiver",
+        },
+        headers={"HX-Request": "true"},
+    )
+
+    assert r.status_code == 200
+    assert seen == {"artist_id": "artist1", "limit": cfg.ARTIST_CATALOG_LIMIT}
+    assert "Albums by Paysage" in r.text
+    assert "Das Tor" in r.text
+    assert "Download" in r.text
+
+
+def test_dashboard_artist_query_renders_initial_results(client, monkeypatch):
+    import qobuz_librarian.api.search as search_mod
+    import qobuz_librarian.web.app as app_mod
+    from qobuz_librarian import config as cfg
+
+    monkeypatch.setattr(app_mod, "_get_token", lambda: "tok")
+    seen = {}
+
+    def fake(q, t, limit=None):
+        seen["query"] = q
+        seen["limit"] = limit
+        return [{"id": "artist1", "name": "Paysage d'Hiver", "albums_count": 12}]
+
+    monkeypatch.setattr(search_mod, "search_artists", fake)
+
+    r = client.get("/?kind=artist&q=Paysage")
+
+    assert r.status_code == 200
+    assert seen == {"query": "Paysage", "limit": cfg.ARTIST_LOOKUP_LIMIT}
+    assert "Paysage d&#39;Hiver" in r.text
+    assert "View albums" in r.text
+
+
+def test_album_search_keeps_upgrades_out_of_search(client, monkeypatch, tmp_path):
+    import qobuz_librarian.api.search as search_mod
+    import qobuz_librarian.library.catalog as catalog_mod
+    import qobuz_librarian.web.app as app_mod
+
+    monkeypatch.setattr(app_mod, "_get_token", lambda: "tok")
+    album = {
+        "id": "album1",
+        "title": "Das Tor",
+        "artist": {"name": "Paysage d'Hiver"},
+        "year": 2013,
+        "tracks_count": 10,
+        "maximum_bit_depth": 24,
+    }
+    owned = tmp_path / "Das Tor (2013)"
+    owned.mkdir()
+
+    monkeypatch.setattr(search_mod, "search_albums", lambda *_a, **_kw: [album])
+    monkeypatch.setattr(catalog_mod, "find_album_dir_filesystem", lambda _a: owned)
+
+    r = client.post("/search", data={"q": "Das Tor", "kind": "album"},
+                    headers={"HX-Request": "true"})
+
+    assert r.status_code == 200
+    assert "In library" in r.text
+    assert "quality-upgrade" not in r.text
+    assert ">Upgrade<" not in r.text
 
 
 def test_new_release_check_refused_without_baseline(client, monkeypatch):
@@ -200,9 +503,10 @@ def test_library_scan_state_explains_empty_music_root(tmp_path, monkeypatch):
     state = app_mod._library_scan_state()
 
     assert state["ready"] is False
-    assert "MUSIC_ROOT" in state["message"]
-    assert "artist" in state["message"].lower()
+    assert str(tmp_path) in state["message"]
+    assert "MUSIC_ROOT" not in state["message"]
     assert "QL_MUSIC_DIR" not in state["message"]
+    assert "artist" in state["message"].lower()
 
 
 def test_qobuz_ready_false_when_saved_token_is_rejected(monkeypatch):
@@ -228,21 +532,16 @@ def test_qobuz_ready_allows_unproven_saved_token(monkeypatch):
 def test_recent_empty_hint_matches_qobuz_account_state(monkeypatch):
     import qobuz_librarian.web.app as app_mod
 
-    monkeypatch.setattr(app_mod, "_read_creds",
-                        lambda: {"auth_token": "bad-token", "user_id": "user"})
-    monkeypatch.setattr(app_mod, "_TOKEN_VALID", False)
-    assert app_mod._recent_empty_hint() == "Reconnect Qobuz before searching."
-
     monkeypatch.setattr(app_mod, "_read_creds", lambda: {})
     monkeypatch.setattr(app_mod, "_TOKEN_VALID", None)
     assert app_mod._recent_empty_hint() == "Set up Qobuz before searching."
 
     monkeypatch.setattr(app_mod, "_read_creds",
                         lambda: {"auth_token": "maybe-token", "user_id": "user"})
-    assert app_mod._recent_empty_hint() == "Search above to find an album or artist."
+    assert app_mod._recent_empty_hint() == "Search above to find an artist, album, or track."
 
 
-def test_empty_library_scan_message_uses_music_root(monkeypatch, caplog):
+def test_empty_library_scan_message_uses_plain_music_library_wording(monkeypatch, caplog):
     from qobuz_librarian.web import flows
 
     monkeypatch.setattr(flows, "list_library_artists", lambda: [])
@@ -251,10 +550,12 @@ def test_empty_library_scan_message_uses_music_root(monkeypatch, caplog):
 
     flows.scan_library(job, "tok")
 
-    assert "MUSIC_ROOT" in job.summary
+    assert "music library" in job.summary
+    assert "artist folders" in job.summary
+    assert "MUSIC_ROOT" not in job.summary
     assert "QL_MUSIC_DIR" not in job.summary
     out = caplog.text
-    assert "MUSIC_ROOT" in out
+    assert "MUSIC_ROOT" not in out
     assert "QL_MUSIC_DIR" not in out
 
 
@@ -264,31 +565,29 @@ def test_settings_save_defers_apply_when_job_is_active(tmp_path, monkeypatch):
     from qobuz_librarian.web import settings_store as ss
 
     monkeypatch.setattr(ss, "SETTINGS_FILE", tmp_path / "s.json")
-    monkeypatch.setattr(cfg, "AUTO_UPGRADE_ENABLED", False)
+    monkeypatch.setattr(cfg, "DOWNSAMPLE_HIRES_ENABLED", False)
     monkeypatch.setattr(ss, "_any_active_job", lambda: True)
     with ss._pending_lock:
         ss._pending_apply = None
 
-    ok, _ = ss.save({"AUTO_UPGRADE_ENABLED": True})
+    ok, _ = ss.save({"DOWNSAMPLE_HIRES_ENABLED": True})
     assert ok is True
     assert (tmp_path / "s.json").exists()
-    assert cfg.AUTO_UPGRADE_ENABLED is False  # not yet applied
+    assert cfg.DOWNSAMPLE_HIRES_ENABLED is False  # not yet applied
 
     ss.drain_pending()
-    assert cfg.AUTO_UPGRADE_ENABLED is True
+    assert cfg.DOWNSAMPLE_HIRES_ENABLED is True
     ss.drain_pending()
-    assert cfg.AUTO_UPGRADE_ENABLED is True  # idempotent
+    assert cfg.DOWNSAMPLE_HIRES_ENABLED is True  # idempotent
 
 
 # ── CSRF middleware ───────────────────────────────────────────────────────────
 
 def test_csrf_post_without_token_is_rejected():
     """One representative POST verifies CSRF-missing → 403."""
-    from fastapi.testclient import TestClient
-
-    from qobuz_librarian.web.app import app
-    with TestClient(app) as c:
-        c.get("/")
+    from qobuz_librarian.web import app as app_mod
+    with _SameThreadASGIClient(app_mod.app) as c:
+        c.get("/queue")
         r = c.post("/search", data={"q": "anything"})
         assert r.status_code == 403
 
@@ -296,18 +595,18 @@ def test_csrf_post_without_token_is_rejected():
 # ── run-lock busy → destructive routes 503, read-only stay open ───────
 
 def test_lock_busy_refuses_destructive_routes(monkeypatch):
-    from fastapi.testclient import TestClient
-
     from qobuz_librarian.web import app as webapp
-    with TestClient(webapp.app) as c:
-        c.get("/")
+    _run_web_executors_inline(monkeypatch, webapp)
+    with _SameThreadASGIClient(webapp.app) as c:
+        c.get("/queue")
         token = c.cookies.get("qf_csrf")
         c.headers.update({"X-CSRF-Token": token})
         monkeypatch.setattr(webapp, "_LOCK_BUSY_PID", 4321)
 
         dash = c.get("/")
         assert dash.status_code == 200
-        assert "4321" in dash.text
+        assert "Another Qobuz Librarian run is active." in dash.text
+        assert "4321" not in dash.text
 
         for path, data in [
             ("/download", {"album_id": "1"}),
@@ -324,7 +623,10 @@ def test_lock_busy_refuses_destructive_routes(monkeypatch):
             assert r.status_code == 503, f"{path} should 503 when lock busy"
             # The full-page response should render the base shell, not a bare
             # <pre>, so a non-htmx caller still has navigation back.
-            assert "navbar" in r.text, f"{path} should render base.html shell"
+            assert "ql-app-shell" in r.text, f"{path} should render base.html shell"
+            assert "Another Qobuz Librarian run is active." in r.text
+            assert "pid 4321" not in r.text
+            assert "run-lock" not in r.text
             assert 'class="btn btn-primary w-full sm:w-auto">Try again</button>' in r.text
             assert 'class="btn btn-ghost w-full sm:w-auto">Back to dashboard</a>' in r.text
 
@@ -335,18 +637,6 @@ def test_error_page_action_is_mobile_friendly(client):
     assert r.status_code == 404
     assert "Page not found" in r.text
     assert 'href="/" class="btn btn-primary w-full sm:w-auto"' in r.text
-
-
-def test_tool_pages_link_to_focused_artist_scans(client, monkeypatch):
-    from qobuz_librarian.web import app as webapp
-
-    monkeypatch.setattr(webapp, "_read_creds",
-                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
-    for path in ("/upgrade", "/downsample", "/repair", "/lyrics"):
-        r = client.get(path)
-        assert r.status_code == 200
-        assert "Just one artist?" in r.text
-        assert 'href="/artist"' in r.text
 
 
 def test_scan_action_buttons_are_mobile_friendly(client, monkeypatch):
@@ -383,65 +673,88 @@ def test_dashboard_search_button_label_is_visible_on_mobile(client, monkeypatch)
     r = client.get("/")
 
     assert r.status_code == 200
-    assert 'class="join w-full"' in r.text
-    assert 'class="input input-bordered input-lg join-item min-w-0 flex-1"' in r.text
-    assert 'class="btn btn-primary btn-lg join-item gap-2"' in r.text
+    assert 'class="ql-search-row"' in r.text
+    # The Search button keeps a visible text label at every width, instead of
+    # collapsing to an icon behind a sm: breakpoint.
     assert '<span>Search</span>' in r.text
     assert '<span class="hidden sm:inline">Search</span>' not in r.text
 
 
-def test_dashboard_setup_scan_action_stacks_on_mobile(client, monkeypatch):
+def test_dashboard_first_run_offers_baseline_scan_with_skip(client, monkeypatch):
+    # On first run the dashboard OFFERS the baseline scan (Scan / Skip) rather
+    # than auto-starting it. The library folder must be ready for the offer to
+    # render, so give it artists.
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.library import new_releases
     from qobuz_librarian.web import app as webapp
 
     monkeypatch.setattr(webapp, "_read_creds",
                         lambda: {"auth_token": "dummy", "user_id": "dummy"})
-    # The first-run setup card only offers the inline scan button once the
-    # library folder is ready; give it artists so that branch renders.
-    monkeypatch.setattr(
-        "qobuz_librarian.library.scanner.list_library_artists",
-        lambda: ["Some Artist"],
-    )
+    monkeypatch.setattr("qobuz_librarian.library.scanner.list_library_artists",
+                        lambda: ["Some Artist"])
+    monkeypatch.setattr(cfg, "AUTO_LIBRARY_SCAN", True)
+    monkeypatch.setattr(new_releases, "is_baseline_complete", lambda: False)
+    monkeypatch.setattr(new_releases, "auto_scan_attempted", lambda: False)
 
     r = client.get("/")
 
     assert r.status_code == 200
-    assert 'class="w-full shrink-0 sm:ml-auto sm:w-auto"' in r.text
-    assert 'class="btn btn-sm btn-primary w-full sm:w-auto"' in r.text
+    assert "Scan library" in r.text
+    assert "Scan once to find missing albums and track gaps." in r.text
+    assert 'action="/library/skip-setup"' in r.text and "Not now" in r.text
+    # It's an offer, not an auto-started scan.
+    assert "Your baseline scan is running" not in r.text
 
 
-def test_search_page_form_is_a_clean_unified_bar(client, monkeypatch):
+def test_dashboard_search_bar_is_a_clean_unified_bar(client, monkeypatch):
     from qobuz_librarian.web import app as webapp
 
     monkeypatch.setattr(webapp, "_read_creds",
                         lambda: {"auth_token": "dummy", "user_id": "dummy"})
 
-    r = client.get("/search")
+    r = client.get("/")
 
     assert r.status_code == 200
-    assert "Artist, album, or URL" in r.text
-    assert "Artist, album, or Qobuz URL" not in r.text
-    assert "Type an artist, album, or URL above to search." in r.text
+    assert "Artist name" in r.text
     assert "autofocus" not in r.text
-    assert 'class="join w-full"' in r.text
-    assert 'class="input input-bordered input-lg join-item min-w-0 flex-1"' in r.text
-    assert 'class="btn btn-primary btn-lg join-item gap-2"' in r.text
+    # Input and button render as one responsive search row.
+    assert 'class="ql-search-row"' in r.text
 
 
-def test_artist_page_form_stacks_cleanly_on_mobile(client, monkeypatch):
-    from qobuz_librarian.web import app as webapp
+def test_search_path_redirects_to_the_dashboard(client):
+    # Search is on the dashboard; /search redirects there.
+    r = client.get("/search", follow_redirects=False)
+    assert r.status_code in (302, 307, 308)
+    assert r.headers["location"] == "/"
 
-    monkeypatch.setattr(webapp, "_read_creds",
-                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
 
-    r = client.get("/artist")
+def test_non_htmx_search_post_returns_to_dashboard(client, monkeypatch):
+    import qobuz_librarian.api.search as search_mod
+    import qobuz_librarian.web.app as app_mod
 
-    assert r.status_code == 200
-    assert "autofocus" not in r.text
-    assert 'class="flex flex-col gap-2 sm:flex-row"' in r.text
-    assert 'class="input input-bordered input-lg w-full min-w-0 flex-1"' in r.text
-    assert 'class="btn btn-primary btn-lg w-full sm:w-auto"' in r.text
-    assert 'class="grid grid-cols-2 gap-2 sm:grid-cols-4"' in r.text
-    assert 'class="btn btn-sm btn-outline w-full sm:w-auto"' in r.text
+    monkeypatch.setattr(app_mod, "_get_token", lambda: "tok")
+    monkeypatch.setattr(search_mod, "search_albums", lambda *_a, **_kw: [])
+
+    r = client.post("/search", data={"q": "Paysage d'Hiver"},
+                    follow_redirects=False)
+
+    assert r.status_code == 303
+    assert r.headers["location"] == "/"
+
+
+def test_artist_page_redirects_to_dashboard_artist_search(client):
+    r = client.get("/artist", follow_redirects=False)
+
+    assert r.status_code == 303
+    assert r.headers["location"] == "/?kind=artist"
+
+
+def test_artist_page_redirect_preserves_artist_query(client):
+    r = client.get("/artist?artist=Paysage%20d%27Hiver",
+                   follow_redirects=False)
+
+    assert r.status_code == 303
+    assert r.headers["location"] == "/?kind=artist&q=Paysage+d%27Hiver"
 
 
 def test_queue_empty_state_has_clear_actions(client):
@@ -449,9 +762,59 @@ def test_queue_empty_state_has_clear_actions(client):
 
     assert r.status_code == 200
     assert "Queue is empty." in r.text
-    assert "New downloads, scans, and reviews appear here" in r.text
-    assert 'href="/search" class="btn btn-primary w-full sm:w-auto"' in r.text
+    assert "Downloads, scans, and reviews appear here" in r.text
+    assert 'href="/" class="btn btn-primary w-full sm:w-auto"' in r.text
     assert 'href="/queue/history" class="btn btn-outline w-full sm:w-auto"' in r.text
+
+
+def test_queue_job_actions_use_clear_labels(client):
+    queued = _inject_job(jm.JobStatus.PENDING, "Queued scan")
+    running = _inject_job(jm.JobStatus.RUNNING, "Running scan")
+    review = _inject_job(jm.JobStatus.AWAITING_REVIEW, "Review scan")
+    review.execute_kind = "library"
+    review.add_candidate(kind="album", title="Dummy", artist="Portishead",
+                         payload={"year": "1994"}, selected=False)
+    downsample = _inject_job(jm.JobStatus.AWAITING_REVIEW, "Downsample scan")
+    downsample.execute_kind = "downsample"
+    downsample.add_candidate(kind="album", title="Dummy", artist="Portishead",
+                             payload={"year": "1994"}, selected=False)
+    migration = _inject_job(jm.JobStatus.AWAITING_REVIEW, "Library migration")
+    migration.execute_kind = "migration"
+    migration.add_candidate(kind="album", title="Dummy", artist="Portishead",
+                            payload={"year": "1994"}, selected=False)
+    try:
+        r = client.get("/queue")
+
+        assert r.status_code == 200
+        assert 'id="queue-review-heading"' in r.text and "Needs review" in r.text
+        assert 'id="queue-active-heading"' in r.text and "Running now" in r.text
+        assert 'id="queue-waiting-heading"' in r.text and "Waiting" in r.text
+        assert ">Clear queue and reviews</button>" in r.text
+        assert "Queued jobs are removed, reviews are discarded" in r.text
+        assert "Starts automatically after the current job finishes." in r.text
+        assert "1 missing album or track gap found." in r.text
+        assert "1 album can be downsampled." in r.text
+        assert "Migration preview ready." in r.text
+        assert "hi-res album to review" not in r.text
+        assert "album folder to review" not in r.text
+        assert "Waiting for “Running scan”" not in r.text
+        assert ">Remove</button>" in r.text
+        assert 'aria-label="Remove from queue"' in r.text
+        assert ">Cancel</button>" in r.text
+        assert 'data-confirm="Cancel this job? It will stop after the current safe step."' in r.text
+        assert 'data-confirm="Remove this waiting job from the queue?"' in r.text
+        assert ">Discard</button>" in r.text
+        assert "Its 1 result are" not in r.text
+        assert "No files will change. Run the scan again to see these results later." in r.text
+        assert ">×</button>" not in r.text
+        assert "loading loading-spinner" not in r.text
+        assert "btn-outline" in r.text
+    finally:
+        _remove_job(queued)
+        _remove_job(running)
+        _remove_job(review)
+        _remove_job(downsample)
+        _remove_job(migration)
 
 
 def test_history_empty_state_has_clear_action(client):
@@ -459,15 +822,71 @@ def test_history_empty_state_has_clear_action(client):
 
     assert r.status_code == 200
     assert "No finished jobs yet." in r.text
-    assert "Completed downloads, scans, and reviews show up here." in r.text
+    assert "Completed downloads, scans, and reviews appear here." in r.text
     assert 'href="/queue" class="btn btn-outline w-full sm:w-auto"' in r.text
+
+
+def test_history_retry_only_shows_for_live_failed_download(client, monkeypatch):
+    from qobuz_librarian.web import job_persistence
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+
+    archived = jm.Job(title="Archived failure", artist="Portishead",
+                      album_id="archived")
+    archived.status = jm.JobStatus.FAILED
+    archived.finished_at = time.time() - 10
+    job_persistence.persist(archived)
+
+    live = jm.Job(title="Live failure", artist="Portishead", album_id="live")
+    live.status = jm.JobStatus.FAILED
+    live.finished_at = time.time()
+    jm.registry.add(live)
+    try:
+        r = client.get("/queue/history")
+
+        assert r.status_code == 200
+        assert f'action="/jobs/{live.id}/retry"' in r.text
+        assert f'action="/jobs/{archived.id}/retry"' not in r.text
+    finally:
+        _remove_job(live)
+
+
+def test_archived_job_page_hides_live_only_actions(client, monkeypatch):
+    from qobuz_librarian.web import job_persistence
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+
+    failed = jm.Job(title="Archived album", artist="Portishead",
+                    album_id="album-id")
+    failed.status = jm.JobStatus.FAILED
+    failed.finished_at = time.time()
+    job_persistence.persist(failed)
+
+    single = jm.Job(title="Archived single", artist="Portishead")
+    single.status = jm.JobStatus.DONE
+    single.single = {"dir": "/music/Portishead/Dummy", "track_id": "t1"}
+    single.finished_at = time.time()
+    job_persistence.persist(single)
+
+    r = client.get(f"/jobs/{failed.id}")
+    assert r.status_code == 200
+    assert "This job is archived." in r.text
+    assert ">Retry</button>" not in r.text
+
+    r = client.get(f"/jobs/{single.id}")
+    assert r.status_code == 200
+    assert "Undo (removes track)" not in r.text
 
 
 def test_hidden_empty_state_has_mobile_friendly_action(client):
     r = client.get("/library/hidden")
 
     assert r.status_code == 200
-    assert "Nothing hidden." in r.text
+    assert "No dismissed albums or gaps." in r.text
     assert 'href="/library" class="btn btn-primary w-full sm:w-auto mt-4"' in r.text
 
 
@@ -510,16 +929,18 @@ def test_dashboard_active_non_download_job_uses_neutral_wording(client, monkeypa
     r = client.get("/")
 
     assert r.status_code == 200
-    assert "Working" in r.text
+    assert "Fetching lyrics" in r.text
     assert "Fetching lyrics 3 / 12 tracks" in r.text
     assert 'aria-label="Cancel job"' in r.text
+    assert ">Cancel</button>" in r.text
+    assert 'data-confirm="Cancel this job? It will stop after the current safe step."' in r.text
     assert "Cancel download" not in r.text
     assert "Cancel scan" not in r.text
 
 
 def test_library_hide_then_restore_round_trip(client, monkeypatch, tmp_path):
-    """Hiding an artist from a library review writes the durable store and drops
-    those candidates; the Hidden view then restores them."""
+    """Dismissing an artist from a library review writes the durable store and
+    drops those candidates; the Dismissed albums/gaps view then restores them."""
     from qobuz_librarian.library import hidden
     monkeypatch.setattr("qobuz_librarian.config.HIDDEN_FILE", tmp_path / "h.json")
 
@@ -533,8 +954,8 @@ def test_library_hide_then_restore_round_trip(client, monkeypatch, tmp_path):
                       payload={"year": "2007"}, selected=False)
     try:
         # Selection is server-backed: tick Dummy via the select endpoint, then
-        # "hide the rest" drops only Portishead's unselected album (Third),
-        # keeps the ticked Dummy, and never touches Burial.
+        # dismissing unselected Portishead albums drops only Third, keeps the
+        # ticked Dummy, and never touches Burial.
         r = client.post(f"/jobs/{job.id}/select",
                         data={"cid": c_dummy, "checked": "1"})
         assert r.status_code == 200 and r.json()["selected"] == 1
@@ -551,9 +972,11 @@ def test_library_hide_then_restore_round_trip(client, monkeypatch, tmp_path):
         r = client.get("/library/hidden")
         assert r.status_code == 200
         assert "Portishead" in r.text
+        assert 'href="/?kind=artist&q=Portishead"' in r.text
+        assert 'href="/artist?artist=Portishead"' not in r.text
 
         r = client.post("/library/hidden/restore", data={"artist": "Portishead"})
-        assert r.status_code == 200  # follows the 303 to the Hidden view
+        assert r.status_code == 200  # follows the 303 to the dismissed-items view
         assert hidden.count(hidden.SCOPE_MISSING) == 0
     finally:
         _remove_job(job)
@@ -568,37 +991,138 @@ def test_review_zero_selection_has_clear_disabled_action(client):
     try:
         r = client.get(f"/jobs/{job.id}")
         assert r.status_code == 200
-        assert "Select albums to download" in r.text
+        assert "Select albums or gaps to download" in r.text
         assert "Download 1 selected" not in r.text
     finally:
         _remove_job(job)
 
 
-def test_review_footer_actions_stack_on_mobile(client):
+def test_non_album_reviews_use_specific_action_language(client):
+    repair = _inject_job(jm.JobStatus.AWAITING_REVIEW, "Repair scan")
+    repair.execute_kind = "repair"
+    repair.review_verb = "Repair"
+    repair.add_candidate(kind="repair", title="Damaged Album",
+                         artist="Portishead",
+                         detail="1 truncated track", selected=False)
+
+    migration = _inject_job(jm.JobStatus.AWAITING_REVIEW, "Library migration")
+    migration.execute_kind = "migration"
+    migration.review_verb = "Move"
+    migration.add_candidate(kind="migrate", title="Dummy (1994)",
+                            artist="Portishead",
+                            detail="10 tracks -> Portishead/Dummy (1994)",
+                            selected=False)
+    try:
+        r = client.get(f"/jobs/{repair.id}")
+        assert r.status_code == 200
+        assert "Select repairs to run" in r.text
+        assert "Discard repair review" in r.text
+        assert "Select albums to repair" not in r.text
+        assert "Discard scan" not in r.text
+
+        r = client.get(f"/jobs/{migration.id}")
+        assert r.status_code == 200
+        assert "Select folders to move" in r.text
+        assert "Discard migration preview" in r.text
+        assert "Select albums to move" not in r.text
+        assert "Discard scan" not in r.text
+    finally:
+        _remove_job(repair)
+        _remove_job(migration)
+
+
+def test_review_footer_renders_all_actions(client):
+    # The footer carries every review action; the dismissed-albums link lives in
+    # the summary row, not the action bar. (Layout/stacking is checked in a browser.)
     job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
     job.execute_kind = "library"
     job.review_verb = "Download"
     job.add_candidate(kind="album", title="Dummy", artist="Portishead",
                       payload={"year": "1994"}, selected=True)
+    job.add_candidate(kind="album", title="Third", artist="Portishead",
+                      payload={"year": "2008"}, selected=False)
     try:
         r = client.get(f"/jobs/{job.id}")
 
         assert r.status_code == 200
-        assert 'id="review-submit" class="btn btn-primary w-full sm:w-auto"' in r.text
-        assert 'class="btn btn-ghost w-full sm:w-auto">Cancel</button>' in r.text
-        assert 'class="btn btn-ghost btn-sm w-full sm:ml-auto sm:w-auto">Hidden albums</a>' in r.text
+        assert 'id="review-submit"' in r.text
+        assert "Download 1 selected" in r.text
+        assert 'id="review-dismiss-rest"' in r.text
+        assert "Dismiss unselected (1)" in r.text
+        assert "Dismissed albums and gaps" in r.text
+        assert ">Back to queue</a>" in r.text
+        assert ">Discard library review</button>" in r.text
+        assert 'href="/library/hidden"' in r.text
     finally:
         _remove_job(job)
 
 
-def test_library_bulk_hide_marked_artists_keeps_selected_albums(client, monkeypatch, tmp_path):
+def test_review_artist_header_keeps_actions_outside_summary(client):
+    job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
+    job.execute_kind = "library"
+    job.review_verb = "Download"
+    job.add_candidate(kind="album", title="Dummy", artist="Portishead",
+                      payload={"year": "1994"}, selected=True)
+    job.add_candidate(kind="album", title="Third", artist="Portishead",
+                      payload={"year": "2008"}, selected=False)
+    try:
+        r = client.get(f"/jobs/{job.id}")
+
+        assert r.status_code == 200
+        summary = r.text.split('<summary class="ql-review-summary">', 1)[1].split("</summary>", 1)[0]
+        assert "data-artist-select" not in summary
+        assert "data-hide" not in summary
+        assert 'data-artist-select value="Portishead"' in r.text
+        assert 'data-hide data-artist="Portishead"' in r.text
+    finally:
+        _remove_job(job)
+
+
+def test_review_hides_page_select_when_everything_is_on_one_page(client):
+    job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
+    job.execute_kind = "library"
+    job.review_verb = "Download"
+    job.add_candidate(kind="album", title="Dummy", artist="Portishead",
+                      payload={"year": "1994"}, selected=True)
+    job.add_candidate(kind="album", title="Third", artist="Portishead",
+                      payload={"year": "2008"}, selected=False)
+    try:
+        r = client.get(f"/jobs/{job.id}")
+
+        assert r.status_code == 200
+        assert 'data-select-all="1"' in r.text
+        assert "data-select-page" not in r.text
+    finally:
+        _remove_job(job)
+
+
+def test_downsample_review_uses_keep_hi_res_language(client):
+    job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
+    job.execute_kind = "downsample"
+    job.review_verb = "Downsample"
+    job.add_candidate(kind="album", title="Dummy", artist="Portishead",
+                      payload={"year": "1994", "est_saving": 10}, selected=True)
+    job.add_candidate(kind="album", title="Third", artist="Portishead",
+                      payload={"year": "2008", "est_saving": 20}, selected=False)
+    try:
+        r = client.get(f"/jobs/{job.id}")
+
+        assert r.status_code == 200
+        assert "Downsample 1 selected" in r.text
+        assert "Keep hi-res (1)" in r.text
+        assert "Kept hi-res" in r.text
+    finally:
+        _remove_job(job)
+
+
+def test_library_dismiss_rest_hides_everything_unselected(client, monkeypatch, tmp_path):
     from qobuz_librarian.library import hidden
     monkeypatch.setattr("qobuz_librarian.config.HIDDEN_FILE", tmp_path / "h.json")
 
     job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
     job.execute_kind = "library"
-    c_dummy = job.add_candidate(kind="album", title="Dummy", artist="Portishead",
-                                payload={"year": "1994"}, selected=False)
+    keep = job.add_candidate(kind="album", title="Dummy", artist="Portishead",
+                             payload={"year": "1994"}, selected=False)
     job.add_candidate(kind="album", title="Third", artist="Portishead",
                       payload={"year": "2008"}, selected=False)
     job.add_candidate(kind="album", title="Untrue", artist="Burial",
@@ -606,31 +1130,25 @@ def test_library_bulk_hide_marked_artists_keeps_selected_albums(client, monkeypa
     job.add_candidate(kind="album", title="Mezzanine", artist="Massive Attack",
                       payload={"year": "1998"}, selected=False)
     try:
-        r = client.post(f"/jobs/{job.id}/select",
-                        data={"cid": c_dummy, "checked": "1"})
+        r = client.post(f"/jobs/{job.id}/select", data={"cid": keep, "checked": "1"})
         assert r.status_code == 200
 
-        r = client.post(
-            f"/jobs/{job.id}/hide-artists",
-            content="artist=Portishead&artist=Burial",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
+        r = client.post(f"/jobs/{job.id}/dismiss-rest")
         assert r.status_code == 200
-        assert r.json()["hidden"] == 2
-        assert r.json()["total"] == 2
-        assert r.json()["selected"] == 1
+        body = r.json()
+        assert body["hidden"] == 3
+        assert body["total"] == 1
+        assert body["selected"] == 1
+        assert body["review_done"] is False
 
-        survivors = {c["artist"] + "/" + c["title"]: c["selected"]
-                     for c in job.candidates}
-        assert survivors == {
-            "Portishead/Dummy": True,
-            "Massive Attack/Mezzanine": False,
-        }
+        survivors = {c["artist"] + "/" + c["title"]: c["selected"] for c in job.candidates}
+        assert survivors == {"Portishead/Dummy": True}
+
         store = hidden.load()
+        assert not hidden.is_hidden(hidden.SCOPE_MISSING, "Portishead", "Dummy", store)
         assert hidden.is_hidden(hidden.SCOPE_MISSING, "Portishead", "Third", store)
         assert hidden.is_hidden(hidden.SCOPE_MISSING, "Burial", "Untrue", store)
-        assert not hidden.is_hidden(hidden.SCOPE_MISSING, "Portishead", "Dummy", store)
-        assert not hidden.is_hidden(hidden.SCOPE_MISSING, "Massive Attack", "Mezzanine", store)
+        assert hidden.is_hidden(hidden.SCOPE_MISSING, "Massive Attack", "Mezzanine", store)
     finally:
         _remove_job(job)
 
@@ -697,6 +1215,37 @@ def test_persistence_restores_awaiting_review_with_candidates(monkeypatch):
     assert jm.approve(restored, ["c0"]) is True
     assert _wait_for(lambda: restored.status == jm.JobStatus.DONE)
     assert executed.get("ids") == ["abc"]
+
+
+def test_restart_interrupt_message_matches_the_retry_affordance(monkeypatch):
+    # A job rebadged FAILED by a restart must not tell the user to "submit this
+    # job again" unless it actually offers a Retry button. Album downloads do; a
+    # lyrics backfill / migration / library execute does not — point those at the
+    # page they re-run from instead of promising a control that isn't there.
+    from qobuz_librarian.web import job_persistence
+
+    job_persistence._reset_for_tests()
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence.init()
+
+    album = jm.Job(title="Album", artist="Artist", album_id="abc")
+    album.status = jm.JobStatus.RUNNING
+    job_persistence.persist(album)
+
+    lyrics = jm.Job(title="Lyrics backfill")
+    lyrics.execute_kind = "lyrics"
+    lyrics.status = jm.JobStatus.RUNNING
+    job_persistence.persist(lyrics)
+
+    monkeypatch.setattr(jm, "registry", jm.JobRegistry())
+    jm.restore_jobs({})
+
+    a = jm.registry.get(album.id)
+    ly = jm.registry.get(lyrics.id)
+    assert a.status == jm.JobStatus.FAILED and ly.status == jm.JobStatus.FAILED
+    assert "Retry" in a.error
+    assert "Submit this" not in ly.error
+    assert "Lyrics" in ly.error
 
 
 def test_persist_survives_non_json_candidate_payload(monkeypatch):
@@ -777,13 +1326,16 @@ def test_settings_save_rejects_out_of_enum_quality(tmp_path, monkeypatch):
     assert json.loads((tmp_path / "s.json").read_text())["STREAMRIP_QUALITY"] == "2"
 
 
-def test_settings_cli_only_consolidate_is_read_only_and_preserved(
+def test_settings_omits_cli_only_consolidation_setting(
         client, tmp_path, monkeypatch):
     import json
 
+    import qobuz_librarian.web.app as app_mod
     from qobuz_librarian import config as cfg
     from qobuz_librarian.web import settings_store as ss
 
+    monkeypatch.setattr(app_mod, "_read_creds",
+                        lambda: {"user_id": "u", "auth_token": "t"})
     monkeypatch.setattr(ss, "SETTINGS_FILE", tmp_path / "s.json")
     monkeypatch.setattr(ss, "_any_active_job", lambda: False)
     monkeypatch.setattr(cfg, "CONSOLIDATE", True)
@@ -791,26 +1343,51 @@ def test_settings_cli_only_consolidate_is_read_only_and_preserved(
     r = client.get("/settings")
 
     assert r.status_code == 200
-    assert 'id="cb-CONSOLIDATE"' not in r.text
-    assert "CLI only" in r.text
-    assert 'name="CONSOLIDATE" value="1"' in r.text
+    assert "Consolidate duplicate folders" not in r.text
+    assert "CLI only" not in r.text
+    assert "CONSOLIDATE" not in r.text
 
     data = {"form_complete": "1", "CONSOLIDATE": "1"}
     data.update({key: "" for key in ss.TEXT_KEYS})
     r = client.post("/settings/behavior", data=data, follow_redirects=False)
 
     assert r.status_code == 303
-    assert json.loads((tmp_path / "s.json").read_text())["CONSOLIDATE"] is True
+    assert "CONSOLIDATE" not in json.loads((tmp_path / "s.json").read_text())
 
 
-def test_settings_primary_actions_are_mobile_friendly(client):
+def test_settings_primary_actions_are_mobile_friendly(client, monkeypatch):
+    import qobuz_librarian.web.app as app_mod
+    monkeypatch.setattr(app_mod, "_read_creds",
+                        lambda: {"user_id": "u", "auth_token": "t"})
     r = client.get("/settings")
 
     assert r.status_code == 200
-    assert 'class="input input-bordered min-w-0 flex-1 font-mono text-base sm:text-sm"' in r.text
+    assert 'class="input input-bordered w-full pr-12 font-mono text-base sm:text-sm"' in r.text
+    assert 'data-toggle-password="auth_token"' in r.text
     assert 'class="btn btn-primary w-full sm:w-auto">Save &amp; connect</button>' in r.text
-    assert 'class="btn btn-outline btn-sm w-full sm:w-auto">Hand off to terminal</button>' in r.text
+    assert "Switch to terminal mode" in r.text
     assert 'class="btn btn-primary w-full sm:w-auto">Save behaviour</button>' in r.text
+    assert "CLI command" in r.text
+    assert "CLI entrypoint" not in r.text
+    assert "Paths currently in use" in r.text
+    assert "QL_MUSIC_DIR" not in r.text
+    assert "QL_STAGING_DIR" not in r.text
+    assert "MUSIC_ROOT" not in r.text
+    assert "STAGING_DIR" not in r.text
+
+
+def test_settings_empty_token_warning_names_localuser_token(client, monkeypatch):
+    import qobuz_librarian.web.app as app_mod
+
+    monkeypatch.setattr(app_mod, "_read_creds", lambda: {})
+    r = client.post("/settings", data={"user_id": "user@example.com",
+                                       "auth_token": ""})
+
+    assert r.status_code == 200
+    assert "Token cannot be empty" in r.text
+    assert "localuser" in r.text
+    assert "<code>token</code>" in r.text
+    assert "user_auth_token" not in r.text
 
 
 # ── CLI/web mode hand-off ───────────────────────────────────────────────────────
@@ -842,19 +1419,18 @@ def test_mode_handoff_to_cli_pauses_web_downloads(client, monkeypatch):
 
 def _enable_auth(monkeypatch, tmp_path, *, configure=True):
     """Turn auth on for one test against an isolated credential file. Returns
-    a TestClient bound to the app. The session-wide conftest default of
+    a client bound to the app. The session-wide conftest default of
     WEB_AUTH=none is restored on teardown by monkeypatch."""
-    from fastapi.testclient import TestClient
-
     from qobuz_librarian import config as cfg
+    from qobuz_librarian.web import app as app_mod
     from qobuz_librarian.web import auth as web_auth
-    from qobuz_librarian.web.app import app
 
     monkeypatch.setenv("WEB_AUTH", "")
+    _run_web_executors_inline(monkeypatch, app_mod)
     monkeypatch.setattr(cfg, "WEB_AUTH_FILE", tmp_path / "web_auth.json")
     if configure:
         assert web_auth.set_credentials("admin", "hunter2hunter")
-    return TestClient(app)
+    return _SameThreadASGIClient(app_mod.app)
 
 
 def test_login_form_password_row_is_mobile_safe(monkeypatch, tmp_path):
@@ -862,7 +1438,8 @@ def test_login_form_password_row_is_mobile_safe(monkeypatch, tmp_path):
         r = c.get("/login")
 
     assert r.status_code == 200
-    assert 'class="input input-bordered min-w-0 flex-1"' in r.text
+    assert 'class="input input-bordered w-full pr-12"' in r.text
+    assert r.text.count('class="ql-secret-toggle"') == 1
 
 
 def test_setup_form_password_rows_are_mobile_safe(monkeypatch, tmp_path):
@@ -870,7 +1447,8 @@ def test_setup_form_password_rows_are_mobile_safe(monkeypatch, tmp_path):
         r = c.get("/setup")
 
     assert r.status_code == 200
-    assert r.text.count('class="input input-bordered min-w-0 flex-1"') == 2
+    assert r.text.count('class="input input-bordered w-full pr-12"') == 2
+    assert r.text.count('class="ql-secret-toggle"') == 2
 
 
 def test_login_rejects_wrong_password(monkeypatch, tmp_path):
@@ -934,6 +1512,24 @@ def test_artist_sort_key_files_articles_under_the_real_letter():
     assert _artist_sort_key("The Beatles") == "beatles"
     assert _artist_sort_key("A Tribe Called Quest") == "tribe called quest"
     assert _artist_sort_key("Adele") == "adele"   # no leading "a " to strip
+
+
+def test_review_artist_groups_use_library_sort_order():
+    from qobuz_librarian.web.app import _review_artist_groups
+
+    job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
+    job.add_candidate(kind="album", title="Revolver", artist="The Beatles",
+                      payload={"album_id": "beatles"})
+    job.add_candidate(kind="album", title="Highway 61 Revisited",
+                      artist="Bob Dylan", payload={"album_id": "dylan"})
+    job.add_candidate(kind="album", title="Low", artist="David Bowie",
+                      payload={"album_id": "bowie"})
+
+    assert [artist for artist, _items in _review_artist_groups(job)] == [
+        "The Beatles",
+        "Bob Dylan",
+        "David Bowie",
+    ]
 
 
 def test_migrate_post_submits_a_creds_free_job(client, monkeypatch, tmp_path):

@@ -1,79 +1,112 @@
 {% extends "base.html" %}
 {% block title %}Migrate — Qobuz Librarian{% endblock %}
+{% block content_max %}max-w-5xl{% endblock %}
 {% block content %}
-
-<h1 class="text-2xl font-bold mb-2">Library migration</h1>
-<p class="text-base-content/60 mb-6">
-  One-time setup: reads a messy music folder and builds a tidy copy in the <code>Artist/Album (Year)</code> layout, identified by tags.
-</p>
 
 {% if error %}
 <div class="alert alert-error mb-4" data-flash><span class="break-words">{{ error }}</span></div>
 {% endif %}
 
 {% if configured %}
-<div class="card bg-base-200 mb-4">
-  <div class="card-body py-4 text-sm space-y-2">
+<section class="ql-tool-panel mx-auto max-w-3xl">
+  <div class="ql-tool-panel-body">
+    <div class="mb-5">
+      <h1 class="text-2xl font-bold mb-2">Library migration</h1>
+      <p class="text-base-content/65">
+        Preview a one-time copy or move into the folder structure <code>Artist/Album (Year)</code>.
+      </p>
+    </div>
+
+    <div class="ql-path-checks mb-5">
     {% for c in migrate_checks %}
-    <div class="flex items-start gap-3">
-      <span class="shrink-0 mt-0.5">
+    <div class="ql-path-check">
+      <span class="ql-path-check-icon">
         {% if c.ok %}<span class="badge badge-sm badge-success">✓</span>
         {% else %}<span class="badge badge-sm badge-error">✗</span>{% endif %}
       </span>
       <div class="min-w-0">
-        <div class="text-sm text-base-content/60">{{ c.label }}</div>
+        <div class="text-sm font-medium">{{ c.label }}</div>
         <div class="font-mono text-xs break-all">{{ c.detail }}</div>
       </div>
     </div>
     {% endfor %}
-  </div>
-</div>
+    </div>
 
-<form action="/migrate" method="post" data-busy-submit>
-  <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-  <div class="space-y-3 mb-4">
-    <label class="flex items-start gap-3 cursor-pointer">
-      <input type="checkbox" name="acoustid" class="checkbox checkbox-primary mt-1">
-      <div>
-        <div class="font-medium">Fingerprint files my tags can't place</div>
-        <div class="text-sm text-base-content/50">
-          Identify untagged files by audio fingerprint (AcoustID). Slower — leave off for a fast first pass.
-        </div>
+    <form action="/migrate" method="post" data-busy-submit>
+      <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+      <div class="space-y-3 mb-5">
+        <label class="ql-option-row">
+          <input type="checkbox" name="acoustid" class="checkbox checkbox-primary mt-1">
+          <span>
+            <span class="block font-medium">Fingerprint unclear files</span>
+            <span class="block text-sm text-base-content/50">
+              Uses AcoustID for files with weak tags. Slower; off by default.
+            </span>
+          </span>
+        </label>
+        <label class="ql-option-row">
+          <input type="checkbox" name="in_place" class="checkbox mt-1">
+          <span>
+            <span class="block font-medium">Move instead of copy</span>
+            <span class="block text-sm text-warning">
+              Relocates originals and removes emptied folders. Copying is the safe default.
+            </span>
+          </span>
+        </label>
+        <label class="ql-option-row">
+          <input type="checkbox" name="allow_low_space" class="checkbox mt-1">
+          <span>
+            <span class="block font-medium">Continue despite low-space warning</span>
+            <span class="block text-sm text-warning">
+              Use only after confirming the destination has enough room.
+            </span>
+          </span>
+        </label>
       </div>
-    </label>
-    <label class="flex items-start gap-3 cursor-pointer">
-      <input type="checkbox" name="in_place" class="checkbox mt-1">
-      <div>
-        <div class="font-medium">Move instead of copy</div>
-        <div class="text-sm text-warning">
-          Relocates your originals instead of copying, and removes emptied folders. Copying is the safe default.
-        </div>
-      </div>
-    </label>
-    <label class="flex items-start gap-3 cursor-pointer">
-      <input type="checkbox" name="allow_low_space" class="checkbox mt-1">
-      <div>
-        <div class="font-medium">Proceed even if low on space</div>
-        <div class="text-sm text-base-content/50">
-          A move into a destination that's short on space is blocked by default, since running out mid-move leaves the library half-relocated. Tick this only if you're sure there's room.
-        </div>
-      </div>
-    </label>
+      <button type="submit" class="btn btn-primary w-full sm:w-auto">Preview migration</button>
+      <p class="text-xs text-base-content/45 mt-2">
+        Preview writes a manifest only. Copy or move happens after review.
+      </p>
+    </form>
   </div>
-  <button type="submit" class="btn btn-primary w-full sm:w-auto">Preview migration</button>
-  <p class="text-xs text-base-content/40 mt-2">
-    Nothing is written until you confirm on the next screen.
-  </p>
-</form>
+</section>
 {% else %}
-<div class="alert alert-warning">
-  <span>
-    Set <code>QL_MIGRATE_SRC</code> (the library to read) and
-    <code>QL_MIGRATE_DEST</code> (where to build the organized copy) — mount
-    both into the container and set them in your <code>.env</code> — then
-    reload this page.
-  </span>
-</div>
+<section class="ql-tool-panel mx-auto max-w-3xl">
+  <div class="ql-tool-panel-body">
+    <div class="mb-5">
+      <h1 class="text-2xl font-bold mb-2">Library migration</h1>
+      <p class="text-base-content/65">
+        Set both paths before previewing the folder reorganisation.
+      </p>
+    </div>
+
+    <dl class="ql-definition-list mb-5">
+      <div>
+        <dt>Source path</dt>
+        <dd>Existing library to organise. Uses <code>MIGRATE_SRC</code>.</dd>
+      </div>
+      <div>
+        <dt>Destination path</dt>
+        <dd>Organised library output. Uses <code>MIGRATE_DEST</code>.</dd>
+      </div>
+    </dl>
+
+    <ol class="space-y-3 text-sm">
+      <li class="flex gap-3">
+        <span class="ql-step-number">1</span>
+        <span>Mount both locations into the container.</span>
+      </li>
+      <li class="flex gap-3">
+        <span class="ql-step-number">2</span>
+        <span>Set both path values in <code>.env</code> or Compose.</span>
+      </li>
+      <li class="flex gap-3">
+        <span class="ql-step-number">3</span>
+        <span>Restart the container, then return to this page.</span>
+      </li>
+    </ol>
+  </div>
+</section>
 {% endif %}
 
 {% endblock %}

@@ -1,90 +1,138 @@
 {% extends "base.html" %}
 {% block title %}Library — Qobuz Librarian{% endblock %}
+{% block content_max %}max-w-5xl{% endblock %}
 {% block content %}
 
-<h1 class="text-2xl font-bold mb-2">Scan your library</h1>
-<p class="text-base-content/60 mb-2">
-  Checks every artist in your library against Qobuz and lists what you're missing.
-</p>
-{% if creds_ok %}
-<p class="text-base-content/40 text-sm mb-3">
-  {%- if last_full_scan -%}
-  Last scan {{ last_full_scan }}{% if not baseline_complete %} · the first full scan hasn't finished yet, so new-release alerts are still off{% endif %}.
-  {%- else -%}
-  No scan has finished yet — new-release alerts switch on once the first one completes.
-  {%- endif -%}
-</p>
-{% endif %}
-{% if hidden_count %}
-<p class="mb-6">
-  <a href="/library/hidden" class="link link-hover text-sm">
-    {{ hidden_count }} hidden album{% if hidden_count != 1 %}s{% endif %} — manage</a>
-</p>
-{% else %}
-<div class="mb-6"></div>
-{% endif %}
+<section class="ql-tool-panel mx-auto max-w-3xl">
+  <div class="ql-tool-panel-body">
+    <div class="mb-5">
+      <h1 class="text-2xl font-bold mb-2">Library</h1>
+      <p class="text-base-content/65">
+        Find missing albums and track gaps across your library.
+      </p>
+    </div>
 
-{% if error %}
-<div class="alert alert-warning mb-4" data-flash><span>{{ error }}</span></div>
-{% endif %}
+    {% if not qobuz_ready %}
+    {% with connect_embedded=True %}
+      {% include "_connect_cta.html" %}
+    {% endwith %}
 
-{% if creds_ok and library_resume %}
-<div class="ql-notice ql-notice-info mb-4 flex items-start gap-3 p-3 text-sm">
-  <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0 text-info" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
-  </svg>
-  <span class="min-w-0 flex-1">A scan was interrupted — {{ library_resume.done }} artist{{ 's' if library_resume.done != 1 }} already checked. Continue below to resume it, or choose a different mode to start a separate scan — the interrupted one stays saved either way.</span>
-</div>
-{% endif %}
+    {% elif not library_scan_state.ready %}
+    <div class="ql-notice ql-notice-warning flex items-start flex-wrap gap-3 p-4 text-sm">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0 text-warning" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M5 19h14a2 2 0 0 0 1.84-2.75L13.74 4a2 2 0 0 0-3.5 0L3.18 16.25A2 2 0 0 0 5 19z"/>
+      </svg>
+      <span class="min-w-0 flex-1"><strong>Music library unavailable.</strong> {{ library_scan_state.message }}</span>
+      <a href="/settings" class="btn btn-sm btn-primary w-full shrink-0 sm:ml-auto sm:w-auto">Open Settings</a>
+    </div>
 
-{% if creds_ok %}
-{% if not library_scan_state.ready %}
-<div class="ql-notice ql-notice-warning mb-4 flex items-start flex-wrap gap-3 p-4 text-sm">
-  <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0 text-warning" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M5 19h14a2 2 0 0 0 1.84-2.75L13.74 4a2 2 0 0 0-3.5 0L3.18 16.25A2 2 0 0 0 5 19z"/>
-  </svg>
-  <span class="min-w-0 flex-1">
-    <strong>Library folder is not ready.</strong> {{ library_scan_state.message }}
-  </span>
-  <a href="/settings" class="btn btn-sm btn-primary w-full shrink-0 sm:ml-auto sm:w-auto">Open Settings</a>
-</div>
-{% else %}
-<form action="/library" method="post" data-busy-submit>
-  <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-  <div class="space-y-2 mb-4">
-    <label class="flex items-start gap-3 cursor-pointer">
-      <input type="radio" name="mode" value="missing_albums" class="radio radio-primary mt-1"
-             {% if not library_resume or library_resume.kind == 'missing' %}checked{% endif %}>
-      <div>
-        <div class="font-medium">Find missing albums</div>
-        <div class="text-sm text-base-content/50">Albums you don't own at all.</div>
+    {% elif not baseline_complete %}
+    <div class="ql-tool-status mb-5">
+      <span>First scan needed.</span>
+      {% if hidden_count %}
+      <a href="/library/hidden" class="link link-hover ml-0 sm:ml-auto">
+        {{ hidden_count }} dismissed result{% if hidden_count != 1 %}s{% endif %}
+      </a>
+      {% endif %}
+    </div>
+
+    <div class="ql-tool-note ql-tool-note-info mb-5">
+      <p class="font-semibold">Build the library baseline</p>
+      <p>This scan finds missing albums and track gaps. It also creates the saved baseline used by new-release checks.</p>
+    </div>
+
+    {% if error %}<div class="alert alert-warning mb-4" data-flash><span>{{ error }}</span></div>{% endif %}
+    {% if library_resume %}
+    <div class="ql-tool-note ql-tool-note-info mb-5">
+      <p class="font-semibold">Scan can resume</p>
+      <p>{{ library_resume.done }} artist{{ 's' if library_resume.done != 1 }} already checked. Starting again continues from there.</p>
+    </div>
+    {% endif %}
+
+    <form action="/library" method="post" data-busy-submit>
+      <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+      <input type="hidden" name="mode" value="missing_albums">
+      <button type="submit" class="btn btn-primary w-full sm:w-auto">Scan library</button>
+    </form>
+
+    <details class="ql-action-group mt-5">
+      <summary class="ql-disclosure-summary">More options</summary>
+      <div class="pt-3">
+        <p class="text-sm text-base-content/50 mb-3">Scan only for missing tracks in albums already in your library.</p>
+        <form action="/library" method="post" data-busy-submit>
+          <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+          <input type="hidden" name="mode" value="partial_fill">
+          <button type="submit" class="btn btn-outline btn-sm ql-secondary-action w-full sm:w-auto">Scan album gaps</button>
+        </form>
       </div>
-    </label>
-    <label class="flex items-start gap-3 cursor-pointer">
-      <input type="radio" name="mode" value="partial_fill" class="radio radio-primary mt-1"
-             {% if library_resume and library_resume.kind == 'partial' %}checked{% endif %}>
+    </details>
+
+    {% else %}
+    <div class="ql-tool-status mb-5">
+      <span>
+        {% if last_full_scan %}Last full scan {{ last_full_scan }}.{% else %}Baseline scan complete.{% endif %}
+      </span>
+      {% if hidden_count %}
+      <a href="/library/hidden" class="link link-hover ml-0 sm:ml-auto">
+        {{ hidden_count }} dismissed result{% if hidden_count != 1 %}s{% endif %}
+      </a>
+      {% endif %}
+    </div>
+
+    {% if error %}<div class="alert alert-warning mb-4" data-flash><span>{{ error }}</span></div>{% endif %}
+    {% if library_resume %}
+    <div class="ql-tool-note ql-tool-note-info mb-5">
+      <p class="font-semibold">Re-scan can resume</p>
+      <p>{{ library_resume.done }} artist{{ 's' if library_resume.done != 1 }} already checked. Open re-scan options to continue.</p>
+    </div>
+    {% endif %}
+
+    <div class="ql-tool-action">
       <div>
-        <div class="font-medium">Fill gaps in albums you own</div>
-        <div class="text-sm text-base-content/50">Albums you own that are missing tracks.</div>
+        <p class="ql-tool-action-title">New releases</p>
+        <p class="ql-tool-action-text">
+          Find albums added since the saved Qobuz baseline.
+        </p>
       </div>
-    </label>
-    <label class="flex items-start gap-3 {% if baseline_complete %}cursor-pointer{% else %}opacity-60 cursor-not-allowed{% endif %}">
-      <input type="radio" name="mode" value="new_releases" class="radio radio-primary mt-1"
-             {% if not baseline_complete %}disabled{% endif %}>
-      <div>
-        <div class="font-medium">Check for new releases</div>
-        <div class="text-sm text-base-content/50">{% if baseline_complete %}Recent releases you don't own yet.{% else %}Needs a completed library scan first.{% endif %}</div>
+      <form action="/library" method="post" data-busy-submit>
+        <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+        <input type="hidden" name="mode" value="new_releases">
+        <button type="submit" class="btn btn-primary w-full sm:w-auto">Check new releases</button>
+      </form>
+    </div>
+
+    <details class="mt-3"{% if library_resume %} open{% endif %}>
+      <summary class="ql-disclosure-summary">Re-scan library</summary>
+      <div class="pt-3">
+        <div class="ql-tool-note ql-tool-note-warning mb-3">
+          <p>Use a full re-scan after deleting files or when you want to re-check the whole library.</p>
+        </div>
+        <form action="/library" method="post" data-busy-submit>
+          <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+          <div class="space-y-2 mb-3">
+            <label class="ql-option-row">
+              <input type="radio" name="mode" value="missing_albums" class="radio radio-primary mt-1"
+                     {% if not library_resume or library_resume.kind == 'missing' %}checked{% endif %}>
+              <div>
+                <div class="font-medium">Missing albums and track gaps</div>
+                <div class="text-sm text-base-content/50">Albums not in your library, plus missing tracks in albums you own.</div>
+              </div>
+            </label>
+            <label class="ql-option-row">
+              <input type="radio" name="mode" value="partial_fill" class="radio radio-primary mt-1"
+                     {% if library_resume and library_resume.kind == 'partial' %}checked{% endif %}>
+              <div>
+                <div class="font-medium">Track gaps only</div>
+                <div class="text-sm text-base-content/50">Skips fully missing albums.</div>
+              </div>
+            </label>
+          </div>
+          <button type="submit" class="btn btn-outline btn-sm ql-secondary-action w-full sm:w-auto">Start re-scan</button>
+        </form>
       </div>
-    </label>
+    </details>
+    {% endif %}
   </div>
-  <button type="submit" class="btn btn-primary w-full sm:w-auto">Start library scan</button>
-</form>
-{% endif %}
-{% else %}
-<div class="alert alert-warning">
-  <span>No Qobuz credentials set —
-    <a href="/settings" class="link">set them in Settings</a> before starting a scan.</span>
-</div>
-{% endif %}
+</section>
 
 {% endblock %}

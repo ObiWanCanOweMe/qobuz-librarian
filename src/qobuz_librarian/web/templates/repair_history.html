@@ -2,46 +2,38 @@
 {% block title %}Repair history — Qobuz Librarian{% endblock %}
 {% block content %}
 
-<div class="flex items-center justify-between gap-3 mb-2">
-  <h1 class="text-2xl font-bold">Repair history</h1>
-  <a href="/repair" class="btn btn-ghost btn-sm">Back to Repair</a>
+<div class="mb-6 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+  <div class="min-w-0">
+    <h1 class="text-2xl font-bold">Repair history</h1>
+    <p class="mt-3 text-base-content/60">
+      Tracks repaired in place. Re-sync the album on offline devices to pick up
+      the fixed file.
+    </p>
+  </div>
+  <a href="/repair" class="btn btn-outline btn-sm w-full sm:w-auto">Back to repair</a>
 </div>
-<p class="text-base-content/60 mb-6">
-  Tracks that Repair has refilled in place. Most music servers keep the same
-  track ID across the swap, so an offline-sync client may keep serving the old
-  broken file until you refresh that album on the device.
-</p>
 
 {% if entries %}
 <p class="text-sm text-base-content/50 mb-3">
   {{ entries | length }} most recent (newest first)
 </p>
-<div class="overflow-x-auto">
-  <table class="table table-sm">
-    <thead>
-      <tr>
-        <th>When</th>
-        <th>Artist</th>
-        <th>Album</th>
-        <th>Track</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for e in entries %}
-      <tr>
-        <td class="whitespace-nowrap text-base-content/60">{{ e.when }}</td>
-        <td>{{ e.artist }}</td>
-        <td>{{ e.album }}</td>
-        <td>{{ e.title }}</td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-</div>
+<ul class="space-y-2">
+  {% for e in entries %}
+  <li class="ql-queue-card">
+    <div class="flex flex-col gap-0.5 sm:flex-row sm:items-baseline sm:justify-between sm:gap-3">
+      <span class="min-w-0">
+        <span class="font-medium break-words">{{ e.title }}</span>
+        <span class="block text-xs text-base-content/50 truncate">{{ e.artist }} · {{ e.album }}</span>
+      </span>
+      <span class="text-xs text-base-content/40 whitespace-nowrap shrink-0">{{ e.when }}</span>
+    </div>
+  </li>
+  {% endfor %}
+</ul>
 {% else %}
-<div class="text-center py-12 text-base-content/60">
-  <p class="font-medium">Nothing repaired yet.</p>
-  <p class="text-sm mt-1">When Repair refills a damaged track, it'll show up here.</p>
+<div class="ql-empty-state text-base-content/60">
+  <p class="text-base font-semibold text-base-content/75">Nothing repaired yet.</p>
+  <p class="mx-auto mt-1 max-w-md text-sm">When Repair refills a damaged track, it appears here.</p>
   <a href="/repair" class="btn btn-primary w-full sm:w-auto mt-4">Go to Repair</a>
 </div>
 {% endif %}

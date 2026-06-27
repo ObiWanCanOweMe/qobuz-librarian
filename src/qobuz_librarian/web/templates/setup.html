@@ -20,20 +20,20 @@
   <script src="/static/app.js?v={{ asset_version }}"></script>
 </head>
 <body class="min-h-screen bg-base-100 flex items-center justify-center px-4 py-8">
-  <div class="card bg-base-200 shadow-lg w-full max-w-md">
-    <div class="card-body">
+  <div class="ql-auth-panel w-full max-w-md">
+    <div class="ql-auth-body">
       <div class="flex items-center gap-2 mb-2">
         <img src="/static/icon.png" alt="" class="h-8 w-8 rounded-lg shrink-0">
         <h1 class="text-lg font-bold text-primary">Qobuz Librarian</h1>
       </div>
       <h2 class="text-base font-semibold mb-1">Protect the web UI</h2>
       <p class="text-sm text-base-content/60 mb-2">
-        Set a username and password — you'll sign in with these from now on.
+        Set a username and password.
       </p>
       <details class="mb-4">
-        <summary class="text-xs text-base-content/40 cursor-pointer select-none hover:underline">Prefer no login at all?</summary>
+        <summary class="text-xs text-base-content/40 cursor-pointer select-none hover:underline">Disable web login</summary>
         <p class="text-xs text-base-content/40 mt-1">
-          Stop the container, set <code>WEB_AUTH=none</code> in your env or
+          Stop the container, set <code>WEB_AUTH=none</code> in <code>.env</code> or
           <code>compose.yaml</code>, and start it again.
         </p>
       </details>
@@ -42,6 +42,7 @@
       <div class="alert alert-error mb-4"><span>{{ error }}</span></div>
       {% endif %}
 
+      {% from "_secret_toggle.html" import secret_toggle %}
       <form action="/setup" method="post">
         <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
         <div class="form-control mb-3">
@@ -51,21 +52,19 @@
         </div>
         <div class="form-control mb-3">
           <label class="label" for="password"><span class="label-text">Password</span></label>
-          <div class="flex items-center gap-2">
+          <div class="relative">
             <input type="password" name="password" id="password"
-                   autocomplete="new-password" class="input input-bordered min-w-0 flex-1">
-            <button type="button" class="btn btn-ghost btn-sm"
-                    data-toggle-password="password">Show</button>
+                   autocomplete="new-password" class="input input-bordered w-full pr-12">
+            {{ secret_toggle("password", "password") }}
           </div>
           <p class="text-xs text-base-content/40 mt-1">At least 8 characters.</p>
         </div>
         <div class="form-control mb-4">
           <label class="label" for="confirm"><span class="label-text">Confirm password</span></label>
-          <div class="flex items-center gap-2">
+          <div class="relative">
             <input type="password" name="confirm" id="confirm"
-                   autocomplete="new-password" class="input input-bordered min-w-0 flex-1">
-            <button type="button" class="btn btn-ghost btn-sm"
-                    data-toggle-password="confirm">Show</button>
+                   autocomplete="new-password" class="input input-bordered w-full pr-12">
+            {{ secret_toggle("confirm", "password") }}
           </div>
         </div>
         <button type="submit" class="btn btn-primary w-full">Create login</button>

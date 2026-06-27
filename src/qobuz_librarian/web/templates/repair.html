@@ -1,46 +1,74 @@
 {% extends "base.html" %}
 {% block title %}Repair — Qobuz Librarian{% endblock %}
+{% block content_max %}max-w-5xl{% endblock %}
 {% block content %}
 
-<div class="flex items-center justify-between gap-3 mb-4">
-  <h1 class="text-2xl font-bold">Repair</h1>
-  <a href="/repair/history" class="btn btn-ghost btn-sm">View history</a>
+{% if not qobuz_ready %}
+<section class="ql-tool-panel mx-auto max-w-3xl">
+  <div class="ql-tool-panel-body">
+    <div class="mb-5">
+      <div class="mb-2 flex items-center justify-between gap-3">
+        <h1 class="text-2xl font-bold">Repair</h1>
+        <a href="/repair/history" class="btn btn-outline btn-sm ql-secondary-action shrink-0">View history</a>
+      </div>
+      <p class="text-base-content/65">
+        Find damaged or truncated FLACs and review verified repair options.
+      </p>
+    </div>
+    {% with connect_embedded=True %}
+      {% include "_connect_cta.html" %}
+    {% endwith %}
+  </div>
+</section>
+{% elif not repair_job %}
+<section class="ql-tool-panel mx-auto max-w-3xl">
+  <div class="ql-tool-panel-body">
+    <div class="mb-5">
+      <div class="mb-2 flex items-center justify-between gap-3">
+        <h1 class="text-2xl font-bold">Repair</h1>
+        <a href="/repair/history" class="btn btn-outline btn-sm ql-secondary-action shrink-0">View history</a>
+      </div>
+      <p class="text-base-content/65">
+        Find damaged or truncated FLACs and review verified repair options.
+      </p>
+    </div>
+
+    <div class="ql-tool-status mb-5">
+      <span>
+        {% if last_run %}Last repair scan {{ last_run }}.{% else %}No repair scan has finished yet.{% endif %}
+      </span>
+    </div>
+
+    {% if repair_resume %}
+    <div class="ql-tool-note ql-tool-note-info mb-5">
+      <p class="font-semibold">Scan can resume</p>
+      <p>A repair scan was interrupted. {{ repair_resume.done }} artist{{ 's' if repair_resume.done != 1 }} already checked{% if repair_resume.found %}, {{ repair_resume.found }} repair option{{ 's' if repair_resume.found != 1 }} found{% endif %}. Starting it again continues from there.</p>
+    </div>
+    {% endif %}
+
+    <form action="/repair" method="post" data-busy-submit>
+      <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+      <button type="submit" class="btn btn-primary w-full sm:w-auto"
+              {% if repair_resume %}data-confirm="Continue the repair scan from where it left off?"{% else %}data-confirm="Start a full repair scan? This can take a while on a large library."{% endif %}>{% if repair_resume %}Resume scan{% else %}Start repair scan{% endif %}</button>
+    </form>
+  </div>
+</section>
+{% else %}
+<div class="mb-4">
+  <div class="mb-2 flex items-center justify-between gap-3">
+    <h1 class="text-2xl font-bold">Repair</h1>
+    <a href="/repair/history" class="btn btn-outline btn-sm ql-secondary-action shrink-0">View history</a>
+  </div>
+  <p class="text-base-content/65">
+    Find damaged or truncated FLACs and review verified repair options.
+  </p>
 </div>
 
-{% if creds_ok %}
+{% if qobuz_ready %}
 {% if repair_job %}
-{# A repair job owns this surface across every phase. Render its live body inline
-   — scanning → review → repairing → done — so the whole task stays on /repair
-   instead of handing a parked review off to /jobs/{id}. The phase strip + body
-   live inside #job-content, so the SSE content-swap advances them together. #}
 {% with job = repair_job %}{% include "_job_body.html" %}{% endwith %}
-{% else %}
-{# Idle: start (or resume an interrupted sweep). #}
-<p class="text-base-content/60 mb-6">
-  Finds truncated or partially-downloaded FLACs — even ones that still play — by checking each track's length against its Qobuz recording by ISRC. Broken files are backed up before refilling.
-</p>
-<p class="text-base-content/40 text-sm mb-6 -mt-3">
-  Just one artist? <a href="/artist" class="link">Run a focused artist scan</a>.
-</p>
-{% if repair_resume %}
-<div class="alert alert-info mb-4">
-  <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
-  </svg>
-  <span>A repair scan was interrupted — {{ repair_resume.done }} artist{{ 's' if repair_resume.done != 1 }} already checked{% if repair_resume.found %}, {{ repair_resume.found }} album{{ 's' if repair_resume.found != 1 }} flagged{% endif %}. Starting it again continues from there.</span>
-</div>
 {% endif %}
-<form action="/repair" method="post" data-busy-submit>
-  <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-  <button type="submit" class="btn btn-primary w-full sm:w-auto"
-          {% if repair_resume %}data-confirm="Continue the repair scan from where it left off?"{% else %}data-confirm="Start a full repair scan? This can take a couple of hours on a large library."{% endif %}>{% if repair_resume %}Resume scan{% else %}Scan library for damaged tracks{% endif %}</button>
-</form>
 {% endif %}
-{% else %}
-<div class="alert alert-warning">
-  <span>No Qobuz credentials set —
-    <a href="/settings" class="link">set them in Settings</a> before starting a scan.</span>
-</div>
 {% endif %}
 
 {% endblock %}

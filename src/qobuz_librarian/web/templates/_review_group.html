@@ -1,49 +1,45 @@
-<details class="group bg-base-200 border border-base-300/70 rounded-lg shadow-sm overflow-hidden transition-colors hover:border-base-300" data-artist="{{ artist }}"{% if open %} open{% endif %}>
-  <summary class="flex items-center justify-between gap-2 px-3 py-2.5 cursor-pointer select-none transition-colors hover:bg-base-300/30 group-open:border-b group-open:border-base-300/50">
-    <span class="flex items-center gap-2 min-w-0">
-      {% if triage %}
-      <label class="inline-flex items-center gap-1.5 shrink-0 text-xs text-base-content/60 cursor-pointer" data-artist-mark-label>
-        <input type="checkbox" class="checkbox checkbox-xs" data-artist-mark value="{{ artist }}"
-               aria-label="Mark {{ artist or 'this artist' }} for hiding">
-        <span>Mark</span>
-      </label>
-      {% endif %}
-      <span class="min-w-0">
-        <span class="block truncate font-medium sm:inline">{{ artist or 'Unknown artist' }}</span>
-        <span class="block truncate text-xs font-normal text-base-content/50 sm:inline sm:text-sm">— {{ items | length }} album{% if items | length != 1 %}s{% endif %}</span>
-      </span>
+{% import "_job_labels.html" as labels %}
+
+<details class="ql-review-group group{% if triage %} ql-review-group--triage{% endif %}" data-artist="{{ artist }}"{% if open %} open{% endif %}>
+  <summary class="ql-review-summary">
+    <span class="ql-review-title">
+      <span class="ql-review-title-main">{{ artist or 'Artist not recorded' }}</span>
+      <span class="ql-review-title-meta">{{ labels.review_count(job, items | length) }}</span>
     </span>
-    {% if triage %}
-    {# Hide drops this artist's UNticked albums (selection is saved server-side,
-       so no cids need to ride along). Target this group only so the rest of the
-       page is untouched. #}
+  </summary>
+  {% if triage %}
+  {% set _hide_label = 'Keep hi-res' if job.execute_kind == 'downsample' else 'Dismiss unselected' %}
+  <div class="ql-review-group-actions">
+    <label class="ql-review-artist-select">
+      <input type="checkbox" class="checkbox checkbox-sm checkbox-primary" data-artist-select value="{{ artist }}"
+             {% if items and (items | selectattr('selected') | list | length) == (items | length) %}checked{% endif %}
+             aria-label="Select shown {{ labels.review_item_plural(job) }} by {{ artist or 'this artist' }} to {{ job.review_verb | lower }}">
+      <span>Select shown</span>
+    </label>
     <button type="button" data-hide data-artist="{{ artist }}"
-            aria-label="Hide albums by {{ artist or 'this artist' }}"
+            aria-label="{% if job.execute_kind == 'downsample' %}Keep unselected albums by {{ artist or 'this artist' }} hi-res{% elif job.execute_kind == 'upgrade' %}Dismiss unselected upgrades by {{ artist or 'this artist' }}{% elif job.execute_kind == 'library' %}Dismiss unselected albums and track gaps by {{ artist or 'this artist' }}{% else %}Dismiss unselected albums by {{ artist or 'this artist' }}{% endif %}"
             hx-post="/jobs/{{ job.id }}/hide"
             hx-vals='{{ {"artist": artist}|tojson }}'
             hx-target="closest details"
             hx-swap="outerHTML swap:280ms"
-            class="btn btn-xs btn-ghost shrink-0"><span data-hide-label>Hide artist</span></button>
-    {% endif %}
-  </summary>
+            hx-disabled-elt="this"
+            class="btn btn-sm sm:btn-xs btn-outline ql-secondary-action disabled:opacity-60"><span data-hide-label>{{ _hide_label }}</span></button>
+  </div>
+  {% endif %}
   <div class="px-3 pb-3 pt-1 space-y-1">
-    <div class="flex gap-2 mb-1">
-      <button type="button" class="btn btn-xs" aria-label="Select all albums by {{ artist or 'this artist' }}"
-              data-group-select="1">All</button>
-      <button type="button" class="btn btn-xs" aria-label="Deselect all albums by {{ artist or 'this artist' }}"
-              data-group-select="0">None</button>
-    </div>
     {% for c in items %}
-    <label class="flex items-center gap-3 px-3 py-2 bg-base-100 border border-base-300/40 rounded-lg cursor-pointer transition-colors hover:border-base-content/20">
+    <label class="ql-review-candidate">
       <input type="checkbox" class="checkbox checkbox-sm cb" name="cid"
              value="{{ c.cid }}" data-seq="{{ c.seq }}"
-             data-saving="{{ c.payload.est_saving or 0 }}" {% if c.selected %}checked{% endif %}>
+             {% if c.selected %}checked{% endif %}>
+      {% if c.payload.cover %}
+      <img src="{{ c.payload.cover }}" alt="" loading="lazy" width="40" height="40"
+           class="shrink-0 w-10 h-10 rounded object-cover bg-base-300">
+      {% endif %}
       <span class="flex-1 min-w-0">
         <span class="font-medium">{{ c.title }}</span>{% if c.payload.is_new %}
         <span class="badge badge-primary badge-xs align-middle ml-1">new</span>{% endif %}
         <span class="block text-xs text-base-content/40">{{ c.detail }}</span>
-        {# Repair: name the actual damaged tracks (track no. + title), not just a
-           count — the per-track data is already in the candidate payload. #}
         {% if c.payload.verified_truncated %}
         <span class="block mt-1.5 pl-2 border-l-2 border-warning/40 space-y-0.5">
           {% for t in c.payload.verified_truncated[:12] %}
@@ -56,7 +52,7 @@
           <span class="block text-xs text-base-content/40">+{{ (c.payload.verified_truncated | length) - 12 }} more</span>
           {% endif %}
         </span>
-        {% endif %}
+      {% endif %}
       </span>
     </label>
     {% endfor %}

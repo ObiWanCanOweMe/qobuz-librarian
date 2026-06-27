@@ -20,8 +20,8 @@
   <script src="/static/app.js?v={{ asset_version }}"></script>
 </head>
 <body class="min-h-screen bg-base-100 flex items-center justify-center px-4 py-8">
-  <div class="card bg-base-200 shadow-lg w-full max-w-sm">
-    <div class="card-body">
+  <div class="ql-auth-panel w-full max-w-sm">
+    <div class="ql-auth-body">
       <div class="flex items-center gap-2 mb-1">
         <img src="/static/icon.png" alt="" class="h-8 w-8 rounded-lg shrink-0">
         <h1 class="text-lg font-bold text-primary">Qobuz Librarian</h1>
@@ -32,6 +32,7 @@
       <div class="alert alert-error mb-4"><span>{{ error }}</span></div>
       {% endif %}
 
+      {% from "_secret_toggle.html" import secret_toggle %}
       <form action="/login" method="post">
         <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
         <div class="form-control mb-3">
@@ -41,11 +42,10 @@
         </div>
         <div class="form-control mb-4">
           <label class="label" for="password"><span class="label-text">Password</span></label>
-          <div class="flex items-center gap-2">
+          <div class="relative">
             <input type="password" name="password" id="password"
-                   autocomplete="current-password" class="input input-bordered min-w-0 flex-1">
-            <button type="button" class="btn btn-ghost btn-sm"
-                    data-toggle-password="password">Show</button>
+                   autocomplete="current-password" class="input input-bordered w-full pr-12">
+            {{ secret_toggle("password", "password") }}
           </div>
         </div>
         <button type="submit" class="btn btn-primary w-full">Sign in</button>
