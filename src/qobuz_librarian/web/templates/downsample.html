@@ -9,15 +9,15 @@
 <section class="ql-tool-panel mx-auto max-w-3xl">
   <div class="ql-tool-panel-body">
     <div class="mb-5">
-      <h1 class="text-2xl font-bold mb-2">Downsample hi-res</h1>
+      <h1 class="text-2xl font-bold mb-2">Downsample candidates</h1>
       <p class="text-base-content/65">
-        Find local hi-res FLAC albums that can be reduced to 44.1 or 48&nbsp;kHz.
+        Review local hi-res FLAC albums that can be reduced to 44.1 or 48&nbsp;kHz.
       </p>
     </div>
 
     <div class="ql-tool-status mb-4">
       <span>
-        {% if last_run %}Last downsample scan {{ last_run }}.{% else %}No downsample scan has finished yet.{% endif %}
+        {% if downsample_state.updated %}Candidates refreshed {{ downsample_state.updated }}.{% elif last_run %}Last downsample refresh {{ last_run }}.{% else %}No downsample refresh has finished yet.{% endif %}
       </span>
       {% if hidden_count %}
       <a href="/downsample/hidden" class="link link-hover ml-0 sm:ml-auto">
@@ -32,11 +32,34 @@
     </div>
 
     {% if have_downsample %}
+    {% if downsample_state.count %}
+    <div class="ql-tool-note mb-5">
+      <p class="font-semibold">{{ downsample_state.count }} album{% if downsample_state.count != 1 %}s{% endif %} can be downsampled</p>
+      <p>Select the albums to rewrite on the review screen.</p>
+    </div>
+    <div class="flex flex-col gap-2 sm:flex-row">
+      <form action="/downsample/review" method="post" data-busy-submit>
+        <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+        <button type="submit" class="btn btn-primary w-full sm:w-auto"
+                data-confirm="Review saved downsample candidates? Nothing changes until you approve selected albums.">Review candidates</button>
+      </form>
+      <form action="/downsample" method="post" data-busy-submit>
+        <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+        <button type="submit" class="btn btn-outline ql-secondary-action w-full sm:w-auto"
+                data-confirm="Refresh local downsample candidates? You review and choose what to downsample before anything changes.">Refresh candidates</button>
+      </form>
+    </div>
+    {% else %}
+    <div class="ql-tool-note mb-5">
+      <p class="font-semibold">No downsample candidates saved</p>
+      <p>Refresh local candidates or run a Library refresh to update missing albums, track gaps, upgrades, and downsample candidates.</p>
+    </div>
     <form action="/downsample" method="post" data-busy-submit>
       <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
       <button type="submit" class="btn btn-primary w-full sm:w-auto"
-              data-confirm="Scan the library for local hi-res albums? You review and choose what to downsample before anything changes.">Start downsample scan</button>
+              data-confirm="Refresh local downsample candidates? You review and choose what to downsample before anything changes.">Refresh candidates</button>
     </form>
+    {% endif %}
     {% else %}
     <div class="alert alert-warning">
       <span>Downsampling is not available on this server (the resample helper is missing).</span>

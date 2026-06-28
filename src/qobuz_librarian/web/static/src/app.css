@@ -42,17 +42,22 @@
 
 /* Brand accent: use the logo teal as primary and keep status colours distinct. */
 [data-theme="night"] {
-  --color-primary: oklch(79% 0.134 182);
-  --color-primary-content: oklch(21% 0.035 196);
-  /* Lift body text so muted captions remain readable in dark mode. */
-  --color-base-content: oklch(95% 0.012 255);
+  --color-base-100: #101312;
+  --color-base-200: #171b1a;
+  --color-base-300: #2a302e;
+  --color-base-content: #f2f5f3;
+  --color-primary: #27c8b8;
+  --color-primary-content: #061513;
 }
 
 /* Light theme adjustments for the same brand accent and readable status text. */
 [data-theme="winter"] {
-  --color-primary: oklch(50% 0.105 187);
-  --color-primary-content: oklch(99% 0.01 187);
-  --color-base-content: oklch(20% 0.015 255);
+  --color-base-100: #fbfbfa;
+  --color-base-200: #f3f5f4;
+  --color-base-300: #dce3e0;
+  --color-base-content: #111817;
+  --color-primary: #008b7d;
+  --color-primary-content: #ffffff;
   --color-info: oklch(52% 0.14 245);
   --color-info-content: oklch(99% 0.01 245);
 }
@@ -144,6 +149,17 @@ h1, h2, h3 { letter-spacing: 0; }
   font-weight: 700;
   text-decoration: none;
 }
+.ql-sidebar-brand {
+  min-height: 2.5rem;
+  padding-inline: 0.125rem;
+}
+.ql-sidebar-brand span,
+.ql-mobile-brand span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .ql-brand-mark {
   width: 2rem;
   height: 2rem;
@@ -153,7 +169,21 @@ h1, h2, h3 { letter-spacing: 0; }
 .ql-sidebar-nav {
   display: flex;
   flex-direction: column;
+  gap: 0.25rem;
+}
+.ql-nav-group {
+  display: grid;
   gap: 0.125rem;
+}
+.ql-nav-group + .ql-nav-group {
+  margin-top: 0.75rem;
+}
+.ql-nav-group-title {
+  margin: 0 0.625rem 0.25rem;
+  color: color-mix(in oklab, var(--color-base-content) 48%, transparent);
+  font-size: 0.75rem;
+  font-weight: 650;
+  line-height: 1.2;
 }
 .ql-nav-link,
 .ql-sidebar-action {
@@ -189,19 +219,24 @@ h1, h2, h3 { letter-spacing: 0; }
   flex: none;
   fill: currentColor;
 }
-.ql-nav-group {
-  display: flex;
-  flex-direction: column;
-  gap: 0.125rem;
+.ql-nav-link .ql-nav-icon-stroke {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.ql-icon-button .ql-nav-icon-stroke {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.ql-nav-separator {
   margin-top: 0.75rem;
   padding-top: 0.75rem;
   border-top: 1px solid color-mix(in oklab, var(--color-base-content) 9%, transparent);
-}
-.ql-nav-group-title {
-  padding: 0 0.625rem 0.25rem;
-  color: color-mix(in oklab, var(--color-base-content) 50%, transparent);
-  font-size: 0.8125rem;
-  line-height: 1.2;
 }
 .ql-queue-badge {
   margin-left: auto;
@@ -216,6 +251,14 @@ h1, h2, h3 { letter-spacing: 0; }
 }
 .ql-queue-badge.is-warning {
   background-color: color-mix(in oklab, var(--color-warning) 24%, transparent);
+}
+.ql-review-badge {
+  margin-left: auto;
+  width: 0.375rem;
+  height: 1rem;
+  flex: none;
+  border-radius: 0.1875rem;
+  background-color: var(--color-warning);
 }
 .ql-sidebar-alert {
   display: flex;
@@ -238,10 +281,10 @@ h1, h2, h3 { letter-spacing: 0; }
   position: sticky;
   top: 0;
   z-index: 30;
-  display: flex;
+  display: grid;
+  grid-template-columns: 2.5rem minmax(0, 1fr) 2.5rem;
   min-height: 3.875rem;
   align-items: center;
-  justify-content: space-between;
   gap: 0.75rem;
   border-bottom: 1px solid var(--color-base-300);
   background-color: var(--color-base-100);
@@ -258,7 +301,12 @@ h1, h2, h3 { letter-spacing: 0; }
 .ql-mobile-actions {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 0.25rem;
+  min-width: 2.5rem;
+}
+.ql-mobilebar > .ql-mobile-brand {
+  justify-content: center;
 }
 .ql-icon-button {
   display: inline-grid;
@@ -273,6 +321,25 @@ h1, h2, h3 { letter-spacing: 0; }
 .ql-icon-button:hover {
   background-color: color-mix(in oklab, var(--color-base-content) 7%, transparent);
 }
+.ql-mobile-drawer > summary.ql-icon-button {
+  justify-self: start;
+  border-color: color-mix(in oklab, var(--color-base-content) 14%, transparent);
+  color: color-mix(in oklab, var(--color-base-content) 86%, transparent);
+  background-color: color-mix(in oklab, var(--color-base-content) 4%, transparent);
+}
+.ql-mobile-drawer > summary.ql-icon-button:hover,
+details.dropdown.ql-mobile-drawer[open] > summary.ql-icon-button {
+  border-color: color-mix(in oklab, var(--color-base-content) 20%, transparent);
+  color: var(--color-base-content);
+  background-color: color-mix(in oklab, var(--color-base-content) 8%, transparent);
+}
+.ql-mobile-drawer > summary.ql-icon-button svg {
+  width: 1.25rem;
+  height: 1.25rem;
+}
+.ql-mobile-drawer > summary.ql-icon-button .ql-nav-icon-stroke {
+  stroke-width: 2.05;
+}
 .ql-icon-button.is-error {
   color: var(--color-error);
   background-color: color-mix(in oklab, var(--color-error) 13%, transparent);
@@ -281,19 +348,28 @@ h1, h2, h3 { letter-spacing: 0; }
   color: var(--color-warning);
   background-color: color-mix(in oklab, var(--color-warning) 14%, transparent);
 }
-.ql-mobile-dropdown {
-  position: relative;
+.ql-mobile-drawer {
+  position: static;
+}
+details.dropdown.ql-mobile-drawer[open]::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background-color: oklch(0% 0 0 / 0.42);
 }
 .ql-mobile-menu {
-  right: 0;
-  z-index: 60;
-  margin-top: 0.625rem;
-  width: min(22rem, calc(100vw - 2rem));
-  border: 1px solid color-mix(in oklab, var(--color-base-content) 12%, transparent);
-  border-radius: 0.5rem;
+  position: fixed;
+  inset: 0 auto 0 0;
+  z-index: 70;
+  display: flex;
+  width: min(21.5rem, calc(100vw - 2.5rem));
+  flex-direction: column;
+  gap: 1.125rem;
+  border-right: 1px solid color-mix(in oklab, var(--color-base-content) 12%, transparent);
   background-color: var(--color-base-100);
-  padding: 0.375rem;
-  box-shadow: 0 2px 8px oklch(0% 0 0 / 0.16);
+  padding: 1rem;
+  overflow-y: auto;
   opacity: 1 !important;
   transform: none !important;
   transition: none !important;
@@ -303,46 +379,36 @@ h1, h2, h3 { letter-spacing: 0; }
   background-color: #ffffff;
 }
 [data-theme="night"] .ql-mobile-menu {
-  border-color: oklch(100% 0 0 / 0.14);
+  border-right-color: oklch(100% 0 0 / 0.14);
   background-color: color-mix(in oklab, var(--color-base-200) 82%, var(--color-base-100));
-  box-shadow:
-    0 2px 8px oklch(0% 0 0 / 0.34),
-    inset 0 1px 0 oklch(100% 0 0 / 0.05);
 }
-details.dropdown.ql-mobile-dropdown:not([open]) > .ql-mobile-menu {
+details.dropdown.ql-mobile-drawer:not([open]) > .ql-mobile-menu {
   display: none;
 }
-details.dropdown.ql-mobile-dropdown[open] > .ql-mobile-menu {
-  display: flex;
+details.dropdown.ql-mobile-drawer[open] > .ql-mobile-menu {
   visibility: visible;
-  opacity: 1 !important;
-  transform: none !important;
 }
-@media (max-width: 520px) {
-  .ql-mobile-dropdown .ql-mobile-menu {
-    position: fixed;
-    top: 3.875rem;
-    right: 1rem;
-    left: 1rem;
-    width: auto;
-  }
+.ql-mobile-menu-header,
+.ql-mobile-menu-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
 }
-.ql-mobile-menu a,
-.ql-mobile-menu button {
-  min-height: 2.5rem;
-  border-radius: 0.375rem;
-  font-weight: 600;
+.ql-mobile-menu-nav {
+  display: grid;
+  gap: 0.875rem;
 }
-.ql-mobile-menu :where(a, button).active {
-  background-color: color-mix(in oklab, var(--color-primary) 16%, transparent);
-  color: var(--color-base-content);
+.ql-mobile-menu .ql-nav-link {
+  min-height: 2.75rem;
+  padding: 0.625rem 0.75rem;
 }
-.ql-mobile-menu-title {
-  margin-top: 0.25rem;
+.ql-mobile-menu-footer {
+  margin-top: auto;
+  align-items: stretch;
+  flex-direction: column;
   border-top: 1px solid color-mix(in oklab, var(--color-base-content) 9%, transparent);
-  padding: 0.75rem 0.75rem 0.25rem;
-  color: color-mix(in oklab, var(--color-base-content) 55%, transparent);
-  font-size: 0.8125rem;
+  padding-top: 0.75rem;
 }
 .ql-cli-banner {
   border-bottom: 1px solid color-mix(in oklab, var(--color-warning) 32%, transparent);
@@ -360,7 +426,7 @@ details.dropdown.ql-mobile-dropdown[open] > .ql-mobile-menu {
   width: 100%;
   margin-inline: auto;
   flex: 1;
-  padding: 1.25rem 1rem 2rem;
+  padding: 1.125rem 1rem 2rem;
 }
 @media (min-width: 768px) {
   .ql-main {
@@ -433,36 +499,60 @@ details.dropdown.ql-mobile-dropdown[open] > .ql-mobile-menu {
   display: grid;
   gap: 0.75rem;
 }
-.ql-dashboard-grid {
+.ql-dashboard-grid,
+.ql-search-workspace {
   display: grid;
   gap: 1rem;
 }
-@media (min-width: 980px) {
-  .ql-dashboard-grid {
-    grid-template-columns: minmax(0, 1.35fr) minmax(18rem, 0.85fr);
-    align-items: start;
-  }
-  .ql-search-panel {
-    grid-column: 1;
-    grid-row: 1;
-  }
-  .ql-review-panel {
-    grid-column: 2;
-    grid-row: 1;
-  }
-  .ql-search-results {
-    grid-column: 1 / -1;
-  }
+.ql-search-workspace {
+  max-width: 64rem;
 }
 .ql-panel {
   border: 1px solid var(--color-base-300);
-  border-radius: 0.625rem;
+  border-radius: 0.5rem;
   background-color: color-mix(in oklab, var(--color-base-100) 96%, var(--color-base-200));
   padding: 1rem;
+}
+.ql-search-panel:not([data-qobuz-setup-card]) {
+  padding: 1rem;
+}
+.ql-search-panel[data-qobuz-setup-card] {
+  max-width: 54rem;
+  overflow: hidden;
+  padding: 0;
 }
 [data-theme="night"] .ql-panel {
   border-color: oklch(100% 0 0 / 0.10);
   background-color: color-mix(in oklab, var(--color-base-100) 88%, var(--color-base-200));
+}
+.ql-locked-search {
+  display: grid;
+  gap: 0;
+}
+.ql-locked-search-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 1rem;
+  padding: 1.125rem;
+}
+.ql-state-icon {
+  display: grid;
+  width: 2.5rem;
+  height: 2.5rem;
+  place-items: center;
+  border-radius: 0.5rem;
+  background-color: color-mix(in oklab, var(--color-warning) 14%, transparent);
+  color: var(--color-warning);
+}
+.ql-state-icon svg {
+  width: 1.25rem;
+  height: 1.25rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 .ql-panel-header {
   display: flex;
@@ -470,6 +560,10 @@ details.dropdown.ql-mobile-dropdown[open] > .ql-mobile-menu {
   flex-direction: column;
   gap: 0.2rem;
   margin-bottom: 0.875rem;
+}
+.ql-search-panel[data-qobuz-setup-card] .ql-panel-header,
+.ql-locked-search .ql-panel-header {
+  margin-bottom: 0;
 }
 .ql-panel-header-row {
   flex-direction: row;
@@ -495,12 +589,38 @@ details.dropdown.ql-mobile-dropdown[open] > .ql-mobile-menu {
   gap: 0.875rem;
   align-items: flex-start;
 }
+.ql-search-panel[data-qobuz-setup-card] .ql-panel-actions {
+  align-items: flex-end;
+  gap: 0.625rem;
+}
+.ql-locked-search-form {
+  display: grid;
+  gap: 0.75rem;
+  border-top: 1px solid color-mix(in oklab, var(--color-base-content) 9%, transparent);
+  padding: 1rem 1.125rem;
+  background-color: color-mix(in oklab, var(--color-base-content) 2.5%, transparent);
+}
+[data-theme="night"] .ql-locked-search-form {
+  border-top-color: oklch(100% 0 0 / 0.09);
+}
+.ql-locked-search .ql-local-links {
+  border-top: 1px solid color-mix(in oklab, var(--color-base-content) 9%, transparent);
+  padding: 0.875rem 1.125rem;
+  justify-content: flex-start;
+}
+[data-theme="night"] .ql-locked-search .ql-local-links {
+  border-top-color: oklch(100% 0 0 / 0.09);
+}
 .ql-local-links {
   display: flex;
   flex-wrap: wrap;
   gap: 0.625rem 0.875rem;
   color: color-mix(in oklab, var(--color-base-content) 66%, transparent);
   font-size: 0.875rem;
+  justify-content: flex-end;
+}
+.ql-local-links span {
+  color: color-mix(in oklab, var(--color-base-content) 54%, transparent);
 }
 .ql-local-links a {
   text-decoration: underline;
@@ -539,6 +659,13 @@ details.dropdown.ql-mobile-dropdown[open] > .ql-mobile-menu {
   outline: 2px solid color-mix(in oklab, var(--color-primary) 72%, var(--color-base-content));
   outline-offset: 2px;
 }
+.ql-segmented-disabled {
+  pointer-events: none;
+}
+.ql-segmented-disabled span {
+  color: color-mix(in oklab, var(--color-base-content) 52%, transparent);
+  cursor: default;
+}
 .ql-search-row {
   display: flex;
   min-width: 0;
@@ -554,7 +681,49 @@ details.dropdown.ql-mobile-dropdown[open] > .ql-mobile-menu {
   min-height: 2.75rem;
   gap: 0.45rem;
 }
+.ql-disabled-input {
+  display: flex;
+  min-width: 0;
+  min-height: 2.75rem;
+  flex: 1 1 auto;
+  align-items: center;
+  border: 1px solid color-mix(in oklab, var(--color-base-content) 11%, transparent);
+  border-radius: 0.5rem;
+  background-color: color-mix(in oklab, var(--color-base-100) 72%, transparent);
+  padding-inline: 0.875rem;
+  color: color-mix(in oklab, var(--color-base-content) 45%, transparent);
+  font-size: 1rem;
+}
 @media (max-width: 520px) {
+  .ql-search-panel[data-qobuz-setup-card] {
+    max-width: none;
+  }
+  .ql-locked-search-head {
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 0.875rem;
+    padding: 1rem;
+  }
+  .ql-locked-search-action {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+  .ql-locked-search-form,
+  .ql-locked-search .ql-local-links {
+    padding-inline: 1rem;
+  }
+  .ql-local-links {
+    justify-content: flex-start;
+  }
+  .ql-segmented {
+    width: 100%;
+  }
+  .ql-segmented label {
+    flex: 1 1 0;
+    min-width: 0;
+  }
+  .ql-segmented span {
+    min-width: 0;
+  }
   .ql-search-row {
     flex-direction: column;
   }
@@ -565,6 +734,65 @@ details.dropdown.ql-mobile-dropdown[open] > .ql-mobile-menu {
 .ql-search-results {
   min-width: 0;
 }
+.ql-active-strip {
+  display: grid;
+  gap: 0.75rem;
+  border: 1px solid var(--color-base-300);
+  border-radius: 0.5rem;
+  background-color: color-mix(in oklab, var(--color-base-100) 96%, var(--color-base-200));
+  padding: 0.875rem;
+}
+[data-theme="night"] .ql-active-strip {
+  border-color: oklch(100% 0 0 / 0.10);
+  background-color: color-mix(in oklab, var(--color-base-100) 88%, var(--color-base-200));
+}
+.ql-active-strip-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.ql-active-strip-header h2 {
+  margin: 0;
+  font-size: 0.9375rem;
+  font-weight: 700;
+  line-height: 1.25;
+}
+.ql-active-list {
+  display: grid;
+}
+.ql-active-row {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.875rem;
+  padding-block: 0.75rem;
+}
+.ql-active-row + .ql-active-row {
+  border-top: 1px solid color-mix(in oklab, var(--color-base-content) 9%, transparent);
+}
+.ql-active-list > .ql-active-row:first-child {
+  padding-top: 0;
+}
+.ql-active-list > .ql-active-row:last-child {
+  padding-bottom: 0;
+}
+.ql-active-main {
+  min-width: 0;
+}
+@media (max-width: 520px) {
+  .ql-active-strip-header,
+  .ql-active-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .ql-active-action,
+  .ql-active-action .btn,
+  .ql-active-row > .btn {
+    width: 100%;
+  }
+}
 .ql-results-panel,
 .ql-queue-card,
 .ql-review-group,
@@ -572,7 +800,7 @@ details.dropdown.ql-mobile-dropdown[open] > .ql-mobile-menu {
 .ql-connect-cta,
 .ql-auth-panel {
   border: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
-  border-radius: 0.625rem;
+  border-radius: 0.5rem;
   background-color: color-mix(in oklab, var(--color-base-100) 94%, var(--color-base-200));
 }
 [data-theme="night"] .ql-results-panel,
@@ -587,6 +815,12 @@ details.dropdown.ql-mobile-dropdown[open] > .ql-mobile-menu {
 .ql-results-panel,
 .ql-review-group {
   overflow: hidden;
+}
+@media (min-width: 768px) {
+  .ql-search-results .ql-results-panel {
+    max-height: min(68vh, 44rem);
+    overflow-y: auto;
+  }
 }
 .ql-result-list > * + *,
 .ql-version-panel {
@@ -608,28 +842,251 @@ details.dropdown.ql-mobile-dropdown[open] > .ql-mobile-menu {
   display: flex;
   min-width: 0;
   flex-direction: column;
-  gap: 0.75rem;
+  gap: 0.875rem;
   padding: 0.875rem 1rem;
 }
 @media (min-width: 640px) {
   .ql-result-row {
     flex-direction: row;
+    align-items: center;
     gap: 1rem;
+    min-height: 4.75rem;
+    padding-block: 0.8125rem;
+  }
+}
+.ql-result-row:hover {
+  background-color: color-mix(in oklab, var(--color-base-content) 2.5%, transparent);
+}
+.ql-result-main {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 0.875rem;
+}
+.ql-result-art {
+  width: 3.25rem;
+  height: 3.25rem;
+  flex: none;
+  border-radius: 0.375rem;
+  object-fit: cover;
+  background-color: var(--color-base-300);
+}
+.ql-result-copy {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.ql-result-title {
+  display: block;
+  margin: 0;
+  overflow: hidden;
+  color: var(--color-base-content);
+  font-size: 0.9375rem;
+  font-weight: 680;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ql-result-title span {
+  color: color-mix(in oklab, var(--color-base-content) 48%, transparent);
+  font-weight: 450;
+}
+.ql-result-meta {
+  display: block;
+  margin: 0.1875rem 0 0;
+  overflow: hidden;
+  color: color-mix(in oklab, var(--color-base-content) 58%, transparent);
+  font-size: 0.875rem;
+  line-height: 1.28;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ql-result-artist {
+  color: color-mix(in oklab, var(--color-base-content) 76%, transparent);
+  font-weight: 640;
+}
+.ql-result-detail {
+  color: color-mix(in oklab, var(--color-base-content) 42%, transparent);
+}
+.ql-result-inline-quality {
+  display: none;
+}
+.ql-result-side {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.625rem;
+}
+.ql-result-actions,
+.ql-result-flags {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.5rem;
+}
+.ql-result-action-form {
+  width: 100%;
+}
+.ql-result-action-form .btn {
+  width: 100%;
+}
+@media (min-width: 640px) {
+  .ql-result-side {
+    width: auto;
+    flex: none;
+    justify-content: flex-end;
+  }
+  .ql-result-action-form {
+    width: auto;
+    flex: none;
+  }
+  .ql-result-action-form .btn {
+    width: auto;
+  }
+}
+@media (max-width: 520px) {
+  .ql-search-results .ql-results-panel {
+    border: 0;
+    background-color: transparent;
+    overflow: visible;
+  }
+  .ql-result-list {
+    display: grid;
+    gap: 0.5rem;
+  }
+  .ql-result-list > * + *,
+  .ql-version-panel {
+    border-top: 0;
+  }
+  .ql-result-list > .ql-result-row,
+  .ql-result-list > .ql-result-item,
+  .ql-result-section {
+    border: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
+    border-radius: 0.5rem;
+    background-color: color-mix(in oklab, var(--color-base-100) 94%, var(--color-base-200));
+  }
+  [data-theme="night"] .ql-result-list > .ql-result-row,
+  [data-theme="night"] .ql-result-list > .ql-result-item,
+  [data-theme="night"] .ql-result-section {
+    border-color: oklch(100% 0 0 / 0.10);
+    background-color: color-mix(in oklab, var(--color-base-100) 88%, var(--color-base-200));
+  }
+  .ql-result-item > .ql-result-row {
+    border: 0;
+    border-radius: 0;
+    background-color: transparent;
+  }
+  .ql-version-group > .ql-version-panel {
+    border-top: 1px solid color-mix(in oklab, var(--color-base-content) 8%, transparent);
+  }
+  [data-theme="night"] .ql-version-group > .ql-version-panel {
+    border-top-color: oklch(100% 0 0 / 0.09);
+  }
+  .ql-result-row {
+    padding: 0.875rem;
+  }
+  .ql-result-main {
+    align-items: flex-start;
+  }
+  .ql-result-art {
+    width: 3rem;
+    height: 3rem;
+  }
+  .ql-result-title,
+  .ql-result-meta {
+    white-space: normal;
+  }
+  .ql-result-meta {
+    line-height: 1.34;
+  }
+  .ql-result-artist {
+    display: block;
+    margin-bottom: 0.0625rem;
+    color: color-mix(in oklab, var(--color-base-content) 80%, transparent);
+  }
+  .ql-result-detail {
+    color: color-mix(in oklab, var(--color-base-content) 52%, transparent);
+  }
+  .ql-result-inline-quality {
+    display: inline-grid;
+    height: 1.125rem;
+    min-width: 1.55rem;
+    place-items: center;
+    border: 0;
+    border-radius: 0.25rem;
+    margin-left: 0.35rem;
+    padding: 0 0.32rem;
+    font-size: 0.6875rem;
+    font-weight: 700;
+    line-height: 1;
+    white-space: nowrap;
+    vertical-align: -0.08rem;
+    box-shadow: inset 0 0 0 1px var(--ql-quality-edge, currentColor);
+  }
+  .ql-result-inline-owned {
+    --ql-quality-edge: color-mix(in oklab, var(--color-success) 34%, transparent);
+    color: var(--color-success);
+    background-color: color-mix(in oklab, var(--color-success) 9%, transparent);
+    border-color: color-mix(in oklab, var(--color-success) 34%, transparent);
+  }
+  .ql-result-side {
+    align-items: center;
+    flex-direction: row;
+    justify-content: flex-end;
+    gap: 0.75rem;
+  }
+  .ql-result-flags,
+  .ql-result-side > .ql-quality-badge {
+    display: none;
+  }
+  .ql-result-actions {
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    margin-left: auto;
+  }
+  .ql-result-side form {
+    flex: none;
+  }
+  .ql-result-side .btn {
+    min-width: 7.5rem;
+    width: auto;
   }
 }
 .ql-result-section {
-  padding: 0.75rem 1rem;
+  padding: 0.8125rem 1rem;
   background-color: color-mix(in oklab, var(--color-base-content) 3%, transparent);
+}
+.ql-selected-artist {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.ql-selected-artist-copy {
+  min-width: 0;
+}
+.ql-result-section-title {
+  margin: 0;
+  font-size: 0.875rem;
+  font-weight: 700;
+  line-height: 1.25;
+}
+.ql-result-section-meta {
+  margin: 0.1875rem 0 0;
+  color: color-mix(in oklab, var(--color-base-content) 48%, transparent);
+  font-size: 0.75rem;
+  line-height: 1.25;
 }
 .ql-version-button {
   display: inline-flex;
-  min-height: 2rem;
+  min-height: 1.875rem;
   align-items: center;
   gap: 0.25rem;
   border: 0;
   border-radius: 0.375rem;
-  padding: 0.35rem 0.2rem;
-  color: color-mix(in oklab, var(--color-primary) 72%, var(--color-base-content));
+  padding: 0.25rem 0.125rem;
+  color: color-mix(in oklab, var(--color-primary) 68%, var(--color-base-content));
   font-size: 0.8125rem;
   font-weight: 650;
   line-height: 1;
@@ -641,14 +1098,14 @@ details.dropdown.ql-mobile-dropdown[open] > .ql-mobile-menu {
   background-color: color-mix(in oklab, var(--color-base-content) 5%, transparent);
 }
 .ql-version-panel {
-  padding: 0.5rem 1rem 0.875rem;
+  padding: 0.625rem 1rem 0.875rem;
   background-color: color-mix(in oklab, var(--color-base-content) 2%, transparent);
 }
 .ql-version-row {
   display: flex;
   min-width: 0;
   flex-direction: column;
-  gap: 0.5rem;
+  gap: 0.625rem;
   border: 1px solid color-mix(in oklab, var(--color-base-content) 9%, transparent);
   border-radius: 0.5rem;
   background-color: color-mix(in oklab, var(--color-base-100) 82%, transparent);
@@ -660,6 +1117,52 @@ details.dropdown.ql-mobile-dropdown[open] > .ql-mobile-menu {
     align-items: center;
     gap: 0.75rem;
   }
+}
+.ql-version-row + .ql-version-row {
+  margin-top: 0.5rem;
+}
+.ql-version-copy {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.ql-version-copy p {
+  display: block;
+  margin: 0;
+  overflow: hidden;
+  font-size: 0.875rem;
+  font-weight: 620;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ql-version-copy span {
+  display: block;
+  margin-top: 0.1875rem;
+  color: color-mix(in oklab, var(--color-base-content) 44%, transparent);
+  font-size: 0.75rem;
+  line-height: 1.2;
+}
+.ql-owned-label,
+.ql-quality-badge {
+  display: inline-flex;
+  min-height: 1.375rem;
+  align-items: center;
+  gap: 0.25rem;
+  border: 1px solid currentColor;
+  border-radius: 0.3125rem;
+  padding: 0.125rem 0.4375rem;
+  font-size: 0.75rem;
+  font-weight: 650;
+  line-height: 1;
+  white-space: nowrap;
+}
+.ql-owned-label {
+  color: var(--color-success);
+}
+.ql-owned-label svg {
+  width: 0.875rem;
+  height: 0.875rem;
+  flex: none;
 }
 .ql-queue-card {
   padding: 1rem;
@@ -679,7 +1182,7 @@ details.dropdown.ql-mobile-dropdown[open] > .ql-mobile-menu {
   justify-content: space-between;
   gap: 1rem;
   border: 1px solid color-mix(in oklab, var(--color-error) 22%, transparent);
-  border-radius: 0.625rem;
+  border-radius: 0.5rem;
   background-color: color-mix(in oklab, var(--color-error) 5%, var(--color-base-100));
   padding: 1rem;
 }
@@ -989,7 +1492,7 @@ details.dropdown.ql-mobile-dropdown[open] > .ql-mobile-menu {
 
 .ql-empty-state {
   border: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
-  border-radius: 0.625rem;
+  border-radius: 0.5rem;
   background-color: color-mix(in oklab, var(--color-base-200) 44%, transparent);
   padding: 1.25rem;
   text-align: center;
@@ -1047,7 +1550,7 @@ details.dropdown.ql-mobile-dropdown[open] > .ql-mobile-menu {
   background-color: oklch(100% 0 0 / 0.028);
 }
 .ql-tool-note {
-  border-radius: 0.625rem;
+  border-radius: 0.5rem;
   padding: 0.875rem 1rem;
   font-size: 0.875rem;
   line-height: 1.45;
@@ -1066,7 +1569,7 @@ details.dropdown.ql-mobile-dropdown[open] > .ql-mobile-menu {
   flex-direction: column;
   gap: 1rem;
   border: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
-  border-radius: 0.625rem;
+  border-radius: 0.5rem;
   background-color: color-mix(in oklab, var(--color-base-content) 2%, transparent);
   padding: 1rem;
 }
@@ -1114,7 +1617,7 @@ details.dropdown.ql-mobile-dropdown[open] > .ql-mobile-menu {
   flex-direction: column;
   gap: 0.875rem;
   border: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
-  border-radius: 0.625rem;
+  border-radius: 0.5rem;
   background-color: color-mix(in oklab, var(--color-base-content) 3%, transparent);
   padding: 0.875rem 1rem;
 }
@@ -1209,7 +1712,7 @@ details.dropdown.ql-mobile-dropdown[open] > .ql-mobile-menu {
   align-items: flex-start;
   gap: 0.75rem;
   border: 1px solid var(--color-base-300);
-  border-radius: 0.625rem;
+  border-radius: 0.5rem;
   background-color: color-mix(in oklab, var(--color-base-100) 76%, transparent);
   padding: 0.875rem 1rem;
   cursor: pointer;
@@ -1329,7 +1832,7 @@ details[open] > .ql-disclosure-summary::after {
 }
 .ql-job-summary {
   border: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
-  border-radius: 0.625rem;
+  border-radius: 0.5rem;
   background-color: color-mix(in oklab, var(--color-base-100) 82%, var(--color-base-200));
   color: color-mix(in oklab, var(--color-base-content) 74%, transparent);
   padding: 0.875rem 1rem;
@@ -1474,7 +1977,7 @@ details[open] > .ql-disclosure-summary::after {
   border: 1px solid color-mix(in oklab, var(--ql-seam) 22%, transparent);
   border-left: 3px solid var(--ql-seam);
   background-color: color-mix(in oklab, var(--ql-seam) 9%, var(--color-base-200));
-  border-radius: 0.625rem;
+  border-radius: 0.5rem;
 }
 .ql-notice-info    { --ql-seam: var(--color-info); }
 .ql-notice-warning { --ql-seam: var(--color-warning); }
@@ -1504,31 +2007,37 @@ details[open] > .ql-disclosure-summary::after {
 
 /* Quality badges use a faint fill so small borders render consistently. */
 .quality-hires {
+  --ql-quality-edge: rgb(126 231 135 / 0.58);
   color: #a7f3d0;
   background-color: rgb(46 160 67 / 0.16);
   border-color: rgb(126 231 135 / 0.58);
 }
 .quality-cd {
+  --ql-quality-edge: rgb(121 192 255 / 0.58);
   color: #9ecbff;
   background-color: rgb(56 139 253 / 0.15);
   border-color: rgb(121 192 255 / 0.58);
 }
 .quality-lossy {
+  --ql-quality-edge: rgb(247 129 102 / 0.58);
   color: #ffab91;
   background-color: rgb(247 129 102 / 0.15);
   border-color: rgb(247 129 102 / 0.58);
 }
 [data-theme="winter"] .quality-hires {
+  --ql-quality-edge: rgb(22 163 74 / 0.32);
   color: #166534;
   background-color: rgb(22 163 74 / 0.11);
   border-color: rgb(22 163 74 / 0.32);
 }
 [data-theme="winter"] .quality-cd {
+  --ql-quality-edge: rgb(37 99 235 / 0.30);
   color: #1e40af;
   background-color: rgb(37 99 235 / 0.10);
   border-color: rgb(37 99 235 / 0.30);
 }
 [data-theme="winter"] .quality-lossy {
+  --ql-quality-edge: rgb(234 88 12 / 0.32);
   color: #9a3412;
   background-color: rgb(234 88 12 / 0.10);
   border-color: rgb(234 88 12 / 0.32);

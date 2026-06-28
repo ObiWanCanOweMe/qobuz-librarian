@@ -14,12 +14,18 @@ from pathlib import Path
 from qobuz_librarian import config as cfg
 from qobuz_librarian.api.auth import AuthLost, QobuzUnavailable
 from qobuz_librarian.api.search import get_album
+from qobuz_librarian.library import (
+    downsample_state,
+    library_scan_state,
+    scan_checkpoint,
+)
 from qobuz_librarian.library import hidden as hidden_mod
 from qobuz_librarian.library import new_releases as new_releases_mod
-from qobuz_librarian.library import scan_checkpoint
+from qobuz_librarian.library.artist_fingerprint import artist_fingerprint
 from qobuz_librarian.library.catalog import (
     album_quality_label,
     album_year,
+    find_album_dir_filesystem,
     find_qobuz_album_for_dir,
     is_lossless_album,
 )
@@ -28,6 +34,7 @@ from qobuz_librarian.library.discovery import (
     find_missing_for_artist,
     find_new_releases_for_artist,
     flush_resolve_cache,
+    resolve_artist_dir,
 )
 from qobuz_librarian.library.scanner import (
     clear_scan_caches,
@@ -35,9 +42,11 @@ from qobuz_librarian.library.scanner import (
     list_library_artists,
 )
 from qobuz_librarian.library.tags import VA_NORMALIZED, normalize
+from qobuz_librarian.quality import upgrade_state
 from qobuz_librarian.ui_cli.colors import format_size
 from qobuz_librarian.ui_cli.errors import plural
 from qobuz_librarian.ui_cli.logging import log
+from qobuz_librarian.web import review_badges
 
 
 def build_args():
@@ -74,6 +83,90 @@ def _set_empty_library_summary(job):
     log.info("  Check the music library path in Settings.")
 
 
+def _surface_has_candidates(surface):
+    if surface == "upgrade":
+        return upgrade_state.has_visible_candidates()
+    elif surface == "downsample":
+        return downsample_state.has_visible_candidates()
+    return False
+
+
+def _artist_dir_from_result(album, result=None, fallback_artist=None):
+    result_dir = (result or {}).get("dir")
+    if result_dir:
+        album_dir = Path(result_dir)
+        if album_dir.exists():
+            return album_dir.parent if album_dir.is_dir() else album_dir.parent.parent
+    if album:
+        try:
+            clear_scan_caches()
+            album_dir = find_album_dir_filesystem(album)
+            if album_dir and album_dir.exists():
+                return album_dir.parent
+        except Exception as exc:
+            log.info(f"  state refresh path lookup failed: {exc}")
+    if fallback_artist:
+        try:
+            return resolve_artist_dir(fallback_artist)
+        except Exception as exc:
+            log.info(f"  state refresh artist lookup failed: {exc}")
+    return None
+
+
+def _refresh_downsample_artist_state(artist_dir):
+    if artist_dir is None:
+        return
+    result = downsample_state.update_artist(artist_dir, hidden=hidden_mod.load())
+    if result.complete:
+        review_badges.set_ready("downsample", _surface_has_candidates("downsample"))
+    else:
+        err = next(iter(result.errors.values()), "unknown error")
+        log.info(f"  downsample view refresh skipped for {artist_dir.name}: {err}")
+
+
+def _refresh_upgrade_artist_state(artist_dir, token, args=None):
+    if not cfg.UPGRADE_SCAN_ENABLED:
+        review_badges.set_ready("upgrade", False)
+        return
+    if artist_dir is None or not token:
+        return
+    try:
+        from qobuz_librarian.quality.decision import load_capped
+        result = upgrade_state.update_artist(
+            artist_dir,
+            token=token,
+            args=args or build_args(),
+            capped=load_capped(),
+            hidden=hidden_mod.load(),
+        )
+    except (AuthLost, QobuzUnavailable):
+        raise
+    if result.complete:
+        review_badges.set_ready("upgrade", _surface_has_candidates("upgrade"))
+    else:
+        err = next(iter(result.errors.values()), "unknown error")
+        log.info(f"  upgrade view refresh skipped for {artist_dir.name}: {err}")
+
+
+def _refresh_after_local_album_change(
+    album,
+    result=None,
+    *,
+    fallback_artist=None,
+    token=None,
+    args=None,
+    upgrade=False,
+    downsample=False,
+):
+    artist_dir = _artist_dir_from_result(album, result, fallback_artist)
+    if artist_dir is None:
+        return
+    if upgrade:
+        _refresh_upgrade_artist_state(artist_dir, token, args=args)
+    if downsample:
+        _refresh_downsample_artist_state(artist_dir)
+
+
 def _album_cover(album):
     """The album's small cover URL, only if it's a trusted Qobuz CDN link."""
     img = album.get("image") or {}
@@ -81,7 +174,13 @@ def _album_cover(album):
     return url if url.startswith("https://static.qobuz.com/") else ""
 
 
-def _add_album_candidate(job, album, artist_name, selected=True, is_new=False):
+def _album_candidate_spec(
+    album,
+    artist_name,
+    selected=True,
+    is_new=False,
+    extra_payload=None,
+):
     year = album_year(album)
     partial_n = album.get("_partial_missing_count")
     if partial_n:
@@ -94,23 +193,39 @@ def _add_album_candidate(job, album, artist_name, selected=True, is_new=False):
         detail = (f"{year or '?'} · {album_quality_label(album)} · "
                   f"{n if n is not None else '?'} track{'' if n == 1 else 's'}")
     payload = {"album_id": album.get("id"), "year": year, "cover": _album_cover(album)}
+    if extra_payload:
+        payload.update(extra_payload)
     if is_new:
         payload["is_new"] = True
-    job.add_candidate(
-        kind="album",
-        title=album.get("title") or "?",
-        artist=artist_name,
-        detail=detail,
-        payload=payload,
-        selected=selected,
+    return {
+        "kind": "album",
+        "title": album.get("title") or "?",
+        "artist": artist_name,
+        "detail": detail,
+        "payload": payload,
+        "selected": selected,
+    }
+
+
+def _add_candidate_spec(job, spec):
+    return job.add_candidate(
+        kind=spec.get("kind", "album"),
+        title=spec.get("title") or "?",
+        artist=spec.get("artist") or "",
+        detail=spec.get("detail") or "",
+        payload=spec.get("payload") or {},
+        selected=bool(spec.get("selected")),
     )
+
+
+def _add_album_candidate(job, album, artist_name, selected=True, is_new=False):
+    return _add_candidate_spec(
+        job, _album_candidate_spec(album, artist_name, selected, is_new))
 
 
 def _readd_candidate(job, c):
     """Re-add a candidate restored from a scan checkpoint, with a fresh cid."""
-    job.add_candidate(kind=c.get("kind", "album"), title=c.get("title", "?"),
-                      artist=c.get("artist", ""), detail=c.get("detail", ""),
-                      payload=c.get("payload") or {}, selected=bool(c.get("selected")))
+    _add_candidate_spec(job, c)
 
 
 def _cap_note(job) -> str:
@@ -124,13 +239,27 @@ def _cap_note(job) -> str:
             "JOB_CANDIDATE_CAP, to see the rest.")
 
 
-def _add_gap_candidate(job, gap, artist_name, selected=False, is_new=False):
+def _gap_candidate_spec(
+    gap,
+    artist_name,
+    selected=False,
+    is_new=False,
+    artist_key=None,
+):
     """Turn an engine AlbumGap into a review candidate. A partial gap carries
     its missing-track count so the detail reads 'gap-fill: N missing'."""
     album = gap.qobuz_album
     if gap.on_disk_dir is not None:
         album = {**album, "_partial_missing_count": gap.missing_count}
-    _add_album_candidate(job, album, artist_name, selected=selected, is_new=is_new)
+    extra_payload = {"_artist_dir": artist_key} if artist_key else None
+    return _album_candidate_spec(
+        album, artist_name, selected=selected, is_new=is_new,
+        extra_payload=extra_payload)
+
+
+def _add_gap_candidate(job, gap, artist_name, selected=False, is_new=False):
+    return _add_candidate_spec(
+        job, _gap_candidate_spec(gap, artist_name, selected, is_new))
 
 
 def _record_last_scan():
@@ -299,7 +428,8 @@ def _scan_library_artist(artist_dir, token, partial_only, hidden):
     result = find_missing_for_artist(
         artist_dir.name, token=token,
         opts=DiscoveryOpts(prefer_hires=cfg.PREFER_HIRES),
-        artist_dir=artist_dir, hidden=hidden, single_store=hidden,
+        artist_dir=artist_dir, hidden=hidden,
+        single_store=hidden if cfg.SUPPRESS_SINGLE_TRACK_GAPS else None,
         want_missing=not partial_only)
     artist_id = str(result.artist_id) if result.artist_id else None
     # None signals "don't seed a baseline" — a transient short-page fetch isn't
@@ -321,7 +451,7 @@ _CHECKPOINT_EVERY = 15  # artists between progress saves (resume granularity)
 _REPAIR_HEARTBEAT_SECS = 2
 
 
-def scan_library(job, token, partial_only=False):
+def scan_library(job, token, partial_only=False, force_full=False):
     clear_scan_caches()
     # Drop the Various-Artists folder: it has no single Qobuz artist catalog to
     # diff against, so a gap scan can only mis-resolve it. The upgrade/downsample
@@ -336,27 +466,155 @@ def scan_library(job, token, partial_only=False):
     # restore the albums they turned up, so we continue rather than restart.
     cp = scan_checkpoint.load(kind)
     resuming = cp is not None
-    scanned = set(cp["scanned"]) if resuming else set()
-    baseline_seen = dict(cp["seen"]) if resuming else {}
+    checkpoint_artists = dict(cp.get("artists") or {}) if resuming else {}
+    current_artist_names = {ad.name for ad in artists}
+    if resuming:
+        scanned = set()
+        baseline_seen = {}
+        for name in set(cp["scanned"]):
+            if name not in current_artist_names:
+                continue
+            saved = checkpoint_artists.get(name)
+            if not isinstance(saved, dict) or saved.get("catalog_ids") is None:
+                continue
+            scanned.add(name)
+            artist_id = saved.get("artist_id") or ""
+            if artist_id:
+                baseline_seen[str(artist_id)] = list(saved.get("catalog_ids") or [])
+    else:
+        scanned = set()
+        baseline_seen = {}
     total = 0
     # Snapshot the dismissed-album memory before restoring the checkpoint so
     # albums the user dismissed since the interruption are not re-added, and
     # so the parallel workers below see the same consistent view.
     hidden = hidden_mod.load()
+    hidden_sig = library_scan_state.hidden_signature(
+        hidden, hidden_mod.SCOPE_MISSING)
+    previous_scan = library_scan_state.kind_state(kind)
+    cheap_refresh = (
+        not force_full
+        and not resuming
+        and previous_scan.get("complete")
+        and previous_scan.get("hidden_signature", "") == hidden_sig
+    )
+    downsample_refresh_started_at = time.time()
+    downsample_refresh = downsample_state.refresh_for_artists(
+        artists,
+        hidden=hidden,
+        cancel_check=lambda: bool(job.cancel_requested),
+        persist=False,
+        skip_unchanged=cheap_refresh,
+    )
+    upgrade_refresh = None
+    upgrade_refresh_started_at = None
+    if not job.cancel_requested and cfg.UPGRADE_SCAN_ENABLED:
+        from qobuz_librarian.quality.decision import load_capped
+        from qobuz_librarian.web.jobs import pool_initializer_kwargs
+        upgrade_refresh_started_at = time.time()
+        upgrade_refresh = upgrade_state.refresh_for_artists(
+            artists,
+            token=token,
+            args=build_args(),
+            capped=load_capped(),
+            hidden=hidden,
+            cancel_check=lambda: bool(job.cancel_requested),
+            workers=max(1, int(cfg.ARTIST_SCAN_WORKERS)),
+            pool_kwargs=pool_initializer_kwargs(),
+            skip_unchanged=cheap_refresh,
+            persist=False,
+        )
+    elif not cfg.UPGRADE_SCAN_ENABLED:
+        review_badges.set_ready("upgrade", False)
+    target = "track gaps in owned albums" if partial_only else "missing albums"
+    log.info(f"Scanning {plural(len(artists), 'library artist')} for {target}")
+    fingerprints = {ad.name: artist_fingerprint(ad) for ad in artists}
+    previous_artists = (previous_scan.get("artists") or {}) if cheap_refresh else {}
+    state_artists: dict[str, dict] = {}
     if resuming:
+        restored_by_artist: dict[str, list[dict]] = {}
         for c in cp["candidates"]:
+            artist_key = (c.get("payload") or {}).get("_artist_dir") or c.get("artist")
+            if artist_key not in scanned:
+                continue
             if hidden_mod.is_hidden(hidden_mod.SCOPE_MISSING,
                                     c.get("artist"), c.get("title"), hidden):
                 continue
             _readd_candidate(job, c)
             total += 1
+            if artist_key:
+                restored_by_artist.setdefault(artist_key, []).append(c)
+        for name in scanned:
+            saved = checkpoint_artists.get(name)
+            if not isinstance(saved, dict):
+                continue
+            catalog_ids = saved.get("catalog_ids")
+            if catalog_ids is None:
+                continue
+            candidates = [
+                c for c in saved.get("candidates", [])
+                if not hidden_mod.is_hidden(
+                    hidden_mod.SCOPE_MISSING,
+                    c.get("artist"),
+                    c.get("title"),
+                    hidden,
+                )
+            ]
+            state_artists[name] = {
+                "fingerprint": saved.get("fingerprint") or fingerprints.get(name, ""),
+                "candidates": candidates or restored_by_artist.get(name, []),
+                "artist_id": saved.get("artist_id") or "",
+                "catalog_ids": list(catalog_ids or []),
+            }
         log.info(f"Resuming. {len(scanned)} artist(s) already scanned, "
                  f"{plural(total, 'album')} found so far.")
-    target = "track gaps in owned albums" if partial_only else "missing albums"
-    log.info(f"Scanning {plural(len(artists), 'library artist')} for {target}")
-    todo = [ad for ad in artists if ad.name not in scanned]
+    todo = []
     n = len(artists)
     done = len(scanned)
+    reused = 0
+    scan_errors = 0
+    for artist_dir in artists:
+        if artist_dir.name in scanned:
+            continue
+        saved = previous_artists.get(artist_dir.name)
+        saved_catalog_ids = saved.get("catalog_ids") if saved else None
+        if (
+            saved
+            and saved_catalog_ids is not None
+            and saved.get("fingerprint") == fingerprints.get(artist_dir.name)
+            and (saved.get("artist_id") or not saved.get("candidates"))
+        ):
+            candidates = [
+                c for c in saved.get("candidates", [])
+                if not hidden_mod.is_hidden(
+                    hidden_mod.SCOPE_MISSING,
+                    c.get("artist"),
+                    c.get("title"),
+                    hidden,
+                )
+            ]
+            for c in candidates:
+                _readd_candidate(job, c)
+                total += 1
+            scanned.add(artist_dir.name)
+            done += 1
+            reused += 1
+            if saved.get("artist_id"):
+                baseline_seen[str(saved["artist_id"])] = list(saved_catalog_ids or [])
+            state_artists[artist_dir.name] = {
+                "fingerprint": fingerprints.get(artist_dir.name, ""),
+                "candidates": candidates,
+                "artist_id": saved.get("artist_id") or "",
+                "catalog_ids": list(saved_catalog_ids or []),
+            }
+            hit = ({"artist": artist_dir.name, "albums": len(candidates)}
+                   if candidates else None)
+            job.push_progress("Scanning library", done, n, artist_dir.name,
+                              found=total, hit=hit, unit="artist")
+        else:
+            todo.append(artist_dir)
+    if reused:
+        log.info(f"  Reused {plural(reused, 'unchanged artist')} from the saved scan.")
     since_save = 0
     workers = max(1, int(cfg.ARTIST_SCAN_WORKERS))
     # Resolve/scan artists in parallel (each worker has its own HTTP session),
@@ -388,6 +646,7 @@ def scan_library(job, token, partial_only=False):
             except Exception as e:
                 # A per-artist failure (not auth/outage) is left unscanned so a
                 # resume retries it rather than baking in a transient miss.
+                scan_errors += 1
                 log.info(f"    skipped {futures[fut].name}: {e}")
                 job.push_progress("Scanning library", done, n, futures[fut].name,
                                   found=total, unit="artist")
@@ -395,11 +654,22 @@ def scan_library(job, token, partial_only=False):
             scanned.add(name)
             if artist_id and catalog_ids is not None:
                 baseline_seen[artist_id] = catalog_ids
+            artist_candidates = []
             for gap in gaps:
                 # Library is a discovery list — leave candidates unticked so a
                 # single click can't queue hundreds nobody reviewed.
-                _add_gap_candidate(job, gap, artist_name or name, selected=False)
-                total += 1
+                spec = _gap_candidate_spec(
+                    gap, artist_name or name, selected=False, artist_key=name)
+                if _add_candidate_spec(job, spec) is not None:
+                    artist_candidates.append(spec)
+                    total += 1
+            if catalog_ids is not None:
+                state_artists[name] = {
+                    "fingerprint": fingerprints.get(name, ""),
+                    "candidates": artist_candidates,
+                    "artist_id": artist_id or "",
+                    "catalog_ids": list(catalog_ids or []),
+                }
             # Add the albums before the progress tick so a hit lands the live
             # preview the same moment the running total moves.
             hit = ({"artist": artist_name or name, "albums": len(gaps)}
@@ -412,7 +682,8 @@ def scan_library(job, token, partial_only=False):
             since_save += 1
             if since_save >= _CHECKPOINT_EVERY:
                 since_save = 0
-                scan_checkpoint.save(kind, scanned, job.candidates, baseline_seen)
+                scan_checkpoint.save(
+                    kind, scanned, job.candidates, baseline_seen, state_artists)
     # Reached here only without an AuthLost/outage abort (that re-raises out
     # above, leaving the checkpoint for resume and not seeding the baseline).
     flush_resolve_cache()
@@ -420,17 +691,53 @@ def scan_library(job, token, partial_only=False):
         # Deliberate stop — discard this kind's progress so it isn't auto-resumed.
         scan_checkpoint.clear(kind)
     else:
-        # Only a clean, complete crawl stamps "last scanned" — a cancelled scan
-        # mustn't make the dashboard read as freshly scanned and suppress the
-        # next automatic new-release check.
-        _record_last_scan()
-        _flag_new_since_last_scan(job, kind)
-        # The crawl reached every artist cleanly — establish the new-release
-        # baseline from the catalog snapshot (only the first time; the daily
-        # check keeps it fresh after), and clear this kind's checkpoint.
-        if not new_releases_mod.is_baseline_complete():
-            new_releases_mod.seed_baseline(baseline_seen)
-        scan_checkpoint.clear(kind)
+        # Only a reached-all-artists crawl stamps "last scanned" or seeds the
+        # new-release baseline. A candidate cap means the review list is partial,
+        # but the catalog crawl can still be complete.
+        catalog_complete = (
+            len(state_artists) == len(artists)
+            and len(scanned) == len(artists)
+            and scan_errors == 0
+        )
+        library_complete = (
+            catalog_complete
+            and not job.candidate_cap_hit
+        )
+        library_scan_state.save_kind(
+            kind,
+            artists=state_artists,
+            complete=library_complete,
+            hidden_signature=hidden_sig,
+        )
+        if library_complete:
+            if downsample_refresh.complete:
+                downsample_state.save(
+                    downsample_refresh,
+                    preserve_concurrent=True,
+                    refresh_started_at=downsample_refresh_started_at,
+                )
+                review_badges.set_ready(
+                    "downsample", _surface_has_candidates("downsample"))
+            if upgrade_refresh is not None and upgrade_refresh.complete:
+                upgrade_state.save(
+                    upgrade_refresh,
+                    preserve_concurrent=True,
+                    refresh_started_at=upgrade_refresh_started_at,
+                )
+                review_badges.set_ready(
+                    "upgrade", _surface_has_candidates("upgrade"))
+        if catalog_complete:
+            _record_last_scan()
+            _flag_new_since_last_scan(job, kind)
+            # The crawl reached every artist cleanly — establish the new-release
+            # baseline from the catalog snapshot (only the first time; the daily
+            # check keeps it fresh after), and clear this kind's checkpoint.
+            if not new_releases_mod.is_baseline_complete():
+                new_releases_mod.seed_baseline(baseline_seen)
+            scan_checkpoint.clear(kind)
+        elif scanned or job.candidates or baseline_seen:
+            scan_checkpoint.save(
+                kind, scanned, job.candidates, baseline_seen, state_artists)
     if job.cancel_requested:
         job.summary = (f"Stopped early. {plural(total, 'album')} found so far."
                        if total else "Stopped before anything turned up.")
@@ -471,6 +778,7 @@ def scan_new_releases(job, token):
     prev_limit = state.get("baseline_limit")
     rebaseline = prev_limit is None or cur_limit > int(prev_limit)
     hidden = hidden_mod.load()
+    single_store = hidden if cfg.SUPPRESS_SINGLE_TRACK_GAPS else None
     opts = DiscoveryOpts(prefer_hires=cfg.PREFER_HIRES)
     log.info(f"Checking {plural(len(artists), 'artist')} for new releases…")
     total = 0
@@ -486,7 +794,7 @@ def scan_new_releases(job, token):
                             **pool_initializer_kwargs()) as ex:
         futures = {ex.submit(find_new_releases_for_artist, ad.name, token=token,
                              opts=opts, seen_by_id=seen, hidden=hidden,
-                             single_store=hidden, artist_dir=ad,
+                             single_store=single_store, artist_dir=ad,
                              baseline_only=rebaseline): ad
                    for ad in artists}
         for fut in as_completed(futures):
@@ -608,6 +916,12 @@ def execute_albums(job, chosen, token):
             failed += 1
             continue
         if result and result.get("imported") and result.get("n_ok", 0) > 0:
+            _refresh_after_local_album_change(
+                full,
+                result,
+                fallback_artist=cand.get("artist"),
+                downsample=True,
+            )
             # A partial (some tracks landed, some failed) isn't a full download —
             # count it apart so the summary doesn't claim it finished.
             if result.get("n_fail", 0) > 0:
@@ -652,6 +966,11 @@ def scan_upgrades(job, token):
     """Scan the library for albums Qobuz can serve at higher quality."""
     from qobuz_librarian.quality.decision import load_capped
 
+    if not cfg.UPGRADE_SCAN_ENABLED:
+        review_badges.set_ready("upgrade", False)
+        job.summary = "Upgrade scanning is turned off."
+        log.info(job.summary)
+        return
     clear_scan_caches()
     artists = [d for d in list_library_artists()
                if normalize(d.name) not in VA_NORMALIZED]
@@ -665,68 +984,61 @@ def scan_upgrades(job, token):
     hidden = hidden_mod.load()
     log.info(f"Scanning {plural(len(artists), 'artist')} for quality upgrades")
     total = 0
-    done = 0
-    n = len(artists)
     workers = max(1, int(cfg.ARTIST_SCAN_WORKERS))
-    # Same parallel shape as scan_library: each artist needs 2–3 Qobuz calls,
-    # so a serial loop makes the user wait through hundreds of round-trips
-    # before the first result. Workers fan out; candidates are added on this
-    # thread so the list stays single-writer.
     from qobuz_librarian.web.jobs import pool_initializer_kwargs
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="upgradescan",
-                            **pool_initializer_kwargs()) as ex:
-        futures = {ex.submit(_scan_artist_upgrades, ad, token, args, capped): ad
-                   for ad in artists}
-        for fut in as_completed(futures):
-            if job.cancel_requested:
-                for f in futures:
-                    f.cancel()
-                log.info("Cancelled. Stopping scan.")
-                break
-            done += 1
-            name = futures[fut].name
-            try:
-                name, cands = fut.result()
-            except (AuthLost, QobuzUnavailable):
-                for f in futures:
-                    f.cancel()
-                raise
-            except Exception as e:
-                log.info(f"    skipped {name}: {e}")
-                job.push_progress("Scanning for upgrades", done, n, name,
-                                  found=total, unit="artist")
-                continue
-            added = 0
-            for c in cands:
-                album = c["qobuz_album"]
-                title = album.get("title") or "?"
-                if hidden_mod.is_hidden(hidden_mod.SCOPE_UPGRADE, name, title, hidden):
-                    continue
-                np_, nt = c.get("n_present", 0), c.get("n_total", 0)
-                part = f" · {np_}/{nt} tracks" if nt and np_ < nt else ""
-                # Store just the matched album's id and re-fetch it at execute
-                # time (get_album is disk-cached), rather than persisting the
-                # whole album dict the cache already holds. An edition swap keeps
-                # its own id, so the id alone reproduces the exact edition to rip.
-                # Unticked by default — like the gap scan, one click shouldn't
-                # re-rip hundreds of albums nobody reviewed.
-                job.add_candidate(
-                    kind="upgrade",
-                    title=title,
-                    artist=name,
-                    detail=f"{c.get('existing_quality_label','?')} → "
-                           f"{c.get('target_quality_label','?')}{part}",
-                    payload={"album_id": album.get("id"), "year": album_year(album),
-                             "cover": _album_cover(album)},
-                    selected=False,
-                )
-                total += 1
-                added += 1
-            hit = {"artist": name, "albums": added} if added else None
+
+    def _on_artist(ad, specs, error, done, n):
+        nonlocal total
+        name = ad.name
+        if isinstance(error, (AuthLost, QobuzUnavailable)):
+            raise error
+        if error is not None:
+            log.info(f"    skipped {name}: {error}")
             job.push_progress("Scanning for upgrades", done, n, name,
-                              found=total, hit=hit, unit="artist")
-            if added:
-                log.info(f"  {name} — {plural(added, 'album')} to upgrade")
+                              found=total, unit="artist")
+            return
+        added = 0
+        current_hidden = hidden_mod.load()
+        for spec in specs:
+            if hidden_mod.is_hidden(
+                    hidden_mod.SCOPE_UPGRADE,
+                    spec.get("artist") or name,
+                    spec.get("title"),
+                    current_hidden):
+                continue
+            # Unticked by default — like the gap scan, one click shouldn't
+            # re-rip hundreds of albums nobody reviewed.
+            job.add_candidate(
+                kind="upgrade",
+                title=spec.get("title") or "?",
+                artist=spec.get("artist") or name,
+                detail=spec.get("detail") or "",
+                payload=spec.get("payload") or {},
+                selected=False,
+            )
+            total += 1
+            added += 1
+        hit = {"artist": name, "albums": added} if added else None
+        job.push_progress("Scanning for upgrades", done, n, name,
+                          found=total, hit=hit, unit="artist")
+        if added:
+            log.info(f"  {name} — {plural(added, 'album')} to upgrade")
+
+    refresh = upgrade_state.refresh_for_artists(
+        artists,
+        token=token,
+        args=args,
+        capped=capped,
+        hidden=hidden,
+        cancel_check=lambda: bool(job.cancel_requested),
+        on_artist=_on_artist,
+        workers=workers,
+        pool_kwargs=pool_initializer_kwargs(),
+    )
+    if not job.cancel_requested and refresh.complete:
+        review_badges.set_ready("upgrade", _surface_has_candidates("upgrade"))
+    if job.cancel_requested or not refresh.complete:
+        log.info("Cancelled. Stopping scan.")
     if not job.cancel_requested:
         _flag_new_since_last_scan(job, "upgrade")
     if job.cancel_requested:
@@ -751,6 +1063,11 @@ def scan_upgrades_for_artist(job, artist_name, token):
     from qobuz_librarian.library.discovery import resolve_artist_dir
     from qobuz_librarian.quality.decision import load_capped
 
+    if not cfg.UPGRADE_SCAN_ENABLED:
+        review_badges.set_ready("upgrade", False)
+        job.summary = "Upgrade scanning is turned off."
+        log.info(job.summary)
+        return
     clear_scan_caches()
     artist_dir = resolve_artist_dir(artist_name)
     if artist_dir is None:
@@ -885,6 +1202,25 @@ def execute_upgrades(job, chosen, token):
                                  f"(Qobuz partial hi-res).")
             except Exception as _e_cap:
                 log.info(f"  post-upgrade cap check failed: {_e_cap}")
+            _refresh_after_local_album_change(
+                album,
+                result,
+                fallback_artist=cand.get("artist"),
+                token=token,
+                args=args,
+                upgrade=True,
+                downsample=True,
+            )
+        elif result and _res in (_skip - {"cancelled", "dry_run"}):
+            _refresh_after_local_album_change(
+                album,
+                result,
+                fallback_artist=cand.get("artist"),
+                token=token,
+                args=args,
+                upgrade=True,
+                downsample=True,
+            )
         elif _res not in _skip:
             failed += 1
         time.sleep(cfg.ARTIST_API_DELAY)
@@ -914,8 +1250,6 @@ def scan_downsamples(job):
     bound; fanning out would just thrash the spindle) with a cancel check and
     per-artist progress.
     """
-    from qobuz_librarian.library.downsample import scan_artist_for_downsample
-
     clear_scan_caches()
     artists = [d for d in list_library_artists()
                if normalize(d.name) not in VA_NORMALIZED]
@@ -925,26 +1259,20 @@ def scan_downsamples(job):
     hidden = hidden_mod.load()
     log.info(f"Scanning {plural(len(artists), 'artist')} for hi-res files to downsample")
     total = 0
-    done = 0
-    n = len(artists)
-    for ad in artists:
-        if job.cancel_requested:
-            log.info("Cancelled. Stopping scan.")
-            break
-        done += 1
+
+    def _on_artist(ad, cands, error, done, n):
+        nonlocal total
         name = ad.name
-        try:
-            cands = scan_artist_for_downsample(ad)
-        except Exception as e:
-            log.info(f"    skipped {name}: {e}")
+        if error is not None:
+            log.info(f"    skipped {name}: {error}")
             job.push_progress("Scanning for hi-res files", done, n, name,
                               found=total, unit="artist")
-            continue
+            return
         added = 0
+        current_hidden = hidden_mod.load()
         for c in cands:
-            # An album the user chose to keep hi-res shouldn't be re-flagged
-            # every scan.
-            if hidden_mod.is_hidden(hidden_mod.SCOPE_DOWNSAMPLE, name, c.title, hidden):
+            if hidden_mod.is_hidden(
+                    hidden_mod.SCOPE_DOWNSAMPLE, c.artist, c.title, current_hidden):
                 continue
             # Unticked by default — a downsample is irreversible, so nothing is
             # shrunk without an explicit per-album tick.
@@ -963,6 +1291,17 @@ def scan_downsamples(job):
                           found=total, hit=hit, unit="artist")
         if added:
             log.info(f"  {name} — {plural(added, 'album')} above CD rate")
+
+    refresh = downsample_state.refresh_for_artists(
+        artists,
+        hidden=hidden,
+        cancel_check=lambda: bool(job.cancel_requested),
+        on_artist=_on_artist,
+    )
+    if not job.cancel_requested and refresh.complete:
+        review_badges.set_ready("downsample", _surface_has_candidates("downsample"))
+    if job.cancel_requested or not refresh.complete:
+        log.info("Cancelled. Stopping scan.")
     if not job.cancel_requested:
         _flag_new_since_last_scan(job, "downsample")
     if job.cancel_requested:
@@ -1024,7 +1363,7 @@ def scan_downsamples_for_artist(job, artist_name):
         job.summary = f"Nothing above CD rate for {name}."
 
 
-def execute_downsamples(job, chosen):
+def execute_downsamples(job, chosen, token=None, args=None):
     """Shrink the chosen albums' hi-res FLACs to CD rate, in place.
 
     Each file is decode-verified before it overwrites the original (in
@@ -1032,6 +1371,7 @@ def execute_downsamples(job, chosen):
     re-download fallback.
     """
     from qobuz_librarian.integrations.downsample_engine import HAVE_DOWNSAMPLE, downsample_dir
+    from qobuz_librarian.quality.decision import mark_local_album_capped
     from qobuz_librarian.web.jobs import staging_lock
 
     if not HAVE_DOWNSAMPLE:
@@ -1046,7 +1386,12 @@ def execute_downsamples(job, chosen):
         if job.cancel_requested:
             break
         processed = i
-        album_dir = Path((cand.get("payload") or {}).get("album_dir", ""))
+        raw_album_dir = (cand.get("payload") or {}).get("album_dir")
+        if not raw_album_dir:
+            log.info("  skipped: saved candidate is missing its folder path")
+            skipped += 1
+            continue
+        album_dir = Path(raw_album_dir)
         title = cand.get("title") or album_dir.name
         log.info(f"[{i}/{len(chosen)}] {cand.get('artist', '')} — {title}")
         job._progress_scope = (i, len(chosen), "album")
@@ -1055,6 +1400,12 @@ def execute_downsamples(job, chosen):
         if not album_dir.is_dir():
             log.info("  skipped: folder no longer exists")
             skipped += 1
+            if album_dir.parent.is_dir():
+                _refresh_downsample_artist_state(album_dir.parent)
+            else:
+                downsample_state.remove_artist(album_dir.parent.name)
+                review_badges.set_ready(
+                    "downsample", _surface_has_candidates("downsample"))
             continue
         try:
             with staging_lock():
@@ -1066,6 +1417,15 @@ def execute_downsamples(job, chosen):
             continue
         if res.get("resampled"):
             shrunk += 1
+            mark_local_album_capped(album_dir)
+            if token:
+                try:
+                    _refresh_upgrade_artist_state(
+                        album_dir.parent, token, args=args or build_args())
+                except (AuthLost, QobuzUnavailable) as exc:
+                    log.info(
+                        f"  upgrade view refresh skipped after downsample: {exc}")
+        _refresh_downsample_artist_state(album_dir.parent)
         total_saved += res.get("saved_bytes", 0)
         total_errors += res.get("errors", 0)
     job._progress_scope = None
@@ -1471,6 +1831,15 @@ def execute_repairs(job, chosen, token):
         # up downloaded-and-imported is a real failure.
         if result and result.get("n_ok", 0) > 0 and result.get("imported"):
             fixed += 1
+            _refresh_after_local_album_change(
+                None,
+                result,
+                fallback_artist=p.get("artist_name"),
+                token=token,
+                args=args,
+                upgrade=True,
+                downsample=True,
+            )
         else:
             failed += 1
         time.sleep(cfg.ARTIST_API_DELAY)

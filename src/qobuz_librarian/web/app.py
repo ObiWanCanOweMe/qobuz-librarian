@@ -3,6 +3,7 @@ import asyncio
 import concurrent.futures
 import hashlib
 import html
+import json
 import threading
 import time
 import tomllib
@@ -111,7 +112,329 @@ def _resume_migration(job, args):
 
 def _resume_downsample(job, _args):
     from qobuz_librarian.web import flows
-    return lambda j, chosen: flows.execute_downsamples(j, chosen)
+    return lambda j, chosen: flows.execute_downsamples(
+        j, chosen, token=_get_optional_token())
+
+
+def _upgrade_available(creds_ok: bool | None = None) -> bool:
+    if creds_ok is None:
+        creds_ok = bool(_read_creds().get("auth_token"))
+    return bool(getattr(cfg, "UPGRADE_SCAN_ENABLED", True) and creds_ok)
+
+
+def _upgrade_unavailable_response():
+    from qobuz_librarian.web import review_badges
+    review_badges.clear_ready("upgrade")
+    return RedirectResponse(url="/", status_code=303)
+
+
+def _upgrade_state_summary():
+    from qobuz_librarian.quality import upgrade_state
+
+    state = upgrade_state.load()
+    complete = bool(state.get("complete"))
+    candidates = (
+        _visible_saved_review_candidates("upgrade", state.get("candidates") or [])
+        if complete else [])
+    updated_at = state.get("updated_at")
+    return {
+        "complete": complete,
+        "candidates": candidates,
+        "count": len(candidates),
+        "updated": _format_age(updated_at) if updated_at else None,
+    }
+
+
+def _downsample_state_summary():
+    from qobuz_librarian.library import downsample_state
+
+    state = downsample_state.load()
+    complete = bool(state.get("complete"))
+    candidates = (
+        _visible_saved_review_candidates("downsample", state.get("candidates") or [])
+        if complete else [])
+    updated_at = state.get("updated_at")
+    return {
+        "complete": complete,
+        "candidates": candidates,
+        "count": len(candidates),
+        "updated": _format_age(updated_at) if updated_at else None,
+    }
+
+
+def _visible_saved_review_candidates(surface, candidates):
+    if surface == "upgrade":
+        from qobuz_librarian.quality import upgrade_state
+        return upgrade_state.visible_candidates({
+            "complete": True,
+            "candidates": list(candidates or []),
+        })
+    if surface == "downsample":
+        from qobuz_librarian.library import downsample_state
+        return downsample_state.visible_candidates({
+            "complete": True,
+            "candidates": list(candidates or []),
+        })
+    return list(candidates or [])
+
+
+def _saved_review_row(surface, spec):
+    if surface == "downsample":
+        payload = spec.get("payload") or {}
+        row_payload = {
+            "album_dir": spec.get("album_dir") or payload.get("album_dir") or "",
+            "est_saving": spec.get("est_saving") or payload.get("est_saving") or 0,
+        }
+    else:
+        row_payload = spec.get("payload") or {}
+    return {
+        "title": spec.get("title") or "?",
+        "artist": spec.get("artist") or "",
+        "detail": spec.get("detail") or "",
+        "payload": row_payload,
+    }
+
+
+def _saved_review_key(surface, spec):
+    return json.dumps(
+        _saved_review_row(surface, spec),
+        sort_keys=True,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def _saved_review_signature(surface, state):
+    rows = []
+    for spec in state.get("candidates") or []:
+        rows.append(_saved_review_row(surface, spec))
+    rows.sort(key=lambda row: json.dumps(
+        row, sort_keys=True, ensure_ascii=True, separators=(",", ":")))
+    raw = json.dumps(rows, sort_keys=True, ensure_ascii=True,
+                     separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _saved_review_specs_from_job(surface, job):
+    with job._lock:
+        candidates = list(job.candidates)
+    specs = []
+    for c in candidates:
+        payload = c.get("payload") or {}
+        if surface == "downsample":
+            specs.append({
+                "title": c.get("title") or "?",
+                "artist": c.get("artist") or "",
+                "detail": c.get("detail") or "",
+                "album_dir": payload.get("album_dir") or "",
+                "est_saving": payload.get("est_saving") or 0,
+            })
+        else:
+            specs.append({
+                "title": c.get("title") or "?",
+                "artist": c.get("artist") or "",
+                "detail": c.get("detail") or "",
+                "payload": payload,
+            })
+    return specs
+
+
+def _existing_saved_review_job(surface, signature):
+    review_jobs = [
+        job for job in job_mgr.registry.awaiting_review()
+        if job.execute_kind == surface
+    ]
+    for job in review_jobs:
+        if (job.execute_kind == surface
+                and getattr(job, "_saved_review_signature", None) == signature):
+            current_signature = _saved_review_signature(
+                surface, {"candidates": _saved_review_specs_from_job(surface, job)})
+            if current_signature == signature:
+                return job
+    for job in review_jobs:
+        current_signature = _saved_review_signature(
+            surface, {"candidates": _saved_review_specs_from_job(surface, job)})
+        if current_signature == signature:
+            job._saved_review_signature = signature
+            return job
+    return None
+
+
+_SAVED_REVIEW_TITLES = {
+    "upgrade": "Upgrade candidates",
+    "downsample": "Downsample candidates",
+}
+_SAVED_REVIEW_LOCK = threading.Lock()
+
+
+def _stale_saved_review_job(surface):
+    review_jobs = [
+        job for job in job_mgr.registry.awaiting_review()
+        if job.execute_kind == surface
+    ]
+    for job in reversed(review_jobs):
+        if (getattr(job, "_saved_review_signature", None) is not None
+                or job.title == _SAVED_REVIEW_TITLES.get(surface)):
+            return job
+    return None
+
+
+def _candidate_from_saved_spec(surface, spec, *, cid, seq, selected):
+    row = _saved_review_row(surface, spec)
+    return {
+        "cid": cid,
+        "seq": seq,
+        "kind": surface,
+        "title": row["title"],
+        "artist": row["artist"],
+        "detail": row["detail"],
+        "payload": row["payload"],
+        "selected": bool(selected),
+    }
+
+
+def _sync_saved_review_job(job, surface, state, signature):
+    """Bring an existing saved-state review job back in line after restore/hide.
+
+    The job is the user's live review session, so preserve ticks for candidates
+    that still exist and add restored saved candidates unticked.
+    """
+    desired = list(state.get("candidates") or [])
+    with job._lock:
+        existing_raw_by_key = {
+            _saved_review_key(surface, c): c
+            for c in job.candidates
+        }
+        next_seq = max(
+            [int(c.get("seq", -1)) for c in job.candidates
+             if str(c.get("seq", "")).lstrip("-").isdigit()] + [-1]
+        ) + 1
+        if job._cand_seq < next_seq:
+            job._cand_seq = next_seq
+        rebuilt = []
+        for spec in desired:
+            key = _saved_review_key(surface, spec)
+            old = existing_raw_by_key.get(key)
+            if old is not None and old.get("cid") is not None:
+                cid = old["cid"]
+                seq = old.get("seq")
+                if not isinstance(seq, int):
+                    seq = job._cand_seq
+                    job._cand_seq += 1
+                selected = bool(old.get("selected"))
+            else:
+                cid = f"c{job._cand_seq}"
+                seq = job._cand_seq
+                job._cand_seq += 1
+                selected = False
+            rebuilt.append(
+                _candidate_from_saved_spec(
+                    surface, spec, cid=cid, seq=seq, selected=selected)
+            )
+        job.candidates = rebuilt
+        job._saved_review_signature = signature
+        n = len(rebuilt)
+        if surface == "downsample":
+            job.summary = f"{n} album{'s' if n != 1 else ''} can be downsampled."
+        else:
+            job.summary = (
+                f"{n} upgrade candidate{'s' if n != 1 else ''} ready to review.")
+    from qobuz_librarian.web import job_persistence
+    job_persistence.persist(job)
+    job.notify_review_changed()
+    return job
+
+
+def _sync_saved_review_before_approve(job):
+    surface = job.execute_kind
+    if surface not in _SAVED_REVIEW_TITLES:
+        return job
+    if (getattr(job, "_saved_review_signature", None) is None
+            and job.title != _SAVED_REVIEW_TITLES.get(surface)):
+        return job
+    state = (
+        _upgrade_state_summary()
+        if surface == "upgrade"
+        else _downsample_state_summary()
+    )
+    current = {
+        "candidates": state["candidates"] if state.get("complete") else [],
+    }
+    signature = _saved_review_signature(surface, current)
+    with _SAVED_REVIEW_LOCK:
+        if job.status != job_mgr.JobStatus.AWAITING_REVIEW:
+            return job
+        return _sync_saved_review_job(job, surface, current, signature)
+
+
+def _review_job_from_upgrade_state(state):
+    from qobuz_librarian.web import flows
+
+    with _SAVED_REVIEW_LOCK:
+        signature = _saved_review_signature("upgrade", state)
+        existing = _existing_saved_review_job("upgrade", signature)
+        if existing is not None:
+            return existing
+        stale = _stale_saved_review_job("upgrade")
+        if stale is not None:
+            return _sync_saved_review_job(stale, "upgrade", state, signature)
+        job = job_mgr.Job(title="Upgrade candidates")
+        job.kind = "scan"
+        job.execute_kind = "upgrade"
+        job.review_verb = "Upgrade"
+        job._saved_review_signature = signature
+        job._execute_fn = lambda j, chosen: flows.execute_upgrades(j, chosen, _get_token())
+        for spec in state.get("candidates") or []:
+            job.add_candidate(
+                kind="upgrade",
+                title=spec.get("title") or "?",
+                artist=spec.get("artist") or "",
+                detail=spec.get("detail") or "",
+                payload=spec.get("payload") or {},
+                selected=False,
+            )
+        job.status = job_mgr.JobStatus.AWAITING_REVIEW
+        n = len(job.candidates)
+        job.summary = f"{n} upgrade candidate{'s' if n != 1 else ''} ready to review."
+        job_mgr.registry.add(job)
+        return job
+
+
+def _review_job_from_downsample_state(state):
+    from qobuz_librarian.web import flows
+
+    with _SAVED_REVIEW_LOCK:
+        signature = _saved_review_signature("downsample", state)
+        existing = _existing_saved_review_job("downsample", signature)
+        if existing is not None:
+            return existing
+        stale = _stale_saved_review_job("downsample")
+        if stale is not None:
+            return _sync_saved_review_job(stale, "downsample", state, signature)
+        job = job_mgr.Job(title="Downsample candidates")
+        job.kind = "scan"
+        job.execute_kind = "downsample"
+        job.review_verb = "Downsample"
+        job._saved_review_signature = signature
+        job._execute_fn = lambda j, chosen: flows.execute_downsamples(
+            j, chosen, token=_get_optional_token())
+        for spec in state.get("candidates") or []:
+            job.add_candidate(
+                kind="downsample",
+                title=spec.get("title") or "?",
+                artist=spec.get("artist") or "",
+                detail=spec.get("detail") or "",
+                payload={
+                    "album_dir": spec.get("album_dir") or "",
+                    "est_saving": spec.get("est_saving") or 0,
+                },
+                selected=False,
+            )
+        job.status = job_mgr.JobStatus.AWAITING_REVIEW
+        n = len(job.candidates)
+        job.summary = f"{n} album{'s' if n != 1 else ''} can be downsampled."
+        job_mgr.registry.add(job)
+        return job
 
 
 # Names the persisted ``execute_kind`` strings so jobs survive a restart
@@ -670,8 +993,20 @@ def _tr(request, name, context, *, status_code=200):
     # a rejected token (auth lost mid-session) and a lock held by another
     # instance both stop downloads, and a user on Search/Queue shouldn't only
     # find out when a job fails. Both are cheap module-level flags — no I/O.
+    creds_ok = bool(_read_creds().get("auth_token"))
+    context.setdefault("health_qobuz_missing", not creds_ok)
     context.setdefault("health_token_invalid", _TOKEN_VALID is False)
     context.setdefault("health_lock_busy", bool(_LOCK_BUSY_PID))
+    context.setdefault("upgrade_available", _upgrade_available(creds_ok))
+    from qobuz_librarian.web import review_badges
+    if (context.get("page") in review_badges.SURFACES
+            and (context.get("page") != "upgrade" or context["upgrade_available"])):
+        review_badges.mark_seen(context["page"])
+    badges = review_badges.snapshot()
+    if not context["upgrade_available"]:
+        badges = dict(badges)
+        badges["upgrade"] = False
+    context.setdefault("nav_review_badges", badges)
     return templates.TemplateResponse(request=request, name=name,
                                       context=context, status_code=status_code)
 
@@ -1099,7 +1434,7 @@ def _library_scan_state():
     return {"ready": True, "count": len(artists), "message": ""}
 
 
-def _start_library_scan(partial_only=False):
+def _start_library_scan(partial_only=False, force_full=False):
     """Submit a library scan and return the job. Shared by the Library page and
     the automatic first-run/resume trigger. scan_library resumes from a matching
     checkpoint on its own, so this is the same call whether starting or resuming.
@@ -1120,7 +1455,12 @@ def _start_library_scan(partial_only=False):
         job.execute_kind = "library"
         job_mgr.submit_scan(
             job,
-            lambda j: flows.scan_library(j, _get_token(), partial_only=partial_only),
+            lambda j: flows.scan_library(
+                j,
+                _get_token(),
+                partial_only=partial_only,
+                force_full=force_full,
+            ),
             lambda j, chosen: flows.execute_albums(j, chosen, _get_token()),
         )
         return job
@@ -1322,13 +1662,13 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
             loop = asyncio.get_running_loop()
             from qobuz_librarian.api.client import call_within
             if parsed and parsed[0] == "album" and kind == "track":
-                # An album URL only resolves in Albums mode; in Tracks mode it
+                # An album URL only resolves in Album mode; in Track mode it
                 # would fetch the album and then be dropped as not-a-track,
                 # leaving a blank "No results". Point the user at the toggle.
-                error = ("That's an album URL. Switch to Albums to download it, "
-                         "or paste a single track to download one song.")
+                error = ("That's an album URL. Switch to Album to download it, "
+                         "or paste a single track to download one track.")
             elif parsed and parsed[0] == "album" and kind == "artist":
-                error = "That's an album URL. Switch to Albums to download it."
+                error = "That's an album URL. Switch to Album to download it."
             elif parsed and parsed[0] == "album":
                 try:
                     raw = [await asyncio.wait_for(
@@ -1351,7 +1691,7 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
                     error = "Couldn't fetch that album. Check the URL."
             elif parsed and parsed[0] == "track" and kind == "track":
                 # Tracks mode: resolve the pasted track URL to that one track;
-                # the track-results loop below renders it for a one-song download.
+                # the track-results loop below renders it for a one-track download.
                 try:
                     _t = await asyncio.wait_for(
                         loop.run_in_executor(None, lambda: call_within(
@@ -1367,10 +1707,10 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
                 except QobuzError:
                     error = "Couldn't fetch that track. Check the URL."
             elif parsed and parsed[0] == "track":
-                # Albums mode: a track URL — point the user at the Tracks toggle
+                # Album mode: a track URL -- point the user at the Track toggle
                 # instead of the old (now false) "works on albums" message.
-                error = ("That's a track URL. Switch to Tracks to download one "
-                         "song, or paste the album URL in Albums mode.")
+                error = ("That's a track URL. Switch to Track to download one "
+                         "track, or paste the album URL in Album mode.")
             elif parsed:
                 # Parsed as some other Qobuz URL kind (artist/playlist).
                 if kind == "artist":
@@ -1693,9 +2033,13 @@ def _make_download_run(album, token, *, treat_as_new=False):
     def run(j):
         from qobuz_librarian.modes.process import process_album
         from qobuz_librarian.ui_cli.errors import plural
-        from qobuz_librarian.web.flows import build_args
+        from qobuz_librarian.web.flows import (
+            _refresh_after_local_album_change,
+            build_args,
+        )
+        args = build_args()
         with job_mgr.staging_lock():
-            r = process_album(album, build_args(), allow_force=False,
+            r = process_album(album, args, allow_force=False,
                               already_confirmed=True, token=token,
                               treat_as_new=treat_as_new) or {}
         benign = {"already_complete", "skipped_already_higher_quality",
@@ -1720,6 +2064,15 @@ def _make_download_run(album, token, *, treat_as_new=False):
         # Claiming/completing the album the normal way graduates it out of the
         # "downloaded single" state, so the rest stops being suppressed in scans.
         if r.get("imported"):
+            _refresh_after_local_album_change(
+                album,
+                r,
+                fallback_artist=(album.get("artist") or {}).get("name"),
+                token=token,
+                args=args,
+                upgrade=True,
+                downsample=True,
+            )
             from qobuz_librarian.library import hidden as hidden_mod
             hidden_mod.unmark_single(
                 (album.get("artist") or {}).get("name") or "?",
@@ -1729,9 +2082,7 @@ def _make_download_run(album, token, *, treat_as_new=False):
 
 def _make_single_track_run(album, track, token):
     """Run a single-track download: download just ``track`` via the per-track
-    queue path (the same isolation repair uses — never a whole-album rip), then
-    mark the album as a deliberate single so scans leave the partial folder —
-    and a sample-only artist's catalogue — alone."""
+    queue path (the same isolation repair uses — never a whole-album rip)."""
     def run(j):
         from qobuz_librarian.library import hidden as hidden_mod
         from qobuz_librarian.library.catalog import (
@@ -1742,7 +2093,11 @@ def _make_single_track_run(album, track, token):
         from qobuz_librarian.queue.builder import _build_queue_item
         from qobuz_librarian.queue.executor import _execute_download_queue
         from qobuz_librarian.ui_cli.errors import plural
-        from qobuz_librarian.web.flows import build_args
+        from qobuz_librarian.web.flows import (
+            _refresh_after_local_album_change,
+            build_args,
+        )
+        args = build_args()
         artist = (album.get("artist") or {}).get("name") or "?"
         title = album.get("title") or "?"
         t_title = track.get("title") or "?"
@@ -1763,7 +2118,7 @@ def _make_single_track_run(album, track, token):
             force_track_by_track=True,
         )
         with job_mgr.staging_lock():
-            _execute_download_queue([qi], build_args(), token)
+            _execute_download_queue([qi], args, token)
         if not (qi.get("n_ok", 0) > 0 and qi.get("imported", False)
                 and qi.get("n_fail", 0) == 0):
             j.status = job_mgr.JobStatus.FAILED
@@ -1775,14 +2130,18 @@ def _make_single_track_run(album, track, token):
                 j.error = ("Couldn't retrieve the track. Qobuz may be rate-limiting "
                            "you, or it's unavailable. Try again shortly.")
             return
-        # Only mark it a single if the album is still partial after this download. If
-        # this was the album's last missing track, you now own the whole thing —
-        # that's a normal complete album, not a single, so leave it unmarked.
-        marked = len(missing) > 1
+        # Only mark it a single when explicitly configured. By default, a track
+        # grab is just a track grab; future library scans should still offer the
+        # rest of the album if it remains incomplete.
+        marked = bool(cfg.SUPPRESS_SINGLE_TRACK_GAPS and len(missing) > 1)
         if marked:
             hidden_mod.mark_single(artist, title, album_year(album), album.get("id"))
             j.summary = (f"Got “{t_title}”, filed under {artist} / {title}. "
                          "The rest of the album stays out of scans.")
+        elif len(missing) > 1:
+            hidden_mod.unmark_single(artist, title)
+            j.summary = (f"Got “{t_title}”, filed under {artist} / {title}. "
+                         "Future scans can still offer the rest of the album.")
         else:
             # This download completed the album — it's a normal full album now, so
             # clear any single mark an earlier partial download left behind.
@@ -1791,6 +2150,15 @@ def _make_single_track_run(album, track, token):
             hidden_mod.unmark_single(artist, title)
             j.summary = (f"Got “{t_title}”; that completed {title}, so it's "
                          "filed as a full album.")
+        _refresh_after_local_album_change(
+            album,
+            {"dir": qi.get("_resolved_post_dir") or album_dir},
+            fallback_artist=artist,
+            token=token,
+            args=args,
+            upgrade=True,
+            downsample=True,
+        )
         # Record which track was added so /undo can cleanly reverse it.
         j.single = {
             "album_id": str(album.get("id") or ""),
@@ -2082,7 +2450,11 @@ async def library_page(request: Request):
 
 
 @app.post("/library")
-async def library_scan(request: Request, mode: str = Form("missing_albums")):
+async def library_scan(
+    request: Request,
+    mode: str = Form("missing_albums"),
+    force_full: str = Form(""),
+):
     busy = _lock_busy_response(request)
     if busy is not None:
         return busy
@@ -2130,8 +2502,16 @@ async def library_scan(request: Request, mode: str = Form("missing_albums")):
     # "library" (not "album") so the review screen knows this is the paced triage
     # surface; both modes run the same album executor and resume from a matching
     # checkpoint if one's waiting (see _start_library_scan / scan_library).
+    force_full_scan = str(force_full or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
     job = await loop.run_in_executor(
-        None, lambda: _start_library_scan(partial_only=(mode_norm == "partial_fill")))
+        None,
+        lambda: _start_library_scan(
+            partial_only=(mode_norm == "partial_fill"),
+            force_full=force_full_scan,
+        ),
+    )
     if job is None:
         return _lock_busy_response(request) or RedirectResponse(
             url="/settings?mode=cli", status_code=303)
@@ -2190,14 +2570,20 @@ async def library_hidden_restore(request: Request):
 async def upgrade_page(request: Request):
     from qobuz_librarian.library import hidden as hidden_mod
     creds_ok = bool(_read_creds().get("auth_token"))
+    if not _upgrade_available(creds_ok):
+        return _upgrade_unavailable_response()
+    state = _upgrade_state_summary()
     return _tr(request, "upgrade.html", {
         "creds_ok": creds_ok, "qobuz_ready": _qobuz_ready(), "page": "upgrade",
-        "last_run": _tool_last_run_age("upgrade"),
+        "upgrade_state": state,
+        "last_run": _tool_last_run_age("library"),
         "hidden_count": hidden_mod.count(hidden_mod.SCOPE_UPGRADE)})
 
 
 @app.get("/upgrade/hidden", response_class=HTMLResponse)
 async def upgrade_hidden(request: Request):
+    if not _upgrade_available():
+        return _upgrade_unavailable_response()
     from qobuz_librarian.library import hidden as hidden_mod
     return _hidden_view(request, hidden_mod.SCOPE_UPGRADE, page="upgrade",
                         restore_action="/upgrade/hidden/restore", back_url="/upgrade")
@@ -2205,70 +2591,55 @@ async def upgrade_hidden(request: Request):
 
 @app.post("/upgrade/hidden/restore")
 async def upgrade_hidden_restore(request: Request):
+    if not _upgrade_available():
+        return _upgrade_unavailable_response()
     from qobuz_librarian.library import hidden as hidden_mod
     return await _restore_hidden(request, hidden_mod.SCOPE_UPGRADE, "/upgrade/hidden")
 
 
-@app.post("/upgrade")
-async def upgrade_scan(request: Request):
+@app.post("/upgrade/review")
+async def upgrade_review(request: Request):
     busy = _lock_busy_response(request)
     if busy is not None:
         return busy
+    if not _upgrade_available():
+        return _upgrade_unavailable_response()
     try:
         _get_token()
     except (SystemExit, NoCredsError):
         return _no_creds_response(request)
-    from qobuz_librarian.web import flows
-    job = job_mgr.Job(title="Quality upgrade scan")
-    job.execute_kind = "upgrade"
-    job.review_verb = "Upgrade"  # the action re-rips, not a fresh download
-    job = await _submit_scan_deduped_async(
-        job,
-        lambda j: flows.scan_upgrades(j, _get_token()),
-        lambda j, chosen: flows.execute_upgrades(j, chosen, _get_token()),
-        "upgrade")
+    state = _upgrade_state_summary()
+    if not state["complete"] or not state["candidates"]:
+        return RedirectResponse(url="/upgrade", status_code=303)
+    loop = asyncio.get_running_loop()
+    job = await loop.run_in_executor(None, lambda: _review_job_from_upgrade_state(state))
     return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
+
+
+@app.post("/upgrade")
+async def upgrade_review_legacy(request: Request):
+    if not _upgrade_available():
+        return _upgrade_unavailable_response()
+    return await upgrade_review(request)
 
 
 @app.post("/upgrade/artist")
-async def upgrade_scan_artist(request: Request, artist: str = Form("")):
-    """Scan one artist's library folder for quality upgrades. Same review-then-
-    execute flow as the whole-library scan, scoped to one artist's albums.
-    The Hidden-Upgrade store is deliberately NOT consulted here — asking for
-    an artist by name is a 'show me everything for this artist' request, same
-    convention scan_artist (find-missing) already followed."""
-    busy = _lock_busy_response(request)
-    if busy is not None:
-        return busy
-    name, err = _clean_artist_name(artist)
-    if err is not None:
-        return err
-    try:
-        _get_token()
-    except (SystemExit, NoCredsError):
-        return _no_creds_response(request)
-    from qobuz_librarian.web import flows
-    # title is the scan kind only; the job-page header prepends `artist` already
-    # (the existing /artist library scan follows the same convention).
-    job = job_mgr.Job(title="Quality upgrade scan", artist=name)
-    job.execute_kind = "upgrade"
-    job.review_verb = "Upgrade"
-    job = await _submit_scan_deduped_async(
-        job,
-        lambda j: flows.scan_upgrades_for_artist(j, name, _get_token()),
-        lambda j, chosen: flows.execute_upgrades(j, chosen, _get_token()),
-        "upgrade")
-    return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
+async def upgrade_scan_artist():
+    if not _upgrade_available():
+        return _upgrade_unavailable_response()
+    return RedirectResponse(url="/upgrade", status_code=303)
 
 
 @app.get("/downsample", response_class=HTMLResponse)
 async def downsample_page(request: Request):
     from qobuz_librarian.integrations.downsample_engine import HAVE_DOWNSAMPLE
     from qobuz_librarian.library import hidden as hidden_mod
+    state = _downsample_state_summary()
     return _tr(request, "downsample.html", {
         "page": "downsample",
         "have_downsample": HAVE_DOWNSAMPLE,
         "creds_ok": bool(_read_creds().get("auth_token")),
+        "downsample_state": state,
         "last_run": _tool_last_run_age("downsample"),
         "hidden_count": hidden_mod.count(hidden_mod.SCOPE_DOWNSAMPLE)})
 
@@ -2288,6 +2659,21 @@ async def downsample_hidden_restore(request: Request):
                                  "/downsample/hidden")
 
 
+@app.post("/downsample/review")
+async def downsample_review(request: Request):
+    # No credential check: downsampling only reads and rewrites local files.
+    busy = _lock_busy_response(request)
+    if busy is not None:
+        return busy
+    state = _downsample_state_summary()
+    if not state["complete"] or not state["candidates"]:
+        return RedirectResponse(url="/downsample", status_code=303)
+    loop = asyncio.get_running_loop()
+    job = await loop.run_in_executor(
+        None, lambda: _review_job_from_downsample_state(state))
+    return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
+
+
 @app.post("/downsample")
 async def downsample_scan(request: Request):
     # No credential check: downsampling only reads and rewrites local files.
@@ -2301,31 +2687,15 @@ async def downsample_scan(request: Request):
     job = await _submit_scan_deduped_async(
         job,
         lambda j: flows.scan_downsamples(j),
-        lambda j, chosen: flows.execute_downsamples(j, chosen),
+        lambda j, chosen: flows.execute_downsamples(
+            j, chosen, token=_get_optional_token()),
         "downsample")
     return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
 
 
 @app.post("/downsample/artist")
 async def downsample_scan_artist(request: Request, artist: str = Form("")):
-    """Scan one artist's library folder for hi-res files. Local-only — no
-    Qobuz creds needed (the answer comes off disk)."""
-    busy = _lock_busy_response(request)
-    if busy is not None:
-        return busy
-    name, err = _clean_artist_name(artist)
-    if err is not None:
-        return err
-    from qobuz_librarian.web import flows
-    job = job_mgr.Job(title="Downsample scan", artist=name)
-    job.execute_kind = "downsample"
-    job.review_verb = "Downsample"
-    job = await _submit_scan_deduped_async(
-        job,
-        lambda j: flows.scan_downsamples_for_artist(j, name),
-        lambda j, chosen: flows.execute_downsamples(j, chosen),
-        "downsample")
-    return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
+    return RedirectResponse(url="/downsample", status_code=303)
 
 
 @app.get("/repair", response_class=HTMLResponse)
@@ -2671,6 +3041,8 @@ async def job_approve(request: Request, job_id: str):
     # discarding the whole review. The submit button is disabled client-side, but
     # a direct POST or a stale page can still reach here — keep it in review and
     # say so instead.
+    if job.status == job_mgr.JobStatus.AWAITING_REVIEW:
+        job = _sync_saved_review_before_approve(job)
     if job.status == job_mgr.JobStatus.AWAITING_REVIEW and not any(
             c.get("selected") for c in job.candidates):
         return RedirectResponse(url=f"{dest}?noselection=1", status_code=303)
@@ -2687,9 +3059,8 @@ async def job_approve(request: Request, job_id: str):
     return RedirectResponse(url=f"{dest}?{flag}", status_code=303)
 
 
-# Scan kinds that get the paced-triage surface (unticked, hideable, live-fill).
-# Both share one review screen; they differ only in which hidden-store scope a
-# dismiss writes — missing-album for the gap scan, upgrade for the upgrade scan.
+# Review kinds that get the paced-triage surface (unticked and hideable). They
+# share one review screen; hidden-store scope decides where dismissals land.
 _TRIAGE_KINDS = ("library", "upgrade", "new_releases", "downsample")
 
 # Kinds whose review screen has server-backed per-candidate selection. Artist
@@ -3011,6 +3382,30 @@ async def job_undo(request: Request, job_id: str):
             return HTMLResponse("", headers={"HX-Redirect": "/queue"})
         return RedirectResponse(url="/queue", status_code=303)
 
+    def _refresh_after_undo():
+        import logging
+
+        from qobuz_librarian.web import flows
+
+        artist = info.get("artist") or ""
+        album = {
+            "title": info.get("album") or "",
+            "artist": {"name": artist},
+        }
+        try:
+            flows._refresh_after_local_album_change(
+                album,
+                {"dir": info.get("dir") or ""},
+                fallback_artist=artist,
+                token=_get_optional_token(),
+                args=flows.build_args(),
+                upgrade=True,
+                downsample=True,
+            )
+        except Exception as exc:
+            logging.getLogger("qobuz_librarian").info(
+                "quality state refresh after undo skipped: %s", exc)
+
     def _reverse():
         from pathlib import Path
 
@@ -3083,6 +3478,7 @@ async def job_undo(request: Request, job_id: str):
     loop = asyncio.get_running_loop()
     removed = await loop.run_in_executor(None, _reverse_under_lock)
     if removed is not None:
+        await loop.run_in_executor(None, _refresh_after_undo)
         job.single = {**info, "removed": True}
         job.summary = f"Removed “{info.get('title')}” and undid the single."
     else:
@@ -3093,6 +3489,10 @@ async def job_undo(request: Request, job_id: str):
         from pathlib import Path as _Path
         dir_gone = not _Path(info["dir"]).exists()
         if dir_gone:
+            if info.get("marked"):
+                from qobuz_librarian.library import hidden as hidden_mod
+                hidden_mod.unmark_single(info.get("artist") or "", info.get("album") or "")
+            await loop.run_in_executor(None, _refresh_after_undo)
             job.single = {**info, "removed": True}
             job.summary = f"“{info.get('title')}” was already gone; cleared the single mark."
         else:
@@ -3819,6 +4219,15 @@ async def jobs_list(status: str = "", limit: int = 50):
 def _get_token():
     from qobuz_librarian.api.auth import load_qobuz_token
     return load_qobuz_token()[1]
+
+
+def _get_optional_token():
+    if not _read_creds().get("auth_token"):
+        return None
+    try:
+        return _get_token()
+    except Exception:
+        return None
 
 
 def _format_age(ts: float) -> str:

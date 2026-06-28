@@ -55,8 +55,12 @@ def _write(data) -> None:
 
 
 def load(kind) -> dict | None:
-    """This kind's checkpoint, or None. Shape: ``{"scanned": [folder_name, …],
-    "candidates": [candidate_dict, …], "seen": {artist_id: [album_id, …]}}``."""
+    """This kind's checkpoint, or None.
+
+    Shape: ``{"scanned": [folder_name, ...], "candidates": [candidate_dict, ...],
+    "seen": {artist_id: [album_id, ...]}, "artists": {folder_name: snapshot}}``.
+    ``artists`` is optional for older checkpoints.
+    """
     cp = _read().get(kind)
     if not isinstance(cp, dict):
         return None
@@ -68,16 +72,19 @@ def load(kind) -> dict | None:
         cp["candidates"] = []
     if not isinstance(cp.get("seen"), dict):
         cp["seen"] = {}
+    if not isinstance(cp.get("artists"), dict):
+        cp["artists"] = {}
     return cp
 
 
-def save(kind, scanned, candidates, seen) -> None:
+def save(kind, scanned, candidates, seen, artists=None) -> None:
     with _lock:
         data = _read()
         data[kind] = {
             "scanned": sorted(scanned),
             "candidates": candidates,
             "seen": seen,
+            "artists": artists or {},
             "ts": time.time(),
         }
         _write(data)

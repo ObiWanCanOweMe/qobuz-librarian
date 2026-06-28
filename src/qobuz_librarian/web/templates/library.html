@@ -8,7 +8,7 @@
     <div class="mb-5">
       <h1 class="text-2xl font-bold mb-2">Library</h1>
       <p class="text-base-content/65">
-        Find missing albums and track gaps across your library.
+        Refresh missing albums, track gaps, upgrades, and downsample candidates.
       </p>
     </div>
 
@@ -38,7 +38,7 @@
 
     <div class="ql-tool-note ql-tool-note-info mb-5">
       <p class="font-semibold">Build the library baseline</p>
-      <p>This scan finds missing albums and track gaps. It also creates the saved baseline used by new-release checks.</p>
+      <p>This refresh finds missing albums and track gaps, then updates upgrade, downsample, and new-release baselines.</p>
     </div>
 
     {% if error %}<div class="alert alert-warning mb-4" data-flash><span>{{ error }}</span></div>{% endif %}
@@ -105,7 +105,7 @@
       <summary class="ql-disclosure-summary">Re-scan library</summary>
       <div class="pt-3">
         <div class="ql-tool-note ql-tool-note-warning mb-3">
-          <p>Use a full re-scan after deleting files or when you want to re-check the whole library.</p>
+          <p>Normal scans skip unchanged artist folders. Force a full rescan after large manual library changes.</p>
         </div>
         <form action="/library" method="post" data-busy-submit>
           <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
@@ -114,8 +114,8 @@
               <input type="radio" name="mode" value="missing_albums" class="radio radio-primary mt-1"
                      {% if not library_resume or library_resume.kind == 'missing' %}checked{% endif %}>
               <div>
-                <div class="font-medium">Missing albums and track gaps</div>
-                <div class="text-sm text-base-content/50">Albums not in your library, plus missing tracks in albums you own.</div>
+                <div class="font-medium">Scan library</div>
+                <div class="text-sm text-base-content/50">Missing albums, track gaps, upgrades, and downsample candidates.</div>
               </div>
             </label>
             <label class="ql-option-row">
@@ -127,7 +127,10 @@
               </div>
             </label>
           </div>
-          <button type="submit" class="btn btn-outline btn-sm ql-secondary-action w-full sm:w-auto">Start re-scan</button>
+          <div class="flex flex-col gap-2 sm:flex-row">
+            <button type="submit" class="btn btn-outline btn-sm ql-secondary-action w-full sm:w-auto">Scan library</button>
+            <button type="submit" name="force_full" value="1" class="btn btn-ghost btn-sm w-full sm:w-auto">Force full rescan</button>
+          </div>
         </form>
       </div>
     </details>

@@ -1,12 +1,13 @@
 """Quality comparison helpers and upgrade detection."""
+import hashlib
 import json
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from qobuz_librarian import config as cfg
 from qobuz_librarian.api.auth import AuthLost, QobuzError
 from qobuz_librarian.api.search import get_artist_albums, search_artists
-from qobuz_librarian.integrations.downsample_engine import HAVE_DOWNSAMPLE
 from qobuz_librarian.library import hidden as hidden_mod
 from qobuz_librarian.library.catalog import (
     album_quality_label,
@@ -20,23 +21,17 @@ from qobuz_librarian.library.scanner import (
     list_artist_album_dirs,
 )
 from qobuz_librarian.library.tags import similarity, strip_album_decorations
-from qobuz_librarian.quality.tiers import downsample_target_rate, streamrip_quality_cap
+from qobuz_librarian.quality.tiers import streamrip_quality_cap
 from qobuz_librarian.ui_cli.logging import vlog
 
 
 def album_max_quality(qobuz_album):
-    """Return the (bit_depth, sample_rate_hz) the pipeline will actually put
-    on disk for a Qobuz album — capped to the streamrip quality tier, then
-    through the downsample hook if it's enabled.
+    """Return the (bit_depth, sample_rate_hz) Qobuz can provide, capped to the
+    streamrip quality tier.
 
     Qobuz reports sample rate in kHz (e.g. 96.0); values >= 1000 are treated
     as already-Hz so an API change to Hz can't make every album read as
     'lower than Qobuz' and trigger spurious upgrades.
-
-    Comparing against the *post-downsample* rate matters: with downsampling
-    on, a 24/192 album lands as 24/48, so capping only to the rip tier would
-    flag every already-downsampled album as below target and re-rip it on
-    every scan, forever.
     """
     bd = qobuz_album.get("maximum_bit_depth") or 0
     sr = qobuz_album.get("maximum_sampling_rate") or 0
@@ -44,8 +39,6 @@ def album_max_quality(qobuz_album):
     cap_bd, cap_sr = streamrip_quality_cap()
     bd = min(bd, cap_bd) if bd else 0
     sr_hz = min(sr_hz, cap_sr) if sr_hz else 0
-    if sr_hz and cfg.DOWNSAMPLE_HIRES_ENABLED and HAVE_DOWNSAMPLE:
-        sr_hz = downsample_target_rate(sr_hz)
     return (bd, sr_hz)
 
 
@@ -197,6 +190,30 @@ def is_album_capped(album_id, capped):
     return _capped_is_fresh(_capped_ts(capped.get(str(album_id))))
 
 
+def _local_album_cap_key(album_dir):
+    if not album_dir:
+        return ""
+    path = Path(album_dir)
+    try:
+        root = Path(cfg.MUSIC_ROOT).resolve(strict=False)
+        resolved = path.resolve(strict=False)
+        try:
+            identity = str(resolved.relative_to(root))
+        except ValueError:
+            identity = str(resolved)
+    except OSError:
+        identity = str(path)
+    digest = hashlib.sha256(identity.encode("utf-8", "surrogateescape")).hexdigest()
+    return f"local:{digest}"
+
+
+def is_local_album_capped(album_dir, capped):
+    key = _local_album_cap_key(album_dir)
+    if not key:
+        return False
+    return _capped_is_fresh(_capped_ts((capped or {}).get(key)))
+
+
 def mark_album_capped(album_id, qobuz_album, post_qual):
     if not album_id:
         return
@@ -210,6 +227,34 @@ def mark_album_capped(album_id, qobuz_album, post_qual):
         "actual_n_below": post_qual.get("n_below", 0),
         "actual_n_above": post_qual.get("n_above", 0),
     }
+    save_capped(capped)
+
+
+def mark_local_album_capped(album_dir, qobuz_album=None, post_qual=None):
+    key = _local_album_cap_key(album_dir)
+    if not key:
+        return
+    album_path = Path(album_dir)
+    post_qual = post_qual or {}
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "scope": "local_album",
+        "album_dir": str(album_path),
+        "title": album_path.name,
+        "artist": album_path.parent.name,
+        "actual_n_at_target": post_qual.get("n_at", 0),
+        "actual_n_below": post_qual.get("n_below", 0),
+        "actual_n_above": post_qual.get("n_above", 0),
+    }
+    if qobuz_album:
+        entry.update({
+            "qobuz_album_id": qobuz_album.get("id"),
+            "title": qobuz_album.get("title") or entry["title"],
+            "artist": (qobuz_album.get("artist") or {}).get("name") or entry["artist"],
+            "qobuz_advertised": album_quality_label(qobuz_album),
+        })
+    capped = load_capped()
+    capped[key] = entry
     save_capped(capped)
 
 
@@ -277,6 +322,9 @@ def scan_artist_for_upgrades(artist_name, artist_dir, token, args, capped=None):
             continue
 
         # Skip albums Qobuz can't actually deliver at target.
+        if capped and is_local_album_capped(album_dir, capped):
+            vlog(f"    {album_dir.name}: capped (locally downsampled)")
+            continue
         if capped and is_album_capped(qobuz_album.get("id"), capped):
             vlog(f"    {album_dir.name}: capped (partial hi-res previously)")
             continue

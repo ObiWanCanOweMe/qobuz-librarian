@@ -1,6 +1,8 @@
+import builtins
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -84,6 +86,26 @@ def test_flac_header_parse_anchors_at_offset_zero():
     assert de.parse_flac_info(not_at_zero) == (0, 0)   # hidden marker ignored
     assert de.parse_flac_total_samples(at_zero) != 0
     assert de.parse_flac_total_samples(not_at_zero) == 0
+
+
+def test_read_sample_rate_uses_cached_scan_metadata_before_file_probe(
+        tmp_path, monkeypatch):
+    src = tmp_path / "track.flac"
+    src.write_bytes(b"not a real flac")
+    monkeypatch.setattr(de, "cfg", SimpleNamespace(FLAC_CACHE_ENABLED=True),
+                        raising=False)
+    monkeypatch.setattr(
+        de, "flac_cache",
+        SimpleNamespace(get=lambda path: {"sample_rate": "96000"}),
+        raising=False,
+    )
+
+    def fail_open(*args, **kwargs):
+        raise OSError("file probe should not run when cache has sample rate")
+
+    monkeypatch.setattr(builtins, "open", fail_open)
+
+    assert read_sample_rate(src) == 96000
 
 
 # ── integration: the destructive resample path ─────────────────────────────

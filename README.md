@@ -20,8 +20,8 @@ Qobuz Librarian searches Qobuz for artists, albums, and tracks, downloads what y
 ## Features
 
 - **Library gap-fill.** Run a Library scan to find missing albums from artists already in your library and track gaps in albums you own. Download only what you choose. Matching is edition-aware, so remasters and deluxe versions are not re-downloaded as duplicates. When an album is already in your library, search folds other pressings under **other versions**; pick **Download** to keep a remaster or deluxe alongside it.
-- **Single tracks.** Switch search to **Tracks** to download an individual song. It is marked as a deliberate single, so gap scans do not prompt you to complete the album. Download the full album later and it is treated as a normal album automatically.
-- **Quality upgrades.** **Upgrade** mode re-rips albums Qobuz can now serve at higher quality, backing up the originals first.
+- **Single tracks.** Switch search to **Track** to download an individual track. By default this does not hide the rest of the album from future gap scans; there is a setting if you want single-track downloads treated as deliberate singles.
+- **Quality upgrades.** The Library refresh finds albums Qobuz can now serve at higher quality. Review and queue them from **Upgrade**, or set `UPGRADE_SCAN_ENABLED=false` to hide Upgrade and skip that pass entirely.
 - **Downsample.** Convert hi-res FLACs to 44.1 / 48 kHz FLAC to reclaim space. Run it on demand, or apply it automatically to new downloads.
 - **New releases.** A periodic pass lists new albums by artists in your library for review and leaves them un-ticked so they cannot all be queued by accident.
 - **Clean import.** beets handles tagging and cover art, and files land in your library in a single move. Lyrics are fetched on import; **Lyrics** mode backfills tracks you already have.

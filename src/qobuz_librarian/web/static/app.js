@@ -138,7 +138,7 @@
     if (!q) return;
     var placeholder = "Album title";
     if (radio.value === "artist") placeholder = "Artist name";
-    if (radio.value === "track") placeholder = "Song title";
+    if (radio.value === "track") placeholder = "Track title";
     q.setAttribute("placeholder", placeholder);
     q.setAttribute("aria-label", placeholder);
   });
@@ -230,6 +230,12 @@
       triggerDd.setAttribute("open", "");
       trigger.setAttribute("aria-expanded", "true");
     }
+  });
+  document.addEventListener("click", function (evt) {
+    var btn = evt.target.closest && evt.target.closest("[data-close-mobile-menu]");
+    if (!btn) return;
+    var dd = btn.closest(".dropdown");
+    if (dd) closeDropdown(dd);
   });
 
   // One-shot flash flags should not stay in the URL after first paint.

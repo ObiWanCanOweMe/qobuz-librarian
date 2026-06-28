@@ -28,7 +28,7 @@ from qobuz_librarian.library.scanner import (
     list_library_artists,
 )
 from qobuz_librarian.ui_cli.colors import C, fmt, section
-from qobuz_librarian.ui_cli.errors import EXIT_AUTH, die, plural
+from qobuz_librarian.ui_cli.errors import EXIT_AUTH, EXIT_GENERAL, die, plural
 from qobuz_librarian.ui_cli.logging import log
 
 
@@ -49,6 +49,11 @@ def run_check_new_releases_mode(args):
             f"(http://<host>:{cfg.WEB_PORT}/settings)\n"
             "   or set QOBUZ_USER_AUTH_TOKEN in your environment.\n"),
             EXIT_AUTH)
+
+    if not new_releases_mod.is_baseline_complete():
+        die(fmt(C.YELLOW,
+            "No new-release baseline exists yet. Run a Library refresh first."),
+            EXIT_GENERAL)
 
     clear_scan_caches()
     artists = list_library_artists()

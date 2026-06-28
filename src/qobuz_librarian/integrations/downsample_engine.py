@@ -23,7 +23,9 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from qobuz_librarian import config as cfg
 from qobuz_librarian.integrations.rip import flac_audio_offset
+from qobuz_librarian.library import flac_cache
 
 
 def _fsync_quiet(path):
@@ -152,6 +154,22 @@ def read_local_bit_depth(path: Path) -> int:
         return 0
 
 
+def _cached_sample_rate(path: Path) -> int:
+    """Sample rate from the library scan's FLAC cache, or 0 when unavailable."""
+    if not cfg.FLAC_CACHE_ENABLED:
+        return 0
+    try:
+        cached = flac_cache.get(Path(path))
+    except (AttributeError, OSError, TypeError):
+        return 0
+    if not isinstance(cached, dict):
+        return 0
+    try:
+        return int(cached.get("sample_rate") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def read_sample_rate(path: Path) -> int:
     """Sample rate of a local FLAC. The 1 KB header byte-parse settles the
     common case in a single read; metaflac backstops files whose STREAMINFO
@@ -161,6 +179,9 @@ def read_sample_rate(path: Path) -> int:
     Inverse of read_local_bit_depth: this is the bulk path (one read per file
     across the whole library), so the cheap byte read leads and the subprocess
     is the exception, not the rule."""
+    cached = _cached_sample_rate(path)
+    if cached:
+        return cached
     try:
         with open(path, "rb") as f:
             data = f.read(PROBE_BYTES)

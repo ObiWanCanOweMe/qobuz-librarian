@@ -159,8 +159,10 @@ services:
       ARTIST_CATALOG_CACHE_TTL: "${ARTIST_CATALOG_CACHE_TTL:-604800}"
 
       # ── Optional features (off by default) ────────────────────────────────
-      # Offer quality upgrades during ordinary gap-fill walks. The explicit
-      # Upgrade walk works regardless of this; this only affects normal walks.
+      # Hide the Upgrade page and skip quality-upgrade scanning entirely.
+      UPGRADE_SCAN_ENABLED: "${UPGRADE_SCAN_ENABLED:-true}"
+      # Offer quality upgrades during ordinary gap-fill walks. The dedicated
+      # Upgrade surface remains the normal place for quality work.
       AUTO_UPGRADE_ENABLED: "${AUTO_UPGRADE_ENABLED:-false}"
       UPGRADE_BACKUP_RETENTION_DAYS: "${UPGRADE_BACKUP_RETENTION_DAYS:-7}"
       # Let the Upgrade walk also re-rip tracks downloaded as singles (off = leave

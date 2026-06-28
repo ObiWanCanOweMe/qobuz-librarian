@@ -6,7 +6,9 @@ auth/session/CSRF, the run-lock destructive-route guard, settings save/load,
 one search + one approve endpoint, and a few genuinely tricky bits of logic.
 """
 import asyncio
+import concurrent.futures
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -170,6 +172,120 @@ def test_download_dedup_respects_new_edition_and_single_track_intent():
     assert app_mod._duplicate_download_job("Y", track_id="7") is grab
     assert app_mod._duplicate_download_job("Y", track_id="8") is None
     assert app_mod._duplicate_download_job("Y") is None
+
+
+def test_direct_album_download_refreshes_saved_quality_state(
+        monkeypatch, tmp_path):
+    from qobuz_librarian.modes import process as process_mod
+    from qobuz_librarian.web import app as app_mod
+    from qobuz_librarian.web import flows
+
+    album_dir = tmp_path / "Artist" / "Album"
+    album_dir.mkdir(parents=True)
+    album = {
+        "id": "alb1",
+        "title": "Album",
+        "artist": {"name": "Artist"},
+    }
+    calls = []
+
+    monkeypatch.setattr(
+        process_mod,
+        "process_album",
+        lambda *_a, **_k: {
+            "imported": True,
+            "n_ok": 1,
+            "n_fail": 0,
+            "result": "downloaded",
+            "dir": album_dir,
+        },
+    )
+    monkeypatch.setattr(
+        flows,
+        "_refresh_after_local_album_change",
+        lambda *a, **kw: calls.append((a, kw)),
+    )
+
+    job = jm.Job(title="Album", artist="Artist", album_id="alb1")
+    app_mod._make_download_run(album, "tok")(job)
+
+    assert job.status != jm.JobStatus.FAILED
+    assert len(calls) == 1
+    assert calls[0][0][0] is album
+    assert Path(calls[0][0][1]["dir"]) == album_dir
+    assert calls[0][1] == {
+        "fallback_artist": "Artist",
+        "token": "tok",
+        "args": calls[0][1]["args"],
+        "upgrade": True,
+        "downsample": True,
+    }
+
+
+def test_direct_single_track_download_refreshes_saved_quality_state(
+        monkeypatch, tmp_path):
+    import qobuz_librarian.library.catalog as cat_mod
+    import qobuz_librarian.queue.builder as builder_mod
+    import qobuz_librarian.queue.executor as executor_mod
+    from qobuz_librarian.web import app as app_mod
+    from qobuz_librarian.web import flows
+
+    album_dir = tmp_path / "Artist" / "Album"
+    album_dir.mkdir(parents=True)
+    album = {
+        "id": "alb1",
+        "title": "Album",
+        "year": 2024,
+        "artist": {"name": "Artist"},
+        "tracks": {"items": [
+            {"id": "t1", "title": "One", "track_number": 1},
+            {"id": "t2", "title": "Two", "track_number": 2},
+        ]},
+    }
+    track = album["tracks"]["items"][0]
+    calls = []
+
+    monkeypatch.setattr(cat_mod, "find_existing_tracks", lambda *_a, **_k: ([], None))
+    monkeypatch.setattr(
+        builder_mod,
+        "_build_queue_item",
+        lambda **kwargs: {
+            "album": kwargs["album"],
+            "missing": kwargs["missing"],
+            "n_ok": 0,
+            "n_fail": 0,
+            "imported": False,
+        },
+    )
+
+    def fake_execute(queue, *_a, **_k):
+        queue[0]["n_ok"] = 1
+        queue[0]["n_fail"] = 0
+        queue[0]["imported"] = True
+        queue[0]["_resolved_post_dir"] = str(album_dir)
+
+    monkeypatch.setattr(executor_mod, "_execute_download_queue", fake_execute)
+    monkeypatch.setattr(
+        flows,
+        "_refresh_after_local_album_change",
+        lambda *a, **kw: calls.append((a, kw)),
+    )
+    monkeypatch.setattr(app_mod.cfg, "SUPPRESS_SINGLE_TRACK_GAPS", False, raising=False)
+
+    job = jm.Job(title="One", artist="Artist", album_id="alb1")
+    app_mod._make_single_track_run(album, track, "tok")(job)
+
+    assert job.status != jm.JobStatus.FAILED
+    assert len(calls) == 1
+    assert calls[0][0][0] is album
+    assert Path(calls[0][0][1]["dir"]) == album_dir
+    assert calls[0][1] == {
+        "fallback_artist": "Artist",
+        "token": "tok",
+        "args": calls[0][1]["args"],
+        "upgrade": True,
+        "downsample": True,
+    }
 
 
 def test_cancel_while_queued_finalizes_and_worker_skips_it():
@@ -423,7 +539,8 @@ def test_artist_search_selected_artist_shows_discography(client, monkeypatch):
 
     assert r.status_code == 200
     assert seen == {"artist_id": "artist1", "limit": cfg.ARTIST_CATALOG_LIMIT}
-    assert "Albums by Paysage" in r.text
+    assert "Paysage d&#39;Hiver" in r.text
+    assert "Artist discography" in r.text
     assert "Das Tor" in r.text
     assert "Download" in r.text
 
@@ -595,7 +712,13 @@ def test_csrf_post_without_token_is_rejected():
 # ── run-lock busy → destructive routes 503, read-only stay open ───────
 
 def test_lock_busy_refuses_destructive_routes(monkeypatch):
+    from qobuz_librarian import config as cfg
     from qobuz_librarian.web import app as webapp
+
+    monkeypatch.setattr(cfg, "UPGRADE_SCAN_ENABLED", True, raising=False)
+    monkeypatch.setattr(webapp, "_read_creds",
+                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
+    monkeypatch.setattr(webapp, "_TOKEN_VALID", True)
     _run_web_executors_inline(monkeypatch, webapp)
     with _SameThreadASGIClient(webapp.app) as c:
         c.get("/queue")
@@ -658,10 +781,845 @@ def test_scan_action_buttons_are_mobile_friendly(client, monkeypatch):
         "qobuz_librarian.integrations.lyric_fetch.AVAILABLE",
         True,
     )
-    for path in ("/library", "/upgrade", "/downsample", "/repair", "/lyrics"):
+    for path in ("/library", "/downsample", "/repair", "/lyrics"):
         r = client.get(path)
         assert r.status_code == 200
         assert 'class="btn btn-primary w-full sm:w-auto"' in r.text
+
+
+def test_primary_nav_matches_webui_blueprint(client, monkeypatch):
+    from qobuz_librarian.web import app as webapp
+
+    monkeypatch.setattr(webapp, "_read_creds",
+                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
+
+    r = client.get("/")
+
+    assert r.status_code == 200
+    labels = [
+        "Search",
+        "Library",
+        "Upgrade",
+        "Downsample",
+        "Repair",
+        "Lyrics",
+        "Queue / History",
+        "Settings",
+    ]
+    positions = [r.text.find(label) for label in labels]
+    assert all(pos >= 0 for pos in positions)
+    assert positions == sorted(positions)
+    assert ">Dashboard<" not in r.text
+    assert ">Tools<" not in r.text
+    assert ">Migrate<" not in r.text
+
+
+def test_nav_shows_qobuz_setup_when_credentials_are_missing(client, monkeypatch):
+    from qobuz_librarian.web import app as webapp
+
+    monkeypatch.setattr(webapp, "_read_creds", lambda: {})
+
+    r = client.get("/")
+
+    assert r.status_code == 200
+    assert "Set up Qobuz in Settings" in r.text
+    assert 'href="/settings"' in r.text
+    assert "Your Qobuz token was rejected" not in r.text
+
+
+def test_dashboard_qobuz_setup_card_stays_until_qobuz_is_connected(
+        client, monkeypatch):
+    from qobuz_librarian.web import app as webapp
+
+    monkeypatch.setattr(webapp, "_read_creds", lambda: {})
+
+    r = client.get("/")
+
+    assert r.status_code == 200
+    assert 'data-qobuz-setup-card' in r.text
+    assert 'data-qobuz-setup-dismiss' not in r.text
+    assert "Qobuz credentials" in r.text
+    assert "Open Settings" in r.text
+    assert "Downsample" in r.text
+    assert "Lyrics" in r.text
+    assert "Set up Qobuz in Settings" in r.text
+
+
+def test_dashboard_search_modes_are_artist_album_track(client, monkeypatch):
+    from qobuz_librarian.web import app as webapp
+
+    monkeypatch.setattr(webapp, "_read_creds",
+                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
+
+    r = client.get("/")
+
+    assert r.status_code == 200
+    assert "<span>Artist</span>" in r.text
+    assert "<span>Album</span>" in r.text
+    assert "<span>Track</span>" in r.text
+    assert "<span>Artists</span>" not in r.text
+    assert "<span>Albums</span>" not in r.text
+    assert "<span>Tracks</span>" not in r.text
+    assert r.text.count('hx-post="/search"') == 1
+    assert 'hx-include="closest form"' not in r.text
+
+
+def test_search_page_does_not_show_empty_dashboard_cards(client, monkeypatch):
+    from qobuz_librarian.web import app as webapp
+
+    monkeypatch.setattr(webapp, "_read_creds",
+                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
+
+    r = client.get("/")
+
+    assert r.status_code == 200
+    assert "<h1>Search</h1>" in r.text
+    assert "Search Qobuz" in r.text
+    assert "Needs review" not in r.text
+    assert "Running and queued" not in r.text
+    assert "Recent downloads" not in r.text
+    assert "Latest completed downloads" not in r.text
+    assert "No scans waiting for review." not in r.text
+    assert "Nothing running or queued." not in r.text
+
+
+def test_search_page_does_not_render_review_jobs_as_front_page_cards(
+        client, monkeypatch):
+    from qobuz_librarian.web import app as webapp
+
+    monkeypatch.setattr(webapp, "_read_creds",
+                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
+
+    job = _inject_job(jm.JobStatus.AWAITING_REVIEW, "Library scan")
+    job.execute_kind = "library"
+    job.add_candidate(kind="album", title="Dummy", artist="Portishead",
+                      payload={"year": "1994"}, selected=False)
+    try:
+        r = client.get("/")
+
+        assert r.status_code == 200
+        assert "Search Qobuz" in r.text
+        assert "Library scan" not in r.text
+        assert "1 missing album or track gap found." not in r.text
+        assert f'href="/jobs/{job.id}"' not in r.text
+    finally:
+        _remove_job(job)
+
+
+def test_nav_review_badges_clear_when_tabs_are_opened(client, monkeypatch):
+    from qobuz_librarian.web import app as webapp
+    from qobuz_librarian.web import review_badges
+
+    monkeypatch.setattr(webapp, "_read_creds",
+                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
+    review_badges.mark_ready("library", now=100.0)
+    review_badges.mark_ready("upgrade", now=101.0)
+    review_badges.mark_ready("downsample", now=102.0)
+
+    r = client.get("/")
+
+    assert r.status_code == 200
+    assert 'data-review-badge="library"' in r.text
+    assert 'data-review-badge="upgrade"' in r.text
+    assert 'data-review-badge="downsample"' in r.text
+
+    assert client.get("/upgrade").status_code == 200
+    r = client.get("/")
+
+    assert 'data-review-badge="library"' in r.text
+    assert 'data-review-badge="upgrade"' not in r.text
+    assert 'data-review-badge="downsample"' in r.text
+
+    assert client.get("/library").status_code == 200
+    assert client.get("/downsample").status_code == 200
+    r = client.get("/")
+
+    assert 'data-review-badge="library"' not in r.text
+    assert 'data-review-badge="upgrade"' not in r.text
+    assert 'data-review-badge="downsample"' not in r.text
+
+
+def test_upgrade_disabled_hides_nav_and_badge(client, monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.web import app as webapp
+    from qobuz_librarian.web import review_badges
+
+    monkeypatch.setattr(cfg, "UPGRADE_SCAN_ENABLED", False, raising=False)
+    monkeypatch.setattr(webapp, "_read_creds",
+                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
+    review_badges.mark_ready("upgrade", now=100.0)
+
+    r = client.get("/")
+
+    assert r.status_code == 200
+    assert 'href="/upgrade"' not in r.text
+    assert 'data-review-badge="upgrade"' not in r.text
+
+
+def test_upgrade_nav_hidden_without_qobuz_credentials(client, monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.web import app as webapp
+
+    monkeypatch.setattr(cfg, "UPGRADE_SCAN_ENABLED", True, raising=False)
+    monkeypatch.setattr(webapp, "_read_creds", lambda: {})
+
+    r = client.get("/")
+
+    assert r.status_code == 200
+    assert 'href="/upgrade"' not in r.text
+
+
+def test_upgrade_disabled_page_redirects_cleanly(client, monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.web import app as webapp
+
+    monkeypatch.setattr(cfg, "UPGRADE_SCAN_ENABLED", False, raising=False)
+    monkeypatch.setattr(webapp, "_read_creds",
+                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
+
+    r = client.get("/upgrade", follow_redirects=False)
+
+    assert r.status_code == 303
+    assert r.headers["location"] == "/"
+
+
+def test_upgrade_page_reviews_saved_baseline_candidates(client, monkeypatch):
+    from qobuz_librarian.web import app as webapp
+
+    monkeypatch.setattr(webapp, "_read_creds",
+                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
+    monkeypatch.setattr(
+        "qobuz_librarian.quality.upgrade_state.load",
+        lambda: {
+            "updated_at": time.time(),
+            "complete": True,
+            "candidates": [{
+                "title": "Dummy",
+                "artist": "Portishead",
+                "detail": "16-bit/44.1 kHz -> 24-bit/96 kHz",
+                "payload": {"album_id": "up1", "year": "1994", "cover": ""},
+            }],
+        },
+    )
+
+    r = client.get("/upgrade")
+
+    assert r.status_code == 200
+    assert "Upgrade candidates" in r.text
+    assert "1 upgrade candidate" in r.text
+    assert 'action="/upgrade/review"' in r.text
+    assert "Review candidates" in r.text
+    assert "Start upgrade scan" not in r.text
+    assert "Quality upgrade scan" not in r.text
+
+
+def test_upgrade_review_post_uses_saved_state_without_scanning(client, monkeypatch):
+    from qobuz_librarian.web import app as webapp
+    from qobuz_librarian.web import jobs as job_mgr
+
+    monkeypatch.setattr(webapp, "_get_token", lambda: "tok")
+    monkeypatch.setattr(webapp, "_read_creds",
+                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
+    monkeypatch.setattr(
+        "qobuz_librarian.quality.upgrade_state.load",
+        lambda: {
+            "updated_at": time.time(),
+            "complete": True,
+            "candidates": [{
+                "title": "Dummy",
+                "artist": "Portishead",
+                "detail": "16-bit/44.1 kHz -> 24-bit/96 kHz",
+                "payload": {"album_id": "up1", "year": "1994", "cover": ""},
+            }],
+        },
+    )
+
+    def fail_scan(*_args, **_kwargs):
+        raise AssertionError("Upgrade review must not start a scan")
+
+    monkeypatch.setattr("qobuz_librarian.web.flows.scan_upgrades", fail_scan)
+
+    r = client.post("/upgrade/review", follow_redirects=False)
+
+    assert r.status_code == 303
+    job_id = r.headers["location"].removeprefix("/jobs/")
+    job = job_mgr.registry.get(job_id)
+    assert job is not None
+    assert job.status == job_mgr.JobStatus.AWAITING_REVIEW
+    assert job.execute_kind == "upgrade"
+    assert job.review_verb == "Upgrade"
+    assert len(job.candidates) == 1
+    assert job.candidates[0]["selected"] is False
+
+
+def test_upgrade_review_post_reuses_existing_saved_review_job(
+        client, monkeypatch):
+    from qobuz_librarian.web import app as webapp
+    from qobuz_librarian.web import jobs as job_mgr
+
+    monkeypatch.setattr(webapp, "_get_token", lambda: "tok")
+    monkeypatch.setattr(webapp, "_read_creds",
+                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
+    monkeypatch.setattr(
+        "qobuz_librarian.quality.upgrade_state.load",
+        lambda: {
+            "updated_at": time.time(),
+            "complete": True,
+            "candidates": [{
+                "title": "Dummy",
+                "artist": "Portishead",
+                "detail": "16-bit/44.1 kHz -> 24-bit/96 kHz",
+                "payload": {"album_id": "up1", "year": "1994", "cover": ""},
+            }],
+        },
+    )
+
+    first = client.post("/upgrade/review", follow_redirects=False)
+    second = client.post("/upgrade/review", follow_redirects=False)
+
+    assert first.status_code == 303
+    assert second.status_code == 303
+    assert second.headers["location"] == first.headers["location"]
+    assert len([
+        j for j in job_mgr.registry.awaiting_review()
+        if j.execute_kind == "upgrade"
+    ]) == 1
+
+
+def test_saved_review_signature_ignores_candidate_order():
+    from qobuz_librarian.web import app as webapp
+
+    first = {
+        "complete": True,
+        "candidates": [
+            {
+                "title": "Dummy",
+                "artist": "Portishead",
+                "detail": "16-bit/44.1 kHz -> 24-bit/96 kHz",
+                "payload": {"album_id": "up1"},
+            },
+            {
+                "title": "Third",
+                "artist": "Portishead",
+                "detail": "16-bit/44.1 kHz -> 24-bit/96 kHz",
+                "payload": {"album_id": "up2"},
+            },
+        ],
+    }
+    second = {**first, "candidates": list(reversed(first["candidates"]))}
+
+    assert (
+        webapp._saved_review_signature("upgrade", first)
+        == webapp._saved_review_signature("upgrade", second)
+    )
+
+
+def test_saved_review_creation_is_atomic_for_parallel_posts(monkeypatch):
+    from qobuz_librarian.web import app as webapp
+    from qobuz_librarian.web import jobs as job_mgr
+
+    real_add = job_mgr.registry.add
+
+    def slow_add(job):
+        time.sleep(0.02)
+        real_add(job)
+
+    monkeypatch.setattr(job_mgr.registry, "add", slow_add)
+    state = {
+        "complete": True,
+        "candidates": [{
+            "title": "Dummy",
+            "artist": "Portishead",
+            "detail": "16-bit/44.1 kHz -> 24-bit/96 kHz",
+            "payload": {"album_id": "up1"},
+        }],
+    }
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        jobs = list(ex.map(
+            lambda _i: webapp._review_job_from_upgrade_state(state),
+            range(8),
+        ))
+
+    assert len({j.id for j in jobs}) == 1
+    assert len([
+        j for j in job_mgr.registry.awaiting_review()
+        if j.execute_kind == "upgrade"
+    ]) == 1
+
+
+def test_upgrade_saved_review_respects_hidden_candidates(
+        client, monkeypatch, tmp_path):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.library import hidden
+    from qobuz_librarian.web import app as webapp
+    from qobuz_librarian.web import jobs as job_mgr
+
+    monkeypatch.setattr(cfg, "HIDDEN_FILE", tmp_path / "hidden.json")
+    monkeypatch.setattr(webapp, "_get_token", lambda: "tok")
+    monkeypatch.setattr(webapp, "_read_creds",
+                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
+    monkeypatch.setattr(
+        "qobuz_librarian.quality.upgrade_state.load",
+        lambda: {
+            "updated_at": time.time(),
+            "complete": True,
+            "candidates": [
+                {
+                    "title": "Dummy",
+                    "artist": "Portishead",
+                    "detail": "16-bit/44.1 kHz -> 24-bit/96 kHz",
+                    "payload": {"album_id": "up1", "year": "1994", "cover": ""},
+                },
+                {
+                    "title": "Third",
+                    "artist": "Portishead",
+                    "detail": "16-bit/44.1 kHz -> 24-bit/96 kHz",
+                    "payload": {"album_id": "up2", "year": "2008", "cover": ""},
+                },
+            ],
+        },
+    )
+
+    first = client.post("/upgrade/review", follow_redirects=False)
+    job_id = first.headers["location"].removeprefix("/jobs/")
+    job = job_mgr.registry.get(job_id)
+    keep = next(c["cid"] for c in job.candidates if c["title"] == "Dummy")
+    client.post(f"/jobs/{job.id}/select", data={"cid": keep, "checked": "1"})
+    client.post(f"/jobs/{job.id}/hide", data={"artist": "Portishead"})
+
+    store = hidden.load()
+    assert hidden.is_hidden(hidden.SCOPE_UPGRADE, "Portishead", "Third", store)
+    assert [c["title"] for c in job.candidates] == ["Dummy"]
+
+    r = client.get("/upgrade")
+    assert r.status_code == 200
+    assert "1 upgrade candidate" in r.text
+    assert "2 upgrade candidates" not in r.text
+
+    second = client.post("/upgrade/review", follow_redirects=False)
+    assert second.headers["location"] == first.headers["location"]
+    assert len([
+        j for j in job_mgr.registry.awaiting_review()
+        if j.execute_kind == "upgrade"
+    ]) == 1
+
+
+def test_upgrade_saved_review_restore_updates_existing_job(
+        client, monkeypatch, tmp_path):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.library import hidden
+    from qobuz_librarian.web import app as webapp
+    from qobuz_librarian.web import jobs as job_mgr
+
+    monkeypatch.setattr(cfg, "HIDDEN_FILE", tmp_path / "hidden.json")
+    monkeypatch.setattr(webapp, "_get_token", lambda: "tok")
+    monkeypatch.setattr(webapp, "_read_creds",
+                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
+    monkeypatch.setattr(
+        "qobuz_librarian.quality.upgrade_state.load",
+        lambda: {
+            "updated_at": time.time(),
+            "complete": True,
+            "candidates": [
+                {
+                    "title": "Dummy",
+                    "artist": "Portishead",
+                    "detail": "16-bit/44.1 kHz -> 24-bit/96 kHz",
+                    "payload": {"album_id": "up1", "year": "1994", "cover": ""},
+                },
+                {
+                    "title": "Third",
+                    "artist": "Portishead",
+                    "detail": "16-bit/44.1 kHz -> 24-bit/96 kHz",
+                    "payload": {"album_id": "up2", "year": "2008", "cover": ""},
+                },
+            ],
+        },
+    )
+
+    first = client.post("/upgrade/review", follow_redirects=False)
+    job_id = first.headers["location"].removeprefix("/jobs/")
+    job = job_mgr.registry.get(job_id)
+    keep = next(c["cid"] for c in job.candidates if c["title"] == "Dummy")
+    client.post(f"/jobs/{job.id}/select", data={"cid": keep, "checked": "1"})
+    client.post(f"/jobs/{job.id}/hide", data={"artist": "Portishead"})
+    hidden.restore_albums(hidden.SCOPE_UPGRADE, [
+        hidden.album_fingerprint("Portishead", "Third")
+    ])
+
+    second = client.post("/upgrade/review", follow_redirects=False)
+
+    assert second.headers["location"] == first.headers["location"]
+    assert [c["title"] for c in job.candidates] == ["Dummy", "Third"]
+    assert {c["title"]: c["selected"] for c in job.candidates} == {
+        "Dummy": True,
+        "Third": False,
+    }
+    assert len([
+        j for j in job_mgr.registry.awaiting_review()
+        if j.execute_kind == "upgrade"
+    ]) == 1
+
+
+def test_upgrade_approve_resyncs_saved_review_before_execution(
+        client, monkeypatch):
+    from qobuz_librarian.web import app as webapp
+    from qobuz_librarian.web import jobs as job_mgr
+
+    monkeypatch.setattr(webapp, "_get_token", lambda: "tok")
+    monkeypatch.setattr(webapp, "_read_creds",
+                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
+    state = {
+        "updated_at": time.time(),
+        "complete": True,
+        "candidates": [{
+            "title": "Stale",
+            "artist": "Portishead",
+            "detail": "16-bit/44.1 kHz -> 24-bit/96 kHz",
+            "payload": {"album_id": "old", "year": "1994", "cover": ""},
+        }],
+    }
+    monkeypatch.setattr("qobuz_librarian.quality.upgrade_state.load", lambda: state)
+
+    first = client.post("/upgrade/review", follow_redirects=False)
+    job_id = first.headers["location"].removeprefix("/jobs/")
+    job = job_mgr.registry.get(job_id)
+    client.post(f"/jobs/{job.id}/select",
+                data={"cid": job.candidates[0]["cid"], "checked": "1"})
+    state["candidates"] = []
+
+    r = client.post(f"/jobs/{job.id}/approve", follow_redirects=False)
+
+    assert r.status_code == 303
+    assert r.headers["location"] == f"/jobs/{job.id}?noselection=1"
+    assert job.status == job_mgr.JobStatus.AWAITING_REVIEW
+    assert job.candidates == []
+
+
+def test_incomplete_upgrade_state_is_not_reviewable(client, monkeypatch):
+    from qobuz_librarian.web import app as webapp
+    from qobuz_librarian.web import jobs as job_mgr
+
+    monkeypatch.setattr(webapp, "_get_token", lambda: "tok")
+    monkeypatch.setattr(webapp, "_read_creds",
+                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
+    monkeypatch.setattr(
+        "qobuz_librarian.quality.upgrade_state.load",
+        lambda: {
+            "updated_at": time.time(),
+            "complete": False,
+            "candidates": [{
+                "title": "Partial",
+                "artist": "Portishead",
+                "detail": "stale",
+                "payload": {"album_id": "up1"},
+            }],
+        },
+    )
+
+    r = client.post("/upgrade/review", follow_redirects=False)
+
+    assert r.status_code == 303
+    assert r.headers["location"] == "/upgrade"
+    assert job_mgr.registry.awaiting_review() == []
+
+
+def test_downsample_page_reviews_saved_shared_candidates(client, monkeypatch):
+    monkeypatch.setattr(
+        "qobuz_librarian.integrations.downsample_engine.HAVE_DOWNSAMPLE", True)
+    monkeypatch.setattr(
+        "qobuz_librarian.library.downsample_state.load",
+        lambda: {
+            "updated_at": time.time(),
+            "complete": True,
+            "candidates": [{
+                "title": "Dummy",
+                "artist": "Portishead",
+                "detail": "24-bit / 96 kHz -> 16-bit / 48 kHz",
+                "album_dir": "/music/Portishead/Dummy",
+                "est_saving": 1234,
+            }],
+        },
+    )
+
+    r = client.get("/downsample")
+
+    assert r.status_code == 200
+    assert "Downsample candidates" in r.text
+    assert "1 album can be downsampled" in r.text
+    assert 'action="/downsample/review"' in r.text
+    assert "Review candidates" in r.text
+    assert "Start downsample scan" not in r.text
+
+
+def test_downsample_review_post_uses_saved_state_without_scanning(client, monkeypatch):
+    from qobuz_librarian.web import jobs as job_mgr
+
+    monkeypatch.setattr(
+        "qobuz_librarian.integrations.downsample_engine.HAVE_DOWNSAMPLE", True)
+    monkeypatch.setattr(
+        "qobuz_librarian.library.downsample_state.load",
+        lambda: {
+            "updated_at": time.time(),
+            "complete": True,
+            "candidates": [{
+                "title": "Dummy",
+                "artist": "Portishead",
+                "detail": "24-bit / 96 kHz -> 16-bit / 48 kHz",
+                "album_dir": "/music/Portishead/Dummy",
+                "est_saving": 1234,
+            }],
+        },
+    )
+
+    def fail_scan(*_args, **_kwargs):
+        raise AssertionError("Downsample review must not start a scan")
+
+    monkeypatch.setattr("qobuz_librarian.web.flows.scan_downsamples", fail_scan)
+
+    r = client.post("/downsample/review", follow_redirects=False)
+
+    assert r.status_code == 303
+    job_id = r.headers["location"].removeprefix("/jobs/")
+    job = job_mgr.registry.get(job_id)
+    assert job is not None
+    assert job.status == job_mgr.JobStatus.AWAITING_REVIEW
+    assert job.execute_kind == "downsample"
+    assert job.review_verb == "Downsample"
+    assert len(job.candidates) == 1
+    assert job.candidates[0]["selected"] is False
+
+
+def test_downsample_review_post_reuses_existing_saved_review_job(
+        client, monkeypatch):
+    from qobuz_librarian.web import jobs as job_mgr
+
+    monkeypatch.setattr(
+        "qobuz_librarian.integrations.downsample_engine.HAVE_DOWNSAMPLE", True)
+    monkeypatch.setattr(
+        "qobuz_librarian.library.downsample_state.load",
+        lambda: {
+            "updated_at": time.time(),
+            "complete": True,
+            "candidates": [{
+                "title": "Dummy",
+                "artist": "Portishead",
+                "detail": "24-bit / 96 kHz -> 16-bit / 48 kHz",
+                "album_dir": "/music/Portishead/Dummy",
+                "est_saving": 1234,
+            }],
+        },
+    )
+
+    first = client.post("/downsample/review", follow_redirects=False)
+    second = client.post("/downsample/review", follow_redirects=False)
+
+    assert first.status_code == 303
+    assert second.status_code == 303
+    assert second.headers["location"] == first.headers["location"]
+    assert len([
+        j for j in job_mgr.registry.awaiting_review()
+        if j.execute_kind == "downsample"
+    ]) == 1
+
+
+def test_downsample_saved_review_respects_hidden_candidates(
+        client, monkeypatch, tmp_path):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.library import hidden
+    from qobuz_librarian.web import jobs as job_mgr
+
+    monkeypatch.setattr(cfg, "HIDDEN_FILE", tmp_path / "hidden.json")
+    monkeypatch.setattr(
+        "qobuz_librarian.integrations.downsample_engine.HAVE_DOWNSAMPLE", True)
+    monkeypatch.setattr(
+        "qobuz_librarian.library.downsample_state.load",
+        lambda: {
+            "updated_at": time.time(),
+            "complete": True,
+            "candidates": [
+                {
+                    "title": "Dummy",
+                    "artist": "Portishead",
+                    "detail": "24-bit / 96 kHz -> 16-bit / 48 kHz",
+                    "album_dir": "/music/Portishead/Dummy",
+                    "est_saving": 1234,
+                },
+                {
+                    "title": "Third",
+                    "artist": "Portishead",
+                    "detail": "24-bit / 96 kHz -> 16-bit / 48 kHz",
+                    "album_dir": "/music/Portishead/Third",
+                    "est_saving": 5678,
+                },
+            ],
+        },
+    )
+
+    first = client.post("/downsample/review", follow_redirects=False)
+    job_id = first.headers["location"].removeprefix("/jobs/")
+    job = job_mgr.registry.get(job_id)
+    keep = next(c["cid"] for c in job.candidates if c["title"] == "Dummy")
+    client.post(f"/jobs/{job.id}/select", data={"cid": keep, "checked": "1"})
+    client.post(f"/jobs/{job.id}/hide", data={"artist": "Portishead"})
+
+    store = hidden.load()
+    assert hidden.is_hidden(hidden.SCOPE_DOWNSAMPLE, "Portishead", "Third", store)
+    assert [c["title"] for c in job.candidates] == ["Dummy"]
+
+    r = client.get("/downsample")
+    assert r.status_code == 200
+    assert "1 album can be downsampled" in r.text
+    assert "2 albums can be downsampled" not in r.text
+
+    second = client.post("/downsample/review", follow_redirects=False)
+    assert second.headers["location"] == first.headers["location"]
+    assert len([
+        j for j in job_mgr.registry.awaiting_review()
+        if j.execute_kind == "downsample"
+    ]) == 1
+
+
+def test_downsample_saved_review_restore_updates_existing_job(
+        client, monkeypatch, tmp_path):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.library import hidden
+    from qobuz_librarian.web import jobs as job_mgr
+
+    monkeypatch.setattr(cfg, "HIDDEN_FILE", tmp_path / "hidden.json")
+    monkeypatch.setattr(
+        "qobuz_librarian.integrations.downsample_engine.HAVE_DOWNSAMPLE", True)
+    monkeypatch.setattr(
+        "qobuz_librarian.library.downsample_state.load",
+        lambda: {
+            "updated_at": time.time(),
+            "complete": True,
+            "candidates": [
+                {
+                    "title": "Dummy",
+                    "artist": "Portishead",
+                    "detail": "24-bit / 96 kHz -> 16-bit / 48 kHz",
+                    "album_dir": "/music/Portishead/Dummy",
+                    "est_saving": 1234,
+                },
+                {
+                    "title": "Third",
+                    "artist": "Portishead",
+                    "detail": "24-bit / 96 kHz -> 16-bit / 48 kHz",
+                    "album_dir": "/music/Portishead/Third",
+                    "est_saving": 5678,
+                },
+            ],
+        },
+    )
+
+    first = client.post("/downsample/review", follow_redirects=False)
+    job_id = first.headers["location"].removeprefix("/jobs/")
+    job = job_mgr.registry.get(job_id)
+    keep = next(c["cid"] for c in job.candidates if c["title"] == "Dummy")
+    client.post(f"/jobs/{job.id}/select", data={"cid": keep, "checked": "1"})
+    client.post(f"/jobs/{job.id}/hide", data={"artist": "Portishead"})
+    hidden.restore_albums(hidden.SCOPE_DOWNSAMPLE, [
+        hidden.album_fingerprint("Portishead", "Third")
+    ])
+
+    second = client.post("/downsample/review", follow_redirects=False)
+
+    assert second.headers["location"] == first.headers["location"]
+    assert [c["title"] for c in job.candidates] == ["Dummy", "Third"]
+    assert {c["title"]: c["selected"] for c in job.candidates} == {
+        "Dummy": True,
+        "Third": False,
+    }
+    assert len([
+        j for j in job_mgr.registry.awaiting_review()
+        if j.execute_kind == "downsample"
+    ]) == 1
+
+
+def test_downsample_approve_resyncs_saved_review_before_execution(
+        client, monkeypatch):
+    from qobuz_librarian.web import jobs as job_mgr
+
+    monkeypatch.setattr(
+        "qobuz_librarian.integrations.downsample_engine.HAVE_DOWNSAMPLE", True)
+    state = {
+        "updated_at": time.time(),
+        "complete": True,
+        "candidates": [{
+            "title": "Stale",
+            "artist": "Portishead",
+            "detail": "24-bit / 96 kHz -> 16-bit / 48 kHz",
+            "album_dir": "/music/Portishead/Stale",
+            "est_saving": 1234,
+        }],
+    }
+    monkeypatch.setattr(
+        "qobuz_librarian.library.downsample_state.load", lambda: state)
+
+    first = client.post("/downsample/review", follow_redirects=False)
+    job_id = first.headers["location"].removeprefix("/jobs/")
+    job = job_mgr.registry.get(job_id)
+    client.post(f"/jobs/{job.id}/select",
+                data={"cid": job.candidates[0]["cid"], "checked": "1"})
+    state["candidates"] = []
+
+    r = client.post(f"/jobs/{job.id}/approve", follow_redirects=False)
+
+    assert r.status_code == 303
+    assert r.headers["location"] == f"/jobs/{job.id}?noselection=1"
+    assert job.status == job_mgr.JobStatus.AWAITING_REVIEW
+    assert job.candidates == []
+
+
+def test_incomplete_downsample_state_is_not_reviewable(client, monkeypatch):
+    from qobuz_librarian.web import jobs as job_mgr
+
+    monkeypatch.setattr(
+        "qobuz_librarian.library.downsample_state.load",
+        lambda: {
+            "updated_at": time.time(),
+            "complete": False,
+            "candidates": [{
+                "title": "Partial",
+                "artist": "Portishead",
+                "detail": "stale",
+                "album_dir": "/music/Portishead/Partial",
+                "est_saving": 1234,
+            }],
+        },
+    )
+
+    r = client.post("/downsample/review", follow_redirects=False)
+
+    assert r.status_code == 303
+    assert r.headers["location"] == "/downsample"
+    assert job_mgr.registry.awaiting_review() == []
+
+
+def test_downsample_artist_route_does_not_start_separate_scan(client):
+    r = client.post("/downsample/artist", data={"artist": "Portishead"},
+                    follow_redirects=False)
+
+    assert r.status_code == 303
+    assert r.headers["location"] == "/downsample"
+    assert jm.registry.awaiting_review() == []
+
+
+def test_upgrade_artist_route_does_not_start_separate_scan(
+        client, monkeypatch):
+    from qobuz_librarian.web import app as webapp
+
+    monkeypatch.setattr(webapp, "_read_creds",
+                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
+
+    r = client.post("/upgrade/artist", data={"artist": "Portishead"},
+                    follow_redirects=False)
+
+    assert r.status_code == 303
+    assert r.headers["location"] == "/upgrade"
+    assert jm.registry.awaiting_review() == []
 
 
 def test_dashboard_search_button_label_is_visible_on_mobile(client, monkeypatch):
@@ -700,10 +1658,63 @@ def test_dashboard_first_run_offers_baseline_scan_with_skip(client, monkeypatch)
 
     assert r.status_code == 200
     assert "Scan library" in r.text
-    assert "Scan once to find missing albums and track gaps." in r.text
+    assert "Scan once to refresh missing albums, track gaps, upgrades, and downsample candidates." in r.text
     assert 'action="/library/skip-setup"' in r.text and "Not now" in r.text
     # It's an offer, not an auto-started scan.
     assert "Your baseline scan is running" not in r.text
+
+
+def test_dashboard_first_run_offer_does_not_submit_baseline_scan(
+        client, monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.library import new_releases, scan_checkpoint
+    from qobuz_librarian.web import app as webapp
+
+    monkeypatch.setattr(webapp, "_read_creds",
+                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
+    monkeypatch.setattr(webapp, "_TOKEN_VALID", True)
+    monkeypatch.setattr("qobuz_librarian.library.scanner.list_library_artists",
+                        lambda: ["Some Artist"])
+    monkeypatch.setattr(cfg, "AUTO_LIBRARY_SCAN", True)
+    monkeypatch.setattr(new_releases, "is_baseline_complete", lambda: False)
+    monkeypatch.setattr(new_releases, "auto_scan_attempted", lambda: False)
+    monkeypatch.setattr(scan_checkpoint, "pending", lambda: None)
+
+    def fail_start_library_scan(*args, **kwargs):
+        pytest.fail("dashboard first-run offer must not start a library scan")
+
+    monkeypatch.setattr(webapp, "_start_library_scan", fail_start_library_scan)
+
+    r = client.get("/")
+
+    assert r.status_code == 200
+    assert "Scan library" in r.text
+
+
+def test_library_force_full_post_starts_forced_scan(client, monkeypatch):
+    from qobuz_librarian.web import app as webapp
+
+    monkeypatch.setattr(webapp, "_get_token", lambda: "tok")
+    monkeypatch.setattr(webapp, "_library_scan_state",
+                        lambda: {"ready": True, "count": 1, "message": ""})
+    started = {}
+
+    def fake_start_library_scan(*, partial_only=False, force_full=False):
+        job = jm.Job(title="scan")
+        started["partial_only"] = partial_only
+        started["force_full"] = force_full
+        return job
+
+    monkeypatch.setattr(webapp, "_start_library_scan", fake_start_library_scan)
+
+    r = client.post(
+        "/library",
+        data={"mode": "missing_albums", "force_full": "1"},
+        follow_redirects=False,
+    )
+
+    assert r.status_code == 303
+    assert started == {"partial_only": False, "force_full": True}
 
 
 def test_dashboard_search_bar_is_a_clean_unified_bar(client, monkeypatch):

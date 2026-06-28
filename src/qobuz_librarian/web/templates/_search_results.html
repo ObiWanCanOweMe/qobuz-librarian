@@ -9,22 +9,22 @@
   <div class="ql-result-list">
       {% if kind == 'artist' and artist_results %}
       {% for a in artist_results %}
-      <div class="ql-result-row sm:items-center">
-        <div class="flex min-w-0 flex-1 items-center gap-3">
+      <div class="ql-result-row ql-result-row--artist">
+        <div class="ql-result-main">
           {% if a.cover %}
           <img src="{{ a.cover }}" alt="" loading="lazy" width="48" height="48"
-               class="shrink-0 w-12 h-12 rounded object-cover bg-base-300">
+               class="ql-result-art">
           {% endif %}
-          <div class="min-w-0 flex-1">
-            <p class="font-semibold ql-clamp-2 ql-sm-truncate">{{ a.name }}</p>
-            <p class="text-sm text-base-content/55">
+          <div class="ql-result-copy">
+            <p class="ql-result-title">{{ a.name }}</p>
+            <p class="ql-result-meta">
               {% if a.albums_count %}{{ a.albums_count }} album{{ 's' if a.albums_count != 1 else '' }} on Qobuz{% else %}Artist{% endif %}
             </p>
           </div>
         </div>
         <form method="post" action="/search"
               hx-post="/search" hx-target="#search-results" hx-swap="innerHTML"
-              hx-disabled-elt="find button[type=submit]" class="sm:shrink-0">
+              hx-disabled-elt="find button[type=submit]" class="ql-result-action-form">
           <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
           <input type="hidden" name="kind" value="artist">
           <input type="hidden" name="q" value="{{ q }}">
@@ -37,24 +37,27 @@
 
       {% elif kind == 'track' %}
       {% for r in results %}
-      <div class="ql-result-row sm:items-center">
-        <div class="flex min-w-0 flex-1 items-center gap-3">
+      <div class="ql-result-row">
+        <div class="ql-result-main">
           {% if r.cover %}
           <img src="{{ r.cover }}" alt="" loading="lazy" width="48" height="48"
-               class="shrink-0 w-12 h-12 rounded object-cover bg-base-300">
+               class="ql-result-art">
           {% endif %}
-          <div class="min-w-0 flex-1">
-            <p class="font-semibold ql-clamp-2 ql-sm-truncate">{{ r.title }}{% if r.version %} <span class="font-normal text-base-content/50">({{ r.version }})</span>{% endif %}</p>
-            <p class="text-sm text-base-content/60 ql-clamp-2 ql-sm-truncate">
-              {{ r.artist }}
-              <span class="text-base-content/40">· {{ r.album_title }}{% if r.year and r.year != '?' %} ({{ r.year }}){% endif %}{% if r.track_n != '?' and r.total != '?' %} · track {{ r.track_n }} of {{ r.total }}{% endif %}</span>
+          <div class="ql-result-copy">
+            <p class="ql-result-title">{{ r.title }}{% if r.version %} <span>({{ r.version }})</span>{% endif %}</p>
+            <p class="ql-result-meta">
+              <span class="ql-result-artist">{{ r.artist }}</span>
+              <span class="ql-result-detail">· {{ r.album_title }}{% if r.year and r.year != '?' %} ({{ r.year }}){% endif %}{% if r.track_n != '?' and r.total != '?' %} · track {{ r.track_n }} of {{ r.total }}{% endif %}</span>
+              {% if r.hires %}<span class="ql-result-inline-quality quality-hires">Hi-Res</span>
+              {% elif r.lossy %}<span class="ql-result-inline-quality quality-lossy">Lossy</span>
+              {% else %}<span class="ql-result-inline-quality quality-cd">CD</span>{% endif %}
             </p>
           </div>
         </div>
-        <div class="flex w-full items-center justify-between gap-2 sm:w-auto sm:shrink-0 sm:justify-end">
-          {% if r.hires %}<span class="badge badge-sm quality-hires border border-current">Hi-Res</span>
-          {% elif r.lossy %}<span class="badge badge-sm quality-lossy border border-current">Lossy</span>
-          {% else %}<span class="badge badge-sm quality-cd border border-current">CD</span>{% endif %}
+        <div class="ql-result-side">
+          {% if r.hires %}<span class="ql-quality-badge quality-hires">Hi-Res</span>
+          {% elif r.lossy %}<span class="ql-quality-badge quality-lossy">Lossy</span>
+          {% else %}<span class="ql-quality-badge quality-cd">CD</span>{% endif %}
           <form method="post" action="/download" hx-post="/download" hx-target="#download-toast"
                 hx-swap="innerHTML" hx-disabled-elt="find button[type=submit]"
                 hx-confirm='Download "{{ r.title }}" by {{ r.artist }}?'
@@ -71,43 +74,54 @@
 
       {% else %}
       {% if selected_artist %}
-      <div class="ql-result-section">
-        <p class="text-sm font-semibold">Albums by {{ selected_artist.name }}</p>
-        <p class="text-xs text-base-content/50">
-          {{ selected_artist.shown }} album{{ 's' if selected_artist.shown != 1 else '' }} from Qobuz{% if selected_artist.total and selected_artist.total > selected_artist.shown %} shown{% endif %}
-        </p>
+      {% set grouped_album_count = album_groups | length %}
+      <div class="ql-result-section ql-selected-artist">
+        <div class="ql-selected-artist-copy">
+          <p class="ql-result-section-title">{{ selected_artist.name }}</p>
+          <p class="ql-result-section-meta">
+            {% if selected_artist.shown and selected_artist.shown > grouped_album_count %}
+            Artist discography · {{ grouped_album_count }} album{{ 's' if grouped_album_count != 1 else '' }} from {{ selected_artist.shown }} Qobuz release{{ 's' if selected_artist.shown != 1 else '' }}{% if selected_artist.total and selected_artist.total > selected_artist.shown %} shown{% endif %}
+            {% else %}
+            Artist discography · {{ grouped_album_count }} album{{ 's' if grouped_album_count != 1 else '' }} from Qobuz{% if selected_artist.total and selected_artist.total > selected_artist.shown %} shown{% endif %}
+            {% endif %}
+          </p>
+        </div>
       </div>
       {% endif %}
       {% for g in album_groups %}
-      <div class="{% if g.others %}ql-version-group{% endif %}">
-      <div class="ql-result-row sm:items-start">
-        <div class="flex min-w-0 flex-1 items-start gap-3">
+      <div class="ql-result-item{% if g.others %} ql-version-group{% endif %}">
+      <div class="ql-result-row">
+        <div class="ql-result-main">
           {% if g.cover %}
           <img src="{{ g.cover }}" alt="" loading="lazy" width="48" height="48"
-               class="shrink-0 w-12 h-12 rounded object-cover bg-base-300">
+               class="ql-result-art">
           {% endif %}
-          <div class="min-w-0 flex-1">
-            <p class="font-semibold ql-clamp-2 ql-sm-truncate">{{ g.title }}{% if g.version and not g.others %} <span class="font-normal text-base-content/50">({{ g.version }})</span>{% endif %}</p>
-            <p class="text-sm text-base-content/60 ql-clamp-2 ql-sm-truncate">
-              {{ g.artist }}
-              <span class="text-base-content/40">· {{ g.year }} · {{ g.tracks }} track{{ 's' if g.tracks != 1 else '' }}</span>
+          <div class="ql-result-copy">
+            <p class="ql-result-title">{{ g.title }}{% if g.version and not g.others %} <span>({{ g.version }})</span>{% endif %}</p>
+            <p class="ql-result-meta">
+              <span class="ql-result-artist">{{ g.artist }}</span>
+              <span class="ql-result-detail">· {{ g.year }} · {{ g.tracks }} track{{ 's' if g.tracks != 1 else '' }}</span>
+              {% if g.owned %}<span class="ql-result-inline-quality ql-result-inline-owned">In library</span>
+              {% elif g.hires %}<span class="ql-result-inline-quality quality-hires">Hi-Res</span>
+              {% elif g.lossy %}<span class="ql-result-inline-quality quality-lossy">Lossy</span>
+              {% else %}<span class="ql-result-inline-quality quality-cd">CD</span>{% endif %}
             </p>
           </div>
         </div>
-        <div class="flex w-full flex-col gap-2 sm:w-auto sm:shrink-0 sm:flex-row sm:items-center sm:justify-end">
-          <div class="flex min-w-0 flex-wrap items-center gap-1.5">
+        <div class="ql-result-side">
+          <div class="ql-result-flags">
             {% if g.owned %}
-            <span class="inline-flex items-center gap-1 text-xs font-medium text-success whitespace-nowrap" title="Already in your library">
+            <span class="ql-owned-label" title="Already in your library">
               <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
               In library
             </span>
             {% else %}
-            {% if g.hires %}<span class="badge badge-sm quality-hires border border-current">Hi-Res</span>
-            {% elif g.lossy %}<span class="badge badge-sm quality-lossy border border-current">Lossy</span>
-            {% else %}<span class="badge badge-sm quality-cd border border-current">CD</span>{% endif %}
+            {% if g.hires %}<span class="ql-quality-badge quality-hires">Hi-Res</span>
+            {% elif g.lossy %}<span class="ql-quality-badge quality-lossy">Lossy</span>
+            {% else %}<span class="ql-quality-badge quality-cd">CD</span>{% endif %}
             {% endif %}
           </div>
-          <div class="flex shrink-0 items-center justify-between gap-2 sm:justify-end">
+          <div class="ql-result-actions">
             {% if g.others %}
             <button type="button" class="ql-version-button"
                     data-version-toggle
@@ -137,14 +151,14 @@
         <div id="search-versions-{{ loop.index0 }}" class="ql-version-panel hidden">
           {% for e in g.others %}
           <div class="ql-version-row">
-            <div class="min-w-0 flex-1">
-              <p class="text-sm font-medium ql-clamp-2 ql-sm-truncate">{{ e.version or ((e.year ~ ' edition · ' ~ ('Hi-Res' if e.hires else ('Lossy' if e.lossy else 'CD'))) if e.year and e.year != '?' else 'Alternate edition') }}</p>
-              <p class="text-xs text-base-content/40">{% if e.year and e.year != '?' %}{{ e.year }} · {% endif %}{{ e.tracks }} track{{ 's' if e.tracks != 1 else '' }}</p>
+            <div class="ql-version-copy">
+              <p>{{ e.version or ((e.year ~ ' edition · ' ~ ('Hi-Res' if e.hires else ('Lossy' if e.lossy else 'CD'))) if e.year and e.year != '?' else 'Alternate edition') }}</p>
+              <span>{% if e.year and e.year != '?' %}{{ e.year }} · {% endif %}{{ e.tracks }} track{{ 's' if e.tracks != 1 else '' }}</span>
             </div>
-            <div class="flex w-full items-center justify-between gap-2 sm:w-auto sm:shrink-0 sm:justify-end">
-              {% if e.hires %}<span class="badge badge-sm quality-hires border border-current shrink-0">Hi-Res</span>
-              {% elif e.lossy %}<span class="badge badge-sm quality-lossy border border-current shrink-0">Lossy</span>
-              {% else %}<span class="badge badge-sm quality-cd border border-current shrink-0">CD</span>{% endif %}
+            <div class="ql-result-side ql-result-side--version">
+              {% if e.hires %}<span class="ql-quality-badge quality-hires">Hi-Res</span>
+              {% elif e.lossy %}<span class="ql-quality-badge quality-lossy">Lossy</span>
+              {% else %}<span class="ql-quality-badge quality-cd">CD</span>{% endif %}
               <form method="post" action="/download" hx-post="/download" hx-target="#download-toast"
                     hx-swap="innerHTML" hx-disabled-elt="find button[type=submit]"
                     hx-confirm='{% if g.owned %}Download this version of "{{ g.title }}" as a separate copy alongside the one in your library?{% else %}Download this version of "{{ g.title }}"?{% endif %}'
@@ -175,7 +189,7 @@
   </p>
   <p class="text-sm mt-1">
     {% if kind == 'artist' %}Try a different artist name.
-    {% elif kind == 'track' %}Try a different song title.
+    {% elif kind == 'track' %}Try a different track title.
     {% else %}Try a different album title.{% endif %}
   </p>
 </div>
@@ -183,7 +197,7 @@
 <div class="text-center py-12 text-base-content/40">
   <p class="text-sm">
     {% if kind == 'artist' %}Type an artist name above to search.
-    {% elif kind == 'track' %}Type a song title above to search.
+    {% elif kind == 'track' %}Type a track title above to search.
     {% else %}Type an album title above to search.{% endif %}
   </p>
 </div>

@@ -37,7 +37,9 @@ def _isolate_data_dir():
     cfg.LYRIC_RETRY_FILE     = tmp_root / ".qobuz_lyric_retry.json"
     cfg.REPAIR_LOG_PATH      = tmp_root / ".qobuz_replaced_tracks.log"
     cfg.CAPPED_FILE          = tmp_root / ".qobuz_upgrade_capped.json"
+    cfg.LIBRARY_SCAN_STATE_FILE = tmp_root / ".qobuz_library_scan_state.json"
     cfg.HIDDEN_FILE          = tmp_root / ".qobuz_hidden.json"
+    cfg.REVIEW_BADGE_STATE_FILE = tmp_root / ".qobuz_review_badges.json"
     cfg.SCAN_SEEN_FILE       = tmp_root / ".qobuz_scan_seen.json"
     cfg.NEW_RELEASE_STATE_FILE = tmp_root / ".qobuz_new_releases.json"
     cfg.SCAN_CHECKPOINT_FILE = tmp_root / ".qobuz_scan_checkpoint.json"
@@ -85,12 +87,14 @@ def _isolate_data_dir():
                  ("WEB_AUTH", "DATA_DIR", "NEW_RELEASE_CHECK_INTERVAL",
                   "AUTO_LIBRARY_SCAN", "ALBUM_CACHE_ENABLED", "FLAC_CACHE_ENABLED",
                   "REPAIR_CACHE_ENABLED",
+                  "UPGRADE_SCAN_ENABLED",
                   "QOBUZ_USER_AUTH_TOKEN", "QOBUZ_USER_ID", "STREAMRIP_CONFIG",
                   "MUSIC_ROOT")}
     os.environ["WEB_AUTH"] = "none"
     os.environ["DATA_DIR"] = str(tmp_root)
     os.environ["NEW_RELEASE_CHECK_INTERVAL"] = "0"
     os.environ["AUTO_LIBRARY_SCAN"] = "false"
+    os.environ["UPGRADE_SCAN_ENABLED"] = "true"
     # The caches are env-backed too so a test that importlib.reload(cfg) keeps
     # them off (their derived paths recompute under the temp DATA_DIR) instead
     # of reverting on for the rest of the session.

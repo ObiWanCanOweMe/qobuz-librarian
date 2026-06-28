@@ -205,7 +205,7 @@ def parse_args():
     p.add_argument("--artist",       metavar="NAME",
                    help="Run artist mode on NAME (skips interactive menu)")
     p.add_argument("--upgrade-walk", action="store_true",
-                   help="Scan every artist for quality upgrades. Per-artist "
+                   help="Review saved Library upgrade candidates. Per-artist "
                         "confirm (enter=yes), auto-advance.")
     p.add_argument("--downsample-walk", action="store_true",
                    help="Scan the library for hi-res files and downsample them "
@@ -323,11 +323,11 @@ def parse_args():
     # silently. Bare --no-catalog stays valid for the menu.
     if args.no_catalog and not args.artist and (args.query or other_run_mode):
         p.error("--no-catalog only applies to artist mode")
-    # The upgrade walk sweeps the whole library; a query would be silently
-    # dropped, so steer the user to --artist instead.
+    # The upgrade walk reviews saved Library candidates; a query would be
+    # silently ignored, so reject it instead of surprising the user.
     if args.upgrade_walk and args.query:
-        p.error("--upgrade-walk scans the whole library — drop the query, "
-                "or use --artist NAME for one artist")
+        p.error("--upgrade-walk reviews saved Library candidates — drop the "
+                "query, or run a normal search without --upgrade-walk")
     # --artist dispatches before the positional query, so extra words after the
     # artist name would be silently dropped. Reject so the user picks one.
     if args.artist and args.query:

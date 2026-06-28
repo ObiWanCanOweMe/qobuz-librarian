@@ -8,14 +8,7 @@
 
 <div class="ql-dashboard">
   <div class="ql-dashboard-title">
-    <h1>Dashboard</h1>
-    {% if last_library_scan or last_new_release_check %}
-    <p>
-      {%- if last_library_scan %}Library scanned {{ last_library_scan }}{% endif -%}
-      {%- if last_library_scan and last_new_release_check %} · {% endif -%}
-      {%- if last_new_release_check %}New releases checked {{ last_new_release_check }}{% endif -%}
-    </p>
-    {% endif %}
+    <h1>Search</h1>
   </div>
 
   <div class="ql-dashboard-notices">
@@ -80,11 +73,11 @@
       </svg>
       <span class="min-w-0 flex-1 text-sm">
         {% if setup_scanning %}
-        <strong>Library scan running.</strong> Checking for missing albums and track gaps.
+        <strong>Library scan running.</strong> Refreshing missing albums, track gaps, upgrades, and downsample candidates.
         {% elif not library_scan_state.ready %}
         <strong>Music library unavailable.</strong> {{ library_scan_state.message }}
         {% else %}
-        <strong>Library scan needed.</strong> Scan once to find missing albums and track gaps.
+        <strong>Library scan needed.</strong> Scan once to refresh missing albums, track gaps, upgrades, and downsample candidates.
         {% endif %}
       </span>
       {% if setup_scanning %}
@@ -125,17 +118,45 @@
     {% endif %}
   </div>
 
-  <div class="ql-dashboard-grid">
-    <section class="ql-panel ql-search-panel">
+  {% set queued_jobs = pending | selectattr('status.value', 'equalto', 'pending') | list %}
+  <div class="ql-search-workspace">
+    <section class="ql-panel ql-search-panel" {% if not creds_ok %}data-qobuz-setup-card{% endif %}>
       {% if not creds_ok %}
-      <div class="ql-panel-header">
-        <h2>Connect Qobuz</h2>
-        <p>Add your Qobuz details to search and download.</p>
-      </div>
-      <div class="ql-panel-actions">
-        <a href="/settings" class="btn btn-primary">Connect Qobuz</a>
+      <div class="ql-locked-search">
+        <div class="ql-locked-search-head">
+          <div class="ql-state-icon" aria-hidden="true">
+            <svg class="ql-nav-icon-stroke" viewBox="0 0 24 24">
+              <path d="M12 3.5c.74 0 1.42.4 1.78 1.05l7.31 13.2A2.05 2.05 0 0 1 19.31 20.8H4.69a2.05 2.05 0 0 1-1.78-3.05l7.31-13.2A2.03 2.03 0 0 1 12 3.5Z"/>
+              <path d="M12 9.25v4"/>
+              <path d="M12 17h.01"/>
+            </svg>
+          </div>
+          <div class="ql-panel-header">
+            <h2>Qobuz credentials</h2>
+            <p>Connect Qobuz to enable Search.</p>
+          </div>
+          <a href="/settings" class="btn btn-primary ql-locked-search-action">Open Settings</a>
+        </div>
+
+        <div class="ql-locked-search-form" aria-hidden="true">
+          <div class="ql-segmented ql-segmented-disabled">
+            <span>Artist</span>
+            <span>Album</span>
+            <span>Track</span>
+          </div>
+          <div class="ql-search-row">
+            <div class="ql-disabled-input">Qobuz search unavailable</div>
+            <button type="button" class="btn btn-primary ql-search-button" disabled>
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-4.35-4.35M17 11A6 6 0 1 1 5 11a6 6 0 0 1 12 0z"/>
+              </svg>
+              <span>Search</span>
+            </button>
+          </div>
+        </div>
+
         <div class="ql-local-links">
-          <a href="/migrate">Migrate library</a>
+          <span>Available without Qobuz:</span>
           <a href="/downsample">Downsample</a>
           <a href="/lyrics">Lyrics</a>
         </div>
@@ -151,7 +172,6 @@
       {% else %}
       <div class="ql-panel-header">
         <h2>Search Qobuz</h2>
-        <p>Find artists, albums, and tracks.</p>
       </div>
       <form action="/search" method="post"
             hx-post="/search" hx-target="#search-results" hx-swap="innerHTML"
@@ -160,26 +180,23 @@
         <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
         <div class="ql-segmented" role="group" aria-label="Search for">
           <label>
-            <input type="radio" name="kind" value="artist" class="sr-only" {% if search_kind == 'artist' %}checked{% endif %}
-                   hx-post="/search" hx-target="#search-results" hx-swap="innerHTML" hx-include="closest form">
-            <span>Artists</span>
+            <input type="radio" name="kind" value="artist" class="sr-only" {% if search_kind == 'artist' %}checked{% endif %}>
+            <span>Artist</span>
           </label>
           <label>
-            <input type="radio" name="kind" value="album" class="sr-only" {% if search_kind == 'album' %}checked{% endif %}
-                   hx-post="/search" hx-target="#search-results" hx-swap="innerHTML" hx-include="closest form">
-            <span>Albums</span>
+            <input type="radio" name="kind" value="album" class="sr-only" {% if search_kind == 'album' %}checked{% endif %}>
+            <span>Album</span>
           </label>
           <label>
-            <input type="radio" name="kind" value="track" class="sr-only" {% if search_kind == 'track' %}checked{% endif %}
-                   hx-post="/search" hx-target="#search-results" hx-swap="innerHTML" hx-include="closest form">
-            <span>Tracks</span>
+            <input type="radio" name="kind" value="track" class="sr-only" {% if search_kind == 'track' %}checked{% endif %}>
+            <span>Track</span>
           </label>
         </div>
         <div class="ql-search-row">
           <input type="text" name="q"
-                 aria-label="{% if search_kind == 'track' %}Song title{% elif search_kind == 'album' %}Album title{% else %}Artist name{% endif %}"
+                 aria-label="{% if search_kind == 'track' %}Track title{% elif search_kind == 'album' %}Album title{% else %}Artist name{% endif %}"
                  value="{{ search_q }}"
-                 placeholder="{% if search_kind == 'track' %}Song title{% elif search_kind == 'album' %}Album title{% else %}Artist name{% endif %}"
+                 placeholder="{% if search_kind == 'track' %}Track title{% elif search_kind == 'album' %}Album title{% else %}Artist name{% endif %}"
                  inputmode="search" enterkeyhint="search" autocapitalize="off" spellcheck="false" maxlength="500"
                  class="input input-bordered ql-search-input" autocomplete="off">
           <button type="submit" class="btn btn-primary ql-search-button">
@@ -197,63 +214,19 @@
 
     <div id="search-results" class="ql-search-results" aria-live="polite">{{ initial_search_results | safe }}</div>
 
-    <div id="dashboard-work" class="contents">
-    {% set _banner_id = new_release_review.id if new_release_review else '' %}
-    {% set other_review = review | rejectattr('id', 'equalto', _banner_id) | list %}
-    <section class="ql-panel ql-review-panel">
-      <div class="ql-panel-header ql-panel-header-row">
-        <div>
-          <h2>Needs review</h2>
-          <p>Scans wait here until you choose what to run.</p>
-        </div>
-        {% if new_release_review and new_release_review.count %}
-        <a href="/jobs/{{ new_release_review.id }}" class="btn btn-sm btn-primary">Review</a>
-        {% endif %}
-      </div>
-      <div class="ql-list">
-        {% if new_release_review and new_release_review.count %}
-        <div class="ql-row">
-          <div class="ql-row-main">
-            <p class="ql-row-title">New-release check</p>
-            <p class="ql-row-meta">{{ new_release_review.count }} new release{{ 's' if new_release_review.count != 1 }} found</p>
-          </div>
-        </div>
-        {% endif %}
-        {% for job in other_review %}
-        {% set _n = job.candidates | length %}
-        {% set _is_repair = job.execute_kind == 'repair' %}
-        <div class="ql-row">
-          <div class="ql-row-main">
-            <p class="ql-row-title">{{ labels.review_title(job) }}{% if job.artist %} · {{ job.artist }}{% endif %}</p>
-            <p class="ql-row-meta">{{ labels.review_detail(job, _n) }}</p>
-          </div>
-          <a href="{{ '/repair' if _is_repair else '/jobs/' ~ job.id }}" class="btn btn-sm btn-primary shrink-0">{% if _is_repair %}Review{% else %}Review{% endif %}</a>
-        </div>
-        {% endfor %}
-        {% if not (new_release_review and new_release_review.count) and not other_review %}
-        <div class="ql-empty-line">No scans waiting for review.</div>
-        {% endif %}
-      </div>
-    </section>
-
-    {% set queued_jobs = pending | selectattr('status.value', 'equalto', 'pending') | list %}
-    <section id="dashboard-active" class="ql-panel">
-      <div class="ql-panel-header ql-panel-header-row">
-        <div>
-          <h2>Running and queued</h2>
-          <p>Active work and waiting jobs.</p>
-        </div>
-        {% if active_jobs or queued_jobs %}
+    {% if active_jobs or queued_jobs %}
+    <section id="dashboard-active" class="ql-active-strip">
+      <div class="ql-active-strip-header">
+        <h2>Background work</h2>
         <a href="/queue" class="btn btn-sm btn-outline">Open queue</a>
-        {% endif %}
       </div>
-      <div class="ql-list">
+      <div class="ql-active-list">
         {% for j in active_jobs %}
         {% set _activity = j.progress_phase or labels.job_activity(j) %}
-        <div class="ql-job-row"
+        <div class="ql-active-row"
              data-job-card data-job-id="{{ j.id }}" data-job-surface="dashboard"
              data-job-status="{{ j.status.value }}" data-job-kind="{{ j.execute_kind or j.kind }}">
-          <div class="ql-row-main">
+          <div class="ql-active-main">
             <div class="ql-row-status">
               <span class="ql-status-chip">{{ labels.job_activity(j) }}</span>
               <span id="dash-reconnect-{{ j.id }}" class="ql-status-chip is-warning hidden">Reconnecting</span>
@@ -271,7 +244,7 @@
               {%- endif -%}
             </p>
           </div>
-          <form action="/jobs/{{ j.id }}/cancel" method="post" class="ql-row-action">
+          <form action="/jobs/{{ j.id }}/cancel" method="post" class="ql-row-action ql-active-action">
             <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
             <button type="submit" class="btn btn-sm btn-outline btn-error"
                     title="Cancel job" aria-label="Cancel job"
@@ -280,63 +253,15 @@
         </div>
         {% endfor %}
         {% if queued_jobs %}
-        <div class="ql-row">
-          <div class="ql-row-main">
+        <div class="ql-active-row">
+          <div class="ql-active-main">
             <p class="ql-row-title">{{ queued_jobs | length }} job{{ 's' if queued_jobs|length != 1 }} queued</p>
             <p class="ql-row-meta">Starts after the current job finishes.</p>
           </div>
           <a href="/queue" class="btn btn-sm btn-outline shrink-0">View queue</a>
         </div>
         {% endif %}
-        {% if not active_jobs and not queued_jobs %}
-        <div class="ql-empty-line">Nothing running or queued.</div>
-        {% endif %}
       </div>
-    </section>
-    </div>
-
-    {% if creds_ok %}
-    <section class="ql-panel">
-      <div class="ql-panel-header">
-        <h2>Recent downloads</h2>
-        <p>Latest completed downloads.</p>
-      </div>
-      {% if recent %}
-      <div class="ql-list">
-        {% for entry in recent %}
-        <div class="ql-row ql-recent-row">
-          <div class="ql-row-main">
-            {% set downloaded_at = (entry.get('ts') or '')[:16].replace('T', ' ') %}
-            <p class="ql-row-title">{{ entry.get('title') or 'Title not recorded' }}</p>
-            <p class="ql-row-meta">
-              {{ entry.get('artist') or 'Artist not recorded' }}{% if downloaded_at %} · {{ downloaded_at }}{% endif %}
-            </p>
-          </div>
-          <div class="ql-result-label">
-            {% set result = entry.get('result') or '' %}
-            {% if result == 'downloaded' %}
-              {% set td = entry.get('tracks_downloaded') or 0 %}
-              {{ td }} track{{ 's' if td != 1 }}
-            {% elif result == 'partial' %}
-              {% set td = entry.get('tracks_downloaded') or 0 %}
-              {% set tf = entry.get('tracks_failed') or 0 %}
-              {{ td }} of {{ td + tf }} tracks
-            {% elif result == 'failed' %}
-              Failed
-            {% elif result == 'upgrade_aborted_backup_failed' %}
-              Backup failed
-            {% else %}
-              {{ result.replace('_', ' ') }}
-            {% endif %}
-          </div>
-        </div>
-        {% endfor %}
-      </div>
-      {% else %}
-      <div class="ql-empty-line">
-        No downloads yet{% if creds_token_valid != False %}. {{ recent_empty_hint }}{% endif %}
-      </div>
-      {% endif %}
     </section>
     {% endif %}
   </div>

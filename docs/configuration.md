@@ -39,6 +39,7 @@ These settings apply to new jobs. Lower-level options stay in `.env` or `compose
 | `ARTIST_CATALOG_CACHE_TTL` | `604800` | How long (seconds) artist album-lists stay cached; 7 days |
 | `REPAIR_CACHE_ENABLED` | `true` | Cache the repair scan's Qobuz ISRC lookups (files are still decode-tested fresh every scan) |
 | `REPAIR_CACHE_TTL_DAYS` | `30` | How long a cached ISRC lookup is reused before re-verifying (`0` = keep until the db is deleted) |
+| `UPGRADE_SCAN_ENABLED` | `true` | Show Upgrade and include the quality-upgrade pass in Library scans (`false` hides Upgrade and skips that pass) |
 | `AUTO_UPGRADE_ENABLED` | `false` | CLI-only compatibility option: during CLI gap-fill walks, also offer eligible quality upgrades. In the web UI, use Upgrade for quality work. |
 | `DOWNSAMPLE_HIRES_ENABLED` | `false` | Downsample hi-res FLACs as they download (see below) |
 | `UPGRADE_SINGLES_ENABLED` | `false` | Let the Upgrade walk re-rip tracks you pulled as singles |

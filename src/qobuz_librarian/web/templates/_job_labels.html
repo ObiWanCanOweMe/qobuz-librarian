@@ -2,7 +2,7 @@
   {%- if job.execute_kind == 'new_releases' -%}
     New-release check
   {%- elif job.execute_kind == 'upgrade' -%}
-    Quality upgrade scan
+    Upgrade candidates
   {%- elif job.execute_kind == 'downsample' -%}
     Downsample scan
   {%- elif job.execute_kind == 'repair' -%}

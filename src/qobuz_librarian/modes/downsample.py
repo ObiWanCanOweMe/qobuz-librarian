@@ -8,12 +8,15 @@ file is decode-verified before it replaces anything.
 import sys
 
 from qobuz_librarian.integrations.downsample_engine import HAVE_DOWNSAMPLE, downsample_dir
-from qobuz_librarian.library.downsample import scan_artist_for_downsample
+from qobuz_librarian.library import downsample_state
+from qobuz_librarian.library import hidden as hidden_mod
 from qobuz_librarian.library.scanner import clear_scan_caches, list_library_artists
+from qobuz_librarian.quality.decision import mark_local_album_capped
 from qobuz_librarian.ui_cli.colors import C, banner, fmt, format_size, truncate
 from qobuz_librarian.ui_cli.errors import plural
 from qobuz_librarian.ui_cli.logging import log
 from qobuz_librarian.ui_cli.prompts import _flush_stdin, confirm
+from qobuz_librarian.web import review_badges
 
 
 def run_downsample_walk_mode(args):
@@ -47,11 +50,32 @@ def run_downsample_walk_mode(args):
         log.info(fmt(C.GRAY, "  --dry-run: listing candidates only, nothing is changed."))
     log.info(fmt(C.GRAY, "  Ctrl-C to stop at any point."))
 
+    hidden = hidden_mod.load()
+
+    def _on_artist(artist_dir, _candidates, error, done, total):
+        _scan_line = f"  [{done}/{total}] Scanning {truncate(artist_dir.name, 46)}…"
+        if sys.stdout.isatty():
+            print(f"\r{_scan_line:<80}", end="", flush=True)
+        if error is not None:
+            log.info("")
+            log.info(fmt(C.YELLOW,
+                f"  Skipped {artist_dir.name}: {error}"))
+
+    refresh = downsample_state.refresh_for_artists(
+        all_artists,
+        hidden=hidden,
+        on_artist=_on_artist,
+        persist=not args.dry_run,
+    )
+    candidates_by_artist = {}
+    for candidate in refresh.candidates:
+        candidates_by_artist.setdefault(candidate.artist, []).append(candidate)
+
     # Auto-accept gate. Plain --yes deliberately does NOT cover this path — its
     # contract is that destructive prompts still ask — so the user opts in
     # explicitly here for an unattended run.
     auto_accept_all = False
-    if not args.dry_run:
+    if refresh.candidates and not args.dry_run:
         try:
             _r = input(fmt(C.CYAN,
                 "\n  Auto-accept every artist and run unattended? [y/N]: "
@@ -63,21 +87,15 @@ def run_downsample_walk_mode(args):
             log.info(fmt(C.GREEN, "  ✓ Auto-accepting every artist. Walk away."))
     log.info("")
 
-    n = len(all_artists)
-    n_scanned = 0
+    n_scanned = len(refresh.artists_scanned)
     n_albums_done = 0
     total_saved = 0
     total_errors = 0
 
     try:
-        for i, artist_dir in enumerate(all_artists):
+        for artist_dir in all_artists:
             artist_name = artist_dir.name
-            _scan_line = f"  [{i + 1}/{n}] Scanning {truncate(artist_name, 46)}…"
-            if sys.stdout.isatty():
-                print(f"\r{_scan_line:<80}", end="", flush=True)
-
-            candidates = scan_artist_for_downsample(artist_dir)
-            n_scanned += 1
+            candidates = candidates_by_artist.get(artist_name, [])
             if not candidates:
                 continue
 
@@ -105,16 +123,26 @@ def run_downsample_walk_mode(args):
                 log.info("")
                 continue
 
+            artist_attempted = False
             for j, c in enumerate(candidates, 1):
                 log.info("")
                 log.info(fmt(C.BOLD + C.WHITE,
                     f"  [{j}/{n_albums}] {truncate(c.title, 55)}"))
+                artist_attempted = True
                 res = downsample_dir(c.album_dir, verbose=True,
                                      base_dir=c.album_dir, log=log.info)
                 if res.get("resampled"):
                     n_albums_done += 1
+                    mark_local_album_capped(c.album_dir)
                 total_saved += res.get("saved_bytes", 0)
                 total_errors += res.get("errors", 0)
+            if artist_attempted:
+                downsample_state.update_artist(artist_dir, hidden=hidden)
+                saved_state = downsample_state.load()
+                review_badges.set_ready(
+                    "downsample",
+                    downsample_state.has_visible_candidates(saved_state, hidden),
+                )
             log.info("")
     except KeyboardInterrupt:
         log.info("")

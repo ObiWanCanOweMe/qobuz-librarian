@@ -1,6 +1,6 @@
 """Web path for single-track grabs: the Tracks search mode, the Get-track
-download contract (marks the album single), and graduation (completing the album
-the normal way clears the mark)."""
+download contract, and graduation (completing the album the normal way clears
+any old single mark)."""
 import pytest
 from test_web import _remove_job, _wait_for, client  # noqa: F401 (fixture)
 
@@ -14,7 +14,8 @@ def fresh_singles(tmp_path, monkeypatch):
     monkeypatch.setattr(cfg, "HIDDEN_FILE", tmp_path / "hidden.json")
 
 
-def test_get_track_downloads_one_and_marks_the_album_single(client, monkeypatch, fresh_singles):
+def test_get_track_downloads_one_without_hiding_album_gaps_by_default(
+        client, monkeypatch, fresh_singles):
     import qobuz_librarian.api.search as search_mod
     import qobuz_librarian.library.catalog as cat_mod
     import qobuz_librarian.queue.executor as ex_mod
@@ -38,6 +39,7 @@ def test_get_track_downloads_one_and_marks_the_album_single(client, monkeypatch,
     monkeypatch.setattr(ex_mod, "_execute_download_queue", fake_exec)
 
     jm.start_worker()
+    monkeypatch.setattr(app_mod.cfg, "SUPPRESS_SINGLE_TRACK_GAPS", False, raising=False)
     r = client.post("/download", data={"album_id": "alb1", "track_id": "trk7"},
                     follow_redirects=False)
     assert r.status_code in (200, 303)
@@ -45,6 +47,44 @@ def test_get_track_downloads_one_and_marks_the_album_single(client, monkeypatch,
             if getattr(j, "album_id", None) == "alb1"]
     assert len(jobs) == 1
     job = jobs[0]
+    try:
+        assert _wait_for(lambda: job.status in (jm.JobStatus.DONE, jm.JobStatus.FAILED))
+        assert job.status == jm.JobStatus.DONE
+        assert hidden.is_single("Allie X", "Girl With No Face", hidden.load()) is False
+        assert "stays out of scans" not in job.summary
+    finally:
+        _remove_job(job)
+
+
+def test_get_track_can_hide_album_gaps_when_setting_is_enabled(
+        client, monkeypatch, fresh_singles):
+    import qobuz_librarian.api.search as search_mod
+    import qobuz_librarian.library.catalog as cat_mod
+    import qobuz_librarian.queue.executor as ex_mod
+    import qobuz_librarian.web.app as app_mod
+
+    monkeypatch.setattr(app_mod, "_get_token", lambda: "tok")
+    monkeypatch.setattr(app_mod.cfg, "SUPPRESS_SINGLE_TRACK_GAPS", True, raising=False)
+    monkeypatch.setattr(search_mod, "get_album", lambda _id, _tok: {
+        "id": "alb1", "title": "Girl With No Face", "year": 2024,
+        "artist": {"name": "Allie X"},
+        "tracks": {"items": [
+            {"id": "trk7", "title": "Black Eye", "track_number": 3},
+            {"id": "trk8", "title": "Galina", "track_number": 4}]}})
+    monkeypatch.setattr(cat_mod, "find_existing_tracks", lambda *a, **k: ([], None))
+
+    def fake_exec(queue, *a, **k):
+        queue[0]["n_ok"] = 1
+        queue[0]["imported"] = True
+        queue[0]["n_fail"] = 0
+    monkeypatch.setattr(ex_mod, "_execute_download_queue", fake_exec)
+
+    jm.start_worker()
+    r = client.post("/download", data={"album_id": "alb1", "track_id": "trk7"},
+                    follow_redirects=False)
+    assert r.status_code in (200, 303)
+    job = [j for j in list(jm.registry._jobs.values())
+           if getattr(j, "album_id", None) == "alb1"][0]
     try:
         assert _wait_for(lambda: job.status in (jm.JobStatus.DONE, jm.JobStatus.FAILED))
         assert job.status == jm.JobStatus.DONE
@@ -56,12 +96,15 @@ def test_get_track_downloads_one_and_marks_the_album_single(client, monkeypatch,
 def test_undo_removes_the_grabbed_track_and_clears_the_mark(client, monkeypatch, fresh_singles, tmp_path):
     import qobuz_librarian.integrations.beets as beets_mod
     import qobuz_librarian.library.scanner as scanner_mod
+    import qobuz_librarian.web.app as app_mod
+    import qobuz_librarian.web.flows as flows_mod
 
     d = tmp_path / "Allie X" / "Girl With No Face (2024)"
     d.mkdir(parents=True)
     f = d / "03 - Black Eye.flac"
     f.write_bytes(b"flac")
     hidden.mark_single("Allie X", "Girl With No Face", "2024", "alb1")
+    refresh_calls = []
 
     job = jm.Job(title="Black Eye", artist="Allie X", album_id="alb1")
     job.status = jm.JobStatus.DONE
@@ -70,6 +113,12 @@ def test_undo_removes_the_grabbed_track_and_clears_the_mark(client, monkeypatch,
                   "artist": "Allie X", "album": "Girl With No Face",
                   "marked": True, "new_folder": False}
     jm.registry.add(job)
+    monkeypatch.setattr(app_mod, "_get_optional_token", lambda: "tok")
+    monkeypatch.setattr(
+        flows_mod,
+        "_refresh_after_local_album_change",
+        lambda *args, **kwargs: refresh_calls.append((args, kwargs)),
+    )
     monkeypatch.setattr(scanner_mod, "read_album_dir",
                         lambda _d: [{"path": str(f), "isrc": "ISRC1", "track": 3}])
     monkeypatch.setattr(beets_mod, "forget_beets_entries", lambda paths: len(paths))
@@ -79,6 +128,49 @@ def test_undo_removes_the_grabbed_track_and_clears_the_mark(client, monkeypatch,
         assert not f.exists()  # the grabbed track is gone
         assert hidden.is_single("Allie X", "Girl With No Face", hidden.load()) is False
         assert job.single.get("removed") is True
+        assert len(refresh_calls) == 1
+        args, kwargs = refresh_calls[0]
+        assert args[0]["title"] == "Girl With No Face"
+        assert args[0]["artist"]["name"] == "Allie X"
+        assert args[1]["dir"] == str(d)
+        assert kwargs["fallback_artist"] == "Allie X"
+        assert kwargs["token"] == "tok"
+        assert kwargs["upgrade"] is True
+        assert kwargs["downsample"] is True
+    finally:
+        _remove_job(job)
+
+
+def test_undo_already_gone_clears_single_mark_and_refreshes_state(
+        client, monkeypatch, fresh_singles, tmp_path):
+    import qobuz_librarian.library.scanner as scanner_mod
+    import qobuz_librarian.web.app as app_mod
+    import qobuz_librarian.web.flows as flows_mod
+
+    d = tmp_path / "Allie X" / "Girl With No Face (2024)"
+    hidden.mark_single("Allie X", "Girl With No Face", "2024", "alb1")
+    refresh_calls = []
+
+    job = jm.Job(title="Black Eye", artist="Allie X", album_id="alb1")
+    job.status = jm.JobStatus.DONE
+    job.single = {"album_id": "alb1", "track_id": "trk7", "dir": str(d),
+                  "isrc": "ISRC1", "track_no": 3, "title": "Black Eye",
+                  "artist": "Allie X", "album": "Girl With No Face",
+                  "marked": True, "new_folder": False}
+    jm.registry.add(job)
+    monkeypatch.setattr(app_mod, "_get_optional_token", lambda: "tok")
+    monkeypatch.setattr(scanner_mod, "read_album_dir", lambda _d: [])
+    monkeypatch.setattr(
+        flows_mod,
+        "_refresh_after_local_album_change",
+        lambda *args, **kwargs: refresh_calls.append((args, kwargs)),
+    )
+    try:
+        r = client.post(f"/jobs/{job.id}/undo", follow_redirects=False)
+        assert r.status_code in (200, 303)
+        assert hidden.is_single("Allie X", "Girl With No Face", hidden.load()) is False
+        assert job.single.get("removed") is True
+        assert len(refresh_calls) == 1
     finally:
         _remove_job(job)
 

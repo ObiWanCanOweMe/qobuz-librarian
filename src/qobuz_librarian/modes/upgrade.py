@@ -1,24 +1,28 @@
-"""Upgrade walk mode — scan every artist for quality upgrade candidates."""
-import sys
+"""Upgrade walk mode — review saved baseline quality upgrade candidates."""
 import time
 
 from qobuz_librarian import config as cfg
-from qobuz_librarian.api.auth import AuthLost, QobuzUnavailable
-from qobuz_librarian.library.catalog import album_year, find_existing_tracks
-from qobuz_librarian.library.scanner import clear_scan_caches, list_library_artists
-from qobuz_librarian.library.tags import VA_NORMALIZED, normalize
+from qobuz_librarian.api.auth import AuthLost
+from qobuz_librarian.api.search import get_album
+from qobuz_librarian.library import downsample_state
+from qobuz_librarian.library import hidden as hidden_mod
+from qobuz_librarian.library.catalog import (
+    find_album_dir_filesystem,
+    find_existing_tracks,
+)
+from qobuz_librarian.library.scanner import clear_scan_caches
 from qobuz_librarian.modes.process import process_album
+from qobuz_librarian.quality import upgrade_state
 from qobuz_librarian.quality.decision import (
     compare_album_quality,
-    is_album_capped,
     load_capped,
     mark_album_capped,
-    scan_artist_for_upgrades,
 )
 from qobuz_librarian.ui_cli.colors import C, banner, fmt, truncate
 from qobuz_librarian.ui_cli.errors import plural
 from qobuz_librarian.ui_cli.logging import log, vlog
 from qobuz_librarian.ui_cli.prompts import _flush_stdin, confirm
+from qobuz_librarian.web import review_badges
 
 # process_album outcomes that mean "nothing to upgrade here", not a failure.
 # A backup-failed abort is deliberately absent: that's a real failure (Qobuz
@@ -37,53 +41,97 @@ BENIGN_UPGRADE_RESULTS = frozenset({
 })
 
 
+def _artist_dir_from_upgrade_result(album, result):
+    result_dir = (result or {}).get("dir")
+    if result_dir:
+        album_dir = result_dir
+        if not hasattr(album_dir, "exists"):
+            from pathlib import Path
+            album_dir = Path(album_dir)
+        if album_dir.exists():
+            return album_dir.parent if album_dir.is_dir() else album_dir.parent.parent
+    try:
+        clear_scan_caches()
+        album_dir = find_album_dir_filesystem(album)
+        if album_dir and album_dir.exists():
+            return album_dir.parent
+    except Exception as exc:
+        vlog(f"post-upgrade state refresh path lookup failed: {exc}")
+    return None
+
+
+def _refresh_saved_state_after_upgrade(album, result, token, args):
+    artist_dir = _artist_dir_from_upgrade_result(album, result)
+    if artist_dir is None:
+        return
+    hidden = hidden_mod.load()
+    upgrade_state.update_artist(
+        artist_dir,
+        token=token,
+        args=args,
+        capped=load_capped(),
+        hidden=hidden,
+    )
+    upgrade_saved = upgrade_state.load()
+    review_badges.set_ready(
+        "upgrade",
+        upgrade_state.has_visible_candidates(upgrade_saved, hidden),
+    )
+    downsample_state.update_artist(artist_dir, hidden=hidden)
+    downsample_saved = downsample_state.load()
+    review_badges.set_ready(
+        "downsample",
+        downsample_state.has_visible_candidates(downsample_saved, hidden),
+    )
+
+
 def run_upgrade_walk_mode(args, token):
-    """Upgrade walk — walk every artist in the library, find albums that can
-    be quality-upgraded, and prompt once per artist (default YES = enter).
+    """Upgrade walk over saved Library/baseline upgrade candidates.
 
-    Artists with no upgradeable albums are skipped silently. A \\r progress
-    line overwrites itself while scanning so the output stays clean — the
-    screen only fills when real upgrades are found. After a Y/n answer the
-    walk automatically advances to the next artist with no further prompts.
+    The Library refresh is the source of truth for upgrade discovery. The CLI
+    keeps its walk value by grouping saved candidates by artist, but it no
+    longer performs a separate live upgrade scan.
     """
+    if not cfg.UPGRADE_SCAN_ENABLED:
+        log.info(fmt(C.YELLOW, "  Upgrade scanning is turned off."))
+        return
     clear_scan_caches()
-    banner("Upgrade walk — quality upgrades across library")
+    banner("Upgrade walk — saved Library candidates")
 
-    all_artists = list_library_artists()
-    if not all_artists:
-        log.info(fmt(C.YELLOW, "  ⚠  No artist directories found."))
+    saved_state = upgrade_state.load()
+    if not saved_state.get("complete"):
+        log.info(fmt(C.YELLOW,
+            "  No complete saved upgrade candidates. Run a Library refresh first."))
+        return
+    saved = [
+        c for c in upgrade_state.visible_candidates(
+            saved_state, hidden_mod.load())
+        if (c.get("payload") or {}).get("album_id")
+    ]
+    if not saved:
+        log.info(fmt(C.YELLOW,
+            "  No saved upgrade candidates. Run a Library refresh first."))
         return
 
-    # Various Artists / VA can't be meaningfully matched on Qobuz.
-    all_artists = [a for a in all_artists
-                   if normalize(a.name) not in VA_NORMALIZED]
-    if not all_artists:
-        log.info(fmt(C.YELLOW, "  ⚠  No scannable artist directories found."))
-        return
+    by_artist: dict[str, list[dict]] = {}
+    for cand in saved:
+        artist = cand.get("artist") or "Unknown artist"
+        by_artist.setdefault(artist, []).append(cand)
 
     # Consolidation prompts per-album would be unbearably noisy at scale.
     saved_consolidate = args.consolidate
     args.consolidate = False
 
-    n = len(all_artists)
-    n_scanned = 0
+    n = len(by_artist)
+    n_reviewed = 0
     n_upgraded_albums = 0
     n_unverified_albums = 0
     n_failed_albums = 0
     unsafe_artists = []  # --auto-safe skipped artists, for end-of-run review
 
-    # Load cap markers; surface count for transparency.
-    capped = load_capped()
-    if capped:
-        active = sum(1 for aid in capped if is_album_capped(aid, capped))
-        if active:
-            log.info(fmt(C.GRAY,
-                f"  ⓘ {active} album(s) marked upgrade-capped will be skipped."))
-            log.info(fmt(C.GRAY,
-                f"     (Qobuz delivered partial hi-res before; "
-                f"retry after {cfg.CAPPED_RETENTION_DAYS}d or edit {cfg.CAPPED_FILE.name}.)"))
-
-    log.info(fmt(C.GRAY, f"  {plural(n, 'artist')} to scan. Artists with no upgrades are skipped silently."))
+    log.info(fmt(C.GRAY,
+        f"  {plural(len(saved), 'upgrade candidate')} across "
+        f"{plural(n, 'artist')} from the saved Library refresh."))
     log.info(fmt(C.GRAY, "  Ctrl-C to stop at any point."))
 
     # Auto-accept-all gate. Skipped under --dry-run (which changes nothing), so
@@ -104,62 +152,24 @@ def run_upgrade_walk_mode(args, token):
     log.info("")
 
     try:
-        for i, artist_dir in enumerate(all_artists):
-            artist_name = artist_dir.name
-
-            _scan_line = f"  [{i + 1}/{n}] Scanning {truncate(artist_name, 46)}…"
-            # The \r overwrite only makes sense on a terminal; piped/log output
-            # would just collect carriage returns, so keep it verbose-only there.
-            if sys.stdout.isatty():
-                print(f"\r{_scan_line:<80}", end="", flush=True)
-            else:
-                vlog(_scan_line.strip())
-
-            try:
-                candidates = scan_artist_for_upgrades(
-                    artist_name, artist_dir, token, args, capped=capped)
-            except (AuthLost, QobuzUnavailable):
-                # Finish the progress line before the abort propagates to the
-                # clean EXIT_AUTH / EXIT_TRANSIENT stop in the entry point.
-                log.info("")
-                raise
-            except KeyboardInterrupt:
-                log.info("")
-                log.info(fmt(C.GRAY, "\n  Interrupted."))
-                break
-
-            n_scanned += 1
-
-            if not candidates:
-                continue
-
-            # Upgrades found — commit the progress line and print the summary.
+        for artist_name, candidates in by_artist.items():
+            n_reviewed += 1
             log.info("")
             log.info("")
-            n_tracks = sum(c["n_present"] for c in candidates)
             n_albums = len(candidates)
 
             log.info(fmt(C.BOLD + C.WHITE, f"  {artist_name}"))
             log.info(fmt(C.MAGENTA,
-                f"  {plural(n_albums, 'album')} — {plural(n_tracks, 'track')} to re-rip:"))
+                f"  {plural(n_albums, 'album')} to upgrade:"))
             log.info("")
             for c in candidates:
-                album = c["qobuz_album"]
-                title = truncate(album.get("title") or "?", 48)
-                year  = album_year(album) or "?"
-                el    = c["existing_quality_label"]
-                tl    = c["target_quality_label"]
-                _np   = c.get("n_present", 0)
-                _nt   = c.get("n_total", 0)
-                _nb   = c.get("n_below", 0)
-                _suffix = ""
-                if _nt and _np < _nt:
-                    _suffix += fmt(C.GRAY, f"   [partial: {_np} of {_nt}]")
-                if 0 < _nb < _np:
-                    _suffix += fmt(C.GRAY, f"   ({_nb} below target)")
-                log.info(f"    • {fmt(C.WHITE, title)} {fmt(C.GRAY, f'({year})')}   "
-                         f"{fmt(C.GRAY, el)} {fmt(C.GRAY, '→')} "
-                         f"{fmt(C.MAGENTA, tl)}{_suffix}")
+                payload = c.get("payload") or {}
+                title = truncate(c.get("title") or "?", 48)
+                year = payload.get("year") or "?"
+                detail = c.get("detail") or "higher Qobuz quality"
+                log.info(f"    • {fmt(C.WHITE, title)} "
+                         f"{fmt(C.GRAY, f'({year})')}   "
+                         f"{fmt(C.MAGENTA, detail)}")
             log.info("")
 
             # --auto-safe — fully unattended path.
@@ -167,16 +177,19 @@ def run_upgrade_walk_mode(args, token):
                 low_conf = []
                 for _c in candidates:
                     _reasons = []
-                    if _c.get("_needed_edition_swap"):
+                    payload = _c.get("payload") or {}
+                    if payload.get("needed_edition_swap"):
                         _reasons.append("edition was auto-swapped")
-                    _sim = _c.get("_title_similarity") or 0.0
-                    if _sim < cfg.AUTO_SAFE_TITLE_SIM_THRESH:
+                    _sim = payload.get("title_similarity")
+                    if _sim is None:
+                        _reasons.append("confidence data missing")
+                    elif float(_sim) < cfg.AUTO_SAFE_TITLE_SIM_THRESH:
                         _reasons.append(
-                            f"title similarity {_sim:.2f} < "
+                            f"title similarity {float(_sim):.2f} < "
                             f"{cfg.AUTO_SAFE_TITLE_SIM_THRESH:.2f}")
                     if _reasons:
                         low_conf.append(
-                            (_c["qobuz_album"].get("title") or "?", _reasons))
+                            (_c.get("title") or "?", _reasons))
                 if low_conf:
                     log.info(fmt(C.YELLOW,
                         f"  ⚠  --auto-safe: skipping {artist_name} "
@@ -199,12 +212,19 @@ def run_upgrade_walk_mode(args, token):
                     continue
 
             for j, c in enumerate(candidates, 1):
-                album = c["qobuz_album"]
+                payload = c.get("payload") or {}
+                album_id = payload.get("album_id")
                 label = f"[{j}/{n_albums}]"
                 log.info("")
                 log.info(fmt(C.BOLD + C.WHITE,
-                    f"  {label} {truncate(album.get('title') or '?', 55)}"))
+                    f"  {label} {truncate(c.get('title') or '?', 55)}"))
                 try:
+                    album = get_album(album_id, token)
+                    if not album:
+                        log.info(fmt(C.YELLOW,
+                            f"  Album {album_id} is no longer on Qobuz; skipping."))
+                        n_failed_albums += 1
+                        continue
                     # Upgrade_only=True so partial-album cases
                     # only re-rip the present tracks, not download missing ones.
                     _proc_result = process_album(album, args, allow_force=False,
@@ -220,6 +240,9 @@ def run_upgrade_walk_mode(args, token):
 
                 _pr_result = (_proc_result or {}).get("result", "")
                 if _pr_result in BENIGN_UPGRADE_RESULTS:
+                    if _pr_result not in {"cancelled", "dry_run"}:
+                        _refresh_saved_state_after_upgrade(
+                            album, _proc_result, token, args)
                     time.sleep(cfg.ARTIST_API_DELAY)
                     continue
                 if (_proc_result or {}).get("upgrade_unverified", False):
@@ -237,8 +260,6 @@ def run_upgrade_walk_mode(args, token):
                     n_failed_albums += 1
                     time.sleep(cfg.ARTIST_API_DELAY)
                     continue
-                n_upgraded_albums += 1
-
                 # Post-upgrade verification.
                 try:
                     post_existing, _ = find_existing_tracks(album)
@@ -246,13 +267,14 @@ def run_upgrade_walk_mode(args, token):
                         post_qual = compare_album_quality(post_existing, album)
                         if post_qual["classification"] in ("all_lower", "mixed_below"):
                             mark_album_capped(album.get("id"), album, post_qual)
-                            capped = load_capped()
                             log.info(fmt(C.YELLOW,
                                 f"     ⚠  Upgrade incomplete: "
                                 f"{post_qual['n_below']} track(s) still below target. "
                                 f"Marked capped (Qobuz partial hi-res)."))
                 except Exception as _e:
                     vlog(f"post-upgrade cap check failed: {_e}")
+                n_upgraded_albums += 1
+                _refresh_saved_state_after_upgrade(album, _proc_result, token, args)
                 time.sleep(cfg.ARTIST_API_DELAY)
 
             log.info("")
@@ -263,7 +285,7 @@ def run_upgrade_walk_mode(args, token):
     log.info("")
     log.info(fmt(C.GREEN, "  ✓  Upgrade walk complete."))
     log.info(fmt(C.GRAY,
-        f"     Scanned {plural(n_scanned, 'artist')} — upgraded tracks in "
+        f"     Reviewed {plural(n_reviewed, 'artist')} — upgraded tracks in "
         f"{plural(n_upgraded_albums, 'album')}."))
     if n_unverified_albums:
         log.info(fmt(C.YELLOW,

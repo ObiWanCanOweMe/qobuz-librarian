@@ -28,7 +28,7 @@ from typing import Callable, Optional
 
 from qobuz_librarian.integrations import rip as rip_module
 from qobuz_librarian.ui_cli.logging import set_progress_reporter, set_thread_wrapper
-from qobuz_librarian.web import job_persistence
+from qobuz_librarian.web import job_persistence, review_badges
 
 # Thread-local pointer to the job currently being run on this worker.
 # Lets rip_url's cancel-check hook (installed below) find the running
@@ -836,6 +836,7 @@ def submit_scan(job: Job, scan_fn, execute_fn):
             return  # _run_task will detect the flag and set CANCELED
         if j.selected_candidates() or j.candidates:
             j.status = JobStatus.AWAITING_REVIEW
+            review_badges.mark_ready(j.execute_kind)
         else:
             j.push_line("Nothing to do. No candidates found.")
             j.status = JobStatus.DONE

@@ -35,6 +35,9 @@ BEHAVIOR_FIELDS = [
     ("DOWNSAMPLE_HIRES_ENABLED", "Downsample new hi-res downloads",
      "Before import, reduce newly downloaded hi-res FLACs to 44.1 or 48 kHz. "
      "The hi-res files are not kept."),
+    ("SUPPRESS_SINGLE_TRACK_GAPS", "Treat track downloads as singles",
+     "Hide the rest of an album from gap scans after you download one track. "
+     "Leave this off if a track download should not affect future album offers."),
     ("LYRICS_ENABLED", "Fetch lyrics",
      "Fetch lyrics during import, using synced lyrics when providers have them."),
 ]

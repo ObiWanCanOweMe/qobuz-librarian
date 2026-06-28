@@ -40,17 +40,16 @@ def test_streamrip_quality_tier_1_coerces_to_lossless(monkeypatch, capsys):
         importlib.reload(cfg)
 
 
-def test_album_max_quality_reflects_downsample_target(monkeypatch):
-    # With downsampling on, a 24/192 master lands on disk as 24/48. The
-    # comparison target must match that, or the album reads as below target
-    # and gets re-ripped on every scan forever.
+def test_album_max_quality_keeps_qobuz_master_when_downsample_enabled(monkeypatch):
+    # Upgrade discovery should still report the best Qobuz can provide. The
+    # downsample preference is a post-download storage choice, not a reason to
+    # hide a 24/192 master from the upgrade/baseline scan.
     monkeypatch.setattr("qobuz_librarian.config.STREAMRIP_QUALITY", 4)
     monkeypatch.setattr("qobuz_librarian.config.DOWNSAMPLE_HIRES_ENABLED", True)
-    monkeypatch.setattr("qobuz_librarian.quality.decision.HAVE_DOWNSAMPLE", True)
     assert album_max_quality(
-        {"maximum_bit_depth": 24, "maximum_sampling_rate": 192.0}) == (24, 48000)
+        {"maximum_bit_depth": 24, "maximum_sampling_rate": 192.0}) == (24, 192000)
     assert album_max_quality(
-        {"maximum_bit_depth": 24, "maximum_sampling_rate": 88.2}) == (24, 44100)
+        {"maximum_bit_depth": 24, "maximum_sampling_rate": 88.2}) == (24, 88200)
     # 44.1/48 kHz aren't resampled, so they pass through.
     assert album_max_quality(
         {"maximum_bit_depth": 16, "maximum_sampling_rate": 44.1}) == (16, 44100)
@@ -94,3 +93,46 @@ def test_capped_persistence_round_trips_and_prunes(tmp_path, monkeypatch):
     # a dict so is_album_capped's .get() doesn't blow up the upgrade scan.
     (tmp_path / "capped.json").write_text('["x", "y"]', encoding="utf-8")
     assert load_capped() == {}
+
+
+def test_upgrade_scan_skips_locally_capped_downsample_album(tmp_path, monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.quality import decision
+
+    monkeypatch.setattr(cfg, "CAPPED_FILE", tmp_path / "capped.json")
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", tmp_path)
+    artist_dir = tmp_path / "Artist"
+    album_dir = artist_dir / "Album (2024)"
+    album_dir.mkdir(parents=True)
+    qobuz_album = {
+        "id": "qobuz-album",
+        "title": "Album",
+        "artist": {"name": "Artist"},
+        "maximum_bit_depth": 24,
+        "maximum_sampling_rate": 192.0,
+        "tracks": {"items": [{"title": "Song"}]},
+    }
+
+    decision.mark_local_album_capped(album_dir)
+    monkeypatch.setattr(decision, "list_artist_album_dirs",
+                        lambda _artist_dir: [album_dir])
+    monkeypatch.setattr(decision, "search_artists", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "qobuz_librarian.library.catalog.find_qobuz_album_for_dir",
+        lambda *a, **k: qobuz_album,
+    )
+
+    def fail_if_quality_compared(*_args, **_kwargs):
+        raise AssertionError("locally capped albums should skip quality compare")
+
+    monkeypatch.setattr(decision, "find_existing_tracks", fail_if_quality_compared)
+
+    result = decision.scan_artist_for_upgrades(
+        "Artist",
+        artist_dir,
+        "tok",
+        type("Args", (), {"prefer_hires": True, "no_upgrade": False})(),
+        capped=decision.load_capped(),
+    )
+
+    assert result == []

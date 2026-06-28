@@ -245,6 +245,10 @@ PENDING_QUEUE_FILE   = DATA_DIR / ".qobuz_pending_queue.json"
 LYRIC_RETRY_FILE     = DATA_DIR / ".qobuz_lyric_retry.json"
 REPAIR_LOG_PATH      = DATA_DIR / ".qobuz_replaced_tracks.log"
 CAPPED_FILE          = DATA_DIR / ".qobuz_upgrade_capped.json"
+UPGRADE_STATE_FILE   = DATA_DIR / ".qobuz_upgrade_state.json"
+DOWNSAMPLE_STATE_FILE = DATA_DIR / ".qobuz_downsample_state.json"
+LIBRARY_SCAN_STATE_FILE = DATA_DIR / ".qobuz_library_scan_state.json"
+REVIEW_BADGE_STATE_FILE = DATA_DIR / ".qobuz_review_badges.json"
 # Albums the user dismissed from the bulk library/upgrade walks so they stop
 # resurfacing on every scan. User-driven and durable (no auto-expiry, unlike
 # CAPPED_FILE). See library/hidden.py.
@@ -494,11 +498,16 @@ UPGRADE_BACKUP_RETENTION_DAYS = _env_num_min("UPGRADE_BACKUP_RETENTION_DAYS", 7,
 CAPPED_RETENTION_DAYS         = _env_num_min("CAPPED_RETENTION_DAYS",         90, 0)
 
 # ── Feature flags ─────────────────────────────────────────────────────────────
+UPGRADE_SCAN_ENABLED = _env_bool("UPGRADE_SCAN_ENABLED", True)
 AUTO_UPGRADE_ENABLED = _env_bool("AUTO_UPGRADE_ENABLED", False)
 # Whether the Upgrade walk re-rips tracks you grabbed as singles. Off by
 # default: a grabbed single is a deliberate one-off, not part of a collection
 # you're keeping at best quality, so the walk leaves it alone unless you opt in.
 UPGRADE_SINGLES_ENABLED = _env_bool("UPGRADE_SINGLES_ENABLED", False)
+# Off by default: grabbing one song should not make the rest of that album
+# disappear from future gap scans. Turn this on only if one-track grabs are
+# intended to be permanent singles.
+SUPPRESS_SINGLE_TRACK_GAPS = _env_bool("SUPPRESS_SINGLE_TRACK_GAPS", False)
 # Off by default: most people want the file Qobuz delivers. Opt in if you
 # prefer to grab hi-res mixes and downsample them to 44.1/48 kHz to save space.
 DOWNSAMPLE_HIRES_ENABLED = _env_bool("DOWNSAMPLE_HIRES_ENABLED", False)
