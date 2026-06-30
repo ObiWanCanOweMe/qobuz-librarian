@@ -2,11 +2,17 @@
 {% block title %}{{ title }} — Qobuz Librarian{% endblock %}
 {% block content %}
 
-<div class="max-w-xl mx-auto text-center py-12">
-  <div class="text-6xl font-bold text-base-content/20 mb-2">{{ code }}</div>
-  <h1 class="text-2xl font-bold mb-3">{{ title }}</h1>
-  <p class="text-base-content/70 mb-6">{{ msg }}</p>
-  <a href="/" class="btn btn-primary w-full sm:w-auto">Back to dashboard</a>
+<div class="ql-list-page ql-system-page">
+  <div class="ql-system-card">
+  <div class="ql-system-code" aria-hidden="true">{{ code }}</div>
+  <header class="ql-page-header">
+    <h1>{{ title }}</h1>
+    <p>{{ msg }}</p>
+  </header>
+  <div class="ql-system-actions">
+    <a href="/" class="ql-btn ql-btn-primary w-full sm:w-auto">Back to dashboard</a>
+  </div>
+  </div>
 </div>
 
 {% endblock %}

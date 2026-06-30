@@ -77,7 +77,7 @@ check /queue/history          200
 check /settings               200
 check /static/icon.png        200   # favicon + navbar mark
 check /static/icon-192.png    200   # PWA icon
-check /static/dist/app.css    200   # compiled Tailwind/DaisyUI; the SW precaches it too
+check /static/dist/app.css    200   # compiled Tailwind/project CSS; the SW precaches it too
 check /api/jobs/nope/status   404   # unknown job id
 
 echo "==> Checking bundled tools in the image"

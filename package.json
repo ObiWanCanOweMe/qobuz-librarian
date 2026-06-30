@@ -1,14 +1,13 @@
 {
   "name": "qobuz-librarian-ui",
   "private": true,
-  "description": "Web UI assets for qobuz-librarian (Tailwind + daisyUI build).",
+  "description": "Web UI assets for Qobuz Librarian.",
   "scripts": {
     "build": "tailwindcss -i src/qobuz_librarian/web/static/src/app.css -o src/qobuz_librarian/web/static/dist/app.css --minify",
     "watch": "tailwindcss -i src/qobuz_librarian/web/static/src/app.css -o src/qobuz_librarian/web/static/dist/app.css --watch"
   },
   "devDependencies": {
     "@tailwindcss/cli": "^4.3.0",
-    "daisyui": "^5.5.20",
     "tailwindcss": "^4.3.0"
   }
 }

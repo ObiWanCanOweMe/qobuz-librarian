@@ -40,7 +40,7 @@
       </span>
       <form action="/lyric-retry" method="post" class="ml-auto shrink-0">
         <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-        <button type="submit" class="btn btn-sm btn-primary">Retry now</button>
+        <button type="submit" class="ql-btn ql-btn-primary ql-btn-sm">Retry now</button>
       </form>
     </div>
     {% endif %}
@@ -73,26 +73,26 @@
       </svg>
       <span class="min-w-0 flex-1 text-sm">
         {% if setup_scanning %}
-        <strong>Library scan running.</strong> Refreshing missing albums, track gaps, upgrades, and downsample candidates.
+        <strong>Library scan running.</strong> Refreshing missing albums, Gap Fill candidates, upgrades, and downsample candidates.
         {% elif not library_scan_state.ready %}
         <strong>Music library unavailable.</strong> {{ library_scan_state.message }}
         {% else %}
-        <strong>Library scan needed.</strong> Scan once to refresh missing albums, track gaps, upgrades, and downsample candidates.
+        <strong>Library scan needed.</strong> Scan once to refresh missing albums, Gap Fill candidates, upgrades, and downsample candidates.
         {% endif %}
       </span>
       {% if setup_scanning %}
       {% elif not library_scan_state.ready %}
-      <a href="/settings" class="btn btn-sm btn-primary w-full shrink-0 sm:ml-auto sm:w-auto">Open Settings</a>
+      <a href="/settings" class="ql-btn ql-btn-primary ql-btn-sm w-full shrink-0 sm:ml-auto sm:w-auto">Open Settings</a>
       {% else %}
       <div class="flex gap-2 w-full shrink-0 sm:ml-auto sm:w-auto">
         <form action="/library" method="post" class="flex-1 sm:flex-none">
           <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
           <input type="hidden" name="mode" value="missing_albums">
-          <button type="submit" class="btn btn-sm btn-primary w-full">Scan library</button>
+          <button type="submit" class="ql-btn ql-btn-primary ql-btn-sm w-full">Scan library</button>
         </form>
         <form action="/library/skip-setup" method="post" class="flex-1 sm:flex-none">
           <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-          <button type="submit" class="btn btn-sm btn-outline ql-secondary-action w-full">Not now</button>
+          <button type="submit" class="ql-btn ql-btn-secondary ql-btn-sm w-full">Not now</button>
         </form>
       </div>
       {% endif %}
@@ -112,7 +112,7 @@
       <form action="/library" method="post" class="ml-auto shrink-0" data-busy-submit>
         <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
         <input type="hidden" name="mode" value="{{ 'partial_fill' if library_resume.kind == 'partial' else 'missing_albums' }}">
-        <button type="submit" class="btn btn-sm btn-primary">Resume scan</button>
+        <button type="submit" class="ql-btn ql-btn-primary ql-btn-sm">Resume scan</button>
       </form>
     </div>
     {% endif %}
@@ -135,7 +135,7 @@
             <h2>Qobuz credentials</h2>
             <p>Connect Qobuz to enable Search.</p>
           </div>
-          <a href="/settings" class="btn btn-primary ql-locked-search-action">Open Settings</a>
+          <a href="/settings" class="ql-btn ql-btn-primary ql-locked-search-action">Open Settings</a>
         </div>
 
         <div class="ql-locked-search-form" aria-hidden="true">
@@ -146,7 +146,7 @@
           </div>
           <div class="ql-search-row">
             <div class="ql-disabled-input">Qobuz search unavailable</div>
-            <button type="button" class="btn btn-primary ql-search-button" disabled>
+            <button type="button" class="ql-btn ql-btn-primary ql-search-button" disabled>
               <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-4.35-4.35M17 11A6 6 0 1 1 5 11a6 6 0 0 1 12 0z"/>
               </svg>
@@ -167,12 +167,9 @@
         <p>Your saved token was rejected.</p>
       </div>
       <div class="ql-panel-actions">
-        <a href="/settings" class="btn btn-primary">Reconnect Qobuz</a>
+        <a href="/settings" class="ql-btn ql-btn-primary">Reconnect Qobuz</a>
       </div>
       {% else %}
-      <div class="ql-panel-header">
-        <h2>Search Qobuz</h2>
-      </div>
       <form action="/search" method="post"
             hx-post="/search" hx-target="#search-results" hx-swap="innerHTML"
             hx-indicator="#dashboard-search-spinner"
@@ -193,18 +190,18 @@
           </label>
         </div>
         <div class="ql-search-row">
+          <svg class="ql-search-field-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="1.8"/>
+            <path d="M21 21l-4.35-4.35" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          </svg>
           <input type="text" name="q"
                  aria-label="{% if search_kind == 'track' %}Track title{% elif search_kind == 'album' %}Album title{% else %}Artist name{% endif %}"
                  value="{{ search_q }}"
                  placeholder="{% if search_kind == 'track' %}Track title{% elif search_kind == 'album' %}Album title{% else %}Artist name{% endif %}"
                  inputmode="search" enterkeyhint="search" autocapitalize="off" spellcheck="false" maxlength="500"
-                 class="input input-bordered ql-search-input" autocomplete="off">
-          <button type="submit" class="btn btn-primary ql-search-button">
-            <span id="dashboard-search-spinner"
-                  class="loading loading-spinner loading-sm htmx-indicator"></span>
-            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-4.35-4.35M17 11A6 6 0 1 1 5 11a6 6 0 0 1 12 0z"/>
-            </svg>
+                 class="ql-input ql-search-input" autocomplete="off">
+          <button type="submit" class="ql-search-submit" aria-label="Search">
+            <span id="dashboard-search-spinner" class="ql-spinner htmx-indicator"></span>
             <span>Search</span>
           </button>
         </div>
@@ -212,13 +209,20 @@
       {% endif %}
     </section>
 
-    <div id="search-results" class="ql-search-results" aria-live="polite">{{ initial_search_results | safe }}</div>
+    <div id="search-results" class="ql-search-results" aria-live="polite">
+      {{ initial_search_results | safe }}
+      {% if creds_ok and creds_token_valid != False and not search_q and not initial_search_results %}
+      <div class="ql-search-idle">
+        <p>Search Qobuz by artist, album, or track.</p>
+      </div>
+      {% endif %}
+    </div>
 
     {% if active_jobs or queued_jobs %}
     <section id="dashboard-active" class="ql-active-strip">
       <div class="ql-active-strip-header">
         <h2>Background work</h2>
-        <a href="/queue" class="btn btn-sm btn-outline">Open queue</a>
+        <a href="/queue" class="ql-btn ql-btn-secondary ql-btn-sm">Open queue</a>
       </div>
       <div class="ql-active-list">
         {% for j in active_jobs %}
@@ -246,7 +250,7 @@
           </div>
           <form action="/jobs/{{ j.id }}/cancel" method="post" class="ql-row-action ql-active-action">
             <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-            <button type="submit" class="btn btn-sm btn-outline btn-error"
+            <button type="submit" class="ql-btn ql-btn-danger ql-btn-sm"
                     title="Cancel job" aria-label="Cancel job"
                     data-confirm="Cancel this job? It will stop after the current safe step.">Cancel</button>
           </form>
@@ -258,7 +262,7 @@
             <p class="ql-row-title">{{ queued_jobs | length }} job{{ 's' if queued_jobs|length != 1 }} queued</p>
             <p class="ql-row-meta">Starts after the current job finishes.</p>
           </div>
-          <a href="/queue" class="btn btn-sm btn-outline shrink-0">View queue</a>
+          <a href="/queue" class="ql-btn ql-btn-secondary ql-btn-sm shrink-0">View queue</a>
         </div>
         {% endif %}
       </div>

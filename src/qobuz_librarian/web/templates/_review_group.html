@@ -1,55 +1,60 @@
 {% import "_job_labels.html" as labels %}
 
-<details class="ql-review-group group{% if triage %} ql-review-group--triage{% endif %}" data-artist="{{ artist }}"{% if open %} open{% endif %}>
+<details class="ql-review-group{% if triage %} ql-review-group--triage{% endif %}" data-artist="{{ artist }}"{% if open %} open{% endif %}>
   <summary class="ql-review-summary">
     <span class="ql-review-title">
       <span class="ql-review-title-main">{{ artist or 'Artist not recorded' }}</span>
       <span class="ql-review-title-meta">{{ labels.review_count(job, items | length) }}</span>
     </span>
+    <span class="ql-review-chevron" aria-hidden="true"></span>
   </summary>
   {% if triage %}
   {% set _hide_label = 'Keep hi-res' if job.execute_kind == 'downsample' else 'Dismiss unselected' %}
   <div class="ql-review-group-actions">
     <label class="ql-review-artist-select">
-      <input type="checkbox" class="checkbox checkbox-sm checkbox-primary" data-artist-select value="{{ artist }}"
+      <input type="checkbox" class="ql-checkbox" data-artist-select value="{{ artist }}"
              {% if items and (items | selectattr('selected') | list | length) == (items | length) %}checked{% endif %}
              aria-label="Select shown {{ labels.review_item_plural(job) }} by {{ artist or 'this artist' }} to {{ job.review_verb | lower }}">
       <span>Select shown</span>
     </label>
     <button type="button" data-hide data-artist="{{ artist }}"
-            aria-label="{% if job.execute_kind == 'downsample' %}Keep unselected albums by {{ artist or 'this artist' }} hi-res{% elif job.execute_kind == 'upgrade' %}Dismiss unselected upgrades by {{ artist or 'this artist' }}{% elif job.execute_kind == 'library' %}Dismiss unselected albums and track gaps by {{ artist or 'this artist' }}{% else %}Dismiss unselected albums by {{ artist or 'this artist' }}{% endif %}"
+            aria-label="{% if job.execute_kind == 'downsample' %}Keep unselected albums by {{ artist or 'this artist' }} hi-res{% elif job.execute_kind == 'upgrade' %}Dismiss unselected upgrades by {{ artist or 'this artist' }}{% elif job.execute_kind == 'library' %}Dismiss unselected albums and Gap Fill candidates by {{ artist or 'this artist' }}{% else %}Dismiss unselected albums by {{ artist or 'this artist' }}{% endif %}"
             hx-post="/jobs/{{ job.id }}/hide"
             hx-vals='{{ {"artist": artist}|tojson }}'
             hx-target="closest details"
             hx-swap="outerHTML swap:280ms"
             hx-disabled-elt="this"
-            class="btn btn-sm sm:btn-xs btn-outline ql-secondary-action disabled:opacity-60"><span data-hide-label>{{ _hide_label }}</span></button>
+            class="ql-btn ql-btn-secondary ql-btn-sm ql-secondary-action"><span data-hide-label>{{ _hide_label }}</span></button>
   </div>
   {% endif %}
-  <div class="px-3 pb-3 pt-1 space-y-1">
+  <div class="ql-review-items">
     {% for c in items %}
     <label class="ql-review-candidate">
-      <input type="checkbox" class="checkbox checkbox-sm cb" name="cid"
+      <input type="checkbox" class="ql-checkbox cb" name="cid"
              value="{{ c.cid }}" data-seq="{{ c.seq }}"
              {% if c.selected %}checked{% endif %}>
       {% if c.payload.cover %}
-      <img src="{{ c.payload.cover }}" alt="" loading="lazy" width="40" height="40"
-           class="shrink-0 w-10 h-10 rounded object-cover bg-base-300">
+      <img src="{{ c.payload.cover }}" alt="" loading="lazy" width="56" height="56"
+           class="ql-review-cover">
+      {% else %}
+      <span class="ql-review-cover ql-review-cover--empty" aria-hidden="true"></span>
       {% endif %}
-      <span class="flex-1 min-w-0">
-        <span class="font-medium">{{ c.title }}</span>{% if c.payload.is_new %}
-        <span class="badge badge-primary badge-xs align-middle ml-1">new</span>{% endif %}
-        <span class="block text-xs text-base-content/40">{{ c.detail }}</span>
+      <span class="ql-review-candidate-body">
+        <span class="ql-review-candidate-heading">
+          <span class="ql-review-candidate-title">{{ c.title }}</span>{% if c.payload.is_new %}
+          <span class="ql-badge ql-badge-primary ql-badge-xs">new</span>{% endif %}
+        </span>
+        <span class="ql-review-candidate-detail">{{ c.detail }}</span>
         {% if c.payload.verified_truncated %}
-        <span class="block mt-1.5 pl-2 border-l-2 border-warning/40 space-y-0.5">
+        <span class="ql-review-truncated">
           {% for t in c.payload.verified_truncated[:12] %}
-          <span class="block text-xs text-base-content/60 truncate">
-            <span class="readout text-base-content/40">{% if t.track_number %}{{ '%02d'|format(t.track_number) }}{% else %}··{% endif %}</span>
-            {{ t.title }}{% if t.reason == 'decode_failed' %} <span class="text-base-content/40">· won't decode</span>{% endif %}
+          <span class="ql-review-truncated-line">
+            <span class="readout ql-review-track-number">{% if t.track_number %}{{ '%02d'|format(t.track_number) }}{% else %}··{% endif %}</span>
+            {{ t.title }}{% if t.reason == 'decode_failed' %} <span class="ql-review-truncated-muted">· won't decode</span>{% endif %}
           </span>
           {% endfor %}
           {% if (c.payload.verified_truncated | length) > 12 %}
-          <span class="block text-xs text-base-content/40">+{{ (c.payload.verified_truncated | length) - 12 }} more</span>
+          <span class="ql-review-truncated-more">+{{ (c.payload.verified_truncated | length) - 12 }} more</span>
           {% endif %}
         </span>
       {% endif %}

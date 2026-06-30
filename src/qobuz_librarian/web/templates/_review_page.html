@@ -1,18 +1,18 @@
 {% set triage = job.execute_kind in ('library', 'upgrade', 'new_releases', 'downsample') %}
-<div id="review-groups" class="space-y-2" data-page="{{ review_page }}">
+<div id="review-groups" class="ql-review-groups" data-page="{{ review_page }}">
   {% for artist, items in review_groups %}
   {% with open = (review_groups | length == 1) %}{% include "_review_group.html" %}{% endwith %}
   {% endfor %}
 </div>
 
 {% if not review_groups %}
-<p class="text-center py-6 text-base-content/50 text-sm">
+<p class="ql-review-page-empty">
   {% if review_query %}No artists or albums match your filter.{% else %}Nothing on this page.{% endif %}
 </p>
 {% endif %}
 
 {% if review_page < review_pages %}
-<div id="review-loadmore" class="flex justify-center mt-4">
-  <button type="button" class="btn btn-outline btn-sm ql-secondary-action" data-load-more data-next-page="{{ review_page + 1 }}">Load more artists</button>
+<div id="review-loadmore" class="ql-review-loadmore">
+  <button type="button" class="ql-btn ql-btn-secondary ql-btn-sm ql-secondary-action" data-load-more data-next-page="{{ review_page + 1 }}">Load more artists</button>
 </div>
 {% endif %}

@@ -3,62 +3,67 @@
 {% block content_max %}max-w-5xl{% endblock %}
 {% block content %}
 
-<section class="ql-tool-panel mx-auto max-w-3xl">
-  <div class="ql-tool-panel-body">
-    <div class="mb-5">
-      <h1 class="text-2xl font-bold mb-2">Lyrics</h1>
-      <p class="text-base-content/65">
-        Write missing lyrics in your configured format. Synced lyrics are preferred when available.
-      </p>
-    </div>
+<div class="ql-tool-page">
+  <header class="ql-page-header">
+    <h1>Lyrics</h1>
+    <p>Write missing lyrics across the library in your configured format. Synced lyrics are preferred when available.</p>
+  </header>
 
-    <div class="ql-tool-status mb-5">
-      <span>
-        {% if last_run %}Last lyrics scan {{ last_run }}.{% else %}No lyrics scan has finished yet.{% endif %}
-      </span>
-      {% if have_lyrics %}
-      <span class="text-base-content/45 sm:ml-auto">
-        Output: {{ lyrics_format }}. Providers: {{ providers }}.
-        <a href="/settings" class="link">Change</a>
-      </span>
-      {% endif %}
-    </div>
-
+  <div class="ql-work-status">
+    <span class="ql-status-chip {% if have_lyrics %}is-neutral{% else %}is-warning{% endif %}">
+      {% if have_lyrics %}Ready{% else %}Unavailable{% endif %}
+    </span>
+    <span>
+      {% if last_run %}Last lyrics scan {{ last_run }}.{% else %}No lyrics scan has finished yet.{% endif %}
+    </span>
     {% if have_lyrics %}
-    <form action="/lyrics" method="post" data-busy-submit>
-      <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-      <div class="space-y-3 mb-5">
-        <label for="cb-synced" class="ql-option-row">
-          <input type="checkbox" name="synced_only" id="cb-synced" class="toggle toggle-primary mt-1">
-          <span>
-            <span class="block font-medium">Synced lyrics only</span>
-            <span class="block text-sm text-base-content/50">
-              Only write timed lyrics that scroll with the song; skip plain text.
-            </span>
-          </span>
-        </label>
-        <label for="cb-rescan" class="ql-option-row">
-          <input type="checkbox" name="rescan" id="cb-rescan" class="toggle toggle-primary mt-1">
-          <span>
-            <span class="block font-medium">Re-check everything</span>
-            <span class="block text-sm text-base-content/50">
-              Check every track again, including tracks already scanned.
-            </span>
-          </span>
-        </label>
-      </div>
-      <button type="submit" class="btn btn-primary w-full sm:w-auto"
-              data-confirm="Start a library-wide lyrics scan? This can take a while on a large library.">Start lyrics scan</button>
-    </form>
-    {% else %}
-    <div class="ql-tool-note ql-tool-note-warning">
-      <p class="font-medium">Lyrics support is not installed.</p>
-      <p class="mt-1 text-base-content/70">
-        Install Qobuz Librarian with lyrics support, then restart the app.
-      </p>
-    </div>
+    <span>
+      Output: {{ lyrics_format }}. Providers: {{ providers }}.
+      <a href="/settings">Change</a>
+    </span>
     {% endif %}
   </div>
-</section>
+
+  {% if have_lyrics %}
+  <form action="/lyrics" method="post" data-busy-submit>
+    <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+    <div class="ql-option-stack">
+      <label for="cb-synced" class="ql-option-row">
+        <input type="checkbox" name="synced_only" id="cb-synced" class="ql-toggle">
+        <span>
+          <span class="ql-option-title">Synced lyrics only</span>
+          <span class="ql-option-help">
+            Only write timed lyrics that scroll with the song; skip plain text.
+          </span>
+        </span>
+      </label>
+      <label for="cb-rescan" class="ql-option-row">
+        <input type="checkbox" name="rescan" id="cb-rescan" class="ql-toggle">
+        <span>
+          <span class="ql-option-title">Re-check everything</span>
+          <span class="ql-option-help">
+            Check every track again, including tracks already scanned.
+          </span>
+        </span>
+      </label>
+    </div>
+    <section class="ql-work-card ql-work-card-primary">
+      <div class="ql-work-card-copy">
+        <p class="ql-work-card-title">Scan library for lyrics</p>
+        <p class="ql-work-card-text">Missing lyrics are written automatically; there is no review step.</p>
+      </div>
+      <button type="submit" class="ql-btn ql-btn-primary w-full sm:w-auto"
+              data-confirm="Start a library-wide lyrics scan? This can take a while on a large library.">Start lyrics scan</button>
+    </section>
+  </form>
+  {% else %}
+  <section class="ql-work-card ql-work-card-warning">
+    <div class="ql-work-card-copy">
+      <p class="ql-work-card-title">Lyrics support is not installed</p>
+      <p class="ql-work-card-text">Install Qobuz Librarian with lyrics support, then restart the app.</p>
+    </div>
+  </section>
+  {% endif %}
+</div>
 
 {% endblock %}

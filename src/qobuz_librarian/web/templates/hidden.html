@@ -2,8 +2,8 @@
 {% set is_upgrade = scope == 'upgrade' %}
 {% set is_downsample = scope == 'downsample' %}
 {% set noun = 'upgrade' if is_upgrade else ('album' if is_downsample else 'item') %}
-{% set heading = 'Dismissed upgrades' if is_upgrade else ('Kept hi-res' if is_downsample else 'Dismissed albums and gaps') %}
-{% set kept_label = 'albums kept hi-res' if is_downsample else ('dismissed upgrades' if is_upgrade else 'dismissed albums and gaps') %}
+{% set heading = 'Dismissed upgrades' if is_upgrade else ('Kept hi-res' if is_downsample else 'Dismissed albums and Gap Fill') %}
+{% set kept_label = 'albums kept hi-res' if is_downsample else ('dismissed upgrades' if is_upgrade else 'dismissed albums and Gap Fill') %}
 {% set restore_all_label = 'album kept hi-res' if is_downsample else noun %}
 {% set restore_all_label_plural = 'albums kept hi-res' if is_downsample else noun ~ 's' %}
 {% set back_label = 'Upgrade' if is_upgrade else ('Downsample' if is_downsample else 'Library') %}
@@ -11,67 +11,82 @@
 {% block content_max %}max-w-4xl{% endblock %}
 {% block content %}
 
-<div class="mb-6 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-  <div class="min-w-0">
-    <h1 class="text-2xl font-bold">{{ heading }}</h1>
-    <p class="mt-3 text-base-content/60">
+<div class="ql-list-page">
+<header class="ql-page-header ql-page-header--actions">
+  <div>
+    <h1>{{ heading }}</h1>
+    <p>
       {% if is_upgrade %}Upgrades you've dismissed. A higher-quality Qobuz copy won't be suggested for these again.
       {% elif is_downsample %}Albums kept in hi-res will not be suggested for downsampling again.
-      {% else %}Missing albums and track gaps you've dismissed. They won't be suggested again.{% endif %}
+      {% else %}Missing albums and Gap Fill candidates you've dismissed. They won't be suggested again.{% endif %}
       Nothing here is deleted; restore an entry to bring it back.
     </p>
   </div>
   {% if groups %}
-  <a href="{{ back_url }}" class="btn btn-outline btn-sm w-full sm:w-auto">Back to {{ back_label }}</a>
+  <a href="{{ back_url }}" class="ql-btn ql-btn-secondary ql-btn-sm w-full sm:w-auto">Back to {{ back_label }}</a>
   {% endif %}
-</div>
+</header>
 
 {% if groups %}
-<p class="text-base-content/70 mb-3">{{ groups | length }} artist{% if groups | length != 1 %}s{% endif %} with {{ kept_label }}</p>
+<p class="ql-hidden-overview">{{ groups | length }} artist{% if groups | length != 1 %}s{% endif %} with {{ kept_label }}</p>
 
-<div class="space-y-2 mb-4">
+<div class="ql-hidden-groups">
   {% for g in groups %}
-  <div class="ql-review-group px-3 py-2.5">
-    <div class="flex flex-col gap-2 sm:flex-row sm:items-start sm:gap-3">
-      <div class="min-w-0 sm:flex-1">
-        <span class="block font-medium truncate">{{ g.artist }}</span>
-        <span class="text-base-content/50 text-sm">{{ g.albums | length }} {{ noun }}{% if g.albums | length != 1 %}s{% endif %}</span>
-      </div>
-      <div class="flex w-full flex-wrap items-center gap-2 sm:w-auto sm:justify-end">
+  <details class="ql-review-group ql-hidden-group"{% if groups | length == 1 %} open{% endif %}>
+    <summary class="ql-hidden-summary">
+      <span class="ql-hidden-summary-copy">
+        <span class="ql-hidden-artist">{{ g.artist }}</span>
+        <span class="ql-hidden-count">{{ g.albums | length }} {{ noun }}{% if g.albums | length != 1 %}s{% endif %}</span>
+      </span>
+      <svg class="ql-hidden-chevron" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M5 12h14"/>
+        <path class="ql-hidden-plus-vertical" d="M12 5v14"/>
+      </svg>
+    </summary>
+    <div class="ql-hidden-group-body">
+      <div class="ql-hidden-actions">
         {% if not is_upgrade and not is_downsample %}
-        <a href="/?kind=artist&q={{ g.artist | urlencode }}" class="btn btn-outline btn-sm sm:btn-xs">Search artist</a>
+        <a href="/?kind=artist&q={{ g.artist | urlencode }}" class="ql-btn ql-btn-secondary ql-btn-sm">Search artist</a>
         {% endif %}
         <form action="{{ restore_action }}" method="post">
           <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
           <input type="hidden" name="artist" value="{{ g.artist }}">
-          <button type="submit" class="btn btn-outline btn-sm sm:btn-xs"
+          <button type="submit" class="ql-btn ql-btn-secondary ql-btn-sm"
                   data-confirm="Restore every {{ restore_all_label }} by {{ g.artist }}?"
                   aria-label="Restore all {{ restore_all_label_plural }} by {{ g.artist }}">Restore all</button>
         </form>
       </div>
-    </div>
-    <ul class="pl-3 pt-1 space-y-0.5">
+      <ul class="ql-hidden-list">
       {% for a in g.albums %}
-      <li class="flex items-center gap-2 text-xs">
-        <span class="text-base-content/60 flex-1 min-w-0 truncate">{{ a.title }}{% if a.year %} <span class="text-base-content/40">({{ a.year }})</span>{% endif %}</span>
-        <form action="{{ restore_action }}" method="post" class="shrink-0">
+      <li class="ql-hidden-item">
+        <span class="ql-hidden-title">{{ a.title }}{% if a.year %} <span>({{ a.year }})</span>{% endif %}</span>
+        <form action="{{ restore_action }}" method="post" class="ql-hidden-restore">
           <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
           <input type="hidden" name="fingerprint" value="{{ a.fp }}">
-          <button type="submit" class="btn btn-outline btn-sm sm:btn-xs"
+          <button type="submit" class="ql-btn ql-btn-secondary ql-btn-sm"
                   aria-label="Restore {{ a.title }} by {{ g.artist }}">Restore</button>
         </form>
       </li>
       {% endfor %}
-    </ul>
-  </div>
+      </ul>
+    </div>
+  </details>
   {% endfor %}
 </div>
 {% else %}
-<div class="ql-empty-state text-base-content/60">
-  <p class="text-base font-semibold text-base-content/75">{% if is_downsample %}No hi-res albums kept.{% elif is_upgrade %}No dismissed upgrades.{% else %}No dismissed albums or gaps.{% endif %}</p>
-  <p class="mx-auto mt-1 max-w-md text-sm">{% if is_downsample %}Albums you keep hi-res appear here so you can downsample them later.{% elif is_upgrade %}Dismissed upgrades appear here so you can restore them.{% else %}Dismissed albums and track gaps appear here so you can restore them.{% endif %}</p>
-  <a href="{{ back_url }}" class="btn btn-primary w-full sm:w-auto mt-4">Go to {{ back_label }}</a>
+<div class="ql-empty-state ql-empty-state--hidden">
+  <span class="ql-state-icon" aria-hidden="true">
+    <svg viewBox="0 0 24 24">
+      <path d="M5 6.5h14"/>
+      <path d="M7 12h10"/>
+      <path d="M9.5 17.5h5"/>
+    </svg>
+  </span>
+  <p class="ql-empty-title">{% if is_downsample %}No hi-res albums kept.{% elif is_upgrade %}No dismissed upgrades.{% else %}No dismissed albums or Gap Fill.{% endif %}</p>
+  <p class="ql-empty-text">{% if is_downsample %}Albums you keep hi-res appear here so you can downsample them later.{% elif is_upgrade %}Dismissed upgrades appear here so you can restore them.{% else %}Dismissed albums and Gap Fill candidates appear here so you can restore them.{% endif %}</p>
+  <a href="{{ back_url }}" class="ql-btn ql-btn-primary w-full sm:w-auto mt-4">Go to {{ back_label }}</a>
 </div>
 {% endif %}
 
+</div>
 {% endblock %}

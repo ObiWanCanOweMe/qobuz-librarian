@@ -1,34 +1,34 @@
 {% import "_job_labels.html" as labels %}
 
-<div id="job-content" data-job-id="{{ job.id }}"
+<div id="job-content" class="ql-job-shell" data-job-id="{{ job.id }}"
   data-job-kind="{{ job.execute_kind }}"
   data-progress-item-singular="{{ labels.progress_item_singular(job) }}"
   data-progress-item-plural="{{ labels.progress_item_plural(job) }}"
   {%- if job.status.value == 'awaiting_review' %} data-job-view="review"
   {%- elif job.status.value in ('pending', 'scanning', 'running') %} data-job-view="progress"{% endif %}>
-  <div class="mb-6 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
-    <div class="order-2 min-w-0 sm:order-1">
-      <h1 class="break-words text-xl font-bold leading-snug sm:text-2xl sm:leading-tight">{% if job.artist %}{{ job.artist }} — {% endif %}{{ job.title }}</h1>
-      <p class="mt-1 text-xs text-base-content/40">Job {{ job.id }}</p>
+  <header class="ql-page-header ql-page-header--actions ql-job-header">
+    <div class="ql-job-heading">
+      <h1 class="ql-job-title">{% if job.artist %}{{ job.artist }} — {% endif %}{{ job.title }}</h1>
+      <p class="ql-job-id">Job {{ job.id }}</p>
     </div>
-    <span id="job-status-badge" class="ql-status-chip ql-job-status order-1 shrink-0 self-start sm:order-2 sm:mt-1
+    <span id="job-status-badge" class="ql-status-chip ql-job-status
       {%- if job.status.value == 'done' %} is-success
       {%- elif job.status.value == 'failed' %} is-error
       {%- elif job.status.value == 'canceled' %} is-neutral
       {%- elif job.status.value == 'awaiting_review' %} is-info
       {%- elif job.status.value == 'running' %} is-active
       {%- else %} is-warning{% endif %}">{% if job.status.value == 'running' %}{{ labels.job_activity(job) }}{% else %}{{ {'done': 'Done', 'failed': 'Failed', 'canceled': 'Cancelled', 'awaiting_review': 'Needs review', 'scanning': 'Scanning', 'pending': 'Queued'}.get(job.status.value, job.status.value.replace('_', ' ')) }}{% endif %}</span>
-  </div>
+  </header>
 
   {% if job.execute_kind == 'repair' %}
   {% set _st = job.status.value %}
   {% set _ph = 'scan' if _st in ('pending','scanning') else ('review' if _st == 'awaiting_review' else ('repair' if _st == 'running' else ('done' if _st == 'done' else 'failed'))) %}
-  <div class="flex items-center gap-2 mb-5 text-xs font-medium select-none" aria-label="Repair phase: {{ _ph }}">
+  <div class="ql-repair-phase" aria-label="Repair phase: {{ _ph }}">
     {% for key, label in [('scan','Scan'), ('review','Review'), ('repair','Repair')] %}
     {% set _done = (key == 'scan' and _ph in ('scan','review','repair','done','failed')) or (key == 'review' and _ph in ('review','repair','done','failed')) or (key == 'repair' and _ph in ('repair','done')) %}
-    <span{% if key == _ph %} aria-current="step"{% endif %} class="grid place-items-center h-6 w-6 rounded-full shrink-0 {{ 'bg-primary text-primary-content' if _done else 'bg-base-300 text-base-content/50' }}">{{ loop.index }}</span>
-    <span class="{{ 'text-base-content' if _done else 'text-base-content/40' }}">{{ label }}</span>
-    {% if not loop.last %}<span class="flex-1 h-px min-w-[1rem] {{ 'bg-primary/40' if _done else 'bg-base-300' }}"></span>{% endif %}
+    <span{% if key == _ph %} aria-current="step"{% endif %} class="ql-repair-phase-number{% if _done %} is-done{% endif %}">{{ loop.index }}</span>
+    <span class="ql-repair-phase-label{% if _done %} is-done{% endif %}">{{ label }}</span>
+    {% if not loop.last %}<span class="ql-repair-phase-line{% if _done %} is-done{% endif %}"></span>{% endif %}
     {% endfor %}
   </div>
   {% endif %}
@@ -41,19 +41,16 @@
 
   {% if s == 'awaiting_review' %}
     {% if job.summary %}
-    <div class="ql-job-summary mb-4"><span class="break-words">{{ job.summary }}</span></div>
+    <div class="ql-job-summary ql-job-summary--review"><span>{{ job.summary }}</span></div>
     {% endif %}
 
     <form id="review-form" action="/jobs/{{ job.id }}/approve" method="post"
           data-job-id="{{ job.id }}" data-review-kind="{{ job.execute_kind }}">
       <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
       {% include "_review_candidates.html" %}
-      <div class="sticky bottom-0 z-20 -mx-4 mt-4
-                  border-t border-base-300 bg-base-100/95 px-4 py-3
-                  supports-[backdrop-filter]:bg-base-100/75 supports-[backdrop-filter]:backdrop-blur"
-           style="padding-bottom:max(0.75rem,env(safe-area-inset-bottom))">
-        <div class="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
-          <button type="submit" id="review-submit" class="btn btn-primary w-full sm:w-auto"
+      <div class="ql-review-footer">
+        <div class="ql-review-footer-actions">
+          <button type="submit" id="review-submit" class="ql-btn ql-btn-primary ql-review-footer-primary"
             data-review-verb="{{ job.review_verb }}"
             data-empty-label="{{ labels.review_empty_label(job) }}"
             {% if not review_counts.selected %} disabled{% endif %}
@@ -63,7 +60,7 @@
           {% if job.execute_kind in ('library', 'upgrade', 'new_releases', 'downsample') %}
           {% set _dismiss_rest_label = 'Keep hi-res' if job.execute_kind == 'downsample' else 'Dismiss unselected' %}
           <button type="button" id="review-dismiss-rest"
-                  class="btn btn-outline btn-sm w-full sm:w-auto{% if review_counts.selected >= review_counts.total %} hidden{% endif %}">{{ _dismiss_rest_label }} ({{ review_counts.total - review_counts.selected }})</button>
+                  class="ql-btn ql-btn-secondary ql-btn-sm ql-review-footer-secondary{% if review_counts.selected >= review_counts.total %} hidden{% endif %}">{{ _dismiss_rest_label }} ({{ review_counts.total - review_counts.selected }})</button>
           {% endif %}
           {% set _result_count = review_counts.total %}
           {% if job.execute_kind == 'migration' %}
@@ -71,10 +68,10 @@
           {% else %}
             {% set _discard_confirm = 'Discard this ' ~ _review_thing ~ '? No files will change. Run the scan again to see these results later.' %}
           {% endif %}
-          <div class="flex items-center justify-between gap-2 sm:contents">
-            <a href="{{ _back_href }}" class="btn btn-outline btn-sm sm:w-auto">{{ _back_label }}</a>
+          <div class="ql-review-footer-secondary-group">
+            <a href="{{ _back_href }}" class="ql-btn ql-btn-secondary ql-btn-sm">{{ _back_label }}</a>
             <button type="submit" formaction="/jobs/{{ job.id }}/cancel"
-                    class="btn btn-outline btn-error btn-sm sm:w-auto"
+                    class="ql-btn ql-btn-danger ql-btn-sm"
                     data-confirm="{{ _discard_confirm }}">Discard {{ _review_thing }}</button>
           </div>
         </div>
@@ -82,67 +79,67 @@
     </form>
 
     {% if job.log_lines %}
-    <div class="divider text-base-content/30 text-xs">Activity log</div>
-    <div class="log-console" style="max-height:min(40vh,600px)">
+    <div class="ql-section-divider">Activity log</div>
+    <div class="log-console log-console--review">
       {%- for line in job.log_lines %}{{ line }}
 {% endfor -%}
     </div>
     {% endif %}
 
   {% elif s in ('pending', 'scanning', 'running') %}
-    <div class="flex items-center justify-between mb-3">
-      <p class="text-base-content/60">
+    <div class="ql-job-progress-head">
+      <p class="ql-job-activity-line">
         <span id="job-activity" aria-live="polite">{% if s == 'scanning' %}{{ job.progress_phase or 'Scanning' }}{% elif s == 'running' %}{{ job.progress_phase or labels.job_activity(job) }}{% else %}Queued{% endif %}</span>
-        <span id="scan-elapsed" class="text-sm text-base-content/40 tabular-nums ml-2" data-start="{{ job.started_at or job.created_at }}" data-now="{{ now_ts() }}"></span>
-        {% if job.cancel_requested %}<span class="badge badge-ghost badge-sm ml-2">stopping</span>{% endif %}
-        <span id="sse-reconnect" class="badge badge-warning badge-sm ml-2 hidden" role="status" aria-live="polite">connection lost, reconnecting…</span>
+        <span id="scan-elapsed" class="ql-job-elapsed readout" data-start="{{ job.started_at or job.created_at }}" data-now="{{ now_ts() }}"></span>
+        {% if job.cancel_requested %}<span class="ql-status-chip is-neutral ql-inline-status">stopping</span>{% endif %}
+        <span id="sse-reconnect" class="ql-status-chip is-warning ql-inline-status hidden" role="status" aria-live="polite">connection lost, reconnecting…</span>
       </p>
       {% if not job.cancel_requested %}
-      <form action="/jobs/{{ job.id }}/cancel" method="post">
+      <form action="/jobs/{{ job.id }}/cancel" method="post" class="ql-job-cancel">
         <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
         {% set _pending = s == 'pending' %}
-        <button type="submit" class="btn btn-sm btn-outline{% if _pending %} ql-secondary-action{% else %} btn-error{% endif %}"
+        <button type="submit" class="ql-btn ql-btn-sm{% if _pending %} ql-btn-secondary ql-secondary-action{% else %} ql-btn-danger{% endif %}"
                 data-confirm="{% if _pending %}Remove this waiting job from the queue?{% else %}Cancel this job? It will stop after the current safe step.{% endif %}">{% if _pending %}Remove{% else %}Cancel{% endif %}</button>
       </form>
       {% endif %}
     </div>
 
     {% if s == 'pending' and queue_wait is defined and queue_wait %}
-    <div class="ql-job-summary mb-3 flex items-start gap-3 text-sm" id="queue-wait-note">
-      <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0 text-base-content/50" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+    <div class="ql-job-wait-note" id="queue-wait-note">
+      <svg xmlns="http://www.w3.org/2000/svg" class="ql-job-wait-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
       </svg>
       <span>Waiting for “{{ queue_wait.ahead_title }}” to finish{% if queue_wait.position > 1 %} ({{ queue_wait.position }} ahead of yours){% endif %}. Starts automatically.</span>
     </div>
     {% endif %}
 
-    <div id="progress-card" class="ql-progress-panel mb-3 hidden">
+    <div id="progress-card" class="ql-progress-panel ql-progress-panel--job hidden">
       <div>
-        <div class="flex items-baseline justify-between gap-3 mb-2">
-          <span id="prog-label" class="font-medium"></span>
-          <span id="prog-count" class="text-sm text-base-content/50 shrink-0 tabular-nums"></span>
+        <div class="ql-progress-panel-head">
+          <span id="prog-label" class="ql-progress-label"></span>
+          <span id="prog-count" class="ql-progress-count readout"></span>
         </div>
-        <progress id="prog-bar" class="progress progress-primary w-full" aria-labelledby="prog-label"></progress>
-        <p id="prog-item" class="text-xs text-base-content/50 mt-2 truncate"></p>
+        <progress id="prog-bar" class="ql-progress-bar" aria-labelledby="prog-label"></progress>
+        <p id="prog-item" class="ql-progress-item"></p>
       </div>
     </div>
 
     {% if s == 'scanning' and job.execute_kind in ('library', 'upgrade', 'downsample', 'new_releases') %}
-    <p id="scan-found" class="text-sm text-base-content/60 mb-3" aria-live="polite"></p>
+    <p id="scan-found" class="ql-scan-found" aria-live="polite"></p>
     {% endif %}
 
-    <details class="mt-3">
+    <details class="ql-job-log-details">
       <summary class="ql-disclosure-summary">Activity log</summary>
-      <div class="log-console mt-2" id="log"></div>
+      <div class="log-console log-console--job" id="log"></div>
     </details>
   {% else %}
     {% if job.finished_at %}
-    <p class="text-sm text-base-content/40 mb-3">Finished {{ fmt_clock(job.finished_at) }}{% if job.started_at %} · took {{ fmt_elapsed(job.finished_at - job.started_at) }}{% endif %}</p>
+    <p class="ql-job-finished">Finished {{ fmt_clock(job.finished_at) }}{% if job.started_at %} · took {{ fmt_elapsed(job.finished_at - job.started_at) }}{% endif %}</p>
     {% endif %}
     {% if job.error %}
-    <div class="alert alert-error mb-4"><span class="break-words whitespace-pre-wrap">{{ job.error }}</span></div>
+    <div class="ql-notice ql-notice-error ql-job-error"><span>{{ job.error }}</span></div>
     {% elif job.summary %}
-    <div class="ql-job-summary mb-4"><span class="break-words">{{ job.summary }}</span></div>
+    <div class="ql-job-summary ql-job-summary--terminal"><span>{{ job.summary }}</span></div>
     {% endif %}
     {% if job.log_lines %}
     <div class="log-console">
@@ -150,13 +147,13 @@
 {% endfor -%}
     </div>
     {% else %}
-    <p class="text-sm text-base-content/40">No log output was retained for this job.</p>
+    <p class="ql-job-muted">No log output was retained for this job.</p>
     {% endif %}
-    <div class="mt-4 flex gap-2">
+    <div class="ql-job-actions">
       {% if not _historical and s == 'failed' and job.album_id %}
       <form action="/jobs/{{ job.id }}/retry" method="post">
         <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-        <button type="submit" class="btn btn-primary btn-sm">Retry</button>
+        <button type="submit" class="ql-btn ql-btn-primary ql-btn-sm">Retry</button>
       </form>
       {% endif %}
       {% if not _historical and s == 'done' and job.single and job.single.get('dir') and not job.single.get('removed') %}
@@ -164,10 +161,10 @@
             hx-post="/jobs/{{ job.id }}/undo" hx-target="#job-content" hx-swap="outerHTML"
             data-confirm="Remove the downloaded track and undo the single?">
         <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-        <button type="submit" class="btn btn-sm btn-outline btn-warning">Undo (removes track)</button>
+        <button type="submit" class="ql-btn ql-btn-danger ql-btn-sm">Undo (removes track)</button>
       </form>
       {% endif %}
-      <a href="{{ _back_href }}" class="btn btn-sm btn-outline ql-secondary-action">{{ _back_label }}</a>
+      <a href="{{ _back_href }}" class="ql-btn ql-btn-secondary ql-btn-sm ql-secondary-action">{{ _back_label }}</a>
     </div>
   {% endif %}
 </div>

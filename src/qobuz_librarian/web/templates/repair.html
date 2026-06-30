@@ -3,72 +3,56 @@
 {% block content_max %}max-w-5xl{% endblock %}
 {% block content %}
 
-{% if not qobuz_ready %}
-<section class="ql-tool-panel mx-auto max-w-3xl">
-  <div class="ql-tool-panel-body">
-    <div class="mb-5">
-      <div class="mb-2 flex items-center justify-between gap-3">
-        <h1 class="text-2xl font-bold">Repair</h1>
-        <a href="/repair/history" class="btn btn-outline btn-sm ql-secondary-action shrink-0">View history</a>
-      </div>
-      <p class="text-base-content/65">
-        Find damaged or truncated FLACs and review verified repair options.
-      </p>
+<div class="ql-tool-page">
+  <header class="ql-page-header ql-page-header--actions">
+    <div>
+      <h1>Repair</h1>
+      <p>Find damaged or truncated FLACs and review verified repair options.</p>
     </div>
-    {% with connect_embedded=True %}
-      {% include "_connect_cta.html" %}
-    {% endwith %}
-  </div>
+    <a href="/repair/history" class="ql-btn ql-btn-secondary ql-btn-sm ql-secondary-action ql-page-action">View history</a>
+  </header>
+
+{% if not qobuz_ready %}
+<section class="ql-work-card">
+  {% with connect_embedded=True %}
+    {% include "_connect_cta.html" %}
+  {% endwith %}
 </section>
 {% elif not repair_job %}
-<section class="ql-tool-panel mx-auto max-w-3xl">
-  <div class="ql-tool-panel-body">
-    <div class="mb-5">
-      <div class="mb-2 flex items-center justify-between gap-3">
-        <h1 class="text-2xl font-bold">Repair</h1>
-        <a href="/repair/history" class="btn btn-outline btn-sm ql-secondary-action shrink-0">View history</a>
-      </div>
-      <p class="text-base-content/65">
-        Find damaged or truncated FLACs and review verified repair options.
-      </p>
-    </div>
-
-    <div class="ql-tool-status mb-5">
-      <span>
-        {% if last_run %}Last repair scan {{ last_run }}.{% else %}No repair scan has finished yet.{% endif %}
-      </span>
-    </div>
-
-    {% if repair_resume %}
-    <div class="ql-tool-note ql-tool-note-info mb-5">
-      <p class="font-semibold">Scan can resume</p>
-      <p>A repair scan was interrupted. {{ repair_resume.done }} artist{{ 's' if repair_resume.done != 1 }} already checked{% if repair_resume.found %}, {{ repair_resume.found }} repair option{{ 's' if repair_resume.found != 1 }} found{% endif %}. Starting it again continues from there.</p>
-    </div>
-    {% endif %}
-
-    <form action="/repair" method="post" data-busy-submit>
-      <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-      <button type="submit" class="btn btn-primary w-full sm:w-auto"
-              {% if repair_resume %}data-confirm="Continue the repair scan from where it left off?"{% else %}data-confirm="Start a full repair scan? This can take a while on a large library."{% endif %}>{% if repair_resume %}Resume scan{% else %}Start repair scan{% endif %}</button>
-    </form>
-  </div>
-</section>
-{% else %}
-<div class="mb-4">
-  <div class="mb-2 flex items-center justify-between gap-3">
-    <h1 class="text-2xl font-bold">Repair</h1>
-    <a href="/repair/history" class="btn btn-outline btn-sm ql-secondary-action shrink-0">View history</a>
-  </div>
-  <p class="text-base-content/65">
-    Find damaged or truncated FLACs and review verified repair options.
-  </p>
+<div class="ql-work-status">
+  <span class="ql-status-chip {% if repair_resume %}is-warning{% else %}is-neutral{% endif %}">
+    {% if repair_resume %}Resume available{% else %}Ready to scan{% endif %}
+  </span>
+  <span>
+    {% if last_run %}Last repair scan {{ last_run }}.{% else %}No repair scan has finished yet.{% endif %}
+  </span>
 </div>
 
+{% if repair_resume %}
+<div class="ql-tool-note ql-tool-note-info">
+  <p class="ql-tool-note-title">Scan can resume</p>
+  <p>A repair scan was interrupted. {{ repair_resume.done }} artist{{ 's' if repair_resume.done != 1 }} already checked{% if repair_resume.found %}, {{ repair_resume.found }} repair option{{ 's' if repair_resume.found != 1 }} found{% endif %}. Starting it again continues from there.</p>
+</div>
+{% endif %}
+
+<section class="ql-work-card ql-work-card-primary">
+  <div class="ql-work-card-copy">
+    <p class="ql-work-card-title">{% if repair_resume %}Resume repair scan{% else %}Scan for damaged files{% endif %}</p>
+    <p class="ql-work-card-text">Nothing is replaced until you review and approve a verified repair.</p>
+  </div>
+  <form action="/repair" method="post" data-busy-submit>
+    <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+    <button type="submit" class="ql-btn ql-btn-primary w-full sm:w-auto"
+            {% if repair_resume %}data-confirm="Continue the repair scan from where it left off?"{% else %}data-confirm="Start a full repair scan? This can take a while on a large library."{% endif %}>{% if repair_resume %}Resume scan{% else %}Start repair scan{% endif %}</button>
+  </form>
+</section>
+{% else %}
 {% if qobuz_ready %}
 {% if repair_job %}
 {% with job = repair_job %}{% include "_job_body.html" %}{% endwith %}
 {% endif %}
 {% endif %}
 {% endif %}
+</div>
 
 {% endblock %}

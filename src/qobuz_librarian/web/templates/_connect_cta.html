@@ -1,20 +1,20 @@
 {% set _embedded = connect_embedded | default(false) %}
-<div class="{{ 'ql-connect-inline' if _embedded else 'ql-connect-cta mt-5' }}">
+<div class="{{ 'ql-connect-inline' if _embedded else 'ql-connect-cta' }}">
   {% if creds_ok %}
-  <div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-    <div class="min-w-0">
-      <h2 class="text-xl font-semibold">Reconnect Qobuz</h2>
-      <p class="mt-2 max-w-xl text-base-content/60">Your saved token was rejected. Reconnect in Settings to use Search, Library, Upgrade, and Repair.</p>
+  <div class="ql-connect-layout">
+    <div class="ql-connect-copy">
+      <h2 class="ql-connect-title">Reconnect Qobuz</h2>
+      <p class="ql-connect-text">Your saved token was rejected. Reconnect in Settings to use Search, Library, Upgrade, and Repair.</p>
     </div>
-    <a href="/settings" class="btn btn-primary w-full shrink-0 sm:w-auto">Reconnect Qobuz</a>
+    <a href="/settings" class="ql-btn ql-btn-primary ql-connect-action">Reconnect Qobuz</a>
   </div>
   {% else %}
-  <div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-    <div class="min-w-0">
-      <h2 class="text-xl font-semibold">Connect your Qobuz account</h2>
-      <p class="mt-2 max-w-xl text-base-content/60">Add your Qobuz token and email or user ID in Settings to use Search, Library, Upgrade, and Repair.</p>
+  <div class="ql-connect-layout">
+    <div class="ql-connect-copy">
+      <h2 class="ql-connect-title">Connect your Qobuz account</h2>
+      <p class="ql-connect-text">Add your Qobuz token and email or user ID in Settings to use Search, Library, Upgrade, and Repair.</p>
     </div>
-    <a href="/settings" class="btn btn-primary w-full shrink-0 sm:w-auto">Connect Qobuz</a>
+    <a href="/settings" class="ql-btn ql-btn-primary ql-connect-action">Connect Qobuz</a>
   </div>
   {% endif %}
 </div>

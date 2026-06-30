@@ -526,7 +526,7 @@ def scan_library(job, token, partial_only=False, force_full=False):
         )
     elif not cfg.UPGRADE_SCAN_ENABLED:
         review_badges.set_ready("upgrade", False)
-    target = "track gaps in owned albums" if partial_only else "missing albums"
+    target = "Gap Fill candidates in owned albums" if partial_only else "missing albums"
     log.info(f"Scanning {plural(len(artists), 'library artist')} for {target}")
     fingerprints = {ad.name: artist_fingerprint(ad) for ad in artists}
     previous_artists = (previous_scan.get("artists") or {}) if cheap_refresh else {}
@@ -677,7 +677,7 @@ def scan_library(job, token, partial_only=False, force_full=False):
             job.push_progress("Scanning library", done, n, artist_name or name,
                               found=total, hit=hit, unit="artist")
             if gaps:
-                tail = "with gaps" if partial_only else "to fill"
+                tail = "with Gap Fill candidates" if partial_only else "to fill"
                 log.info(f"  {artist_name} — {plural(len(gaps), 'album')} {tail}")
             since_save += 1
             if since_save >= _CHECKPOINT_EVERY:
@@ -742,9 +742,9 @@ def scan_library(job, token, partial_only=False, force_full=False):
         job.summary = (f"Stopped early. {plural(total, 'album')} found so far."
                        if total else "Stopped before anything turned up.")
     elif partial_only:
-        job.summary = (f"{plural(total, 'album')} with track gaps across the library."
+        job.summary = (f"{plural(total, 'album')} with Gap Fill candidates across the library."
                        + _cap_note(job)
-                       if total else "No track gaps found in your owned albums.")
+                       if total else "No Gap Fill candidates found in your owned albums.")
     else:
         job.summary = (f"{plural(total, 'missing album')} across the library."
                        + _cap_note(job)

@@ -750,8 +750,8 @@ def test_lock_busy_refuses_destructive_routes(monkeypatch):
             assert "Another Qobuz Librarian run is active." in r.text
             assert "pid 4321" not in r.text
             assert "run-lock" not in r.text
-            assert 'class="btn btn-primary w-full sm:w-auto">Try again</button>' in r.text
-            assert 'class="btn btn-ghost w-full sm:w-auto">Back to dashboard</a>' in r.text
+            assert 'class="ql-btn ql-btn-primary w-full sm:w-auto">Try again</button>' in r.text
+            assert 'class="ql-btn ql-btn-ghost w-full sm:w-auto">Back to dashboard</a>' in r.text
 
 
 def test_error_page_action_is_mobile_friendly(client):
@@ -759,7 +759,7 @@ def test_error_page_action_is_mobile_friendly(client):
 
     assert r.status_code == 404
     assert "Page not found" in r.text
-    assert 'href="/" class="btn btn-primary w-full sm:w-auto"' in r.text
+    assert 'href="/" class="ql-btn ql-btn-primary w-full sm:w-auto"' in r.text
 
 
 def test_scan_action_buttons_are_mobile_friendly(client, monkeypatch):
@@ -784,7 +784,7 @@ def test_scan_action_buttons_are_mobile_friendly(client, monkeypatch):
     for path in ("/library", "/downsample", "/repair", "/lyrics"):
         r = client.get(path)
         assert r.status_code == 200
-        assert 'class="btn btn-primary w-full sm:w-auto"' in r.text
+        assert 'class="ql-btn ql-btn-primary w-full sm:w-auto"' in r.text
 
 
 def test_primary_nav_matches_webui_blueprint(client, monkeypatch):
@@ -874,7 +874,7 @@ def test_search_page_does_not_show_empty_dashboard_cards(client, monkeypatch):
 
     assert r.status_code == 200
     assert "<h1>Search</h1>" in r.text
-    assert "Search Qobuz" in r.text
+    assert 'class="ql-search-form"' in r.text
     assert "Needs review" not in r.text
     assert "Running and queued" not in r.text
     assert "Recent downloads" not in r.text
@@ -898,9 +898,9 @@ def test_search_page_does_not_render_review_jobs_as_front_page_cards(
         r = client.get("/")
 
         assert r.status_code == 200
-        assert "Search Qobuz" in r.text
+        assert 'class="ql-search-form"' in r.text
         assert "Library scan" not in r.text
-        assert "1 missing album or track gap found." not in r.text
+        assert "1 missing album or Gap Fill candidate found." not in r.text
         assert f'href="/jobs/{job.id}"' not in r.text
     finally:
         _remove_job(job)
@@ -1005,7 +1005,7 @@ def test_upgrade_page_reviews_saved_baseline_candidates(client, monkeypatch):
     r = client.get("/upgrade")
 
     assert r.status_code == 200
-    assert "Upgrade candidates" in r.text
+    assert "Review albums the Library refresh found" in r.text
     assert "1 upgrade candidate" in r.text
     assert 'action="/upgrade/review"' in r.text
     assert "Review candidates" in r.text
@@ -1346,7 +1346,7 @@ def test_downsample_page_reviews_saved_shared_candidates(client, monkeypatch):
     r = client.get("/downsample")
 
     assert r.status_code == 200
-    assert "Downsample candidates" in r.text
+    assert "Review local hi-res FLAC albums" in r.text
     assert "1 album can be downsampled" in r.text
     assert 'action="/downsample/review"' in r.text
     assert "Review candidates" in r.text
@@ -1658,7 +1658,7 @@ def test_dashboard_first_run_offers_baseline_scan_with_skip(client, monkeypatch)
 
     assert r.status_code == 200
     assert "Scan library" in r.text
-    assert "Scan once to refresh missing albums, track gaps, upgrades, and downsample candidates." in r.text
+    assert "Scan once to refresh missing albums, Gap Fill candidates, upgrades, and downsample candidates." in r.text
     assert 'action="/library/skip-setup"' in r.text and "Not now" in r.text
     # It's an offer, not an auto-started scan.
     assert "Your baseline scan is running" not in r.text
@@ -1774,8 +1774,8 @@ def test_queue_empty_state_has_clear_actions(client):
     assert r.status_code == 200
     assert "Queue is empty." in r.text
     assert "Downloads, scans, and reviews appear here" in r.text
-    assert 'href="/" class="btn btn-primary w-full sm:w-auto"' in r.text
-    assert 'href="/queue/history" class="btn btn-outline w-full sm:w-auto"' in r.text
+    assert 'href="/" class="ql-btn ql-btn-primary w-full sm:w-auto"' in r.text
+    assert 'href="/queue/history" class="ql-btn ql-btn-secondary w-full sm:w-auto"' in r.text
 
 
 def test_queue_job_actions_use_clear_labels(client):
@@ -1803,7 +1803,7 @@ def test_queue_job_actions_use_clear_labels(client):
         assert ">Clear queue and reviews</button>" in r.text
         assert "Queued jobs are removed, reviews are discarded" in r.text
         assert "Starts automatically after the current job finishes." in r.text
-        assert "1 missing album or track gap found." in r.text
+        assert "1 missing album or Gap Fill candidate found." in r.text
         assert "1 album can be downsampled." in r.text
         assert "Migration preview ready." in r.text
         assert "hi-res album to review" not in r.text
@@ -1819,7 +1819,8 @@ def test_queue_job_actions_use_clear_labels(client):
         assert "No files will change. Run the scan again to see these results later." in r.text
         assert ">×</button>" not in r.text
         assert "loading loading-spinner" not in r.text
-        assert "btn-outline" in r.text
+        assert "ql-btn-secondary" in r.text
+        assert "btn-outline" not in r.text
     finally:
         _remove_job(queued)
         _remove_job(running)
@@ -1834,7 +1835,7 @@ def test_history_empty_state_has_clear_action(client):
     assert r.status_code == 200
     assert "No finished jobs yet." in r.text
     assert "Completed downloads, scans, and reviews appear here." in r.text
-    assert 'href="/queue" class="btn btn-outline w-full sm:w-auto"' in r.text
+    assert 'href="/queue" class="ql-btn ql-btn-secondary w-full sm:w-auto"' in r.text
 
 
 def test_history_retry_only_shows_for_live_failed_download(client, monkeypatch):
@@ -1897,8 +1898,8 @@ def test_hidden_empty_state_has_mobile_friendly_action(client):
     r = client.get("/library/hidden")
 
     assert r.status_code == 200
-    assert "No dismissed albums or gaps." in r.text
-    assert 'href="/library" class="btn btn-primary w-full sm:w-auto mt-4"' in r.text
+    assert "No dismissed albums or Gap Fill." in r.text
+    assert 'href="/library" class="ql-btn ql-btn-primary w-full sm:w-auto mt-4"' in r.text
 
 
 def test_repair_history_empty_state_has_mobile_friendly_action(client):
@@ -1906,7 +1907,7 @@ def test_repair_history_empty_state_has_mobile_friendly_action(client):
 
     assert r.status_code == 200
     assert "Nothing repaired yet." in r.text
-    assert 'href="/repair" class="btn btn-primary w-full sm:w-auto mt-4"' in r.text
+    assert 'href="/repair" class="ql-btn ql-btn-primary w-full sm:w-auto mt-4"' in r.text
 
 
 # ── per-job cancel button on queue page ───────────────────────────────
@@ -1951,7 +1952,7 @@ def test_dashboard_active_non_download_job_uses_neutral_wording(client, monkeypa
 
 def test_library_hide_then_restore_round_trip(client, monkeypatch, tmp_path):
     """Dismissing an artist from a library review writes the durable store and
-    drops those candidates; the Dismissed albums/gaps view then restores them."""
+    drops those candidates; the Dismissed albums and Gap Fill view then restores them."""
     from qobuz_librarian.library import hidden
     monkeypatch.setattr("qobuz_librarian.config.HIDDEN_FILE", tmp_path / "h.json")
 
@@ -2002,7 +2003,7 @@ def test_review_zero_selection_has_clear_disabled_action(client):
     try:
         r = client.get(f"/jobs/{job.id}")
         assert r.status_code == 200
-        assert "Select albums or gaps to download" in r.text
+        assert "Select missing albums or Gap Fill candidates to download" in r.text
         assert "Download 1 selected" not in r.text
     finally:
         _remove_job(job)
@@ -2060,7 +2061,7 @@ def test_review_footer_renders_all_actions(client):
         assert "Download 1 selected" in r.text
         assert 'id="review-dismiss-rest"' in r.text
         assert "Dismiss unselected (1)" in r.text
-        assert "Dismissed albums and gaps" in r.text
+        assert "Dismissed albums and Gap Fill" in r.text
         assert ">Back to queue</a>" in r.text
         assert ">Discard library review</button>" in r.text
         assert 'href="/library/hidden"' in r.text
@@ -2373,11 +2374,11 @@ def test_settings_primary_actions_are_mobile_friendly(client, monkeypatch):
     r = client.get("/settings")
 
     assert r.status_code == 200
-    assert 'class="input input-bordered w-full pr-12 font-mono text-base sm:text-sm"' in r.text
+    assert 'class="ql-input pr-12 font-mono text-base sm:text-sm"' in r.text
     assert 'data-toggle-password="auth_token"' in r.text
-    assert 'class="btn btn-primary w-full sm:w-auto">Save &amp; connect</button>' in r.text
+    assert 'class="ql-btn ql-btn-primary w-full sm:w-auto">Save &amp; connect</button>' in r.text
     assert "Switch to terminal mode" in r.text
-    assert 'class="btn btn-primary w-full sm:w-auto">Save behaviour</button>' in r.text
+    assert 'class="ql-btn ql-btn-primary w-full sm:w-auto">Save behaviour</button>' in r.text
     assert "CLI command" in r.text
     assert "CLI entrypoint" not in r.text
     assert "Paths currently in use" in r.text
@@ -2449,7 +2450,7 @@ def test_login_form_password_row_is_mobile_safe(monkeypatch, tmp_path):
         r = c.get("/login")
 
     assert r.status_code == 200
-    assert 'class="input input-bordered w-full pr-12"' in r.text
+    assert 'class="ql-input pr-12"' in r.text
     assert r.text.count('class="ql-secret-toggle"') == 1
 
 
@@ -2458,7 +2459,7 @@ def test_setup_form_password_rows_are_mobile_safe(monkeypatch, tmp_path):
         r = c.get("/setup")
 
     assert r.status_code == 200
-    assert r.text.count('class="input input-bordered w-full pr-12"') == 2
+    assert r.text.count('class="ql-input pr-12"') == 2
     assert r.text.count('class="ql-secret-toggle"') == 2
 
 
@@ -2570,7 +2571,7 @@ def test_migrate_preview_action_is_mobile_friendly(client, monkeypatch, tmp_path
     r = client.get("/migrate")
 
     assert r.status_code == 200
-    assert 'class="btn btn-primary w-full sm:w-auto">Preview migration</button>' in r.text
+    assert 'class="ql-btn ql-btn-primary w-full sm:w-auto">Preview migration</button>' in r.text
 
 
 def test_settings_path_resolver_maps_container_paths_to_host_bind_mounts(

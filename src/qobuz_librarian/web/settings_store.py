@@ -57,7 +57,9 @@ LYRICS_PROVIDER_CHOICES = [
 # is validated against them; choices=None means any entry is accepted.
 TEXT_FIELDS = [
     ("STREAMRIP_QUALITY", "Download quality",
-     "Maximum quality to request. Qobuz serves the best it has up to this.",
+     "Maximum quality to request. If Qobuz serves less than expected, "
+     "Qobuz Librarian retries at the highest tier and keeps the saved file "
+     "aligned with this setting.",
      "enum", ["4", "3", "2"], ""),
     ("LYRICS_FORMAT", "Lyrics format",
      "How lyrics are written when fetched.",

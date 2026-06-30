@@ -4,33 +4,36 @@
 {% block content %}
 {% import "_job_labels.html" as labels %}
 
+<div class="ql-list-page ql-job-page">
+
 {% if historical %}
-<div class="ql-job-summary mb-4">
+<div class="ql-job-summary ql-job-banner">
   <span>This job is archived. The live log was not kept; status and summary are
     shown below.</span>
 </div>
 {% endif %}
 
 {% if stale %}
-<div class="alert alert-warning mb-4" data-flash>
+<div class="ql-notice ql-notice-warning ql-job-banner" data-flash>
   <span>This job is no longer awaiting review. The previous click already
     started it.</span>
 </div>
 {% endif %}
 
 {% if noselection %}
-<div class="alert alert-warning mb-4" data-flash>
+<div class="ql-notice ql-notice-warning ql-job-banner" data-flash>
   {% set _review_thing = labels.discard_review_label(job) %}
   <span>Nothing was selected. Choose at least one item, or use Discard {{ _review_thing }} to remove this review.</span>
 </div>
 {% endif %}
 
 {% if approved %}
-<div class="alert alert-success mb-4" data-flash>
+<div class="ql-notice ql-notice-success ql-job-banner" data-flash>
   <span>Queued. It'll start shortly.</span>
 </div>
 {% endif %}
 
 {% include "_job_body.html" %}
 
+</div>
 {% endblock %}

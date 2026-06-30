@@ -55,6 +55,13 @@ _CLI_MODE = False
 _TOKEN_VALID: bool | None = None
 
 
+def _ql_notice_html(kind: str, body: str) -> str:
+    return (
+        f'<div class="ql-notice ql-notice-{kind}" '
+        f'data-flash data-flash-kind="{kind}">{body}</div>'
+    )
+
+
 def _lock_busy_response(request):
     """Return a 503 response if the run-lock is busy OR a critical volume
     was unwritable at startup, else None."""
@@ -74,7 +81,7 @@ def _lock_busy_response(request):
         return None
     if _is_htmx(request):
         return HTMLResponse(
-            f'<div class="alert alert-error" data-flash>{html.escape(msg)}</div>',
+            _ql_notice_html("error", html.escape(msg)),
             status_code=200)
     return _tr(request, "lock_busy.html", {"msg": msg}, status_code=503)
 
@@ -1450,7 +1457,7 @@ def _start_library_scan(partial_only=False, force_full=False):
         if existing is not None:
             return existing
         from qobuz_librarian.web import flows
-        title = "Gap-fill scan" if partial_only else "Missing-albums scan"
+        title = "Gap Fill scan" if partial_only else "Missing-albums scan"
         job = job_mgr.Job(title=title)
         job.execute_kind = "library"
         job_mgr.submit_scan(
@@ -1608,6 +1615,36 @@ async def search_page():
     return RedirectResponse(url="/", status_code=307)
 
 
+def _qobuz_quality_bits_rate(primary: dict | None,
+                             fallback: dict | None = None) -> tuple[int, int]:
+    """Return Qobuz source quality as (bits, sample_rate_hz)."""
+    primary = primary or {}
+    fallback = fallback or {}
+    bits = primary.get("maximum_bit_depth") or fallback.get("maximum_bit_depth") or 0
+    rate = (primary.get("maximum_sampling_rate")
+            or fallback.get("maximum_sampling_rate") or 0)
+    try:
+        bits_i = int(bits)
+    except (TypeError, ValueError):
+        bits_i = 0
+    try:
+        rate_f = float(rate)
+    except (TypeError, ValueError):
+        rate_f = 0.0
+    if 0 < rate_f < 1000:
+        rate_f *= 1000
+    return bits_i, int(round(rate_f))
+
+
+def _qobuz_quality_short_label(primary: dict | None,
+                               fallback: dict | None = None) -> str:
+    bits, rate = _qobuz_quality_bits_rate(primary, fallback)
+    if not bits or not rate:
+        return ""
+    from qobuz_librarian.quality.tiers import format_quality
+    return format_quality(bits, rate)
+
+
 @app.post("/search", response_class=HTMLResponse)
 async def do_search(request: Request, q: str = Form("", max_length=500),
                     kind: str = Form("album"),
@@ -1641,7 +1678,6 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
             )
             from qobuz_librarian.cli import parse_qobuz_url
             from qobuz_librarian.library.catalog import (
-                album_quality_label,
                 album_year,
                 find_album_dir_filesystem,
             )
@@ -1802,8 +1838,7 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
                 alb = t.get("album") or {}
                 if not t.get("id") or not alb.get("id"):
                     continue
-                _tbd = (t.get("maximum_bit_depth")
-                        or alb.get("maximum_bit_depth") or 0)
+                _tbd, _tsr = _qobuz_quality_bits_rate(t, alb)
                 _timg = alb.get("image") or {}
                 _tcover = _timg.get("small") or _timg.get("thumbnail") or ""
                 _perf = (t.get("performer") or {}).get("name")
@@ -1817,8 +1852,11 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
                     "year":        album_year(alb) or "?",
                     "track_n":     t.get("track_number") or "?",
                     "total":       alb.get("tracks_count") or "?",
+                    "quality":     _qobuz_quality_short_label(t, alb),
                     "hires":       _tbd >= 24,
                     "lossy":       _tbd == 0,
+                    "bit_depth":   _tbd,
+                    "sample_rate": _tsr,
                     "cover":       _tcover if _tcover.startswith(
                         "https://static.qobuz.com/") else "",
                 })
@@ -1826,14 +1864,10 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
             for a in (raw if kind == "album" or selected_artist else []):
                 if not a.get("id"):
                     continue
-                _bd = a.get("maximum_bit_depth") or 0
+                _bd, _sr = _qobuz_quality_bits_rate(a)
                 _img = a.get("image") or {}
                 _cover = _img.get("small") or _img.get("thumbnail") or ""
-                # The Hi-Res/CD/Lossy badge beside this already names the tier,
-                # so drop the repeated descriptor and keep just the bit/rate.
-                _qual = album_quality_label(a).replace(" (hi-res)", "")
-                if _qual == "lossy":
-                    _qual = ""
+                _qual = _qobuz_quality_short_label(a)
                 results.append({
                     "id":      a.get("id"),
                     "title":   a.get("title") or "?",
@@ -1844,6 +1878,7 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
                     "hires":   _bd >= 24,
                     "lossy":   _bd == 0,
                     "bit_depth": _bd,
+                    "sample_rate": _sr,
                     "cover":   _cover if _cover.startswith(
                         "https://static.qobuz.com/") else "",
                     "owned":   False,
@@ -1936,6 +1971,7 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
                         "year": res["year"], "tracks": res["tracks"],
                         "quality": res["quality"], "hires": res["hires"],
                         "lossy": res["lossy"], "bit_depth": res["bit_depth"],
+                        "sample_rate": res["sample_rate"],
                         "cover": res["cover"],
                     })
                 for g in album_groups:
@@ -1951,7 +1987,8 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
                                 break
                     rep = eds[0]
                     for f in ("id", "year", "tracks", "quality",
-                              "hires", "lossy", "cover", "version"):
+                              "hires", "lossy", "bit_depth", "sample_rate",
+                              "cover", "version"):
                         g[f] = rep[f]
                     g["others"] = eds[1:]
         except (SystemExit, NoCredsError):
@@ -2186,10 +2223,9 @@ async def queue_download(request: Request, album_id: str = Form(""),
         msg = "Missing album id."
         if _is_htmx(request):
             # 200, not 400: htmx only swaps 2xx/3xx responses, so a 400 fragment
-            # is silently dropped and the user sees no feedback. The alert-error
+            # is silently dropped and the user sees no feedback. The notice
             # styling carries the "this failed" meaning instead of the status.
-            return HTMLResponse(
-                f'<div class="alert alert-error" data-flash>{msg}</div>')
+            return HTMLResponse(_ql_notice_html("error", html.escape(msg)))
         return RedirectResponse(url="/queue?error=" + urllib.parse.quote(msg),
                                 status_code=303)
     # "Get this edition too" — download a different edition of an album the user
@@ -2208,8 +2244,12 @@ async def queue_download(request: Request, album_id: str = Form(""),
     if existing:
         if _is_htmx(request):
             return HTMLResponse(
-                f'<div class="alert alert-warning" data-flash>Already queued. '
-                f'<a href="/jobs/{existing.id}" class="link">view job</a>.</div>')
+                _ql_notice_html(
+                    "warning",
+                    f'Already queued. <a href="/jobs/{existing.id}" '
+                    f'class="ql-inline-link">view job</a>.',
+                )
+            )
         return RedirectResponse(url=f"/jobs/{existing.id}", status_code=303)
     try:
         token = _get_token()
@@ -2262,18 +2302,17 @@ async def queue_download(request: Request, album_id: str = Form(""),
                     # button never gets squeezed into a wrapped column on a phone.
                     aid = html.escape(album_id)
                     return HTMLResponse(
-                        f'<div class="rounded-lg border border-base-300 '
-                        f'bg-base-200 p-3 text-sm space-y-2">'
-                        f'<div><p class="font-medium">{html.escape(msg)}</p>'
-                        f'<p class="text-xs text-base-content/60 mt-0.5">A remaster '
-                        f'or different mix downloads into its own folder, kept '
-                        f'alongside the existing library copy; same-year editions '
-                        f'may merge in your player.</p></div>'
+                        f'<div class="ql-download-choice">'
+                        f'<div class="ql-download-choice-copy">'
+                        f'<p>{html.escape(msg)}</p>'
+                        f'<span>A remaster or different mix downloads into its '
+                        f'own folder, kept alongside the existing library copy; '
+                        f'same-year editions may merge in your player.</span></div>'
                         f'<form hx-post="/download" hx-target="#download-toast" '
                         f'hx-swap="innerHTML">'
                         f'<input type="hidden" name="album_id" value="{aid}">'
                         f'<input type="hidden" name="as_new_edition" value="1">'
-                        f'<button type="submit" class="btn btn-sm btn-primary '
+                        f'<button type="submit" class="ql-btn ql-btn-primary ql-btn-sm '
                         f'w-full sm:w-auto whitespace-nowrap">'
                         f'Download this edition anyway</button></form></div>')
                 return RedirectResponse(
@@ -2290,9 +2329,8 @@ async def queue_download(request: Request, album_id: str = Form(""),
                 msg = "That track isn't on this album."
                 if _is_htmx(request):
                     # 200, not 400: htmx drops non-2xx/3xx fragments, so a 400
-                    # here renders nothing. alert-error conveys the failure.
-                    return HTMLResponse(
-                        f'<div class="alert alert-error" data-flash>{msg}</div>')
+                    # here renders nothing. The notice conveys the failure.
+                    return HTMLResponse(_ql_notice_html("error", html.escape(msg)))
                 return RedirectResponse(
                     url="/queue?error=" + urllib.parse.quote(msg), status_code=303)
         job = job_mgr.Job(
@@ -2311,8 +2349,12 @@ async def queue_download(request: Request, album_id: str = Form(""),
             if dup:
                 if _is_htmx(request):
                     return HTMLResponse(
-                        f'<div class="alert alert-warning" data-flash>Already queued. '
-                        f'<a href="/jobs/{dup.id}" class="link">view job</a>.</div>')
+                        _ql_notice_html(
+                            "warning",
+                            f'Already queued. <a href="/jobs/{dup.id}" '
+                            f'class="ql-inline-link">view job</a>.',
+                        )
+                    )
                 return RedirectResponse(url=f"/jobs/{dup.id}", status_code=303)
             # Re-check the run-lock right before submitting. The album fetch
             # above awaited, and set_mode could have handed the lock to the
@@ -2336,8 +2378,7 @@ async def queue_download(request: Request, album_id: str = Form(""),
     except (SystemExit, NoCredsError):
         msg = "No Qobuz credentials set. Visit Settings."
         if _is_htmx(request):
-            return HTMLResponse(
-                f'<div class="alert alert-error" data-flash>{msg}</div>')
+            return HTMLResponse(_ql_notice_html("error", html.escape(msg)))
         return RedirectResponse(url="/settings?error=creds", status_code=303)
     except Exception as e:
         from qobuz_librarian.api.auth import (
@@ -2365,7 +2406,7 @@ async def queue_download(request: Request, album_id: str = Form(""),
             user_msg = "Couldn't queue download. Check your token and try again."
         if _is_htmx(request):
             return HTMLResponse(
-                f'<div class="alert alert-error" data-flash>{html.escape(user_msg)}</div>')
+                _ql_notice_html("error", html.escape(user_msg)))
         msg = urllib.parse.quote(user_msg, safe="")
         return RedirectResponse(url=f"/queue?error={msg}", status_code=303)
 
@@ -2479,7 +2520,7 @@ async def library_scan(
             msg = "Run a full library scan first."
             if _is_htmx(request):
                 return HTMLResponse(
-                    f'<div class="alert alert-warning" data-flash>{html.escape(msg)}</div>',
+                    f'<div class="ql-flash ql-flash-warning" data-flash><span>{html.escape(msg)}</span></div>',
                     status_code=200)
             return RedirectResponse(
                 url="/library?error=" + urllib.parse.quote(msg), status_code=303)
@@ -2495,7 +2536,7 @@ async def library_scan(
         msg = scan_state["message"]
         if _is_htmx(request):
             return HTMLResponse(
-                f'<div class="alert alert-warning" data-flash>{html.escape(msg)}</div>',
+                f'<div class="ql-flash ql-flash-warning" data-flash><span>{html.escape(msg)}</span></div>',
                 status_code=200)
         return RedirectResponse(
             url="/library?error=" + urllib.parse.quote(msg), status_code=303)
@@ -4275,8 +4316,11 @@ def _no_creds_response(request):
     """Return a 303 redirect (or htmx fragment) when no credentials are set."""
     if _is_htmx(request):
         return HTMLResponse(
-            '<div class="alert alert-error" data-flash>No Qobuz credentials set. '
-            'Visit <a href="/settings" class="link">Settings</a>.</div>',
+            _ql_notice_html(
+                "error",
+                'No Qobuz credentials set. Visit '
+                '<a href="/settings" class="ql-inline-link">Settings</a>.',
+            ),
             status_code=200)
     return RedirectResponse(url="/settings?error=creds", status_code=303)
 

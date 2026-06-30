@@ -4,28 +4,32 @@
 {% block content_max %}max-w-5xl{% endblock %}
 {% block content %}
 
-<h1 class="text-2xl font-bold mb-6">Settings</h1>
+<div class="ql-settings-page">
+<header class="ql-page-header ql-settings-header">
+  <h1>Settings</h1>
+  <p>Manage Qobuz access, download behaviour, library paths, and diagnostics.</p>
+</header>
 
 {% if connected %}
 {% if unverified %}
-<div class="alert alert-warning mb-6" data-flash>
+<div class="ql-notice ql-notice-warning mb-6" data-flash>
   <span>Token saved. Qobuz could not be reached for verification.
-    Open the <a href="/" class="link">dashboard</a> and run a search to confirm
+    Open the <a href="/" class="ql-link">dashboard</a> and run a search to confirm
     access.</span>
 </div>
 {% else %}
-<div class="alert alert-success mb-6" data-flash>
+<div class="ql-notice ql-notice-success mb-6" data-flash>
   <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
   </svg>
   <span>Connected. Your Qobuz token was saved.
-    <a href="/" class="link font-semibold">Go to dashboard</a></span>
+    <a href="/" class="ql-link font-semibold">Go to dashboard</a></span>
 </div>
 {% endif %}
 {% endif %}
 
 {% if saved %}
-<div class="alert {% if queued %}alert-info{% else %}alert-success{% endif %} mb-6" data-flash>
+<div class="ql-notice {% if queued %}ql-notice-info{% else %}ql-notice-success{% endif %} mb-6" data-flash>
   <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
   </svg>
@@ -34,7 +38,7 @@
 {% endif %}
 
 {% if warnings %}
-<div class="alert alert-warning mb-6" data-flash>
+<div class="ql-notice ql-notice-warning mb-6" data-flash>
   <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M5.07 19h13.86c1.54 0 2.5-1.67 1.73-3L13.73 4a2 2 0 00-3.46 0L3.34 16c-.77 1.33.19 3 1.73 3z"/>
   </svg>
@@ -43,56 +47,65 @@
 {% endif %}
 
 {% if error == "creds" %}
-<div class="alert alert-error mb-6" data-flash>
+<div class="ql-notice ql-notice-error mb-6" data-flash>
   <span>Qobuz Librarian could not save the credentials. Give the config folder
   write access, then try again.</span>
 </div>
 {% elif error == "rejected" %}
-<div class="alert alert-error mb-6" data-flash>
+<div class="ql-notice ql-notice-error mb-6" data-flash>
   <span>Qobuz rejected this token, so it was not saved. Get a fresh token from
   play.qobuz.com, then try again.</span>
 </div>
 {% elif error == "empty" %}
-<div class="alert alert-warning mb-6" data-flash>
+<div class="ql-notice ql-notice-warning mb-6" data-flash>
   <span>Token cannot be empty. Paste the <code>token</code> value from
   <code>localuser</code> in play.qobuz.com, or configure Qobuz auth in
   your environment.</span>
 </div>
 {% elif error == "needuser" %}
-<div class="alert alert-warning mb-6" data-flash>
+<div class="ql-notice ql-notice-warning mb-6" data-flash>
   <span>Enter your Qobuz account email or user ID as well. The token cannot be
   used by itself.</span>
 </div>
 {% elif error == "persist" %}
-<div class="alert alert-warning mb-6" data-flash>
+<div class="ql-notice ql-notice-warning mb-6" data-flash>
   <span>Applied for this session, but could not be saved. Give the data folder
   write access or the change will be lost after restart.</span>
 </div>
 {% elif error %}
-<div class="alert alert-warning mb-6" data-flash><span>{{ error }}</span></div>
+<div class="ql-notice ql-notice-warning mb-6" data-flash><span>{{ error }}</span></div>
 {% endif %}
 
 {% if mode_changed == "cli" %}
-<div class="alert alert-info mb-6" data-flash>
+<div class="ql-notice ql-notice-info mb-6" data-flash>
   <span>Terminal mode enabled. Web downloads and scans are paused until you
   resume them below.</span>
 </div>
 {% elif mode_changed == "web" %}
-<div class="alert alert-success mb-6" data-flash><span>Web app resumed.</span></div>
+<div class="ql-notice ql-notice-success mb-6" data-flash><span>Web app resumed.</span></div>
 {% endif %}
 
 <div class="ql-settings-stack">
-<section class="ql-tool-panel">
-  <div class="ql-tool-panel-body">
-    <h2 class="text-xl font-semibold mb-1">Qobuz authentication</h2>
-    <p class="text-sm text-base-content/60 mb-2">
-      Save the Qobuz token used for searches, downloads, upgrades, and repair.
-      It stays on this server and is only sent to Qobuz.
-    </p>
-    <details class="mb-4">
+<section class="ql-settings-section ql-settings-section-primary">
+  <div class="ql-settings-section-body">
+    <div class="ql-settings-section-head">
+      <div class="ql-settings-section-copy">
+        <h2>Qobuz authentication</h2>
+        <p>
+          Save the Qobuz token used for searches, downloads, upgrades, and repair.
+          It stays on this server and is only sent to Qobuz.
+        </p>
+      </div>
+      {% if auth_token_set %}
+      <span class="ql-badge ql-badge-success">Token saved</span>
+      {% else %}
+      <span class="ql-badge ql-badge-primary">Required for search</span>
+      {% endif %}
+    </div>
+    <details class="ql-settings-details">
       <summary class="ql-disclosure-summary">How do I find my token?</summary>
-      <p class="text-sm text-base-content/60 mt-2">
-        Sign in at <a href="https://play.qobuz.com" target="_blank" rel="noopener" class="link">play.qobuz.com</a>,
+      <p class="ql-settings-details-copy">
+        Sign in at <a href="https://play.qobuz.com" target="_blank" rel="noopener" class="ql-link">play.qobuz.com</a>,
         open dev tools (F12), then go to Local Storage →
         play.qobuz.com (<strong>Chrome/Edge:</strong> Application tab;
         <strong>Firefox:</strong> Storage tab). Click the <code>localuser</code>
@@ -102,17 +115,17 @@
     </details>
 
     {% if creds_from_env %}
-    <div class="ql-settings-notice mb-5">
-      <p class="font-semibold">Credentials supplied by environment</p>
-      <p class="mt-1 text-sm text-base-content/65">
+    <div class="ql-settings-notice">
+      <p class="ql-settings-notice-title">Credentials supplied by environment</p>
+      <p class="ql-settings-notice-copy">
         Values from <code>.env</code> or Compose take priority after restart.
         Remove them to manage the token from this page.
       </p>
-      <details class="mt-2">
+      <details class="ql-settings-details ql-settings-details-compact">
         <summary class="ql-disclosure-summary">
           Show details
         </summary>
-        <p class="mt-2 text-sm text-base-content/65">
+        <p class="ql-settings-details-copy">
           Remove <code>QOBUZ_USER_AUTH_TOKEN</code> or
           <code>QOBUZ_USER_AUTH_TOKEN_FILE</code> from <code>.env</code> or
           <code>compose.yaml</code>.
@@ -121,25 +134,21 @@
     </div>
     {% endif %}
 
-    <form action="/settings" method="post" class="ql-credentials-form">
+    <form action="/settings" method="post" class="ql-settings-form ql-credentials-form">
       <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-      <div class="form-control mb-4">
-        <label class="label" for="user_id">
-        <span class="label-text">Email or user ID <span class="text-error" aria-hidden="true">*</span></span>
-        </label>
+      <div class="ql-field">
+        <label class="ql-field-label" for="user_id">Email or user ID <span class="ql-required" aria-hidden="true">*</span></label>
         <input type="text" name="user_id" id="user_id" value="{{ user_id or '' }}"
                placeholder="name@example.com or numeric ID"
-               class="input input-bordered w-full max-w-lg">
-        <p class="text-xs text-base-content/40 mt-1">
+               class="ql-input max-w-lg">
+        <p class="ql-field-help">
           Your Qobuz email or numeric user ID.
         </p>
       </div>
-      <div class="form-control mb-4">
-        <label class="label" for="auth_token">
-          <span class="label-text">Auth token <span class="text-error" aria-hidden="true">*</span></span>
-        </label>
+      <div class="ql-field">
+        <label class="ql-field-label" for="auth_token">Auth token <span class="ql-required" aria-hidden="true">*</span></label>
         {% if auth_token_set %}
-        <p class="text-xs text-success mb-1">Token saved. Leave this field blank to keep it.</p>
+        <p class="ql-field-state">Token saved. Leave this field blank to keep it.</p>
         {% endif %}
         <div class="relative max-w-lg">
           <input type="password" name="auth_token" id="auth_token"
@@ -147,51 +156,55 @@
                  aria-label="Qobuz auth token"
                  autocomplete="off" autocorrect="off" spellcheck="false"
                  placeholder="{% if auth_token_set %}{% else %}Paste token{% endif %}"
-                 class="input input-bordered w-full pr-12 font-mono text-base sm:text-sm">
+                 class="ql-input pr-12 font-mono text-base sm:text-sm">
           {{ secret_toggle("auth_token", "token") }}
         </div>
-        <p class="text-xs text-base-content/40 mt-1">
+        <p class="ql-field-help">
           {% if auth_token_set %}Paste a new token here to replace it.{% else %}Use your Qobuz auth token, not your password.{% endif %}
         </p>
       </div>
 
-      <div class="flex gap-3 flex-wrap">
-        <button type="submit" class="btn btn-primary w-full sm:w-auto">Save &amp; connect</button>
+      <div class="ql-settings-actions">
+        <button type="submit" class="ql-btn ql-btn-primary w-full sm:w-auto">Save &amp; connect</button>
       </div>
     </form>
   </div>
 </section>
 
 {% if auth_token_set %}
-<section class="ql-tool-panel">
-  <div class="ql-tool-panel-body">
-    <h2 class="text-xl font-semibold mb-1">Mode</h2>
-    <p class="text-sm text-base-content/60 mb-2">
-      Use terminal mode before running CLI commands. Web scans and
-      downloads pause while terminal mode is active.
-    </p>
-    <details class="mb-4">
+<section class="ql-settings-section">
+  <div class="ql-settings-section-body">
+    <div class="ql-settings-section-head">
+      <div class="ql-settings-section-copy">
+        <h2>Mode</h2>
+        <p>
+          Use terminal mode before running CLI commands. Web scans and
+          downloads pause while terminal mode is active.
+        </p>
+      </div>
+    </div>
+    <details class="ql-settings-details">
       <summary class="ql-disclosure-summary">
         CLI command
       </summary>
-      <div class="mt-2 rounded-lg bg-base-300/70 px-3 py-2">
-        <code class="block whitespace-normal break-words font-mono text-xs leading-relaxed">docker compose exec qobuz-librarian qobuz-librarian</code>
+      <div class="ql-code-block">
+        <code>docker compose exec qobuz-librarian qobuz-librarian</code>
       </div>
     </details>
     {% if cli_mode %}
     <div class="ql-mode-row">
       <div class="min-w-0">
         <p class="ql-mode-state">Terminal mode active</p>
-        <p class="text-sm text-base-content/60">Web scans and downloads are paused.</p>
+        <p class="ql-mode-help">Web scans and downloads are paused.</p>
       </div>
       <form action="/settings/mode" method="post" class="w-full sm:ml-auto sm:w-auto">
         <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
         <input type="hidden" name="target" value="web">
-        <button type="submit" class="btn btn-primary btn-sm w-full sm:w-auto">Resume web app</button>
+        <button type="submit" class="ql-btn ql-btn-primary ql-btn-sm w-full sm:w-auto">Resume web app</button>
       </form>
     </div>
     {% if cli_only_env %}
-    <p class="text-xs text-base-content/50 mt-2">
+    <p class="ql-settings-footnote">
       <code>QL_CLI_ONLY</code> is set, so Qobuz Librarian returns to terminal
       mode after every restart. Remove it to default to the web app.
     </p>
@@ -200,12 +213,12 @@
     <div class="ql-mode-row">
       <div class="min-w-0">
         <p class="ql-mode-state">Web app active</p>
-        <p class="text-sm text-base-content/60">Scans and downloads can run from the web UI.</p>
+        <p class="ql-mode-help">Scans and downloads can run from the web UI.</p>
       </div>
       <form action="/settings/mode" method="post" class="w-full sm:ml-auto sm:w-auto">
         <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
         <input type="hidden" name="target" value="cli">
-        <button type="submit" class="btn btn-outline ql-secondary-action w-full sm:w-auto">Switch to terminal mode</button>
+        <button type="submit" class="ql-btn ql-btn-secondary ql-secondary-action w-full sm:w-auto">Switch to terminal mode</button>
       </form>
     </div>
     {% endif %}
@@ -213,44 +226,46 @@
 </section>
 {% endif %}
 
-<section class="ql-tool-panel">
-  <div class="ql-tool-panel-body">
-    <h2 class="text-xl font-semibold mb-1">Behaviour</h2>
-    <p class="text-sm text-base-content/60 mb-4">
-      These settings apply to new jobs. Saved values override Compose defaults.
-    </p>
+<section class="ql-settings-section">
+  <div class="ql-settings-section-body">
+    <div class="ql-settings-section-head">
+      <div class="ql-settings-section-copy">
+        <h2>Behaviour</h2>
+        <p>These settings apply to new jobs. Saved values override Compose defaults.</p>
+      </div>
+    </div>
     <form action="/settings/behavior" method="post">
       <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
       <input type="hidden" name="form_complete" value="1">
-      <div class="mb-5 divide-y divide-base-300/60">
+      <div class="ql-setting-list">
         {% for key, label, help in behavior_fields %}
-        <div class="py-4">
-          <div class="flex items-center justify-between gap-4">
-            <label for="cb-{{ key }}" class="min-w-0 font-medium leading-6 cursor-pointer">{{ label }}</label>
-            <input type="checkbox" name="{{ key }}" id="cb-{{ key }}"
-                   class="toggle toggle-primary shrink-0"
-                   aria-describedby="help-{{ key }}"
-                   {% if behavior[key] %}checked{% endif %}>
+        <div class="ql-setting-row">
+          <div class="ql-setting-main">
+            <label for="cb-{{ key }}" class="ql-setting-title">{{ label }}</label>
+            <div id="help-{{ key }}" class="ql-setting-help">{{ help }}</div>
           </div>
-          <div id="help-{{ key }}" class="mt-2 max-w-2xl text-sm leading-6 text-base-content/50">{{ help }}</div>
+          <input type="checkbox" name="{{ key }}" id="cb-{{ key }}"
+                 class="ql-toggle shrink-0"
+                 aria-describedby="help-{{ key }}"
+                 {% if behavior[key] %}checked{% endif %}>
         </div>
         {% endfor %}
       </div>
 
-      <details class="mb-5 border-t border-base-300/60 pt-4">
+      <details class="ql-settings-details ql-settings-defaults">
         <summary class="ql-disclosure-summary">
-          <span class="inline-flex w-full min-w-0 flex-col gap-1 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+          <span class="ql-settings-summary-row">
             <span>Download and import defaults</span>
-            <span class="text-xs font-normal text-base-content/45 sm:text-right">Quality, lyrics, artwork, beets</span>
+            <span>Quality, lyrics, artwork, beets</span>
           </span>
         </summary>
-        <div class="mt-4 space-y-4">
+        <div class="ql-defaults-grid">
           {% for key, label, help, kind, choices, placeholder in text_fields %}
-          <div class="grid gap-2 sm:grid-cols-[12rem_minmax(0,1fr)] sm:items-start sm:gap-4">
-            <label class="pt-0.5 text-sm font-medium leading-6" for="f-{{ key }}">{{ label }}</label>
-            <div class="min-w-0">
+          <div class="ql-default-field">
+            <label class="ql-field-label" for="f-{{ key }}">{{ label }}</label>
+            <div class="ql-default-control">
               {% if kind == 'enum' %}
-              <select name="{{ key }}" id="f-{{ key }}" class="select select-bordered w-full text-base sm:max-w-sm sm:select-sm sm:text-xs">
+              <select name="{{ key }}" id="f-{{ key }}" class="ql-input ql-select text-base sm:max-w-sm sm:text-xs">
                 {% for c in choices %}
                 <option value="{{ c }}" {% if behavior[key] == c %}selected{% endif %}>{{ (option_labels|default({})).get(key, {}).get(c, c) }}</option>
                 {% endfor %}
@@ -258,40 +273,44 @@
               {% else %}
               <input type="text" name="{{ key }}" id="f-{{ key }}" value="{{ behavior[key] }}"
                      placeholder="{{ placeholder }}"
-                     class="input input-bordered w-full font-mono text-base sm:max-w-sm sm:input-sm sm:text-xs">
+                     class="ql-input font-mono text-base sm:max-w-sm sm:text-xs">
               {% endif %}
-              <p class="mt-1 text-xs leading-5 text-base-content/50">{{ help }}</p>
+              <p class="ql-field-help">{{ help }}</p>
             </div>
           </div>
           {% endfor %}
         </div>
       </details>
 
-      <button type="submit" class="btn btn-primary w-full sm:w-auto">Save behaviour</button>
+      <button type="submit" class="ql-btn ql-btn-primary w-full sm:w-auto">Save behaviour</button>
     </form>
   </div>
 </section>
 
-<section class="ql-tool-panel">
-  <div class="ql-tool-panel-body">
-    <h2 class="text-xl font-semibold mb-3">Library paths</h2>
-    <p class="text-sm text-base-content/60 mb-4">
-      Paths currently in use. Host paths are shown when Docker exposes them;
-      otherwise this shows the container path.
-    </p>
-    <dl class="divide-y divide-base-300/60">
+<section class="ql-settings-section">
+  <div class="ql-settings-section-body">
+    <div class="ql-settings-section-head">
+      <div class="ql-settings-section-copy">
+        <h2>Library paths</h2>
+        <p>
+          Paths currently in use. Host paths are shown when Docker exposes them;
+          otherwise this shows the container path.
+        </p>
+      </div>
+    </div>
+    <dl class="ql-path-list">
       {% for p in library_paths %}
-      <div class="grid gap-1 py-3 first:pt-0 last:pb-0 sm:grid-cols-[8rem_minmax(0,1fr)] sm:gap-4">
-        <dt class="text-sm font-medium">{{ p.label }}</dt>
-        <dd class="min-w-0">
+      <div class="ql-path-row">
+        <dt>{{ p.label }}</dt>
+        <dd>
           {% if p.resolved %}
-          <div class="text-xs font-medium text-base-content/45">Host path</div>
-          <div class="break-words font-mono text-[0.7rem] leading-5 sm:text-xs">{{ p.host }}</div>
-          <div class="mt-1 text-xs font-medium text-base-content/45">Container path</div>
-          <div class="break-words font-mono text-[0.7rem] leading-5 text-base-content/50 sm:text-xs">{{ p.container }}</div>
+          <div class="ql-path-kind">Host path</div>
+          <div class="ql-path-value">{{ p.host }}</div>
+          <div class="ql-path-kind">Container path</div>
+          <div class="ql-path-value ql-path-value-muted">{{ p.container }}</div>
           {% else %}
-          <div class="text-xs font-medium text-base-content/45">Container path</div>
-          <div class="break-words font-mono text-[0.7rem] leading-5 sm:text-xs">{{ p.container }}</div>
+          <div class="ql-path-kind">Container path</div>
+          <div class="ql-path-value">{{ p.container }}</div>
           {% endif %}
         </dd>
       </div>
@@ -300,19 +319,19 @@
   </div>
 </section>
 
-<section class="ql-tool-panel">
-  <div class="ql-tool-panel-body">
-    <div class="flex items-center justify-between mb-3">
-      <h2 class="text-xl font-semibold">Diagnostics</h2>
-      <button class="btn btn-sm sm:btn-xs btn-outline"
+<section class="ql-settings-section">
+  <div class="ql-settings-section-body">
+    <div class="ql-settings-section-head ql-settings-section-head-actions">
+      <div class="ql-settings-section-copy">
+        <h2>Diagnostics</h2>
+        <p>Checks what the container can see before scans or downloads start.</p>
+      </div>
+      <button class="ql-btn ql-btn-sm ql-btn-secondary"
               hx-get="/api/diagnostics"
               hx-target="#diagnostics-list"
               hx-swap="innerHTML"
               hx-indicator="#diag-spinner">Recheck</button>
     </div>
-    <p class="text-sm text-base-content/60 mb-3">
-      Checks what the container can see before scans or downloads start.
-    </p>
     <div id="diagnostics-list" class="ql-diagnostics-list" aria-live="polite">
       {% for d in diagnostics %}
       <div class="ql-diagnostic-row">
@@ -329,9 +348,10 @@
       </div>
       {% endfor %}
     </div>
-    <span id="diag-spinner" class="htmx-indicator loading loading-spinner loading-xs mt-2"></span>
+    <span id="diag-spinner" class="htmx-indicator ql-spinner ql-spinner-xs mt-2"></span>
   </div>
 </section>
 </div>
 
+</div>
 {% endblock %}

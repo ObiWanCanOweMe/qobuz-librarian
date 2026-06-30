@@ -2,40 +2,49 @@
 {% block title %}Repair history — Qobuz Librarian{% endblock %}
 {% block content %}
 
-<div class="mb-6 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-  <div class="min-w-0">
-    <h1 class="text-2xl font-bold">Repair history</h1>
-    <p class="mt-3 text-base-content/60">
+<div class="ql-list-page">
+<header class="ql-page-header ql-page-header--actions">
+  <div>
+    <h1>Repair history</h1>
+    <p>
       Tracks repaired in place. Re-sync the album on offline devices to pick up
       the fixed file.
     </p>
   </div>
-  <a href="/repair" class="btn btn-outline btn-sm w-full sm:w-auto">Back to repair</a>
-</div>
+  <a href="/repair" class="ql-btn ql-btn-secondary ql-btn-sm w-full sm:w-auto">Back to repair</a>
+</header>
 
 {% if entries %}
-<p class="text-sm text-base-content/50 mb-3">
+<p class="ql-repair-history-summary">
   {{ entries | length }} most recent (newest first)
 </p>
-<ul class="space-y-2">
+<ul class="ql-repair-history-list">
   {% for e in entries %}
-  <li class="ql-queue-card">
-    <div class="flex flex-col gap-0.5 sm:flex-row sm:items-baseline sm:justify-between sm:gap-3">
-      <span class="min-w-0">
-        <span class="font-medium break-words">{{ e.title }}</span>
-        <span class="block text-xs text-base-content/50 truncate">{{ e.artist }} · {{ e.album }}</span>
+  <li class="ql-repair-history-row">
+    <div class="ql-repair-entry">
+      <span class="ql-repair-entry-main">
+        <span class="ql-repair-title">{{ e.title }}</span>
+        <span class="ql-repair-meta">{{ e.artist }} · {{ e.album }}</span>
       </span>
-      <span class="text-xs text-base-content/40 whitespace-nowrap shrink-0">{{ e.when }}</span>
+      <span class="ql-repair-time">{{ e.when }}</span>
     </div>
   </li>
   {% endfor %}
 </ul>
 {% else %}
-<div class="ql-empty-state text-base-content/60">
-  <p class="text-base font-semibold text-base-content/75">Nothing repaired yet.</p>
-  <p class="mx-auto mt-1 max-w-md text-sm">When Repair refills a damaged track, it appears here.</p>
-  <a href="/repair" class="btn btn-primary w-full sm:w-auto mt-4">Go to Repair</a>
+<div class="ql-empty-state ql-empty-state--repair">
+  <span class="ql-state-icon" aria-hidden="true">
+    <svg viewBox="0 0 24 24">
+      <path d="M6 7.5h12"/>
+      <path d="M8 12h8"/>
+      <path d="M10.5 16.5h3"/>
+    </svg>
+  </span>
+  <p class="ql-empty-title">Nothing repaired yet.</p>
+  <p class="ql-empty-text">When Repair refills a damaged track, it appears here.</p>
+  <a href="/repair" class="ql-btn ql-btn-primary w-full sm:w-auto mt-4">Go to Repair</a>
 </div>
 {% endif %}
 
+</div>
 {% endblock %}

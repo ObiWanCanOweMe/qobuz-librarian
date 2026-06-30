@@ -1,12 +1,12 @@
-<div role="tablist" class="tabs ql-tabs max-w-sm text-sm font-medium sm:text-base">
-  <a role="tab" href="/queue"
-     class="tab {% if active_tab == 'queue' %}tab-active{% endif %}"
+<nav class="ql-page-tabs" aria-label="Queue and history">
+  <a href="/queue"
+     class="{% if active_tab == 'queue' %}is-active{% endif %}"
      {% if active_tab == 'queue' %}aria-current="page"{% endif %}>
     Queue
     {% set _qbadge = pending_job_count or 0 %}
     {% if _qbadge > 0 %}<span class="ql-tab-count {% if queue_has_running %}is-warning{% endif %}">{% if _qbadge > 99 %}99+{% else %}{{ _qbadge }}{% endif %}</span>{% endif %}
   </a>
-  <a role="tab" href="/queue/history"
-     class="tab {% if active_tab == 'history' %}tab-active{% endif %}"
+  <a href="/queue/history"
+     class="{% if active_tab == 'history' %}is-active{% endif %}"
      {% if active_tab == 'history' %}aria-current="page"{% endif %}>History</a>
-</div>
+</nav>

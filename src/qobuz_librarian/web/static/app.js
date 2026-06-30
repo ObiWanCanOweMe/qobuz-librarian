@@ -26,19 +26,45 @@
     if (done) setTimeout(done, 320);
   }
 
+  function markSearchDownloadQueued(form) {
+    if (!form || !form.matches || !form.matches("[data-search-download-form]")) return;
+    var item = form.closest("[data-search-item]");
+    var key = item && item.dataset.searchKey;
+    var root = item && item.closest("[data-search-results-root]");
+    var forms = [form];
+    if (root && key) {
+      forms = Array.prototype.map.call(root.querySelectorAll("[data-search-item]"), function (peer) {
+        if (peer.dataset.searchKey !== key) return null;
+        return peer.querySelector("[data-search-download-form]");
+      }).filter(Boolean);
+    }
+    forms.forEach(function (f) {
+      var b = f.querySelector("button[type=submit]");
+      if (!b) return;
+      b.disabled = true;
+      if (b.classList.contains("ql-download-icon-button")) {
+        b.setAttribute("aria-label", "Queued");
+        b.setAttribute("title", "Queued");
+        b.classList.add("is-queued");
+      } else {
+        b.textContent = "Queued";
+      }
+      b.classList.remove("ql-btn-primary");
+      b.classList.add("is-disabled");
+      if (!b.classList.contains("ql-download-icon-button")) {
+        b.classList.add("ql-btn-secondary");
+      }
+    });
+  }
+
   // Disable a search-result button only after a real queue success.
   document.addEventListener("htmx:afterRequest", function (evt) {
     var form = evt.target;
     if (!form || !form.matches || !form.matches("form[data-queue-button]")) return;
     if (!evt.detail || !evt.detail.successful) return;
     var xhr = evt.detail.xhr;
-    if (!xhr || xhr.responseText.indexOf("alert-success") === -1) return;
-    var b = form.querySelector("button[type=submit]");
-    if (!b) return;
-    b.disabled = true;
-    b.textContent = "Queued";
-    b.classList.remove("btn-primary");
-    b.classList.add("btn-ghost", "btn-disabled");
+    if (!xhr || xhr.responseText.indexOf("ql-notice-success") === -1) return;
+    markSearchDownloadQueued(form);
   });
 
   // Surface failed htmx requests instead of failing silently.
@@ -71,9 +97,9 @@
     setTimeout(function () {
       b.dataset.busyHtml = b.innerHTML;
       b.disabled = true;
-      b.classList.add("btn-disabled");
+      b.classList.add("is-disabled");
       b.innerHTML =
-        '<span class="loading loading-spinner loading-sm"></span> Starting…';
+        '<span class="ql-spinner ql-inline-spinner" aria-hidden="true"></span> Starting...';
     }, 0);
   });
 
@@ -83,7 +109,7 @@
     document.querySelectorAll("form[data-busy-submit] button[type=submit]").forEach(function (b) {
       if (b.dataset.busyHtml == null) return;
       b.disabled = false;
-      b.classList.remove("btn-disabled");
+      b.classList.remove("is-disabled");
       b.innerHTML = b.dataset.busyHtml;
       delete b.dataset.busyHtml;
     });
@@ -171,31 +197,31 @@
     document.documentElement.setAttribute("data-theme", next);
     try { localStorage.setItem("ql-theme", next); } catch (e) { /* private mode */ }
     var m = document.querySelector('meta[name="theme-color"]');
-    if (m) m.setAttribute("content", next === "winter" ? "#ffffff" : "#1d232a");
+    if (m) m.setAttribute("content", next === "winter" ? "#f7f2e8" : "#100d09");
   });
 
-  // Keep dropdown aria-expanded in step with the actual open state.
-  function dropdownIsOpen(dd) {
-    return dd.classList.contains("dropdown-open") || dd.hasAttribute("open");
+  // Keep the mobile drawer aria-expanded in step with the actual open state.
+  function drawerIsOpen(dd) {
+    return dd.classList.contains("ql-mobile-drawer-open") || dd.hasAttribute("open");
   }
-  function syncDropdownExpanded(dd) {
+  function syncDrawerExpanded(dd) {
     var btn = dd.querySelector("[aria-expanded]");
-    if (btn) btn.setAttribute("aria-expanded", dropdownIsOpen(dd).toString());
+    if (btn) btn.setAttribute("aria-expanded", drawerIsOpen(dd).toString());
   }
   document.addEventListener("focusin", function (evt) {
-    var dd = evt.target.closest && evt.target.closest(".dropdown");
-    if (dd) syncDropdownExpanded(dd);
+    var dd = evt.target.closest && evt.target.closest(".ql-mobile-drawer");
+    if (dd) syncDrawerExpanded(dd);
   });
   document.addEventListener("focusout", function (evt) {
-    var dd = evt.target.closest && evt.target.closest(".dropdown");
+    var dd = evt.target.closest && evt.target.closest(".ql-mobile-drawer");
     if (!dd) return;
     // focusout fires before the new focus settles, so re-check next tick.
-    setTimeout(function () { syncDropdownExpanded(dd); }, 0);
+    setTimeout(function () { syncDrawerExpanded(dd); }, 0);
   });
 
-  // Tap-driven dropdown support for mobile browsers.
-  function closeDropdown(dd) {
-    dd.classList.remove("dropdown-open");
+  // Tap-driven drawer support for mobile browsers.
+  function closeDrawer(dd) {
+    dd.classList.remove("ql-mobile-drawer-open");
     dd.removeAttribute("open");
     if (dd.contains(document.activeElement) && document.activeElement.blur) {
       document.activeElement.blur();
@@ -206,27 +232,27 @@
   window.qlCloseDropdowns = function (root) {
     var scope = root || document;
     var nodes = [];
-    if (scope.matches && scope.matches(".dropdown")) nodes.push(scope);
-    scope.querySelectorAll(".dropdown.dropdown-open, details.dropdown[open]")
+    if (scope.matches && scope.matches(".ql-mobile-drawer")) nodes.push(scope);
+    scope.querySelectorAll(".ql-mobile-drawer.ql-mobile-drawer-open, details.ql-mobile-drawer[open]")
       .forEach(function (dd) {
         if (nodes.indexOf(dd) === -1) nodes.push(dd);
       });
-    nodes.forEach(closeDropdown);
+    nodes.forEach(closeDrawer);
   };
   document.addEventListener("click", function (evt) {
     var btn = evt.target.closest && evt.target.closest("[aria-haspopup='menu']");
-    var trigger = (btn && btn.closest(".dropdown")) ? btn : null;
-    var triggerDd = trigger ? trigger.closest(".dropdown") : null;
-    // Close outside taps and other open dropdowns.
-    document.querySelectorAll(".dropdown.dropdown-open").forEach(function (o) {
-      if (o !== triggerDd) closeDropdown(o);
+    var trigger = (btn && btn.closest(".ql-mobile-drawer")) ? btn : null;
+    var triggerDd = trigger ? trigger.closest(".ql-mobile-drawer") : null;
+    // Close outside taps and other open drawers.
+    document.querySelectorAll(".ql-mobile-drawer.ql-mobile-drawer-open").forEach(function (o) {
+      if (o !== triggerDd) closeDrawer(o);
     });
     if (!triggerDd) return;
     evt.preventDefault();
-    if (dropdownIsOpen(triggerDd)) {
-      closeDropdown(triggerDd);
+    if (drawerIsOpen(triggerDd)) {
+      closeDrawer(triggerDd);
     } else {
-      triggerDd.classList.add("dropdown-open");
+      triggerDd.classList.add("ql-mobile-drawer-open");
       triggerDd.setAttribute("open", "");
       trigger.setAttribute("aria-expanded", "true");
     }
@@ -234,8 +260,8 @@
   document.addEventListener("click", function (evt) {
     var btn = evt.target.closest && evt.target.closest("[data-close-mobile-menu]");
     if (!btn) return;
-    var dd = btn.closest(".dropdown");
-    if (dd) closeDropdown(dd);
+    var dd = btn.closest(".ql-mobile-drawer");
+    if (dd) closeDrawer(dd);
   });
 
   // One-shot flash flags should not stay in the URL after first paint.
@@ -258,7 +284,7 @@
   function fade(el) { collapse(el, function () { if (el.parentNode) el.remove(); }); }
   function autoDismissFlashes() {
     // Keep warnings/errors visible; auto-clear low-risk notices and toasts.
-    document.querySelectorAll("[data-flash].alert-success, [data-flash].alert-info")
+    document.querySelectorAll("[data-flash].ql-notice-success, [data-flash].ql-notice-info")
       .forEach(function (el) { setTimeout(function () { fade(el); }, 6000); });
     document.querySelectorAll("#download-toast [data-flash]")
       .forEach(function (el) { setTimeout(function () { fade(el); }, 8000); });
@@ -273,14 +299,196 @@
     var host = document.getElementById("download-toast");
     if (!host) return;
     var el = document.createElement("div");
-    el.className = "alert alert-" + (kind || "info");
+    var noticeKind = kind || "info";
+    el.className = "ql-notice ql-notice-" + noticeKind;
     el.setAttribute("data-flash", "");
+    el.setAttribute("data-flash-kind", noticeKind);
     el.setAttribute("role", "status");
     var span = document.createElement("span");
     span.textContent = message;
     el.appendChild(span);
     host.appendChild(el);
     setTimeout(function () { fade(el); }, 8000);
+  }
+  window.qlShowToast = showToast;
+
+  function initCoverFallbacks() {
+    document.querySelectorAll("img.ql-cover, img.ql-grid-cover, img.ql-result-art").forEach(function (img) {
+      if (img.dataset.coverFallbackWired === "1") return;
+      img.dataset.coverFallbackWired = "1";
+      img.addEventListener("error", function () {
+        var fallback = document.createElement("span");
+        fallback.className = img.className + " ql-cover-placeholder";
+        fallback.setAttribute("aria-hidden", "true");
+        img.replaceWith(fallback);
+      }, { once: true });
+    });
+  }
+
+  function initSearchResults() {
+    document.querySelectorAll("[data-search-results-root]").forEach(function (root) {
+      if (root.dataset.searchWired === "1") return;
+      root.dataset.searchWired = "1";
+      var selected = {};
+      var bulkBar = root.querySelector("[data-search-bulk-bar]");
+      var selectedCount = root.querySelector("[data-search-selected-count]");
+      var selectAll = root.querySelector("[data-search-select-all]");
+      var bulkButton = root.querySelector("[data-search-bulk-download]");
+      var clearButton = root.querySelector("[data-search-clear-selection]");
+      var hideOwnedButton = root.querySelector("[data-search-hide-owned]");
+
+      function selectedKeys() {
+        return Object.keys(selected).filter(function (k) { return selected[k]; });
+      }
+      function boxesFor(key) {
+        return Array.prototype.filter.call(root.querySelectorAll("[data-search-select]"),
+          function (cb) { return cb.dataset.searchKey === key; });
+      }
+      function visibleItem(item) {
+        return item && item.offsetParent !== null;
+      }
+      function syncBoxes() {
+        root.querySelectorAll("[data-search-select]").forEach(function (cb) {
+          cb.checked = !!selected[cb.dataset.searchKey];
+        });
+        var keys = selectedKeys();
+        if (bulkBar) bulkBar.classList.toggle("hidden", keys.length === 0);
+        if (selectedCount) {
+          selectedCount.textContent = keys.length + " selected";
+        }
+        if (selectAll) {
+          var selectable = Array.prototype.filter.call(root.querySelectorAll("[data-search-select]"),
+            function (cb) { return visibleItem(cb.closest("[data-search-item]")); });
+          var selectableKeys = {};
+          selectable.forEach(function (cb) { selectableKeys[cb.dataset.searchKey] = true; });
+          var allKeys = Object.keys(selectableKeys);
+          var picked = allKeys.filter(function (k) { return selected[k]; }).length;
+          selectAll.checked = allKeys.length > 0 && picked === allKeys.length;
+          selectAll.indeterminate = picked > 0 && picked < allKeys.length;
+        }
+      }
+      function setView(name) {
+        root.querySelectorAll("[data-search-view-panel]").forEach(function (panel) {
+          panel.classList.toggle("hidden", panel.dataset.searchViewPanel !== name);
+        });
+        root.querySelectorAll("[data-search-view]").forEach(function (btn) {
+          btn.classList.toggle("is-active", btn.dataset.searchView === name);
+        });
+      }
+      root.addEventListener("change", function (evt) {
+        var cb = evt.target.closest && evt.target.closest("[data-search-select]");
+        if (cb) {
+          selected[cb.dataset.searchKey] = cb.checked;
+          boxesFor(cb.dataset.searchKey).forEach(function (peer) {
+            if (peer !== cb) peer.checked = cb.checked;
+          });
+          syncBoxes();
+          return;
+        }
+        if (evt.target.closest && evt.target.closest("[data-search-select-all]")) {
+          var on = evt.target.checked;
+          root.querySelectorAll("[data-search-select]").forEach(function (box) {
+            if (!visibleItem(box.closest("[data-search-item]"))) return;
+            selected[box.dataset.searchKey] = on;
+          });
+          syncBoxes();
+        }
+      });
+      root.addEventListener("click", function (evt) {
+        var view = evt.target.closest && evt.target.closest("[data-search-view]");
+        if (view) {
+          evt.preventDefault();
+          setView(view.dataset.searchView || "table");
+          syncBoxes();
+          return;
+        }
+        if (hideOwnedButton && evt.target.closest("[data-search-hide-owned]")) {
+          evt.preventDefault();
+          var next = hideOwnedButton.getAttribute("aria-pressed") !== "true";
+          hideOwnedButton.setAttribute("aria-pressed", next ? "true" : "false");
+          root.classList.toggle("is-filtering-owned", next);
+          syncBoxes();
+          return;
+        }
+        if (clearButton && evt.target.closest("[data-search-clear-selection]")) {
+          evt.preventDefault();
+          selected = {};
+          syncBoxes();
+          return;
+        }
+        if (bulkButton && evt.target.closest("[data-search-bulk-download]")) {
+          evt.preventDefault();
+          bulkDownload();
+        }
+      });
+      function csrf() {
+        var m = document.querySelector('meta[name="csrf-token"]');
+        return m ? m.content : "";
+      }
+      function firstFormForKey(key) {
+        var items = Array.prototype.filter.call(root.querySelectorAll("[data-search-item]"),
+          function (item) { return item.dataset.searchKey === key; });
+        for (var i = 0; i < items.length; i++) {
+          var form = items[i].querySelector("[data-search-download-form]");
+          if (form) return form;
+        }
+        return null;
+      }
+      function postForm(form) {
+        return fetch(form.action || "/download", {
+          method: "POST",
+          headers: {
+            "HX-Request": "true",
+            "X-CSRF-Token": csrf(),
+          },
+          body: new FormData(form),
+        }).then(function (r) {
+          return r.text().then(function (text) {
+            return { ok: r.ok, text: text };
+          });
+        });
+      }
+      function bulkDownload() {
+        var keys = selectedKeys();
+        if (!keys.length || bulkButton.disabled) return;
+        var forms = keys.map(firstFormForKey).filter(Boolean);
+        if (!forms.length) return;
+        var original = bulkButton.textContent;
+        bulkButton.disabled = true;
+        bulkButton.textContent = "Queueing...";
+        var queued = 0;
+        var skipped = 0;
+        var failed = 0;
+        var chain = Promise.resolve();
+        forms.forEach(function (form) {
+          chain = chain.then(function () {
+            return postForm(form).then(function (res) {
+              if (!res.ok || res.text.indexOf("ql-notice-error") >= 0) failed += 1;
+              else if (res.text.indexOf("ql-notice-warning") >= 0) {
+                skipped += 1;
+                markSearchDownloadQueued(form);
+              } else {
+                queued += 1;
+                markSearchDownloadQueued(form);
+              }
+            }).catch(function () { failed += 1; });
+          });
+        });
+        chain.then(function () {
+          bulkButton.disabled = false;
+          bulkButton.textContent = original;
+          selected = {};
+          syncBoxes();
+          var parts = [];
+          if (queued) parts.push(queued + " queued");
+          if (skipped) parts.push(skipped + " already queued");
+          if (failed) parts.push(failed + " failed");
+          showToast(parts.length ? parts.join(", ") + "." : "Nothing queued.", failed ? "error" : "success");
+        });
+      }
+      setView("table");
+      syncBoxes();
+    });
   }
 
   // Live job and queue streams.
@@ -344,8 +552,6 @@
       src.onerror = function () {
         if (src.readyState === EventSource.CLOSED) {
           reconnect.textContent = "Connection lost. Reload to see the latest.";
-          reconnect.classList.remove("badge-warning");
-          reconnect.classList.add("badge-error");
           reconnect.classList.remove("is-warning");
           reconnect.classList.add("is-error");
           reconnect.classList.remove("hidden");
@@ -479,11 +685,13 @@
         if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
         if (reconnect) {
           reconnect.textContent = "Connection lost. Reload to see the latest.";
-          reconnect.classList.remove("badge-warning");
-          reconnect.classList.add("badge-error");
+          reconnect.classList.remove("is-warning");
+          reconnect.classList.add("is-error");
           reconnect.classList.remove("hidden");
         }
       } else if (reconnect) {
+        reconnect.classList.remove("is-error");
+        reconnect.classList.add("is-warning");
         reconnect.classList.remove("hidden");
       }
     };
@@ -881,6 +1089,8 @@
 
   function initAll() {
     autoDismissFlashes();
+    initCoverFallbacks();
+    initSearchResults();
     initStreamCards();
     initJobContent();
   }

@@ -4,29 +4,30 @@
 {% block content %}
 
 {% if error %}
-<div class="alert alert-error mb-4" data-flash><span class="break-words">{{ error }}</span></div>
+<div class="ql-notice ql-notice-error ql-page-error" data-flash><span>{{ error }}</span></div>
 {% endif %}
 
-{% if configured %}
-<section class="ql-tool-panel mx-auto max-w-3xl">
-  <div class="ql-tool-panel-body">
-    <div class="mb-5">
-      <h1 class="text-2xl font-bold mb-2">Library migration</h1>
-      <p class="text-base-content/65">
-        Preview a one-time copy or move into the folder structure <code>Artist/Album (Year)</code>.
-      </p>
-    </div>
+<div class="ql-list-page ql-migrate-page">
+<header class="ql-page-header">
+  <h1>Library migration</h1>
+  <p>
+    Preview a one-time copy or move into the folder structure <code>Artist/Album (Year)</code>.
+  </p>
+</header>
 
-    <div class="ql-path-checks mb-5">
+{% if configured %}
+<section class="ql-tool-panel ql-migrate-panel">
+  <div class="ql-tool-panel-body">
+    <div class="ql-path-checks ql-migrate-checks">
     {% for c in migrate_checks %}
     <div class="ql-path-check">
       <span class="ql-path-check-icon">
-        {% if c.ok %}<span class="badge badge-sm badge-success">✓</span>
-        {% else %}<span class="badge badge-sm badge-error">✗</span>{% endif %}
+        {% if c.ok %}<span class="ql-badge ql-badge-success ql-badge-xs">OK</span>
+        {% else %}<span class="ql-badge ql-badge-danger ql-badge-xs">Issue</span>{% endif %}
       </span>
-      <div class="min-w-0">
-        <div class="text-sm font-medium">{{ c.label }}</div>
-        <div class="font-mono text-xs break-all">{{ c.detail }}</div>
+      <div class="ql-path-check-copy">
+        <div class="ql-path-check-label">{{ c.label }}</div>
+        <div class="ql-path-check-detail">{{ c.detail }}</div>
       </div>
     </div>
     {% endfor %}
@@ -34,53 +35,50 @@
 
     <form action="/migrate" method="post" data-busy-submit>
       <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-      <div class="space-y-3 mb-5">
+      <div class="ql-migrate-options">
         <label class="ql-option-row">
-          <input type="checkbox" name="acoustid" class="checkbox checkbox-primary mt-1">
+          <input type="checkbox" name="acoustid" class="ql-checkbox">
           <span>
-            <span class="block font-medium">Fingerprint unclear files</span>
-            <span class="block text-sm text-base-content/50">
+            <span class="ql-option-title">Fingerprint unclear files</span>
+            <span class="ql-option-help">
               Uses AcoustID for files with weak tags. Slower; off by default.
             </span>
           </span>
         </label>
         <label class="ql-option-row">
-          <input type="checkbox" name="in_place" class="checkbox mt-1">
+          <input type="checkbox" name="in_place" class="ql-checkbox">
           <span>
-            <span class="block font-medium">Move instead of copy</span>
-            <span class="block text-sm text-warning">
+            <span class="ql-option-title">Move instead of copy</span>
+            <span class="ql-option-help ql-option-help-warning">
               Relocates originals and removes emptied folders. Copying is the safe default.
             </span>
           </span>
         </label>
         <label class="ql-option-row">
-          <input type="checkbox" name="allow_low_space" class="checkbox mt-1">
+          <input type="checkbox" name="allow_low_space" class="ql-checkbox">
           <span>
-            <span class="block font-medium">Continue despite low-space warning</span>
-            <span class="block text-sm text-warning">
+            <span class="ql-option-title">Continue despite low-space warning</span>
+            <span class="ql-option-help ql-option-help-warning">
               Use only after confirming the destination has enough room.
             </span>
           </span>
         </label>
       </div>
-      <button type="submit" class="btn btn-primary w-full sm:w-auto">Preview migration</button>
-      <p class="text-xs text-base-content/45 mt-2">
+      <button type="submit" class="ql-btn ql-btn-primary w-full sm:w-auto">Preview migration</button>
+      <p class="ql-form-note">
         Preview writes a manifest only. Copy or move happens after review.
       </p>
     </form>
   </div>
 </section>
 {% else %}
-<section class="ql-tool-panel mx-auto max-w-3xl">
+<section class="ql-tool-panel ql-migrate-panel">
   <div class="ql-tool-panel-body">
-    <div class="mb-5">
-      <h1 class="text-2xl font-bold mb-2">Library migration</h1>
-      <p class="text-base-content/65">
-        Set both paths before previewing the folder reorganisation.
-      </p>
-    </div>
+    <p class="ql-panel-copy">
+      Set both paths before previewing the folder reorganisation.
+    </p>
 
-    <dl class="ql-definition-list mb-5">
+    <dl class="ql-definition-list ql-migrate-definitions">
       <div>
         <dt>Source path</dt>
         <dd>Existing library to organise. Uses <code>MIGRATE_SRC</code>.</dd>
@@ -91,16 +89,16 @@
       </div>
     </dl>
 
-    <ol class="space-y-3 text-sm">
-      <li class="flex gap-3">
+    <ol class="ql-step-list">
+      <li>
         <span class="ql-step-number">1</span>
         <span>Mount both locations into the container.</span>
       </li>
-      <li class="flex gap-3">
+      <li>
         <span class="ql-step-number">2</span>
         <span>Set both path values in <code>.env</code> or Compose.</span>
       </li>
-      <li class="flex gap-3">
+      <li>
         <span class="ql-step-number">3</span>
         <span>Restart the container, then return to this page.</span>
       </li>
@@ -108,5 +106,6 @@
   </div>
 </section>
 {% endif %}
+</div>
 
 {% endblock %}

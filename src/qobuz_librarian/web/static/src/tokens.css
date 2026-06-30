@@ -1,0 +1,267 @@
+[data-theme="night"] {
+  --ql-bg: #0f0b07;
+  --ql-bg-2: #171109;
+  --ql-surface: #1a140c;
+  --ql-surface-2: #221a0f;
+  --ql-surface-hover: #2a2114;
+  --ql-line: rgba(228, 169, 78, 0.16);
+  --ql-line-soft: rgba(228, 169, 78, 0.09);
+  --ql-text: #f3ead7;
+  --ql-text-2: #b9a888;
+  --ql-text-3: #8d7c63;
+  --ql-gold: #e4a94e;
+  --ql-gold-strong: #c98d2c;
+  --ql-gold-ink: #231604;
+  --ql-gold-dim: #523d1b;
+  --ql-owned: #a8bc7c;
+  --ql-danger: #c8553d;
+  --ql-warning: #d9a441;
+  --ql-info: #7fa6b8;
+  --ql-shadow: 0 24px 50px -30px rgb(0 0 0 / 0.95);
+  --ql-shadow-soft: 0 8px 22px -16px rgb(0 0 0 / 0.6);
+
+  --color-base-100: var(--ql-bg);
+  --color-base-200: var(--ql-surface);
+  --color-base-300: var(--ql-line);
+  --color-base-content: var(--ql-text);
+  --color-primary: var(--ql-gold);
+  --color-primary-content: var(--ql-gold-ink);
+  --color-success: var(--ql-owned);
+  --color-warning: var(--ql-warning);
+  --color-error: var(--ql-danger);
+  --color-info: var(--ql-info);
+}
+
+[data-theme="winter"] {
+  --ql-bg: #f7f1e7;
+  --ql-bg-2: #eee3d2;
+  --ql-surface: #fffaf1;
+  --ql-surface-2: #f4e8d5;
+  --ql-surface-hover: #ead9bf;
+  --ql-line: #d3bd9a;
+  --ql-line-soft: #e4d2b6;
+  --ql-text: #261d12;
+  --ql-text-2: #6b5a43;
+  --ql-text-3: #927d5f;
+  --ql-gold: #b9791f;
+  --ql-gold-strong: #955f16;
+  --ql-gold-ink: #fff7e8;
+  --ql-gold-dim: #ead8b4;
+  --ql-owned: #667d32;
+  --ql-danger: #b84935;
+  --ql-warning: #b77b21;
+  --ql-info: #5e7f8d;
+  --ql-shadow: 0 12px 22px -18px rgb(64 42 15 / 0.34);
+  --ql-shadow-soft: 0 8px 18px -16px rgb(64 42 15 / 0.24);
+
+  --color-base-100: var(--ql-bg);
+  --color-base-200: var(--ql-surface);
+  --color-base-300: var(--ql-line);
+  --color-base-content: var(--ql-text);
+  --color-primary: var(--ql-gold);
+  --color-primary-content: var(--ql-gold-ink);
+  --color-success: var(--ql-owned);
+  --color-warning: var(--ql-warning);
+  --color-error: var(--ql-danger);
+  --color-info: var(--ql-info);
+}
+
+:root {
+  --ql-radius-sm: 0.375rem;
+  --ql-radius: 0.5625rem;
+  --ql-radius-lg: 0.75rem;
+  --ql-font-ui: "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --ql-font-display: "Fraunces", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
+  --ql-font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+.ql-btn {
+  display: inline-flex;
+  min-height: 2.5rem;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+  border: 1px solid transparent;
+  border-radius: var(--ql-radius-sm);
+  padding: 0.55rem 0.9rem;
+  font-family: var(--ql-font-ui);
+  font-size: 0.875rem;
+  font-weight: 680;
+  line-height: 1;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background-color 150ms ease, border-color 150ms ease, color 150ms ease;
+}
+
+.ql-btn:disabled,
+.ql-btn[aria-disabled="true"],
+.ql-btn.is-disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.ql-btn-primary {
+  border-color: rgba(0, 0, 0, 0.3);
+  background: linear-gradient(180deg, #f4c473 0%, var(--ql-gold) 45%, #c98a28 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), inset 0 -1px 0 rgba(0, 0, 0, 0.18), 0 6px 20px -8px color-mix(in oklab, var(--ql-gold) 55%, transparent);
+  color: var(--ql-gold-ink);
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.18);
+}
+
+.ql-btn-primary:hover:not(:disabled):not(.is-disabled) {
+  border-color: rgba(0, 0, 0, 0.3);
+  background: linear-gradient(180deg, #f8cd85 0%, #ecb45c 45%, var(--ql-gold-strong) 100%);
+}
+
+.ql-btn-secondary {
+  border-color: color-mix(in oklab, var(--ql-text) 18%, transparent);
+  background-color: color-mix(in oklab, var(--ql-surface-2) 54%, transparent);
+  color: var(--ql-text);
+}
+
+.ql-btn-secondary:hover:not(:disabled):not(.is-disabled) {
+  border-color: color-mix(in oklab, var(--ql-text) 28%, transparent);
+  background-color: var(--ql-surface-hover);
+}
+
+.ql-btn-ghost {
+  border-color: transparent;
+  background: transparent;
+  color: color-mix(in oklab, var(--ql-text) 76%, transparent);
+}
+
+.ql-btn-ghost:hover:not(:disabled):not(.is-disabled) {
+  background-color: color-mix(in oklab, var(--ql-text) 7%, transparent);
+  color: var(--ql-text);
+}
+
+.ql-btn-danger {
+  border-color: color-mix(in oklab, var(--ql-danger) 44%, transparent);
+  background-color: color-mix(in oklab, var(--ql-danger) 12%, transparent);
+  color: color-mix(in oklab, var(--ql-danger) 86%, var(--ql-text));
+}
+
+.ql-btn-sm {
+  min-height: 2rem;
+  padding: 0.42rem 0.68rem;
+  font-size: 0.8125rem;
+}
+
+.ql-input {
+  width: 100%;
+  min-height: 2.75rem;
+  border: 1px solid color-mix(in oklab, var(--ql-text) 14%, transparent);
+  border-radius: var(--ql-radius-sm);
+  background-color: color-mix(in oklab, var(--ql-surface) 82%, var(--ql-bg));
+  padding: 0.68rem 0.82rem;
+  color: var(--ql-text);
+  font: 500 1rem/1.2 var(--ql-font-ui);
+  outline: none;
+}
+
+.ql-input::placeholder {
+  color: color-mix(in oklab, var(--ql-text-2) 68%, transparent);
+}
+
+.ql-input:focus {
+  border-color: color-mix(in oklab, var(--ql-gold) 72%, var(--ql-line));
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--ql-gold) 18%, transparent);
+}
+
+.ql-select {
+  appearance: none;
+  padding-right: 2.25rem;
+  background-image:
+    linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position:
+    calc(100% - 1rem) 52%,
+    calc(100% - 0.68rem) 52%;
+  background-size: 0.32rem 0.32rem, 0.32rem 0.32rem;
+  background-repeat: no-repeat;
+}
+
+.ql-checkbox {
+  width: 1rem;
+  height: 1rem;
+  flex: none;
+  appearance: none;
+  border: 1px solid color-mix(in oklab, var(--ql-text) 28%, transparent);
+  border-radius: 0.1875rem;
+  background-color: color-mix(in oklab, var(--ql-bg) 72%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, #000 16%, transparent);
+  cursor: pointer;
+}
+
+.ql-checkbox:hover {
+  border-color: color-mix(in oklab, var(--ql-gold) 54%, var(--ql-line));
+}
+
+.ql-checkbox:checked {
+  border-color: var(--ql-gold);
+  background-color: var(--ql-gold);
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 16 16' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M3.5 8.2 6.6 11 12.8 4.7' fill='none' stroke='%23241803' stroke-width='2.1' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: 0.82rem 0.82rem;
+}
+
+.ql-checkbox:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--ql-gold) 62%, transparent);
+  outline-offset: 2px;
+}
+
+.ql-radio {
+  width: 1rem;
+  height: 1rem;
+  flex: none;
+  appearance: none;
+  border: 1px solid color-mix(in oklab, var(--ql-text) 28%, transparent);
+  border-radius: 999px;
+  background-color: color-mix(in oklab, var(--ql-bg) 72%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, #000 16%, transparent);
+  cursor: pointer;
+}
+
+.ql-radio:checked {
+  border-color: var(--ql-gold);
+  background:
+    radial-gradient(circle at center, var(--ql-gold) 0 36%, transparent 39%),
+    color-mix(in oklab, var(--ql-bg) 72%, transparent);
+}
+
+.ql-radio:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--ql-gold) 62%, transparent);
+  outline-offset: 2px;
+}
+
+.ql-toggle {
+  width: 2.4rem;
+  height: 1.28rem;
+  flex: none;
+  appearance: none;
+  border: 1px solid color-mix(in oklab, var(--ql-text) 22%, transparent);
+  border-radius: 999px;
+  background:
+    radial-gradient(circle at 0.62rem 50%, var(--ql-text-2) 0 0.34rem, transparent 0.36rem),
+    color-mix(in oklab, var(--ql-text) 8%, transparent);
+  cursor: pointer;
+  transition: background-color 150ms ease, border-color 150ms ease;
+}
+
+.ql-toggle:checked {
+  border-color: color-mix(in oklab, var(--ql-gold) 72%, var(--ql-line));
+  background:
+    radial-gradient(circle at calc(100% - 0.62rem) 50%, var(--ql-gold-ink) 0 0.34rem, transparent 0.36rem),
+    var(--ql-gold);
+}
+
+.ql-toggle:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--ql-gold) 62%, transparent);
+  outline-offset: 2px;
+}
+
+.ql-mono {
+  font-family: var(--ql-font-mono);
+  font-variant-numeric: tabular-nums;
+}

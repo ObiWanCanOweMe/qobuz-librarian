@@ -2,20 +2,26 @@
 {% block title %}Service paused — Qobuz Librarian{% endblock %}
 {% block content %}
 
-<h1 class="text-2xl font-bold mb-4">Service paused</h1>
+<div class="ql-list-page ql-system-page">
+<div class="ql-system-card">
+<header class="ql-page-header">
+  <h1>Service paused</h1>
+  <p>Another run is using the library right now. Try again when that work is finished.</p>
+</header>
 
-<div class="alert alert-error mb-6">
-  <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0" fill="none"
-       viewBox="0 0 24 24" stroke="currentColor">
+<div class="ql-notice ql-notice-error ql-system-notice">
+  <svg class="ql-system-notice-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
           d="M12 9v2m0 4h.01M5 19h14a2 2 0 0 0 1.84-2.75L13.74 4a2 2 0 0 0-3.5 0L3.18 16.25A2 2 0 0 0 5 19z"/>
   </svg>
-  <span class="min-w-0 break-words">{{ msg }}</span>
+  <span>{{ msg }}</span>
 </div>
 
-<div class="flex flex-col gap-2 sm:flex-row">
-  <button type="button" data-reload class="btn btn-primary w-full sm:w-auto">Try again</button>
-  <a href="/" class="btn btn-ghost w-full sm:w-auto">Back to dashboard</a>
+<div class="ql-system-actions">
+  <button type="button" data-reload class="ql-btn ql-btn-primary w-full sm:w-auto">Try again</button>
+  <a href="/" class="ql-btn ql-btn-ghost w-full sm:w-auto">Back to dashboard</a>
+</div>
+</div>
 </div>
 
 {% endblock %}

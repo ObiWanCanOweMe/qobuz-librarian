@@ -3,30 +3,43 @@
 {% block content %}
 
 {% set active_tab = 'history' %}
-<div class="mb-6 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-  <div class="min-w-0">
-    <h1 class="text-2xl font-bold">History</h1>
-    <p class="mt-2 text-sm text-base-content/55">Finished jobs stay here after they leave the queue.</p>
+<div class="ql-list-page ql-activity-page">
+<header class="ql-page-header ql-page-header--actions">
+  <div>
+    <h1>History</h1>
+    <p>Finished jobs stay here after they leave the queue.</p>
   </div>
-  <div class="w-full sm:w-96">
+  <div>
     {% include "_queue_tabs.html" %}
   </div>
-</div>
+</header>
+
+{% macro history_kind(job) -%}
+  {%- if job.execute_kind == 'library' -%}Library scan
+  {%- elif job.execute_kind == 'upgrade' -%}Upgrade
+  {%- elif job.execute_kind == 'downsample' -%}Downsample
+  {%- elif job.execute_kind == 'repair' -%}Repair
+  {%- elif job.execute_kind == 'lyrics' -%}Lyrics
+  {%- elif job.execute_kind == 'migration' -%}Migration
+  {%- elif job.execute_kind == 'new_releases' -%}New releases
+  {%- else -%}Download
+  {%- endif -%}
+{%- endmacro %}
 
 {% if jobs %}
-<div class="flex items-center justify-between mb-3 gap-2 flex-wrap">
-  <p class="text-sm text-base-content/50">{{ total }} finished job{% if total != 1 %}s{% endif %}</p>
+<div class="ql-activity-toolbar">
+  <p>{{ total }} finished job{% if total != 1 %}s{% endif %}</p>
   <form action="/queue/clear" method="post">
     <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-    <button type="submit" class="btn btn-sm btn-outline btn-error"
+    <button type="submit" class="ql-btn ql-btn-sm ql-btn-danger"
             data-confirm="Clear all {{ total }} finished job{% if total != 1 %}s{% endif %} from history? This permanently removes the records and cannot be undone.">Clear history</button>
   </form>
 </div>
 
-<div class="space-y-2">
+<div class="ql-activity-list ql-history-list">
   {% for job in jobs %}
-  <div class="ql-queue-card flex flex-wrap items-center gap-x-3 gap-y-1">
-    <div class="shrink-0">
+  <article class="ql-activity-row ql-history-row{% if job.status == 'failed' %} is-error{% endif %}">
+    <div class="ql-activity-state">
       {% if job.status == 'done' %}
         <span class="ql-status-chip is-success">Done</span>
       {% elif job.status == 'canceled' %}
@@ -35,55 +48,68 @@
         <span class="ql-status-chip is-error">Failed</span>
       {% endif %}
     </div>
-    <div class="min-w-0 flex-1">
-      <p class="font-medium break-words line-clamp-2 sm:truncate"><a href="/jobs/{{ job.id }}" class="link link-hover">{% if job.artist %}{{ job.artist }} — {% endif %}{{ job.title }}</a></p>
+    <div class="ql-activity-main">
+      <div class="ql-history-title-line">
+        <p class="ql-row-title">
+          <a href="/jobs/{{ job.id }}" class="ql-row-link">{% if job.artist %}{{ job.artist }} — {% endif %}{{ job.title }}</a>
+        </p>
+        <span class="ql-activity-kind">{{ history_kind(job) }}</span>
+      </div>
       {% if job.error %}
-      <p class="text-xs text-error/80 break-words line-clamp-2 sm:truncate">{{ job.error }}</p>
+      <p class="ql-row-meta ql-row-meta--error">{{ job.error }}</p>
       {% elif job.summary %}
-      <p class="text-xs text-base-content/50 break-words line-clamp-2 sm:truncate">{{ job.summary }}</p>
+      <p class="ql-row-meta">{{ job.summary }}</p>
+      {% else %}
+      <p class="ql-row-meta">No summary recorded.</p>
       {% endif %}
     </div>
-    <div class="flex items-center gap-2 w-full sm:w-auto justify-end">
-      <span class="text-xs text-base-content/40 tabular-nums">{{ job.when }}</span>
-      {% if job.status == 'failed' and job.album_id and job.id in retryable_ids %}
-      <form action="/jobs/{{ job.id }}/retry" method="post" class="shrink-0">
-        <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-        <button type="submit" class="btn btn-sm sm:btn-xs btn-outline ql-secondary-action" title="Retry">Retry</button>
-      </form>
-      {% endif %}
-      <a href="/jobs/{{ job.id }}" class="btn btn-sm sm:btn-xs btn-outline ql-secondary-action">Open</a>
+    <div class="ql-activity-side">
+      <span class="ql-activity-time tabular-nums">{{ job.when }}</span>
+      <div class="ql-activity-actions">
+        {% if job.status == 'failed' and job.album_id and job.id in retryable_ids %}
+        <form action="/jobs/{{ job.id }}/retry" method="post" class="shrink-0">
+          <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+          <button type="submit" class="ql-btn ql-btn-sm ql-btn-secondary ql-secondary-action" title="Retry">Retry</button>
+        </form>
+        {% endif %}
+        <a href="/jobs/{{ job.id }}" class="ql-btn ql-btn-sm ql-btn-secondary ql-secondary-action">Open</a>
+      </div>
     </div>
-  </div>
+  </article>
   {% endfor %}
 </div>
 
 {% if pages > 1 %}
-<div class="flex items-center justify-center gap-3 mt-6">
+<nav class="ql-activity-pagination" aria-label="History pages">
   {% if cur_page > 1 %}
-  <a href="/queue/history?p={{ cur_page - 1 }}" class="btn btn-sm btn-outline ql-secondary-action">Newer</a>
+  <a href="/queue/history?p={{ cur_page - 1 }}" class="ql-btn ql-btn-sm ql-btn-secondary ql-secondary-action">Newer</a>
   {% else %}
-  <span class="btn btn-sm btn-outline ql-secondary-action btn-disabled">Newer</span>
+  <span class="ql-btn ql-btn-sm ql-btn-secondary ql-secondary-action is-disabled" aria-disabled="true">Newer</span>
   {% endif %}
-  <span class="text-sm text-base-content/50 tabular-nums">Page {{ cur_page }} of {{ pages }}</span>
+  <span class="ql-activity-page-count tabular-nums">Page {{ cur_page }} of {{ pages }}</span>
   {% if cur_page < pages %}
-  <a href="/queue/history?p={{ cur_page + 1 }}" class="btn btn-sm btn-outline ql-secondary-action">Older</a>
+  <a href="/queue/history?p={{ cur_page + 1 }}" class="ql-btn ql-btn-sm ql-btn-secondary ql-secondary-action">Older</a>
   {% else %}
-  <span class="btn btn-sm btn-outline ql-secondary-action btn-disabled">Older</span>
+  <span class="ql-btn ql-btn-sm ql-btn-secondary ql-secondary-action is-disabled" aria-disabled="true">Older</span>
   {% endif %}
-</div>
+</nav>
 {% endif %}
 
 {% else %}
-<div class="ql-empty-state">
-  <svg xmlns="http://www.w3.org/2000/svg" class="h-12 w-12 mx-auto mb-3 text-base-content/40 opacity-30" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 8v4l3 3m6-3a9 9 0 1 1-18 0 9 9 0 0 1 18 0z"/>
-  </svg>
-  <p class="font-medium text-base-content/60">No finished jobs yet.</p>
-  <p class="text-sm mt-1 text-base-content/40">Completed downloads, scans, and reviews appear here.</p>
-  <div class="mt-4">
-    <a href="/queue" class="btn btn-outline w-full sm:w-auto">Back to queue</a>
+<div class="ql-empty-state ql-empty-state--activity">
+  <div class="ql-state-icon" aria-hidden="true">
+    <svg viewBox="0 0 24 24">
+      <path d="M12 7.25v5l3.5 2.1"/>
+      <path d="M20 12a8 8 0 1 1-16 0 8 8 0 0 1 16 0Z"/>
+    </svg>
+  </div>
+  <p class="font-medium text-base-content/70">No finished jobs yet.</p>
+  <p class="text-sm mt-1 text-base-content/50">Completed downloads, scans, and reviews appear here.</p>
+  <div class="ql-empty-actions">
+    <a href="/queue" class="ql-btn ql-btn-secondary w-full sm:w-auto">Back to queue</a>
   </div>
 </div>
 {% endif %}
 
+</div>
 {% endblock %}
