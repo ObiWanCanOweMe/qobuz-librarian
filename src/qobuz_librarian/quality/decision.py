@@ -25,7 +25,7 @@ from qobuz_librarian.quality.tiers import streamrip_quality_cap
 from qobuz_librarian.ui_cli.logging import vlog
 
 
-def album_max_quality(qobuz_album):
+def album_max_quality(qobuz_album, tier=None):
     """Return the (bit_depth, sample_rate_hz) Qobuz can provide, capped to the
     streamrip quality tier.
 
@@ -36,7 +36,7 @@ def album_max_quality(qobuz_album):
     bd = qobuz_album.get("maximum_bit_depth") or 0
     sr = qobuz_album.get("maximum_sampling_rate") or 0
     sr_hz = int(round(sr)) if sr >= 1000 else int(round(sr * 1000))
-    cap_bd, cap_sr = streamrip_quality_cap()
+    cap_bd, cap_sr = streamrip_quality_cap(tier)
     bd = min(bd, cap_bd) if bd else 0
     sr_hz = min(sr_hz, cap_sr) if sr_hz else 0
     return (bd, sr_hz)
@@ -173,8 +173,13 @@ def _capped_is_fresh(ts):
 def save_capped(data):
     # Prune stale entries before writing. is_album_capped treats them as "not
     # capped" but never removes them, so the file would otherwise accumulate
-    # dead weight on every mark_album_capped call. Cheap to clean here.
-    fresh = {k: v for k, v in (data or {}).items() if _capped_is_fresh(_capped_ts(v))}
+    # dead weight on every mark_album_capped call. Local policy entries are
+    # durable because they record an intentional downsample decision.
+    fresh = {
+        k: v for k, v in (data or {}).items()
+        if (v or {}).get("scope") == "local_album"
+        or _capped_is_fresh(_capped_ts(v))
+    }
     try:
         tmp = cfg.CAPPED_FILE.with_suffix(cfg.CAPPED_FILE.suffix + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
@@ -211,7 +216,7 @@ def is_local_album_capped(album_dir, capped):
     key = _local_album_cap_key(album_dir)
     if not key:
         return False
-    return _capped_is_fresh(_capped_ts((capped or {}).get(key)))
+    return key in (capped or {})
 
 
 def mark_album_capped(album_id, qobuz_album, post_qual):

@@ -360,6 +360,101 @@ def find_album_dir_filesystem(qobuz_album):
     return global_best
 
 
+_DISC_FOLDER_RE = re.compile(r"^(?:disc|cd)\s*\d+", re.IGNORECASE)
+
+
+def track_signatures_for_album_dirs(album_dirs):
+    """Return tag signatures for staged/import-candidate FLACs.
+
+    These signatures survive beets moving/renaming files, so callers can find
+    the imported folder when Qobuz's artist/title prediction misses.
+    """
+    from qobuz_librarian.integrations.rip import _flac_signature
+
+    signatures = []
+    seen = set()
+    for album_dir in album_dirs or []:
+        if album_dir is None:
+            continue
+        root = Path(album_dir)
+        try:
+            flacs = sorted(p for p in root.rglob("*.flac") if p.is_file())
+        except OSError:
+            continue
+        for fp in flacs:
+            sig = _flac_signature(fp)
+            if sig is None or sig in seen:
+                continue
+            signatures.append(sig)
+            seen.add(sig)
+    return signatures
+
+
+def _artist_dirs_for_track_signatures(signatures):
+    artist_names = sorted({str(sig[0]).strip() for sig in signatures
+                           if sig and sig[0]})
+    if not artist_names:
+        return []
+
+    dirs = []
+    seen = set()
+
+    def _push(path):
+        try:
+            key = str(path.resolve(strict=False))
+        except OSError:
+            key = str(path)
+        if key in seen:
+            return
+        seen.add(key)
+        dirs.append(path)
+
+    for artist in artist_names:
+        direct = config.MUSIC_ROOT / beets_sanitize(artist)
+        if direct.exists():
+            _push(direct)
+
+    wanted_norms = {normalize(a) for a in artist_names if normalize(a)}
+    if wanted_norms and config.MUSIC_ROOT.exists():
+        for d in _list_artist_subdirs_cached(config.MUSIC_ROOT):
+            if normalize(d.name) in wanted_norms:
+                _push(d)
+    return dirs
+
+
+def find_album_dir_by_track_signatures(signatures):
+    """Find the album folder that contains imported tracks with these tags.
+
+    This is a narrow fallback for post-import code. It is only needed when
+    `find_album_dir_filesystem()` cannot predict where beets filed the album,
+    usually because Qobuz's album artist string differs from the FLAC tags.
+    """
+    wanted = {tuple(sig) for sig in signatures or [] if sig}
+    if not wanted:
+        return None
+
+    from qobuz_librarian.integrations.rip import _flac_signature
+
+    counts = {}
+    for artist_dir in _artist_dirs_for_track_signatures(wanted):
+        try:
+            flacs = sorted(p for p in artist_dir.rglob("*.flac") if p.is_file())
+        except OSError:
+            continue
+        for fp in flacs:
+            sig = _flac_signature(fp)
+            if sig not in wanted:
+                continue
+            album_dir = fp.parent
+            if _DISC_FOLDER_RE.match(album_dir.name):
+                album_dir = album_dir.parent
+            counts[album_dir] = counts.get(album_dir, 0) + 1
+
+    if not counts:
+        return None
+    return max(counts, key=lambda p: counts[p])
+
+
 def find_existing_tracks(qobuz_album, *, album_dir=None):
     """Return (track_list, album_dir_or_None) by reading the filesystem.
 

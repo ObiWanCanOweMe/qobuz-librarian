@@ -8,13 +8,11 @@ from qobuz_librarian.library import downsample_state
 from qobuz_librarian.library import hidden as hidden_mod
 from qobuz_librarian.library.catalog import (
     find_album_dir_filesystem,
-    find_existing_tracks,
 )
 from qobuz_librarian.library.scanner import clear_scan_caches
 from qobuz_librarian.modes.process import process_album
 from qobuz_librarian.quality import upgrade_state
 from qobuz_librarian.quality.decision import (
-    compare_album_quality,
     load_capped,
     mark_album_capped,
 )
@@ -260,19 +258,17 @@ def run_upgrade_walk_mode(args, token):
                     n_failed_albums += 1
                     time.sleep(cfg.ARTIST_API_DELAY)
                     continue
-                # Post-upgrade verification.
-                try:
-                    post_existing, _ = find_existing_tracks(album)
-                    if post_existing:
-                        post_qual = compare_album_quality(post_existing, album)
-                        if post_qual["classification"] in ("all_lower", "mixed_below"):
-                            mark_album_capped(album.get("id"), album, post_qual)
-                            log.info(fmt(C.YELLOW,
-                                f"     ⚠  Upgrade incomplete: "
-                                f"{post_qual['n_below']} track(s) still below target. "
-                                f"Marked capped (Qobuz partial hi-res)."))
-                except Exception as _e:
-                    vlog(f"post-upgrade cap check failed: {_e}")
+                verdict = (_proc_result or {}).get("quality_verdict")
+                if verdict and verdict["under"] and not verdict["recovered"]:
+                    mark_album_capped(album.get("id"), album, {
+                        "n_below": verdict["n_below"],
+                        "n_at": 0,
+                        "n_above": 0,
+                    })
+                    log.info(fmt(C.YELLOW,
+                        f"     ⚠  Upgrade incomplete: "
+                        f"{verdict['n_below']} track(s) still below target "
+                        f"after retry. Marked capped."))
                 n_upgraded_albums += 1
                 _refresh_saved_state_after_upgrade(album, _proc_result, token, args)
                 time.sleep(cfg.ARTIST_API_DELAY)

@@ -32,12 +32,14 @@ from qobuz_librarian.library.catalog import (
     album_quality_label,
     cleanup_duplicate_art,
     compute_missing,
+    find_album_dir_by_track_signatures,
     find_album_dir_filesystem,
     find_existing_tracks,
     find_expanded_edition,
     find_extras_in_existing,
     is_lossless_album,
     prompt_and_migrate_multi_artist_folder,
+    track_signatures_for_album_dirs,
 )
 from qobuz_librarian.library.scanner import (
     clear_scan_caches,
@@ -49,8 +51,16 @@ from qobuz_librarian.modes.consolidate import consolidate_albums
 from qobuz_librarian.quality.decision import (
     compare_album_quality,
     existing_track_quality,
+    mark_local_album_capped,
 )
-from qobuz_librarian.queue.executor import _pre_import_staging_hooks
+from qobuz_librarian.quality.verify import (
+    redownload_with_staged_fallback,
+    verify_and_recover,
+)
+from qobuz_librarian.queue.executor import (
+    _pre_import_staging_hooks,
+    staged_album_dirs_since,
+)
 from qobuz_librarian.repair_log import warn_if_download_truncated
 from qobuz_librarian.ui_cli.colors import C, fmt, format_size, section, truncate
 from qobuz_librarian.ui_cli.errors import plural
@@ -770,7 +780,11 @@ def process_album(album, args, *, allow_force=True, label=None,
     elapsed = 0.0
     download_phase_completed = False
     transient_lyric_sigs = []
+    resampled_n = 0
+    post_import_signatures = []
+    staged_dirs_for_import = []
     download_result = {}
+    quality_verdict = None
     _gap_fill_not_located = False  # gap-fill succeeded on paper but album not found on disk
 
     try:
@@ -813,6 +827,81 @@ def process_album(album, args, *, allow_force=True, label=None,
             return {"result": "partial", "imported": False,
                     "n_ok": n_ok, "n_fail": n_fail, "n_lossy": n_lossy}
 
+        if n_ok > 0 and not args.no_import and not use_force:
+            staged_dirs_for_import = staged_album_dirs_since(snapshot)
+            staged_dirs = staged_dirs_for_import
+            if staged_dirs:
+                effective_tier = (
+                    quality if quality is not None else cfg.STREAMRIP_QUALITY
+                )
+
+                def _redownload_at_max():
+                    original_result = dict(download_result)
+                    retry_result = {}
+
+                    def _run_retry():
+                        run_album_download(
+                            album=album, missing=missing, present=present,
+                            existing=existing, album_dir=album_dir,
+                            snapshot=snapshot, quality=4,
+                            upgrade_only=upgrade_only, result=retry_result)
+
+                    try:
+                        fresh_dirs, retry_kept = redownload_with_staged_fallback(
+                            staged_dirs,
+                            discard_retry_output=lambda: _discard_staged_since(
+                                snapshot),
+                            run_retry=_run_retry,
+                            collect_staged_dirs=lambda: staged_album_dirs_since(
+                                snapshot))
+                    except Exception:
+                        download_result.clear()
+                        download_result.update(original_result)
+                        raise
+                    if retry_kept:
+                        download_result.clear()
+                        download_result.update(retry_result)
+                    else:
+                        download_result.clear()
+                        download_result.update(original_result)
+                    return fresh_dirs
+
+                quality_verdict = verify_and_recover(
+                    album, staged_dirs,
+                    redownload_at_max=_redownload_at_max,
+                    effective_tier=effective_tier,
+                    allow_retry=download_result.get("gap_fill_backup_path") is None)
+                if quality_verdict["retried"]:
+                    staged_dirs_for_import = (
+                        quality_verdict.get("staged_dirs") or staged_dirs_for_import
+                    )
+                    n_ok = download_result.get("n_ok", 0)
+                    n_fail = download_result.get("n_fail", 0)
+                    n_lossy = download_result.get("n_lossy", 0)
+                    failed_tracks = download_result.get(
+                        "failed_tracks", failed_tracks)
+                    lossy_tracks = download_result.get(
+                        "lossy_tracks", lossy_tracks)
+                    broken_tracks = download_result.get(
+                        "broken_tracks", broken_tracks)
+                    elapsed = download_result.get("elapsed", elapsed)
+                    if (auto_upgrade_active and n_ok > 0
+                            and (n_fail > 0 or n_lossy > 0)):
+                        log.info(fmt(C.YELLOW,
+                            "\n  Recovery re-download came back incomplete — "
+                            "discarding it and keeping your original."))
+                        _discard_staged_since(snapshot)
+                        return {"result": "partial", "imported": False,
+                                "n_ok": n_ok, "n_fail": n_fail,
+                                "n_lossy": n_lossy}
+                if quality_verdict["recovered"]:
+                    log.info(fmt(C.CYAN,
+                        "  ↻ recovered: re-fetched at the highest source after "
+                        "a short first rip."))
+                elif not quality_verdict["under"]:
+                    log.info(fmt(C.GRAY,
+                        "  Quality check: staged rip meets the selected source cap."))
+
         # ── Pre-import: downsample + lyrics on STAGING ──────────────────────────
         # Downsampling and lyric_fetch run on staging BEFORE beets imports.
         # Beets's `move: yes` then transfers already-downsampled,
@@ -821,7 +910,11 @@ def process_album(album, args, *, allow_force=True, label=None,
         # metadata (wrong sample rate, missing lyrics) to its clients
         # between the move and the post-import hooks.
         if n_ok > 0 and not args.no_import:
-            transient_lyric_sigs = _pre_import_staging_hooks(args)
+            transient_lyric_sigs, resampled_n = _pre_import_staging_hooks(args)
+            if not staged_dirs_for_import:
+                staged_dirs_for_import = staged_album_dirs_since(snapshot)
+            post_import_signatures = track_signatures_for_album_dirs(
+                staged_dirs_for_import)
 
         # ── Beets import ─────────────────────────────────────────────────────────
         imported = False
@@ -934,7 +1027,12 @@ def process_album(album, args, *, allow_force=True, label=None,
                 # the re-rip, so if we can't confirm the filled album actually
                 # landed on disk, deleting the backup would strand the only copy
                 # and leave album_dir an empty remnant — keep it instead.
-                _filled = find_album_dir_filesystem(album)
+                _filled = (
+                    find_album_dir_by_track_signatures(post_import_signatures)
+                    if post_import_signatures else None
+                )
+                if _filled is None:
+                    _filled = find_album_dir_filesystem(album)
                 if _filled is None:
                     clear_scan_caches()
                     _filled = find_album_dir_filesystem(album)
@@ -1017,9 +1115,19 @@ def process_album(album, args, *, allow_force=True, label=None,
                 and _strict_success):
             post_dir = prompt_and_migrate_multi_artist_folder(album, args)
             if post_dir is None:
+                post_dir = (
+                    find_album_dir_by_track_signatures(post_import_signatures)
+                    if post_import_signatures else None
+                )
+            if post_dir is None:
                 post_dir = find_album_dir_filesystem(album)
         else:
-            post_dir = find_album_dir_filesystem(album)
+            post_dir = (
+                find_album_dir_by_track_signatures(post_import_signatures)
+                if post_import_signatures else None
+            )
+            if post_dir is None:
+                post_dir = find_album_dir_filesystem(album)
         # A brand-new album can land in a folder the cached listing predates;
         # clear the cache and look once more before giving up, or art cleanup,
         # the split-merge, and the lyric-retry queue all silently no-op.
@@ -1027,6 +1135,8 @@ def process_album(album, args, *, allow_force=True, label=None,
             clear_scan_caches()
             post_dir = find_album_dir_filesystem(album)
         if post_dir:
+            if resampled_n > 0:
+                mark_local_album_capped(post_dir, qobuz_album=album)
             n_art_removed = cleanup_duplicate_art(post_dir)
             if n_art_removed:
                 vlog(f"removed {n_art_removed} duplicate art file(s)")
@@ -1174,4 +1284,5 @@ def process_album(album, args, *, allow_force=True, label=None,
         "imported": imported,
         "upgrade_unverified": upgrade_unverified,
         "auto_upgrade": bool(auto_upgrade_active),
+        "quality_verdict": quality_verdict,
     }

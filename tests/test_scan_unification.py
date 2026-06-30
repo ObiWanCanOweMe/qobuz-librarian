@@ -653,7 +653,12 @@ def test_execute_upgrades_marks_partial_cap_before_refresh(
     monkeypatch.setattr(flows, "get_album", lambda album_id, token: album)
     monkeypatch.setattr("qobuz_librarian.modes.process.process_album",
                         lambda *a, **k: {"imported": True, "result": "downloaded",
-                                         "dir": album_dir})
+                                         "dir": album_dir,
+                                         "quality_verdict": {
+                                             "under": True,
+                                             "recovered": False,
+                                             "n_below": 1,
+                                         }})
     monkeypatch.setattr("qobuz_librarian.library.catalog.find_existing_tracks",
                         lambda _album: ([object()], None))
     monkeypatch.setattr(
@@ -686,6 +691,62 @@ def test_execute_upgrades_marks_partial_cap_before_refresh(
     }], "tok")
 
     assert refreshed_upgrade == ["Artist"]
+
+
+def test_execute_upgrades_does_not_mark_cap_when_staging_verdict_passed(
+        tmp_path, monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.quality import decision
+    from qobuz_librarian.web import flows
+
+    monkeypatch.setattr(cfg, "CAPPED_FILE", tmp_path / "capped.json")
+    album_dir = tmp_path / "Artist" / "Album"
+    album_dir.mkdir(parents=True)
+    album = {
+        "id": "alb-1",
+        "title": "Album",
+        "artist": {"name": "Artist"},
+        "maximum_bit_depth": 24,
+        "maximum_sampling_rate": 192,
+    }
+
+    monkeypatch.setattr(flows, "get_album", lambda album_id, token: album)
+    monkeypatch.setattr("qobuz_librarian.modes.process.process_album",
+                        lambda *a, **k: {"imported": True, "result": "downloaded",
+                                         "dir": album_dir,
+                                         "quality_verdict": {
+                                             "under": False,
+                                             "recovered": False,
+                                             "n_below": 0,
+                                         }})
+    monkeypatch.setattr("qobuz_librarian.library.catalog.find_existing_tracks",
+                        lambda _album: ([object()], None))
+    monkeypatch.setattr(
+        "qobuz_librarian.quality.decision.compare_album_quality",
+        lambda *_a, **_k: {
+            "classification": "mixed_below",
+            "n_at": 0,
+            "n_below": 1,
+            "n_above": 0,
+        },
+    )
+    monkeypatch.setattr(flows.upgrade_state, "update_artist",
+                        lambda _artist_dir, **_kwargs:
+                        SimpleNamespace(complete=True, candidates=[]))
+    monkeypatch.setattr(flows.downsample_state, "update_artist",
+                        lambda _artist_dir, **_kwargs:
+                        SimpleNamespace(complete=True, candidates=[]))
+    monkeypatch.setattr(flows.review_badges, "set_ready", lambda *a, **k: None)
+    monkeypatch.setattr(flows.time, "sleep", lambda *_: None)
+    job = jm.Job(title="upgrade")
+
+    flows.execute_upgrades(job, [{
+        "artist": "Artist",
+        "title": "Album",
+        "payload": {"album_id": "alb-1"},
+    }], "tok")
+
+    assert not decision.is_album_capped("alb-1", decision.load_capped())
 
 
 def test_baseline_scan_refreshes_shared_upgrade_state(tmp_path, monkeypatch):

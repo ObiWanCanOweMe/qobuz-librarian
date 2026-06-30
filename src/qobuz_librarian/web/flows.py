@@ -1183,25 +1183,16 @@ def execute_upgrades(job, chosen, token):
         elif result and result.get("imported") and _res not in (
                 _skip | {"upgrade_aborted_backup_failed"}):
             ok += 1
-            # Mirror the CLI upgrade walk: if Qobuz delivered below its advertised
-            # quality, write the cap marker so scan_artist_for_upgrades stops
-            # re-flagging this album as upgradable on every scan.
-            try:
-                from qobuz_librarian.library.catalog import find_existing_tracks
-                from qobuz_librarian.quality.decision import (
-                    compare_album_quality,
-                    mark_album_capped,
-                )
-                post_existing, _ = find_existing_tracks(album)
-                if post_existing:
-                    post_qual = compare_album_quality(post_existing, album)
-                    if post_qual["classification"] in ("all_lower", "mixed_below"):
-                        mark_album_capped(album.get("id"), album, post_qual)
-                        log.info(f"  upgrade incomplete: {post_qual['n_below']} "
-                                 f"track(s) still below target. Marked capped "
-                                 f"(Qobuz partial hi-res).")
-            except Exception as _e_cap:
-                log.info(f"  post-upgrade cap check failed: {_e_cap}")
+            verdict = result.get("quality_verdict")
+            if verdict and verdict["under"] and not verdict["recovered"]:
+                from qobuz_librarian.quality.decision import mark_album_capped
+                mark_album_capped(album.get("id"), album, {
+                    "n_below": verdict["n_below"],
+                    "n_at": 0,
+                    "n_above": 0,
+                })
+                log.info(f"  upgrade incomplete: {verdict['n_below']} "
+                         f"track(s) still below target after retry. Marked capped.")
             _refresh_after_local_album_change(
                 album,
                 result,

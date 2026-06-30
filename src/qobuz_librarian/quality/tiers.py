@@ -12,7 +12,7 @@ _STREAMRIP_QUALITY_CAPS = {
 }
 
 
-def streamrip_quality_cap():
+def streamrip_quality_cap(tier=None):
     """Return (max_bit_depth, max_sample_rate_hz) streamrip will actually
     deliver at the current quality setting.
 
@@ -24,8 +24,8 @@ def streamrip_quality_cap():
     value that somehow slips past coercion degrades to the top tier rather than
     raising mid-scan.
     """
-    return _STREAMRIP_QUALITY_CAPS.get(cfg.STREAMRIP_QUALITY,
-                                       _STREAMRIP_QUALITY_CAPS[4])
+    tier = cfg.STREAMRIP_QUALITY if tier is None else tier
+    return _STREAMRIP_QUALITY_CAPS.get(tier, _STREAMRIP_QUALITY_CAPS[4])
 
 
 def downsample_target_rate(sr_hz):

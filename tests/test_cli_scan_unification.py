@@ -39,7 +39,6 @@ def test_upgrade_walk_uses_saved_upgrade_state(monkeypatch):
     monkeypatch.setattr(upgrade, "process_album",
                         lambda album, *a, **kw: processed.append(album["id"])
                         or {"imported": True})
-    monkeypatch.setattr(upgrade, "find_existing_tracks", lambda album: ([], None))
     monkeypatch.setattr(upgrade.time, "sleep", lambda *_: None)
 
     upgrade.run_upgrade_walk_mode(args, "tok")
@@ -95,7 +94,6 @@ def test_upgrade_walk_ignores_hidden_saved_candidates(
     monkeypatch.setattr(upgrade, "process_album",
                         lambda album, *a, **kw: processed.append(album["id"])
                         or {"imported": True})
-    monkeypatch.setattr(upgrade, "find_existing_tracks", lambda album: ([], None))
     monkeypatch.setattr(upgrade, "find_album_dir_filesystem", lambda album: None)
     monkeypatch.setattr(upgrade.time, "sleep", lambda *_: None)
 
@@ -177,7 +175,6 @@ def test_upgrade_walk_refreshes_saved_state_after_success(tmp_path, monkeypatch)
                         lambda album_id, token: {"id": album_id, "title": "Album"})
     monkeypatch.setattr(upgrade, "process_album",
                         lambda album, *a, **kw: {"imported": True, "dir": artist_dir / "Album"})
-    monkeypatch.setattr(upgrade, "find_existing_tracks", lambda album: ([], None))
     monkeypatch.setattr(upgrade, "load_capped", lambda: {})
     monkeypatch.setattr(upgrade.upgrade_state, "update_artist",
                         lambda ad, **kwargs: refreshed_upgrade.append(ad.name)
@@ -306,17 +303,12 @@ def test_upgrade_walk_marks_partial_cap_before_refresh(tmp_path, monkeypatch):
                             "imported": True,
                             "result": "downloaded",
                             "dir": album_dir,
+                            "quality_verdict": {
+                                "under": True,
+                                "recovered": False,
+                                "n_below": 1,
+                            },
                         })
-    monkeypatch.setattr(upgrade, "find_existing_tracks",
-                        lambda _album: ([object()], None))
-    monkeypatch.setattr(upgrade, "compare_album_quality",
-                        lambda *_a, **_k: {
-                            "classification": "mixed_below",
-                            "n_at": 0,
-                            "n_below": 1,
-                            "n_above": 0,
-                        })
-
     def refresh_upgrade(ad, **kwargs):
         assert decision.is_album_capped("alb-1", decision.load_capped())
         refreshed_upgrade.append(ad.name)
@@ -333,6 +325,76 @@ def test_upgrade_walk_marks_partial_cap_before_refresh(tmp_path, monkeypatch):
     upgrade.run_upgrade_walk_mode(args, "tok")
 
     assert refreshed_upgrade == ["Artist"]
+
+
+def test_upgrade_walk_does_not_mark_cap_when_staging_verdict_passed(
+        tmp_path, monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.modes import upgrade
+    from qobuz_librarian.quality import decision
+
+    monkeypatch.setattr(cfg, "CAPPED_FILE", tmp_path / "capped.json")
+    artist_dir = tmp_path / "Artist"
+    album_dir = artist_dir / "Album"
+    album_dir.mkdir(parents=True)
+    album = {
+        "id": "alb-1",
+        "title": "Album",
+        "artist": {"name": "Artist"},
+        "maximum_bit_depth": 24,
+        "maximum_sampling_rate": 192,
+    }
+    args = SimpleNamespace(
+        yes=True,
+        auto_safe=False,
+        dry_run=False,
+        consolidate=True,
+    )
+    state = {
+        "complete": True,
+        "candidates": [{
+            "artist": "Artist",
+            "title": "Album",
+            "detail": "CD -> 24-bit / 96 kHz",
+            "payload": {
+                "album_id": "alb-1",
+                "title_similarity": 1.0,
+                "needed_edition_swap": False,
+            },
+        }],
+    }
+
+    upgrade_loads = [state, {"candidates": []}]
+    monkeypatch.setattr(
+        upgrade.upgrade_state,
+        "load",
+        lambda: upgrade_loads.pop(0) if upgrade_loads else {"candidates": []},
+    )
+    monkeypatch.setattr(upgrade, "get_album", lambda album_id, token: album)
+    monkeypatch.setattr(upgrade, "process_album",
+                        lambda album, *a, **kw: {
+                            "imported": True,
+                            "result": "downloaded",
+                            "dir": album_dir,
+                            "quality_verdict": {
+                                "under": False,
+                                "recovered": False,
+                                "n_below": 0,
+                            },
+                        })
+    monkeypatch.setattr(upgrade.upgrade_state, "update_artist",
+                        lambda ad, **kwargs: SimpleNamespace(
+                            complete=True, candidates=[]))
+    monkeypatch.setattr(upgrade.downsample_state, "update_artist",
+                        lambda ad, **kwargs: SimpleNamespace(
+                            complete=True, candidates=[]))
+    monkeypatch.setattr(upgrade.downsample_state, "load", lambda: {"candidates": []})
+    monkeypatch.setattr(upgrade.review_badges, "set_ready", lambda *a, **k: None)
+    monkeypatch.setattr(upgrade.time, "sleep", lambda *_: None)
+
+    upgrade.run_upgrade_walk_mode(args, "tok")
+
+    assert not decision.is_album_capped("alb-1", decision.load_capped())
 
 
 def test_upgrade_walk_refuses_when_upgrade_disabled(monkeypatch, caplog):

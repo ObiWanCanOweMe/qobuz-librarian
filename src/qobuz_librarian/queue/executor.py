@@ -35,10 +35,17 @@ from qobuz_librarian.library.catalog import (
     _count_audio_files_in,
     _is_split_album_merge,
     cleanup_duplicate_art,
+    find_album_dir_by_track_signatures,
     find_album_dir_filesystem,
     prompt_and_migrate_multi_artist_folder,
+    track_signatures_for_album_dirs,
 )
 from qobuz_librarian.library.scanner import clear_scan_caches
+from qobuz_librarian.quality.decision import mark_local_album_capped
+from qobuz_librarian.quality.verify import (
+    redownload_with_staged_fallback,
+    verify_and_recover,
+)
 from qobuz_librarian.repair_log import warn_if_download_truncated
 from qobuz_librarian.ui_cli.colors import C, fmt, section, truncate
 from qobuz_librarian.ui_cli.logging import log, vlog
@@ -66,15 +73,10 @@ def _download_for_queue_item(item):
 _DISC_FOLDER_RE = re.compile(r"^(?:disc|cd)\s*\d+", re.IGNORECASE)
 
 
-def _staged_album_dirs(item):
-    """Top-level album dirs (under STAGING_DIR) that hold this item's freshly
-    downloaded audio. Disc-folder children roll up to the album dir so beets
-    sees a multi-disc release as one album, not one album per disc."""
-    snap = item.get("snapshot_before") or set()
-    audio = [p for p in files_added_since(snap)
+def staged_album_dirs_since(snapshot):
+    """Top-level album dirs holding audio added since a staging snapshot."""
+    audio = [p for p in files_added_since(snapshot or set())
              if p.suffix.lower() in cfg.AUDIO_EXTS]
-    if not audio:
-        return []
     album_dirs = set()
     for p in audio:
         parent = p.parent
@@ -84,17 +86,25 @@ def _staged_album_dirs(item):
     return sorted(album_dirs)
 
 
+def _staged_album_dirs(item):
+    return staged_album_dirs_since(item.get("snapshot_before"))
+
+
 def _run_pre_import_hooks_for_dirs(album_dirs, args):
-    """Run downsample + lyric hooks scoped to ``album_dirs``. Returns the
-    aggregated lyric-signature list so the post-import resolver can map them
-    to library paths once beets has moved the files. Raises KeyboardInterrupt
-    after logging if either hook is interrupted."""
+    """Run downsample + lyric hooks scoped to ``album_dirs``.
+
+    Returns ``(lyric_sigs, resampled_total)`` so post-import code can map
+    transient lyric signatures and mark albums the downsample hook truly
+    resampled.
+    """
     sigs = []
+    resampled_total = 0
     if (cfg.DOWNSAMPLE_HIRES_ENABLED and HAVE_DOWNSAMPLE
             and not getattr(args, "no_downsample", False)):
         for d in album_dirs:
             try:
-                downsample_dir(d, verbose=True, base_dir=d, log=log.info)
+                res = downsample_dir(d, verbose=True, base_dir=d, log=log.info)
+                resampled_total += (res or {}).get("resampled", 0)
             except KeyboardInterrupt:
                 log.info(fmt(C.YELLOW, "  ⚠  downsample hook interrupted"))
                 raise
@@ -122,7 +132,7 @@ def _run_pre_import_hooks_for_dirs(album_dirs, args):
                 pass
         if isinstance(lh_result, tuple) and len(lh_result) == 2:
             sigs.extend(lh_result[1])
-    return sigs
+    return sigs, resampled_total
 
 
 def _pre_import_staging_hooks(args):
@@ -344,7 +354,12 @@ def _resolve_queue_item(item, args, imported_globally):
         _migrated = prompt_and_migrate_multi_artist_folder(item["album"], args)
     else:
         _migrated = None
-    post_dir = _migrated or find_album_dir_filesystem(item["album"]) or album_dir
+    post_dir = _migrated
+    if post_dir is None and imported_globally:
+        post_dir = find_album_dir_by_track_signatures(
+            item.get("post_import_signatures"))
+    if post_dir is None:
+        post_dir = find_album_dir_filesystem(item["album"])
     # For brand-new albums (album_dir=None), find_album_dir_filesystem may
     # return None if the cache hasn't refreshed. Clear and retry once.
     # Only bother when beets actually ran — if the import was never attempted
@@ -353,6 +368,8 @@ def _resolve_queue_item(item, args, imported_globally):
     if post_dir is None and imported_globally:
         clear_scan_caches()
         post_dir = find_album_dir_filesystem(item["album"])
+    if post_dir is None:
+        post_dir = album_dir
     album_has_content = (
         post_dir is not None and post_dir.exists()
         and _count_audio_files_in(post_dir) > 0
@@ -366,6 +383,8 @@ def _resolve_queue_item(item, args, imported_globally):
 
     if had_any_success:
         if post_dir:
+            if item.get("resampled_n", 0) > 0:
+                mark_local_album_capped(post_dir, qobuz_album=item["album"])
             cleanup_duplicate_art(post_dir)
         # Split-folder auto-merge: a gap-fill against a folder beets doesn't
         # name canonically (multi-artist, or missing the year) makes it file
@@ -699,6 +718,38 @@ def _execute_download_queue(queue, args, token, *, on_progress=None):
                               else "auth_lost")
         results.append(_resolve_queue_item(item, args, False))
 
+    def _handle_download_exception(item, exc):
+        nonlocal interrupted, disk_full, io_error, auth_lost_exc
+        if isinstance(exc, KeyboardInterrupt):
+            log.info(fmt(C.YELLOW,
+                "\n    Interrupted. Stopping further downloads — "
+                "resolving backups for albums already processed."))
+            item["result"] = "interrupted"
+            interrupted = True
+        elif isinstance(exc, AuthLost):
+            log.info(fmt(C.RED,
+                "\n    Auth lost. Stopping further downloads — "
+                "will restore upgrade backups and exit."))
+            item["result"] = "auth_lost"
+            auth_lost_exc = exc
+        elif isinstance(exc, OSError):
+            if exc.errno == errno.ENOSPC:
+                log.info(fmt(C.RED,
+                    f"\n    Out of disk space at {cfg.STAGING_DIR}. Stopping "
+                    "the queue — restoring backups and keeping the rest for a "
+                    "retry once space is freed."))
+                item["result"] = "disk_full"
+                disk_full = True
+            else:
+                log.info(fmt(C.RED,
+                    f"\n    Storage error ({exc}). Stopping the queue — "
+                    "restoring backups and keeping the rest for a retry."))
+                item["result"] = "io_error"
+                io_error = True
+        else:
+            raise exc
+        results.append(_resolve_queue_item(item, args, False))
+
     for idx, item in enumerate(items, 1):
         # A cancel raised while the PREVIOUS album was importing (i.e. after its
         # own post-download checkpoint at the bottom of the loop) hasn't set
@@ -717,6 +768,9 @@ def _execute_download_queue(queue, args, token, *, on_progress=None):
         # now-successful re-download isn't read as still-stopped by
         # _queue_item_needs_retry and left in the queue forever.
         item["result"] = None
+        item["quality_verdict"] = None
+        item["resampled_n"] = 0
+        item["post_import_signatures"] = []
 
         album = item["album"]
         album_dir = item["album_dir"]
@@ -742,42 +796,8 @@ def _execute_download_queue(queue, args, token, *, on_progress=None):
         item["snapshot_before"] = snapshot_staging()
         try:
             _download_for_queue_item(item)
-        except KeyboardInterrupt:
-            log.info(fmt(C.YELLOW,
-                "\n    Interrupted. Stopping further downloads — "
-                "resolving backups for albums already processed."))
-            item["result"] = "interrupted"
-            interrupted = True
-            results.append(_resolve_queue_item(item, args, False))
-            continue
-        except AuthLost as _e_auth:
-            log.info(fmt(C.RED,
-                "\n    Auth lost. Stopping further downloads — "
-                "will restore upgrade backups and exit."))
-            item["result"] = "auth_lost"
-            auth_lost_exc = _e_auth
-            results.append(_resolve_queue_item(item, args, False))
-            continue
-        except OSError as _e_os:
-            if _e_os.errno == errno.ENOSPC:
-                log.info(fmt(C.RED,
-                    f"\n    Out of disk space at {cfg.STAGING_DIR}. Stopping "
-                    "the queue — restoring backups and keeping the rest for a "
-                    "retry once space is freed."))
-                item["result"] = "disk_full"
-                disk_full = True
-            else:
-                # EROFS (NAS remounted read-only), EIO (failing disk), EACCES,
-                # etc. — environmental, not this album's fault. Stop the batch
-                # cleanly so the remaining items are short-circuited and their
-                # upgrade backups restored, rather than re-raising out of the
-                # loop and stranding those originals in the backup dir.
-                log.info(fmt(C.RED,
-                    f"\n    Storage error ({_e_os}). Stopping the queue — "
-                    "restoring backups and keeping the rest for a retry."))
-                item["result"] = "io_error"
-                io_error = True
-            results.append(_resolve_queue_item(item, args, False))
+        except (KeyboardInterrupt, AuthLost, OSError) as exc:
+            _handle_download_exception(item, exc)
             continue
 
         if is_cancel_requested():
@@ -809,6 +829,55 @@ def _execute_download_queue(queue, args, token, *, on_progress=None):
                 log.info(fmt(C.YELLOW,
                     "    ⚠  No staged audio dir found for this album — skipping beets."))
             else:
+                effective_tier = item.get("quality") or cfg.STREAMRIP_QUALITY
+
+                def _redownload_at_max():
+                    from qobuz_librarian.modes.process import _discard_staged_since
+                    saved_q = item.get("quality")
+                    retry_item = dict(item)
+                    retry_item["quality"] = 4
+
+                    def _run_retry():
+                        _download_for_queue_item(retry_item)
+
+                    try:
+                        fresh_dirs, retry_kept = redownload_with_staged_fallback(
+                            album_dirs,
+                            discard_retry_output=lambda: _discard_staged_since(
+                                item["snapshot_before"]),
+                            run_retry=_run_retry,
+                            collect_staged_dirs=lambda: _staged_album_dirs(item))
+                    except Exception:
+                        item["quality"] = saved_q
+                        raise
+                    if retry_kept:
+                        for key in ("n_ok", "n_fail", "n_lossy",
+                                    "failed_tracks", "lossy_tracks",
+                                    "broken_tracks", "elapsed",
+                                    "gap_fill_backup_path"):
+                            if key in retry_item:
+                                item[key] = retry_item[key]
+                    item["quality"] = saved_q
+                    return fresh_dirs
+
+                try:
+                    item["quality_verdict"] = verify_and_recover(
+                        album, album_dirs,
+                        redownload_at_max=_redownload_at_max,
+                        effective_tier=effective_tier,
+                        allow_retry=item.get("gap_fill_backup_path") is None)
+                except (KeyboardInterrupt, AuthLost, OSError) as exc:
+                    _handle_download_exception(item, exc)
+                    continue
+                if item["quality_verdict"]["retried"]:
+                    album_dirs = item["quality_verdict"]["staged_dirs"]
+                if item["quality_verdict"]["recovered"]:
+                    log.info(fmt(C.CYAN,
+                        "    ↻ recovered: re-fetched at the highest source."))
+                elif not item["quality_verdict"]["under"]:
+                    log.info(fmt(C.GRAY,
+                        "    Quality check: staged rip meets the selected source cap."))
+
                 # Repair carries a callback that re-tags the staged refills
                 # with the originals' own metadata before beets files them, so
                 # a recording that also lives on a compilation comes back tagged
@@ -821,7 +890,11 @@ def _execute_download_queue(queue, args, token, *, on_progress=None):
                         log.info(fmt(C.YELLOW,
                             f"  ⚠  repair retag step failed: {_e_rt}"))
                 try:
-                    sigs = _run_pre_import_hooks_for_dirs(album_dirs, args)
+                    sigs, resampled_n = _run_pre_import_hooks_for_dirs(
+                        album_dirs, args)
+                    item["resampled_n"] = resampled_n
+                    item["post_import_signatures"] = (
+                        track_signatures_for_album_dirs(album_dirs))
                     queue_transient_lyric_sigs.extend(sigs)
                 except KeyboardInterrupt:
                     log.info(fmt(C.YELLOW,

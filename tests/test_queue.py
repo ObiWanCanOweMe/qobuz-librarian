@@ -123,6 +123,151 @@ def test_executor_gap_fill_backup_restored_when_track_returns_lossy(monkeypatch,
     assert owned.read_bytes() == b"the-owned-original"
 
 
+def test_executor_auto_downsample_marker_uses_signature_fallback(
+        monkeypatch, tmp_path):
+    from qobuz_librarian.queue import executor
+
+    final_dir = tmp_path / "music" / "Bill Evans" / "Waltz For Debby (2023)"
+    final_dir.mkdir(parents=True)
+    (final_dir / "01.flac").write_bytes(b"audio")
+
+    monkeypatch.setattr(executor, "find_album_dir_filesystem", lambda _a: None)
+    monkeypatch.setattr(executor, "find_album_dir_by_track_signatures",
+                        lambda _sigs: final_dir, raising=False)
+    monkeypatch.setattr(executor, "cleanup_duplicate_art", lambda _d: 0)
+    marked = []
+    monkeypatch.setattr(executor, "mark_local_album_capped",
+                        lambda path, qobuz_album=None: marked.append(path))
+
+    item = {
+        "album": {"id": "q8m2", "title": "Waltz For Debby",
+                  "artist": {"name": "Bill Evans Trio"}, "tracks": {"items": []}},
+        "album_dir": None,
+        "backup_path": None,
+        "gap_fill_backup_path": None,
+        "siblings_to_delete": [],
+        "n_ok": 1, "n_fail": 0, "n_lossy": 0,
+        "auto_upgrade": False,
+        "resampled_n": 1,
+        "post_import_signatures": ["sig"],
+    }
+    args = Namespace(migrate_multi_artist=False, no_import=False, consolidate=False)
+    executor._resolve_queue_item(item, args, imported_globally=True)
+
+    assert item["_resolved_post_dir"] == final_dir
+    assert marked == [final_dir]
+
+
+def test_executor_auto_downsample_marker_prefers_signature_over_old_folder(
+        monkeypatch, tmp_path):
+    from qobuz_librarian.queue import executor
+
+    old_dir = tmp_path / "music" / "Bill Evans Trio" / "Waltz For Debby"
+    old_dir.mkdir(parents=True)
+    (old_dir / "01.flac").write_bytes(b"old")
+    final_dir = tmp_path / "music" / "Bill Evans" / "Waltz For Debby (2023)"
+    final_dir.mkdir(parents=True)
+    (final_dir / "01.flac").write_bytes(b"new")
+
+    monkeypatch.setattr(executor, "find_album_dir_filesystem", lambda _a: old_dir)
+    monkeypatch.setattr(executor, "find_album_dir_by_track_signatures",
+                        lambda _sigs: final_dir, raising=False)
+    monkeypatch.setattr(executor, "cleanup_duplicate_art", lambda _d: 0)
+    monkeypatch.setattr(executor, "_is_split_album_merge",
+                        lambda *a, **k: False)
+    marked = []
+    monkeypatch.setattr(executor, "mark_local_album_capped",
+                        lambda path, qobuz_album=None: marked.append(path))
+
+    item = {
+        "album": {"id": "q8m2", "title": "Waltz For Debby",
+                  "artist": {"name": "Bill Evans Trio"}, "tracks": {"items": []}},
+        "album_dir": old_dir,
+        "backup_path": None,
+        "gap_fill_backup_path": None,
+        "siblings_to_delete": [],
+        "n_ok": 1, "n_fail": 0, "n_lossy": 0,
+        "auto_upgrade": False,
+        "resampled_n": 1,
+        "post_import_signatures": ["sig"],
+    }
+    args = Namespace(migrate_multi_artist=False, no_import=False, consolidate=False)
+    executor._resolve_queue_item(item, args, imported_globally=True)
+
+    assert item["_resolved_post_dir"] == final_dir
+    assert marked == [final_dir]
+
+
+def test_executor_self_heal_retry_no_files_keeps_first_download_state(
+        monkeypatch, tmp_path):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.queue import executor
+
+    staging = tmp_path / "staging"
+    first_staged = staging / "Artist" / "Album"
+    monkeypatch.setattr(cfg, "STAGING_DIR", staging)
+
+    album = {"id": "ALB", "title": "Album", "artist": {"name": "Artist"},
+             "maximum_bit_depth": 24, "maximum_sampling_rate": 192.0,
+             "tracks": {"items": [{"id": 1, "title": "A", "track_number": 1}]}}
+    item = _qitem(title="Album", album=album, album_dir=None,
+                  missing=album["tracks"]["items"], present=[])
+    queue = [item]
+
+    monkeypatch.setattr(executor, "staging_preflight", lambda _a: None)
+    monkeypatch.setattr(executor, "snapshot_staging", lambda: set())
+    monkeypatch.setattr(executor, "is_cancel_requested", lambda: False)
+    monkeypatch.setattr(executor, "_reimport_parked_albums", lambda: False)
+    monkeypatch.setattr(executor, "_run_pre_import_hooks_for_dirs",
+                        lambda _d, _a: ([], 0))
+    monkeypatch.setattr(executor, "track_signatures_for_album_dirs",
+                        lambda _d: [])
+    monkeypatch.setattr(executor, "_resolve_queue_item",
+                        lambda item, _args, imported: {
+                            "result": "imported" if imported else item.get("result"),
+                            "n_ok": item.get("n_ok", 0),
+                        })
+
+    imported_dirs = []
+    monkeypatch.setattr(executor, "_import_album_with_retry",
+                        lambda dirs: imported_dirs.append(list(dirs)) or True)
+
+    def fake_download(**kw):
+        result = kw["result"]
+        if kw.get("quality") == 4:
+            result.update(n_ok=0, n_fail=1, n_lossy=0, failed_tracks=["A"],
+                          lossy_tracks=[], broken_tracks=[], elapsed=0.0,
+                          gap_fill_backup_path=None)
+        else:
+            first_staged.mkdir(parents=True, exist_ok=True)
+            (first_staged / "01.flac").write_bytes(b"first")
+            result.update(n_ok=1, n_fail=0, n_lossy=0, failed_tracks=[],
+                          lossy_tracks=[], broken_tracks=[], elapsed=0.0,
+                          gap_fill_backup_path=None)
+        return result
+
+    def fake_verify(_album, _staged_dirs, *, redownload_at_max, **_kw):
+        dirs = redownload_at_max()
+        return {"under": True, "recovered": False, "retried": True,
+                "n_below": 1, "served": (16, 44100),
+                "target": (24, 96000), "staged_dirs": dirs}
+
+    monkeypatch.setattr(executor, "run_album_download", fake_download)
+    monkeypatch.setattr(executor, "verify_and_recover", fake_verify)
+
+    args = Namespace(dry_run=False, no_import=False, no_downsample=True,
+                     migrate_multi_artist=False, consolidate=False)
+    results, drained = executor._execute_download_queue(
+        queue, args, token="tok")
+
+    assert drained is True
+    assert queue == []
+    assert item["n_ok"] == 1
+    assert results[-1]["n_ok"] == 1
+    assert imported_dirs == [[first_staged]]
+    assert (first_staged / "01.flac").read_bytes() == b"first"
+
+
 def test_executor_upgrade_runs_completeness_gate_before_dropping_backup(monkeypatch, tmp_path):
     # The artist/upgrade walks bulk-upgrade through this executor, so it must run
     # the same completeness gate process.py does: a decode-clean import whose
@@ -236,7 +381,7 @@ def test_executor_per_album_isolation_one_album_failure_keeps_others(monkeypatch
     monkeypatch.setattr(executor, "staging_preflight", lambda _a: None)
     monkeypatch.setattr(executor, "_download_for_queue_item", fake_download)
     monkeypatch.setattr(executor, "_run_pre_import_hooks_for_dirs",
-                        lambda _d, _a: [])
+                        lambda _d, _a: ([], 0))
     # Item B fails beets ("error" = non-retryable); A and C succeed.
     by_label = {"A": "ok", "B": "error", "C": "ok"}
     seen = []
@@ -306,7 +451,8 @@ def test_executor_keeps_only_failed_downloads_for_retry(monkeypatch, tmp_path):
     monkeypatch.setattr(executor, "_download_for_queue_item", lambda _i: None)
     monkeypatch.setattr(executor, "_staged_album_dirs",
                         lambda item: [staging / item["label"]] if item["n_ok"] else [])
-    monkeypatch.setattr(executor, "_run_pre_import_hooks_for_dirs", lambda _d, _a: [])
+    monkeypatch.setattr(executor, "_run_pre_import_hooks_for_dirs",
+                        lambda _d, _a: ([], 0))
     monkeypatch.setattr(executor, "beets_import_albums", lambda _d: "ok")
     monkeypatch.setattr(executor, "_consolidate_duplicate_albums", lambda: None)
     monkeypatch.setattr(executor, "_resolve_queue_item",
@@ -411,7 +557,8 @@ def test_queue_runs_post_download_truncation_recheck_on_success(monkeypatch, tmp
     monkeypatch.setattr(executor, "_download_for_queue_item",
                         lambda item: item.update(n_ok=1, n_fail=0, n_lossy=0, elapsed=0.0))
     monkeypatch.setattr(executor, "_staged_album_dirs", lambda item: [post_dir])
-    monkeypatch.setattr(executor, "_run_pre_import_hooks_for_dirs", lambda dirs, args: [])
+    monkeypatch.setattr(executor, "_run_pre_import_hooks_for_dirs",
+                        lambda dirs, args: ([], 0))
     monkeypatch.setattr(executor, "_import_album_with_retry", lambda dirs: True)
     monkeypatch.setattr(executor, "find_album_dir_filesystem", lambda _a: post_dir)
     monkeypatch.setattr(executor, "_count_audio_files_in", lambda _d: 1)

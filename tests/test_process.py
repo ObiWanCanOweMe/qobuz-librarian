@@ -111,7 +111,7 @@ def test_treat_as_new_downloads_an_owned_album_as_a_separate_edition(monkeypatch
     monkeypatch.setattr(proc, "staging_preflight", lambda _a: None)
     monkeypatch.setattr(proc, "snapshot_staging", lambda: set())
     monkeypatch.setattr(proc, "is_cancel_requested", lambda: False)
-    monkeypatch.setattr(proc, "_pre_import_staging_hooks", lambda _a: [])
+    monkeypatch.setattr(proc, "_pre_import_staging_hooks", lambda _a: ([], 0))
     monkeypatch.setattr(proc, "cleanup_duplicate_art", lambda _d: 0)
     monkeypatch.setattr(proc, "write_post_import_sidecars", lambda _ds: None)
     monkeypatch.setattr(proc, "sweep_staging_artwork", lambda: None)
@@ -137,6 +137,202 @@ def test_treat_as_new_downloads_an_owned_album_as_a_separate_edition(monkeypatch
     result = proc.process_album(album, _args(), token="tok", treat_as_new=True)
     assert result.get("imported") is True
     assert consolidate_seen == [False]
+
+
+def test_auto_downsample_marks_imported_folder_when_album_resolver_misses(
+        monkeypatch, tmp_path):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.modes import process as proc
+
+    staging = tmp_path / "staging"
+    staged_album = staging / "Bill Evans" / "Waltz For Debby"
+    staged_album.mkdir(parents=True)
+    final_dir = tmp_path / "music" / "Bill Evans" / "Waltz For Debby (2023)"
+    final_dir.mkdir(parents=True)
+    (final_dir / "01.flac").write_bytes(b"audio")
+    monkeypatch.setattr(cfg, "STAGING_DIR", staging)
+    monkeypatch.setattr(cfg, "AUTO_UPGRADE_ENABLED", False)
+
+    tracks = [{"id": 1, "title": "My Foolish Heart", "track_number": 1}]
+    album = {"id": "q8m2", "title": "Waltz For Debby",
+             "artist": {"name": "Bill Evans Trio"},
+             "maximum_bit_depth": 24, "maximum_sampling_rate": 192.0,
+             "tracks": {"items": tracks}}
+
+    monkeypatch.setattr(proc, "is_lossless_album", lambda _a: True)
+    monkeypatch.setattr(proc, "find_existing_tracks", lambda _a: ([], None))
+    monkeypatch.setattr(proc, "compute_missing", lambda q, _e: (q, []))
+    monkeypatch.setattr(proc, "find_album_dir_filesystem", lambda _a: None)
+    monkeypatch.setattr(proc, "staging_preflight", lambda _a: None)
+    monkeypatch.setattr(proc, "snapshot_staging", lambda: set())
+    monkeypatch.setattr(proc, "staged_album_dirs_since", lambda _s: [staged_album])
+    monkeypatch.setattr(proc, "is_cancel_requested", lambda: False)
+    monkeypatch.setattr(proc, "_pre_import_staging_hooks", lambda _a: ([], 1))
+    monkeypatch.setattr(proc, "beets_import_paths", lambda *a, **k: True)
+    monkeypatch.setattr(proc, "cleanup_duplicate_art", lambda _d: 0)
+    monkeypatch.setattr(proc, "write_post_import_sidecars", lambda _ds: None)
+    monkeypatch.setattr(proc, "sweep_staging_artwork", lambda: None)
+    monkeypatch.setattr(proc, "print_album_summary", lambda *a, **k: None)
+    monkeypatch.setattr(proc, "log_fetch", lambda _e: None)
+    monkeypatch.setattr(proc, "warn_if_download_truncated", lambda *a, **k: None)
+    monkeypatch.setattr(proc, "verify_and_recover",
+                        lambda *a, **k: {"under": False, "recovered": False,
+                                         "retried": False, "staged_dirs": [staged_album]})
+    monkeypatch.setattr(proc, "track_signatures_for_album_dirs",
+                        lambda _dirs: ["sig"], raising=False)
+    monkeypatch.setattr(proc, "find_album_dir_by_track_signatures",
+                        lambda _sigs: final_dir, raising=False)
+    marked = []
+    monkeypatch.setattr(proc, "mark_local_album_capped",
+                        lambda path, qobuz_album=None: marked.append(path))
+
+    def fake_download(**kw):
+        kw["result"].update(n_ok=1, n_fail=0, n_lossy=0, failed_tracks=[],
+                            lossy_tracks=[], elapsed=0.0,
+                            gap_fill_backup_path=None)
+        return kw["result"]
+    monkeypatch.setattr(proc, "run_album_download", fake_download)
+
+    result = proc.process_album(album, _args(), token="tok")
+
+    assert result["imported"] is True
+    assert marked == [final_dir]
+
+
+def test_self_heal_retry_signatures_use_fresh_staged_dirs(monkeypatch, tmp_path):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.modes import process as proc
+
+    staging = tmp_path / "staging"
+    first_staged = staging / "first" / "Album"
+    retry_staged = staging / "retry" / "Album"
+    first_staged.mkdir(parents=True)
+    retry_staged.mkdir(parents=True)
+    old_dir = tmp_path / "music" / "Artist" / "Album"
+    old_dir.mkdir(parents=True)
+    (old_dir / "01.flac").write_bytes(b"old")
+    final_dir = tmp_path / "music" / "Artist" / "Album (2026)"
+    final_dir.mkdir(parents=True)
+    monkeypatch.setattr(cfg, "STAGING_DIR", staging)
+    monkeypatch.setattr(cfg, "AUTO_UPGRADE_ENABLED", False)
+
+    tracks = [{"id": 1, "title": "A", "track_number": 1}]
+    album = {"id": "ALB", "title": "Album", "artist": {"name": "Artist"},
+             "maximum_bit_depth": 24, "maximum_sampling_rate": 192.0,
+             "tracks": {"items": tracks}}
+
+    monkeypatch.setattr(proc, "is_lossless_album", lambda _a: True)
+    monkeypatch.setattr(proc, "find_existing_tracks", lambda _a: ([], None))
+    monkeypatch.setattr(proc, "compute_missing", lambda q, _e: (q, []))
+    monkeypatch.setattr(proc, "find_album_dir_filesystem", lambda _a: old_dir)
+    monkeypatch.setattr(proc, "staging_preflight", lambda _a: None)
+    monkeypatch.setattr(proc, "snapshot_staging", lambda: set())
+    monkeypatch.setattr(proc, "staged_album_dirs_since", lambda _s: [first_staged])
+    monkeypatch.setattr(proc, "is_cancel_requested", lambda: False)
+    monkeypatch.setattr(proc, "_pre_import_staging_hooks", lambda _a: ([], 1))
+    monkeypatch.setattr(proc, "beets_import_paths", lambda *a, **k: True)
+    monkeypatch.setattr(proc, "cleanup_duplicate_art", lambda _d: 0)
+    monkeypatch.setattr(proc, "write_post_import_sidecars", lambda _ds: None)
+    monkeypatch.setattr(proc, "sweep_staging_artwork", lambda: None)
+    monkeypatch.setattr(proc, "print_album_summary", lambda *a, **k: None)
+    monkeypatch.setattr(proc, "log_fetch", lambda _e: None)
+    monkeypatch.setattr(proc, "warn_if_download_truncated", lambda *a, **k: None)
+    monkeypatch.setattr(proc, "verify_and_recover",
+                        lambda *a, **k: {"under": False, "recovered": True,
+                                         "retried": True,
+                                         "staged_dirs": [retry_staged]})
+
+    signature_dirs = []
+
+    def fake_signatures(dirs):
+        signature_dirs.append(list(dirs))
+        return ["sig"] if list(dirs) == [retry_staged] else []
+
+    monkeypatch.setattr(proc, "track_signatures_for_album_dirs", fake_signatures,
+                        raising=False)
+    monkeypatch.setattr(proc, "find_album_dir_by_track_signatures",
+                        lambda _sigs: final_dir, raising=False)
+    marked = []
+    monkeypatch.setattr(proc, "mark_local_album_capped",
+                        lambda path, qobuz_album=None: marked.append(path))
+
+    def fake_download(**kw):
+        kw["result"].update(n_ok=1, n_fail=0, n_lossy=0, failed_tracks=[],
+                            lossy_tracks=[], elapsed=0.0,
+                            gap_fill_backup_path=None)
+        return kw["result"]
+    monkeypatch.setattr(proc, "run_album_download", fake_download)
+
+    result = proc.process_album(album, _args(), token="tok")
+
+    assert result["imported"] is True
+    assert signature_dirs == [[retry_staged]]
+    assert marked == [final_dir]
+
+
+def test_self_heal_retry_no_files_imports_first_staged_rip(
+        monkeypatch, tmp_path):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.modes import process as proc
+
+    staging = tmp_path / "staging"
+    first_staged = staging / "Artist" / "Album"
+    monkeypatch.setattr(cfg, "STAGING_DIR", staging)
+    monkeypatch.setattr(cfg, "AUTO_UPGRADE_ENABLED", False)
+
+    album = {"id": "ALB", "title": "Album", "artist": {"name": "Artist"},
+             "maximum_bit_depth": 24, "maximum_sampling_rate": 192.0,
+             "tracks": {"items": [{"id": 1, "title": "A", "track_number": 1}]}}
+
+    monkeypatch.setattr(proc, "is_lossless_album", lambda _a: True)
+    monkeypatch.setattr(proc, "find_existing_tracks", lambda _a: ([], None))
+    monkeypatch.setattr(proc, "compute_missing", lambda q, _e: (q, []))
+    monkeypatch.setattr(proc, "find_album_dir_filesystem", lambda _a: None)
+    monkeypatch.setattr(proc, "staging_preflight", lambda _a: None)
+    monkeypatch.setattr(proc, "snapshot_staging", lambda: set())
+    monkeypatch.setattr(proc, "is_cancel_requested", lambda: False)
+    monkeypatch.setattr(proc, "_pre_import_staging_hooks", lambda _a: ([], 0))
+    monkeypatch.setattr(proc, "cleanup_duplicate_art", lambda _d: 0)
+    monkeypatch.setattr(proc, "write_post_import_sidecars", lambda _ds: None)
+    monkeypatch.setattr(proc, "sweep_staging_artwork", lambda: None)
+    monkeypatch.setattr(proc, "print_album_summary", lambda *a, **k: None)
+    monkeypatch.setattr(proc, "log_fetch", lambda _e: None)
+    monkeypatch.setattr(proc, "warn_if_download_truncated", lambda *a, **k: None)
+    monkeypatch.setattr(proc, "track_signatures_for_album_dirs", lambda _d: [])
+
+    imported = []
+    monkeypatch.setattr(proc, "beets_import_paths",
+                        lambda *a, **k: imported.append(
+                            first_staged / "01.flac") or True)
+
+    def fake_download(**kw):
+        result = kw["result"]
+        if kw.get("quality") == 4:
+            result.update(n_ok=0, n_fail=1, n_lossy=0, failed_tracks=["A"],
+                          lossy_tracks=[], broken_tracks=[], elapsed=0.0,
+                          gap_fill_backup_path=None)
+        else:
+            first_staged.mkdir(parents=True, exist_ok=True)
+            (first_staged / "01.flac").write_bytes(b"first")
+            result.update(n_ok=1, n_fail=0, n_lossy=0, failed_tracks=[],
+                          lossy_tracks=[], broken_tracks=[], elapsed=0.0,
+                          gap_fill_backup_path=None)
+        return result
+
+    def fake_verify(_album, _staged_dirs, *, redownload_at_max, **_kw):
+        dirs = redownload_at_max()
+        return {"under": True, "recovered": False, "retried": True,
+                "n_below": 1, "served": (16, 44100),
+                "target": (24, 96000), "staged_dirs": dirs}
+
+    monkeypatch.setattr(proc, "run_album_download", fake_download)
+    monkeypatch.setattr(proc, "verify_and_recover", fake_verify)
+
+    result = proc.process_album(album, _args(), token="tok")
+
+    assert result["imported"] is True
+    assert imported == [first_staged / "01.flac"]
+    assert (first_staged / "01.flac").read_bytes() == b"first"
 
 
 def test_gap_fill_backup_restored_when_track_returns_lossy(monkeypatch, tmp_path):
@@ -175,7 +371,7 @@ def test_gap_fill_backup_restored_when_track_returns_lossy(monkeypatch, tmp_path
     monkeypatch.setattr(proc, "snapshot_staging", lambda: set())
     monkeypatch.setattr(proc, "staging_preflight", lambda _a: None)
     monkeypatch.setattr(proc, "is_cancel_requested", lambda: False)
-    monkeypatch.setattr(proc, "_pre_import_staging_hooks", lambda _a: [])
+    monkeypatch.setattr(proc, "_pre_import_staging_hooks", lambda _a: ([], 0))
     monkeypatch.setattr(proc, "beets_import_paths", lambda *a, **k: True)
     monkeypatch.setattr(proc, "cleanup_duplicate_art", lambda _d: 0)
     monkeypatch.setattr(proc, "write_post_import_sidecars", lambda _ds: None)
