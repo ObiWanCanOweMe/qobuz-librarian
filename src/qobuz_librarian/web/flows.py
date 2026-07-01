@@ -274,6 +274,77 @@ def is_gap_candidate(c):
     return "gap-fill:" in (c.get("detail") or "")
 
 
+def prune_library_review_candidates(album):
+    """A full album just landed on disk (Search download, batch download,
+    upgrade replace): drop its candidates from every parked or still-scanning
+    library review, so a stale review can't offer to download an album the
+    user already has. The executing job itself is RUNNING and untouched.
+    Matched by Qobuz album id. Returns the number of candidates dropped."""
+    from qobuz_librarian.web import job_persistence
+    from qobuz_librarian.web import jobs as job_mgr
+    album_id = str((album or {}).get("id") or "")
+    if not album_id:
+        return 0
+    dropped = 0
+    states = (job_mgr.JobStatus.AWAITING_REVIEW, job_mgr.JobStatus.SCANNING)
+    for job in job_mgr.registry.all():
+        if (getattr(job, "execute_kind", "") not in ("library", "new_releases")
+                or job.status not in states):
+            continue
+        try:
+            with job._lock:
+                keep = [c for c in job.candidates
+                        if str((c.get("payload") or {}).get("album_id") or "")
+                        != album_id]
+                n = len(job.candidates) - len(keep)
+                if not n:
+                    continue
+                job.candidates = keep
+            dropped += n
+            job_persistence.persist(job)
+            job.notify_review_changed()
+            job_mgr.finalize_review_if_empty(job)
+        except Exception as e:
+            # Pruning is housekeeping on the side of a successful download —
+            # never let it turn that success into a failure.
+            log.info(f"  couldn't prune review {job.id}: {e}")
+    return dropped
+
+
+def drop_owned_missing_candidates(job):
+    """Reconcile a parked library review against the disk right before it
+    executes: a missing-album candidate whose folder now exists (grabbed from
+    Search while the review sat parked, or added by hand) is dropped instead
+    of downloaded again. Gap Fill candidates are left alone — their album
+    folder exists by definition; full-album imports already prune them via
+    prune_library_review_candidates. Returns how many of the dropped
+    candidates were selected (the number the user believes they're about to
+    download)."""
+    from qobuz_librarian.library.catalog import find_album_dir_filesystem
+    from qobuz_librarian.web import job_persistence
+    with job._lock:
+        snapshot = [(c["cid"], bool(c.get("selected")),
+                     {"id": (c.get("payload") or {}).get("album_id"),
+                      "title": c.get("title") or "",
+                      "artist": {"name": c.get("artist") or ""}})
+                    for c in job.candidates if not is_gap_candidate(c)]
+    # Disk probes happen outside the lock; a live scan can keep appending.
+    owned = {}
+    for cid, selected, alb in snapshot:
+        try:
+            if find_album_dir_filesystem(alb) is not None:
+                owned[cid] = selected
+        except Exception:
+            continue
+    if not owned:
+        return 0
+    with job._lock:
+        job.candidates = [c for c in job.candidates if c["cid"] not in owned]
+    job_persistence.persist(job)
+    job.notify_review_changed()
+    return sum(1 for sel in owned.values() if sel)
+
+
 def _record_last_scan():
     try:
         cfg.LAST_SCAN_FILE.write_text(str(time.time()), encoding="utf-8")
@@ -940,6 +1011,9 @@ def execute_albums(job, chosen, token):
                 fallback_artist=cand.get("artist"),
                 downsample=True,
             )
+            # The album is on disk now — any OTHER parked library review still
+            # offering it is stale.
+            prune_library_review_candidates(full)
             # A partial (some tracks landed, some failed) isn't a full download —
             # count it apart so the summary doesn't claim it finished.
             if result.get("n_fail", 0) > 0:
@@ -1220,6 +1294,9 @@ def execute_upgrades(job, chosen, token):
                 upgrade=True,
                 downsample=True,
             )
+            # The verified replace refreshed the whole album, so a parked
+            # library review's candidates for it (incl. Gap Fill) are stale.
+            prune_library_review_candidates(album)
         elif result and _res in (_skip - {"cancelled", "dry_run"}):
             _refresh_after_local_album_change(
                 album,

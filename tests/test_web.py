@@ -2066,6 +2066,104 @@ def test_library_approve_scoped_to_tab_splits_off_other_tab(client, monkeypatch)
             _remove_job(split)
 
 
+def test_search_download_prunes_parked_library_review(client, monkeypatch, tmp_path):
+    """A Search download that imports an album must drop that album from a
+    parked library review — otherwise the stale review offers to download it
+    again. Other candidates and their ticks stay put."""
+    from qobuz_librarian.web import app as webapp
+    monkeypatch.setattr("qobuz_librarian.config.HIDDEN_FILE", tmp_path / "h.json")
+    monkeypatch.setattr("qobuz_librarian.modes.process.process_album",
+                        lambda *a, **k: {"imported": True, "n_ok": 9})
+
+    parked = _inject_job(jm.JobStatus.AWAITING_REVIEW)
+    parked.execute_kind = "library"
+    parked.add_candidate(kind="album", title="Third", artist="Portishead",
+                         payload={"album_id": "q123", "year": "2008"},
+                         selected=True)
+    parked.add_candidate(kind="album", title="Dummy", artist="Portishead",
+                         payload={"album_id": "q456", "year": "1994"},
+                         selected=True)
+    runner = _inject_job(jm.JobStatus.RUNNING)
+    try:
+        album = {"id": "q123", "title": "Third",
+                 "artist": {"name": "Portishead"}}
+        webapp._make_download_run(album, token="tok")(runner)
+        assert runner.status != jm.JobStatus.FAILED
+        flags = {c["title"]: c["selected"] for c in parked.candidates}
+        assert flags == {"Dummy": True}
+        assert parked.status == jm.JobStatus.AWAITING_REVIEW
+    finally:
+        _remove_job(parked)
+        _remove_job(runner)
+
+
+def test_library_approve_skips_candidates_already_on_disk(client, monkeypatch):
+    """Approving a parked review re-checks the disk: a missing-album candidate
+    whose folder appeared while the review sat parked is dropped (and counted
+    in the redirect note) instead of downloaded again. Gap Fill candidates are
+    exempt — their folder exists by definition."""
+    monkeypatch.setattr(jm._scan_queue, "put", lambda item: None)
+    monkeypatch.setattr(
+        "qobuz_librarian.library.catalog.find_album_dir_filesystem",
+        lambda alb: Path("/music/Portishead/Third") if alb.get("id") == "q123"
+        else None)
+
+    job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
+    job.execute_kind = "library"
+    job.review_verb = "Download"
+    job._execute_fn = lambda j, chosen: None
+    job.add_candidate(kind="album", title="Third", artist="Portishead",
+                      payload={"album_id": "q123", "year": "2008"},
+                      selected=True)
+    job.add_candidate(kind="album", title="Dummy", artist="Portishead",
+                      payload={"album_id": "q456", "year": "1994"},
+                      selected=True)
+    # An owned-looking gap candidate must survive the disk check.
+    job.add_candidate(kind="album", title="Roseland NYC Live",
+                      artist="Portishead",
+                      payload={"album_id": "q123", "gap_fill": 2},
+                      selected=False)
+    split = None
+    try:
+        r = client.post(f"/jobs/{job.id}/approve", data={"tab": "missing"},
+                        follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/library?approved=1&skipped=1"
+        assert [c["title"] for c in job.candidates] == ["Dummy"]
+        split = next(j for j in jm.registry.all()
+                     if j is not job and j.execute_kind == "library"
+                     and j.status == jm.JobStatus.AWAITING_REVIEW)
+        assert [c["title"] for c in split.candidates] == ["Roseland NYC Live"]
+        # The note is rendered on /library.
+        r = client.get("/library?approved=1&skipped=1")
+        assert "1 album already in your library — skipped." in r.text
+    finally:
+        _remove_job(job)
+        if split is not None:
+            _remove_job(split)
+
+
+def test_library_approve_when_everything_is_already_on_disk(client, monkeypatch):
+    monkeypatch.setattr(jm._scan_queue, "put", lambda item: None)
+    monkeypatch.setattr(
+        "qobuz_librarian.library.catalog.find_album_dir_filesystem",
+        lambda alb: Path("/music/Portishead/x"))
+    job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
+    job.execute_kind = "library"
+    job._execute_fn = lambda j, chosen: None
+    job.add_candidate(kind="album", title="Third", artist="Portishead",
+                      payload={"album_id": "q123"}, selected=True)
+    try:
+        r = client.post(f"/jobs/{job.id}/approve", follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/library?skipped=1"
+        # Nothing left to review or download; the review completed quietly.
+        assert job.candidates == []
+        assert job.status != jm.JobStatus.AWAITING_REVIEW
+    finally:
+        _remove_job(job)
+
+
 def test_library_select_all_scoped_to_tab(client):
     job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
     job.execute_kind = "library"

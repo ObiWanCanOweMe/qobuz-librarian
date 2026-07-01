@@ -8,6 +8,9 @@
     <h1>Library</h1>
   </header>
 
+  {% if error %}<div class="ql-flash ql-flash-warning" data-flash><span>{{ error }}</span></div>{% endif %}
+  {% if library_notice %}<div class="ql-flash ql-flash-info" data-flash><span>{{ library_notice }}</span></div>{% endif %}
+
   {% if not qobuz_ready %}
   <section class="ql-work-card">
     {% with connect_embedded=True %}
@@ -16,7 +19,6 @@
   </section>
 
   {% elif library_job %}
-  {% if library_notice %}<div class="ql-flash ql-flash-info" data-flash><span>{{ library_notice }}</span></div>{% endif %}
   {# Single surface: the scan's live progress and the Missing Albums / Gap
      Fill review render right here, same as /repair. #}
   {% with job = library_job, embedded_surface = true %}{% include "_job_body.html" %}{% endwith %}
@@ -33,7 +35,6 @@
   </section>
 
   {% elif not baseline_complete %}
-  {% if error %}<div class="ql-flash ql-flash-warning" data-flash><span>{{ error }}</span></div>{% endif %}
 
   <section class="ql-scan-hero">
     <svg class="ql-scan-hero-mark" viewBox="0 0 96 96" fill="none" aria-hidden="true">
@@ -53,8 +54,6 @@
   </section>
 
   {% else %}
-  {% if error %}<div class="ql-flash ql-flash-warning" data-flash><span>{{ error }}</span></div>{% endif %}
-  {% if library_notice %}<div class="ql-flash ql-flash-info" data-flash><span>{{ library_notice }}</span></div>{% endif %}
 
   <div class="ql-scan-status">
     <span class="ql-status-chip is-success">Baseline ready</span>

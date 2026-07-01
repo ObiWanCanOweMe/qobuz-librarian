@@ -2140,6 +2140,10 @@ def _make_download_run(album, token, *, treat_as_new=False):
                 upgrade=True,
                 downsample=True,
             )
+            # A parked library review may still offer this album — drop it
+            # there so the stale review can't download it a second time.
+            from qobuz_librarian.web.flows import prune_library_review_candidates
+            prune_library_review_candidates(album)
             from qobuz_librarian.library import hidden as hidden_mod
             hidden_mod.unmark_single(
                 (album.get("artist") or {}).get("name") or "?",
@@ -2217,6 +2221,9 @@ def _make_single_track_run(album, track, token):
             hidden_mod.unmark_single(artist, title)
             j.summary = (f"Got “{t_title}”; that completed {title}, so it's "
                          "filed as a full album.")
+            # Complete means any parked Gap Fill candidate for it is stale.
+            from qobuz_librarian.web.flows import prune_library_review_candidates
+            prune_library_review_candidates(album)
         _refresh_after_local_album_change(
             album,
             {"dir": qi.get("_resolved_post_dir") or album_dir},
@@ -2502,12 +2509,19 @@ async def library_page(request: Request, page: int = 1):
     from qobuz_librarian.library import scan_checkpoint
     creds_ok = bool(_read_creds().get("auth_token"))
     from qobuz_librarian.library import new_releases
+    notice_bits = []
+    _skipped = request.query_params.get("skipped", "")
+    if _skipped.isdigit() and int(_skipped):
+        n = int(_skipped)
+        notice_bits.append(
+            f"{n} album{'s' if n != 1 else ''} already in your library — skipped.")
     if request.query_params.get("noselection"):
-        notice = "Nothing is selected on that tab yet."
+        notice_bits.append("Nothing else is selected on that tab."
+                           if notice_bits else
+                           "Nothing is selected on that tab yet.")
     elif request.query_params.get("approved"):
-        notice = "Download started — it's running in the queue."
-    else:
-        notice = ""
+        notice_bits.append("Download started — it's running in the queue.")
+    notice = " ".join(notice_bits)
     ctx = {
         "creds_ok": creds_ok, "qobuz_ready": _qobuz_ready(), "page": "library",
         "library_scan_state": _library_scan_state(),
@@ -3195,6 +3209,21 @@ async def job_approve(request: Request, job_id: str):
     tab = (form.get("tab") or "").strip()
     if job.execute_kind != "library" or tab not in ("missing", "gaps"):
         tab = ""
+    loop = asyncio.get_running_loop()
+    skipped = 0
+    if (job.status == job_mgr.JobStatus.AWAITING_REVIEW
+            and job.execute_kind in _LIBRARY_SURFACE_KINDS):
+        # The review may have gone stale while parked: an album grabbed from
+        # Search (or added by hand) can still sit here as a missing-album
+        # candidate. Re-check against the disk and drop what's already owned,
+        # instead of downloading it again. Disk probes — off the event loop.
+        from qobuz_librarian.web import flows
+        skipped = await loop.run_in_executor(
+            None, lambda: flows.drop_owned_missing_candidates(job))
+        if skipped and job_mgr.finalize_review_if_empty(job):
+            return RedirectResponse(url=f"{dest}?skipped={skipped}",
+                                    status_code=303)
+    _skip_q = f"&skipped={skipped}" if skipped else ""
     if job.status == job_mgr.JobStatus.AWAITING_REVIEW:
         from qobuz_librarian.web import flows
         if tab:
@@ -3206,7 +3235,8 @@ async def job_approve(request: Request, job_id: str):
         else:
             has_pick = any(c.get("selected") for c in job.candidates)
         if not has_pick:
-            return RedirectResponse(url=f"{dest}?noselection=1", status_code=303)
+            return RedirectResponse(url=f"{dest}?noselection=1{_skip_q}",
+                                    status_code=303)
     # Selection is saved server-side as the user ticks (the paginated review no
     # longer carries every checkbox in the form), so approve runs against the
     # saved flags — passing None keeps them as-is rather than reading the form.
@@ -3214,8 +3244,6 @@ async def job_approve(request: Request, job_id: str):
     # candidate dicts + a SQLite commit, which would block the single event loop
     # (freezing every SSE stream / other request) for a large parked review —
     # the same reason /select was offloaded.
-    loop = asyncio.get_running_loop()
-
     def _split_and_approve():
         if tab and job.status == job_mgr.JobStatus.AWAITING_REVIEW:
             _split_off_inactive_tab(job, tab)
@@ -3223,7 +3251,7 @@ async def job_approve(request: Request, job_id: str):
 
     approved = await loop.run_in_executor(None, _split_and_approve)
     flag = "approved=1" if approved else "stale=1"
-    return RedirectResponse(url=f"{dest}?{flag}", status_code=303)
+    return RedirectResponse(url=f"{dest}?{flag}{_skip_q}", status_code=303)
 
 
 # Review kinds that get the paced-triage surface (unticked and hideable). They
