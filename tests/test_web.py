@@ -540,7 +540,7 @@ def test_artist_search_selected_artist_shows_discography(client, monkeypatch):
     assert r.status_code == 200
     assert seen == {"artist_id": "artist1", "limit": cfg.ARTIST_CATALOG_LIMIT}
     assert "Paysage d&#39;Hiver" in r.text
-    assert "Artist discography" in r.text
+    assert "1 album on Qobuz" in r.text
     assert "Das Tor" in r.text
     assert "Download" in r.text
 
