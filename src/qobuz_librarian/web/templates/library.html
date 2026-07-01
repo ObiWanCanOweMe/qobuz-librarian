@@ -6,7 +6,6 @@
 <div class="ql-tool-page ql-library-page">
   <header class="ql-page-header">
     <h1>Library</h1>
-    <p>Refresh the saved baseline for missing albums, Gap Fill candidates, upgrades, and downsample candidates.</p>
   </header>
 
   {% if not qobuz_ready %}
@@ -15,6 +14,12 @@
       {% include "_connect_cta.html" %}
     {% endwith %}
   </section>
+
+  {% elif library_job %}
+  {% if library_notice %}<div class="ql-flash ql-flash-info" data-flash><span>{{ library_notice }}</span></div>{% endif %}
+  {# Single surface: the scan's live progress and the Missing Albums / Gap
+     Fill review render right here, same as /repair. #}
+  {% with job = library_job, embedded_surface = true %}{% include "_job_body.html" %}{% endwith %}
 
   {% elif not library_scan_state.ready %}
   <section class="ql-work-card ql-work-card-warning">
@@ -28,125 +33,66 @@
   </section>
 
   {% elif not baseline_complete %}
-  <div class="ql-work-status ql-work-status--bar">
-    <span class="ql-status-chip is-warning">First scan needed</span>
-    <span>{{ library_scan_state.count }} artist folder{% if library_scan_state.count != 1 %}s{% endif %} ready to scan.</span>
+  {% if error %}<div class="ql-flash ql-flash-warning" data-flash><span>{{ error }}</span></div>{% endif %}
+
+  <section class="ql-scan-hero">
+    <svg class="ql-scan-hero-mark" viewBox="0 0 96 96" fill="none" aria-hidden="true">
+      <path d="M30 22v52M42 22v52" stroke="currentColor" stroke-opacity="0.5" stroke-width="2" stroke-linecap="round"/>
+      <path d="M54 26l12 46" stroke="currentColor" stroke-opacity="0.5" stroke-width="2" stroke-linecap="round"/>
+      <circle cx="70" cy="66" r="14" stroke="currentColor" stroke-width="2"/>
+      <path d="M80.5 76.5 88 84" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+    </svg>
+    <p class="ql-scan-hero-title">One scan builds your library&rsquo;s baseline.</p>
+    <p class="ql-scan-hero-text">It finds missing albums, missing tracks inside albums you own, and albums Qobuz can serve at better quality &mdash; ready to review here and on the Upgrade and Downsample pages.</p>
+    <p class="ql-scan-hero-meta">{{ library_scan_state.count }} artist folder{% if library_scan_state.count != 1 %}s{% endif %} to scan{% if library_resume and library_resume.kind == 'missing' %} &middot; {{ library_resume.done }} already checked, continues from there{% endif %}</p>
+    <form action="/library" method="post" data-busy-submit>
+      <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+      <input type="hidden" name="mode" value="missing_albums">
+      <button type="submit" class="ql-btn ql-btn-primary w-full sm:w-auto">Scan library</button>
+    </form>
+  </section>
+
+  {% else %}
+  {% if error %}<div class="ql-flash ql-flash-warning" data-flash><span>{{ error }}</span></div>{% endif %}
+  {% if library_notice %}<div class="ql-flash ql-flash-info" data-flash><span>{{ library_notice }}</span></div>{% endif %}
+
+  <div class="ql-scan-status">
+    <span class="ql-status-chip is-success">Baseline ready</span>
+    <span class="ql-scan-status-meta">{% if last_full_scan %}Last full scan {{ last_full_scan }}{% else %}A full baseline has finished{% endif %}</span>
     {% if hidden_count %}
-    <a href="/library/hidden">
+    <a href="/library/hidden" class="ql-inline-link ql-scan-status-link">
       {{ hidden_count }} dismissed result{% if hidden_count != 1 %}s{% endif %}
     </a>
     {% endif %}
   </div>
 
-  {% if error %}<div class="ql-flash ql-flash-warning" data-flash><span>{{ error }}</span></div>{% endif %}
-
-  <section class="ql-work-card ql-work-card-primary ql-baseline-card">
-    <div class="ql-work-card-copy">
-      <p class="ql-work-card-kicker">Baseline</p>
-      <p class="ql-work-card-title">Build baseline</p>
-      <p class="ql-work-card-text">Run this once before reviewing Library, Upgrade, or Downsample results.</p>
+  <section class="ql-scan-panel">
+    <div class="ql-scan-panel-copy">
+      <p class="ql-scan-panel-title">Scan library</p>
+      <p class="ql-scan-panel-text">Quick scans skip unchanged artist folders and refresh Missing Albums, Gap Fill, Upgrade, and Downsample in one pass.</p>
     </div>
-    <div class="ql-work-card-actions">
+    <div class="ql-scan-panel-actions">
       <form action="/library" method="post" data-busy-submit>
         <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
         <input type="hidden" name="mode" value="missing_albums">
         <button type="submit" class="ql-btn ql-btn-primary w-full sm:w-auto">Scan library</button>
       </form>
+      <form action="/library" method="post" data-busy-submit>
+        <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+        <input type="hidden" name="mode" value="new_releases">
+        <button type="submit" class="ql-btn ql-btn-secondary ql-secondary-action">Check new releases</button>
+      </form>
     </div>
   </section>
 
-  <div class="ql-scan-map" aria-label="Baseline refresh includes">
-    <section class="ql-scan-map-item">
-      <h2>Missing Albums</h2>
-      <p>Find Qobuz albums by artists already in your library.</p>
-    </section>
-    <section class="ql-scan-map-item">
-      <h2>Gap Fill</h2>
-      <p>Find missing tracks inside albums you already own.</p>
-    </section>
-    <section class="ql-scan-map-item">
-      <h2>Upgrade</h2>
-      <p>Refresh saved candidates where Qobuz can serve a better source.</p>
-    </section>
-    <section class="ql-scan-map-item">
-      <h2>Downsample</h2>
-      <p>Refresh local hi-res albums that can be reduced later.</p>
-    </section>
-  </div>
-
-  {% if library_resume %}
+  {% if library_resume and library_resume.kind == 'missing' %}
   <div class="ql-tool-note ql-tool-note-info">
     <p class="ql-tool-note-title">Scan can resume</p>
-    <p>{{ library_resume.done }} artist{{ 's' if library_resume.done != 1 }} already checked. Starting again continues from there.</p>
+    <p>{{ library_resume.done }} artist{{ 's' if library_resume.done != 1 }} already checked. Scan library continues from there.</p>
   </div>
   {% endif %}
 
-  <details class="ql-action-group ql-scan-options">
-    <summary class="ql-disclosure-summary">Scan Gap Fill only</summary>
-    <div class="ql-disclosure-body">
-      <p>Use this if you only want missing tracks inside albums already in your library.</p>
-      <form action="/library" method="post" data-busy-submit>
-        <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-        <input type="hidden" name="mode" value="partial_fill">
-        <button type="submit" class="ql-btn ql-btn-secondary ql-btn-sm w-full sm:w-auto">Scan Gap Fill</button>
-      </form>
-    </div>
-  </details>
-
-  {% else %}
-  <div class="ql-work-status ql-work-status--bar">
-    <span class="ql-status-chip is-success">Baseline ready</span>
-    <span>
-      {% if last_full_scan %}Last full scan {{ last_full_scan }}.{% else %}A full baseline has finished.{% endif %}
-    </span>
-    {% if hidden_count %}
-    <a href="/library/hidden">
-      {{ hidden_count }} dismissed result{% if hidden_count != 1 %}s{% endif %}
-    </a>
-    {% endif %}
-  </div>
-
-  {% if error %}<div class="ql-flash ql-flash-warning" data-flash><span>{{ error }}</span></div>{% endif %}
-  {% if library_resume %}
-  <div class="ql-tool-note ql-tool-note-info">
-    <p class="ql-tool-note-title">Re-scan can resume</p>
-    <p>{{ library_resume.done }} artist{{ 's' if library_resume.done != 1 }} already checked. Open scan options to continue.</p>
-  </div>
-  {% endif %}
-
-  <div class="ql-work-grid">
-    <section class="ql-work-card ql-work-card-primary ql-baseline-card">
-      <div class="ql-work-card-copy">
-        <p class="ql-work-card-kicker">Baseline</p>
-        <p class="ql-work-card-title">Refresh baseline</p>
-        <p class="ql-work-card-text">Quick scans skip unchanged artist folders and refresh Library, Upgrade, and Downsample state.</p>
-      </div>
-      <div class="ql-work-card-actions">
-        <form action="/library" method="post" data-busy-submit>
-          <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-          <input type="hidden" name="mode" value="missing_albums">
-          <button type="submit" class="ql-btn ql-btn-primary w-full sm:w-auto">Scan library</button>
-        </form>
-      </div>
-    </section>
-
-    <section class="ql-work-card">
-      <div class="ql-work-card-copy">
-        <p class="ql-work-card-kicker">Baseline delta</p>
-        <p class="ql-work-card-title">New releases</p>
-        <p class="ql-work-card-text">Compare Qobuz against the saved baseline for artists you already keep.</p>
-      </div>
-      <div class="ql-work-card-actions">
-        <form action="/library" method="post" data-busy-submit>
-          <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-          <input type="hidden" name="mode" value="new_releases">
-          <button type="submit" class="ql-btn ql-btn-secondary w-full sm:w-auto">Check new releases</button>
-        </form>
-      </div>
-    </section>
-  </div>
-
-  <details class="ql-scan-options"{% if library_resume %} open{% endif %}>
+  <details class="ql-scan-options">
     <summary class="ql-disclosure-summary">Scan options</summary>
     <div class="ql-disclosure-body">
       <div class="ql-tool-note ql-tool-note-warning">
@@ -154,50 +100,11 @@
       </div>
       <form action="/library" method="post" data-busy-submit>
         <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-        <div class="ql-option-stack">
-          <label class="ql-option-row">
-            <input type="radio" name="mode" value="missing_albums" class="ql-radio ql-option-control"
-                   {% if not library_resume or library_resume.kind == 'missing' %}checked{% endif %}>
-            <div>
-              <div class="ql-option-title">Full baseline refresh</div>
-              <div class="ql-option-help">Missing albums, Gap Fill candidates, upgrades, and downsample candidates.</div>
-            </div>
-          </label>
-          <label class="ql-option-row">
-            <input type="radio" name="mode" value="partial_fill" class="ql-radio ql-option-control"
-                   {% if library_resume and library_resume.kind == 'partial' %}checked{% endif %}>
-            <div>
-              <div class="ql-option-title">Gap Fill only</div>
-              <div class="ql-option-help">Skips fully missing albums.</div>
-            </div>
-          </label>
-        </div>
-        <div class="ql-button-row">
-          <button type="submit" class="ql-btn ql-btn-secondary ql-btn-sm w-full sm:w-auto">Run selected scan</button>
-          <button type="submit" name="force_full" value="1" class="ql-btn ql-btn-ghost ql-btn-sm w-full sm:w-auto">Force full rescan</button>
-        </div>
+        <input type="hidden" name="mode" value="missing_albums">
+        <button type="submit" name="force_full" value="1" class="ql-btn ql-btn-ghost ql-btn-sm w-full sm:w-auto">Force full rescan</button>
       </form>
     </div>
   </details>
-
-  <div class="ql-scan-map" aria-label="Baseline refresh includes">
-    <section class="ql-scan-map-item">
-      <h2>Missing Albums</h2>
-      <p>Saved for review when Qobuz has albums not in your library.</p>
-    </section>
-    <section class="ql-scan-map-item">
-      <h2>Gap Fill</h2>
-      <p>Saved for review when local albums are missing tracks.</p>
-    </section>
-    <section class="ql-scan-map-item">
-      <h2>Upgrade</h2>
-      <p>Refreshes the saved quality review without adding a separate scan button.</p>
-    </section>
-    <section class="ql-scan-map-item">
-      <h2>Downsample</h2>
-      <p>Refreshes local candidates; can also be run offline from Downsample.</p>
-    </section>
-  </div>
   {% endif %}
 </div>
 

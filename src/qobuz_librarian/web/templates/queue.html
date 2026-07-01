@@ -32,7 +32,7 @@
 
   <div class="ql-activity-main">
     <p class="ql-row-title">
-      <a href="{{ '/repair' if job.execute_kind == 'repair' else '/jobs/' ~ job.id }}" class="ql-row-link">
+      <a href="{{ '/repair' if job.execute_kind == 'repair' else ('/library' if job.execute_kind in ('library', 'new_releases') else '/jobs/' ~ job.id) }}" class="ql-row-link">
         {% if job.status.value == 'awaiting_review' %}
           {{ labels.review_title(job) }}{% if job.artist %} · {{ job.artist }}{% endif %}
         {% else %}
@@ -85,7 +85,7 @@
   {% set _discard_confirm = 'Discard this ' ~ _thing ~ '? No files will change. Run the scan again to see these results later.' %}
   {% endif %}
   <div class="ql-activity-actions">
-    <a href="{{ '/repair' if job.execute_kind == 'repair' else '/jobs/' ~ job.id }}" class="ql-btn ql-btn-sm ql-btn-primary">Review</a>
+    <a href="{{ '/repair' if job.execute_kind == 'repair' else ('/library' if job.execute_kind in ('library', 'new_releases') else '/jobs/' ~ job.id) }}" class="ql-btn ql-btn-sm ql-btn-primary">Review</a>
     <form action="/jobs/{{ job.id }}/cancel" method="post">
       <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
       <button type="submit" class="ql-btn ql-btn-sm ql-btn-danger"

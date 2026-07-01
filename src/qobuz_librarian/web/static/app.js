@@ -769,14 +769,45 @@
     function pageBox() { return document.getElementById("review-groups"); }
     function curPage() { var g = pageBox(); return g ? parseInt(g.dataset.page || "1", 10) : 1; }
     function curQuery() { return (filterInput && filterInput.value || "").trim(); }
+    function curTab() {
+      var b = cont.querySelector("[data-review-tab].is-active");
+      return b ? b.getAttribute("data-review-tab") : "";
+    }
+    // Last server counts payload. Seeded from the initial render's data
+    // attributes so tab switches can re-scope the bulk bar without a request.
+    var lastCounts = {
+      total: parseInt(cont.dataset.reviewTotal || "0", 10),
+      selected: parseInt(cont.dataset.reviewSelected || "0", 10),
+    };
+    if (cont.dataset.reviewMissingTotal !== undefined) {
+      lastCounts.missing_total = parseInt(cont.dataset.reviewMissingTotal || "0", 10);
+      lastCounts.missing_selected = parseInt(cont.dataset.reviewMissingSelected || "0", 10);
+      lastCounts.gap_total = parseInt(cont.dataset.reviewGapTotal || "0", 10);
+      lastCounts.gap_selected = parseInt(cont.dataset.reviewGapSelected || "0", 10);
+    }
+    // The active tab's share of the counts — the bulk bar acts on the active
+    // tab only, so it counts the active tab only. Untabbed reviews fall back
+    // to the whole set.
+    function tabCounts(c) {
+      var tab = curTab();
+      if (!tab || !c || c.missing_total === undefined) {
+        return { total: c ? c.total : 0, selected: c ? c.selected : 0 };
+      }
+      return tab === "gaps"
+        ? { total: c.gap_total, selected: c.gap_selected }
+        : { total: c.missing_total, selected: c.missing_selected };
+    }
 
-    // Counts come from the server because the DOM only holds one page.
+    // Counts come from the server because the DOM only holds one page. The
+    // bulk bar (submit + dismiss-unselected) is scoped to the active tab.
     function applyCounts(c) {
       if (!c) return;
+      lastCounts = c;
+      var tc = tabCounts(c);
       if (submit) {
-        submit.disabled = c.selected === 0;
-        submit.textContent = c.selected
-          ? (submit.dataset.reviewVerb || "Download") + " " + c.selected + " selected"
+        submit.disabled = tc.selected === 0;
+        submit.textContent = tc.selected
+          ? (submit.dataset.reviewVerb || "Download") + " " + tc.selected + " selected"
           : (submit.dataset.emptyLabel || "Select " + reviewItemPlural);
       }
       if (summaryCount) {
@@ -784,6 +815,8 @@
       }
       if (summaryRow) summaryRow.classList.toggle("hidden", c.total === 0);
       if (emptyBox) emptyBox.classList.toggle("hidden", c.total > 0);
+      var tabsNav = cont.querySelector("[data-review-tabs]");
+      if (tabsNav) tabsNav.classList.toggle("hidden", c.total === 0);
       if (filterRow && !curQuery()) filterRow.classList.toggle("hidden", c.artists < 4);
       if (dsTotal) {
         dsTotal.textContent = c.reclaimable_label
@@ -791,13 +824,21 @@
       }
       cont.dataset.reviewTotal = c.total;
       cont.dataset.reviewSelected = c.selected;
+      // A library review's tabs carry per-tab totals; keep the tab count
+      // chips honest as hides and dismissals shrink the sets.
+      if (c.missing_total !== undefined) {
+        var mc = cont.querySelector('[data-tab-count="missing"]');
+        var gc = cont.querySelector('[data-tab-count="gaps"]');
+        if (mc) mc.textContent = c.missing_total;
+        if (gc) gc.textContent = c.gap_total;
+      }
       updateDismissRest();
     }
 
     function updateDismissRest() {
       if (!dismissRest) return;
-      var rest = parseInt(cont.dataset.reviewTotal || "0", 10)
-               - parseInt(cont.dataset.reviewSelected || "0", 10);
+      var tc = tabCounts(lastCounts);
+      var rest = tc.total - tc.selected;
       dismissRest.classList.toggle("hidden", rest <= 0);
       dismissRest.textContent = dismissRestLabel(rest);
     }
@@ -835,7 +876,8 @@
     function bulkSelect(on, scope) {
       if (bulkBusy) return Promise.resolve();
       bulkBusy = true;
-      var body = "on=" + (on ? "1" : "0") + "&scope=" + scope;
+      var body = "on=" + (on ? "1" : "0") + "&scope=" + scope +
+                 "&tab=" + encodeURIComponent(curTab());
       if (scope === "page") {
         pageBox() && pageBox().querySelectorAll(".cb").forEach(function (cb) {
           body += "&cid=" + encodeURIComponent(cb.value);
@@ -932,7 +974,8 @@
       if (loading) return;
       loading = true;
       var url = "/jobs/" + id + "/review?page=" + (page || 2) +
-                "&q=" + encodeURIComponent(curQuery());
+                "&q=" + encodeURIComponent(curQuery()) +
+                "&tab=" + encodeURIComponent(curTab());
       fetch(url, { headers: { "HX-Request": "true" } })
         .then(function (r) { return r.ok ? r.text() : null; })
         .then(function (txt) {
@@ -963,7 +1006,8 @@
       if (loading) return;
       loading = true;
       var url = "/jobs/" + id + "/review?page=" + (page || 1) +
-                "&q=" + encodeURIComponent(query || "");
+                "&q=" + encodeURIComponent(query || "") +
+                "&tab=" + encodeURIComponent(curTab());
       fetch(url, { headers: { "HX-Request": "true" } })
         .then(function (r) { return r.ok ? r.text() : null; })
         .then(function (txt) {
@@ -996,23 +1040,49 @@
     cont.addEventListener("click", function (e) {
       var t = e.target;
       if (t.closest("[data-hide]")) return;
+      // The artist checkbox sits inside a <summary>: its own activation runs
+      // instead of the summary's, but stop the bubble so nothing else fires.
+      if (t.closest("[data-artist-select]")) { e.stopPropagation(); return; }
       var allBtn = t.closest("[data-select-all]");
       if (allBtn) { bulkSelect(allBtn.getAttribute("data-select-all") === "1", "all"); return; }
       var pageBtn = t.closest("[data-select-page]");
       if (pageBtn) { bulkSelect(true, "page"); return; }
       var more = t.closest("[data-load-more]");
       if (more) { loadMore(parseInt(more.getAttribute("data-next-page") || "2", 10)); return; }
+      var tabBtn = t.closest("[data-review-tab]");
+      if (tabBtn && !tabBtn.classList.contains("is-active")) {
+        cont.querySelectorAll("[data-review-tab]").forEach(function (b) {
+          var on2 = b === tabBtn;
+          b.classList.toggle("is-active", on2);
+          if (on2) b.setAttribute("aria-current", "true");
+          else b.removeAttribute("aria-current");
+        });
+        var tabField = document.getElementById("review-tab-field");
+        if (tabField) tabField.value = curTab();
+        applyCounts(lastCounts);  // re-scope the bulk bar to the new tab
+        loadPage(1, curQuery());
+        return;
+      }
+      var expBtn = t.closest("[data-expand-all]");
+      if (expBtn) {
+        var openAll = expBtn.getAttribute("data-expand-all") === "1";
+        var box = pageBox();
+        if (box) {
+          box.querySelectorAll("details[data-artist]").forEach(function (d) { d.open = openAll; });
+        }
+        return;
+      }
     });
     if (dismissRest) {
       dismissRest.addEventListener("click", function () {
-        var rest = parseInt(cont.dataset.reviewTotal || "0", 10)
-                 - parseInt(cont.dataset.reviewSelected || "0", 10);
+        var tc = tabCounts(lastCounts);
+        var rest = tc.total - tc.selected;
         if (rest <= 0) return;
         if (!window.confirm(dismissConfirm(rest))) return;
         var prev = dismissRest.textContent;
         dismissRest.disabled = true;
         dismissRest.textContent = dismissBusyLabel();
-        post("/jobs/" + id + "/dismiss-rest", "")
+        post("/jobs/" + id + "/dismiss-rest", "tab=" + encodeURIComponent(curTab()))
           .then(function (r) { return r.ok ? r.json() : Promise.reject(); })
           .then(function (c) {
             if (c.review_done) { location.reload(); return; }
@@ -1076,8 +1146,14 @@
         .then(function (c) { if (c) applyCounts(c); });
     });
     rsrc.addEventListener("closed", function (e) {
+      // An archived/restored review has no live producer, so the server ends
+      // the stream with "inactive" right away. Hides and ticks still work
+      // there, so keep the count listeners — only stop the dead stream.
+      if ((e.data || "") === "inactive") {
+        try { rsrc.close(); } catch (err) {}
+        return;
+      }
       shutReview();
-      if ((e.data || "") === "inactive") return;
       if (window.htmx) {
         window.htmx.ajax("GET", "/jobs/" + id + "/content", { target: "#job-content", swap: "outerHTML" });
       } else { location.reload(); }

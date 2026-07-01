@@ -193,6 +193,8 @@ def _album_candidate_spec(
         detail = (f"{year or '?'} · {album_quality_label(album)} · "
                   f"{n if n is not None else '?'} track{'' if n == 1 else 's'}")
     payload = {"album_id": album.get("id"), "year": year, "cover": _album_cover(album)}
+    if partial_n:
+        payload["gap_fill"] = partial_n
     if extra_payload:
         payload.update(extra_payload)
     if is_new:
@@ -262,6 +264,16 @@ def _add_gap_candidate(job, gap, artist_name, selected=False, is_new=False):
         job, _gap_candidate_spec(gap, artist_name, selected, is_new))
 
 
+def is_gap_candidate(c):
+    """Whether a saved review candidate is a Gap Fill entry (missing tracks in
+    an owned album) rather than a fully missing album. New scans stamp the
+    payload; candidates carried forward from older checkpoints only say so in
+    their detail line, so fall back to that."""
+    if (c.get("payload") or {}).get("gap_fill"):
+        return True
+    return "gap-fill:" in (c.get("detail") or "")
+
+
 def _record_last_scan():
     try:
         cfg.LAST_SCAN_FILE.write_text(str(time.time()), encoding="utf-8")
@@ -323,7 +335,7 @@ def _flag_new_since_last_scan(job, mode):
     _save_scan_seen(mode, seen_now)
 
 
-def dismiss_albums(job, artist, scope=hidden_mod.SCOPE_MISSING):
+def dismiss_albums(job, artist, scope=hidden_mod.SCOPE_MISSING, gap_only=None):
     """Hide ``artist``'s albums that aren't currently selected, in ``scope``.
 
     Selection is server-backed (saved as the user ticks), so "hide the rest"
@@ -331,6 +343,11 @@ def dismiss_albums(job, artist, scope=hidden_mod.SCOPE_MISSING):
     flag is off and keep the ticked ones. Other artists' candidates and their
     selections are never touched — critical now that pagination means most of
     them aren't even on the page that triggered the hide.
+
+    ``gap_only`` narrows the hide to one side of a library review's tab split:
+    True drops only Gap Fill candidates, False only fully missing albums, None
+    (the default) both. The button only ever shows one tab's rows, so it must
+    not silently dismiss the other tab's.
 
     The hidden albums are recorded in the durable store so future bulk walks of
     that scope skip them, then dropped from this job's review list. Returns the
@@ -343,7 +360,8 @@ def dismiss_albums(job, artist, scope=hidden_mod.SCOPE_MISSING):
     # separate steps could drop a concurrently-added album.
     with job._lock:
         to_hide = [c for c in job.candidates
-                   if c.get("artist") == artist and not c.get("selected")]
+                   if c.get("artist") == artist and not c.get("selected")
+                   and (gap_only is None or is_gap_candidate(c) == gap_only)]
         if not to_hide:
             return 0
         drop = {c["cid"] for c in to_hide}

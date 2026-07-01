@@ -113,6 +113,19 @@
   background: linear-gradient(180deg, #f8cd85 0%, #ecb45c 45%, var(--ql-gold-strong) 100%);
 }
 
+/* A disabled primary drops the brass entirely — dimmed gold still reads as
+   "the thing to press", which is exactly wrong while nothing is selected. */
+.ql-btn-primary:disabled,
+.ql-btn-primary[aria-disabled="true"],
+.ql-btn-primary.is-disabled {
+  border-color: color-mix(in oklab, var(--ql-text) 14%, transparent);
+  background: color-mix(in oklab, var(--ql-surface-2) 60%, transparent);
+  box-shadow: none;
+  color: var(--ql-text-3);
+  text-shadow: none;
+  opacity: 1;
+}
+
 .ql-btn-secondary {
   border-color: color-mix(in oklab, var(--ql-text) 18%, transparent);
   background-color: color-mix(in oklab, var(--ql-surface-2) 54%, transparent);

@@ -1366,6 +1366,36 @@ def _repair_current_job():
     return cur
 
 
+# Library follows the same single-surface rule as Repair: the scan, its live
+# progress, and the parked Missing Albums / Gap Fill review all live on
+# /library — never handed off to /jobs/{id} under the Queue nav.
+_LIBRARY_SURFACE_KINDS = ("library", "new_releases")
+
+
+def _library_current_job():
+    """The scan that owns the /library surface right now (baseline or
+    new-release check, still pending / scanning / awaiting-review / running),
+    or None when the surface is idle and shows the launcher. A parked review
+    outranks running work: after a tab-scoped download splits the review, the
+    user stays on the tab still waiting for them while the download runs in
+    the queue."""
+    states = (job_mgr.JobStatus.PENDING, job_mgr.JobStatus.SCANNING,
+              job_mgr.JobStatus.AWAITING_REVIEW, job_mgr.JobStatus.RUNNING)
+    cur = None
+    for j in job_mgr.registry.all():
+        if (getattr(j, "execute_kind", "") not in _LIBRARY_SURFACE_KINDS
+                or j.status not in states):
+            continue
+        if cur is None:
+            cur = j
+            continue
+        j_rev = j.status == job_mgr.JobStatus.AWAITING_REVIEW
+        cur_rev = cur.status == job_mgr.JobStatus.AWAITING_REVIEW
+        if (j_rev, (j.created_at or 0)) >= (cur_rev, (cur.created_at or 0)):
+            cur = j
+    return cur
+
+
 async def _submit_scan_deduped_async(job, scan_fn, execute_fn, *kinds, **kw):
     """Run _submit_scan_deduped off the event loop.
 
@@ -2467,27 +2497,44 @@ async def artist_scan(request: Request, artist: str = Form("")):
 
 
 @app.get("/library", response_class=HTMLResponse)
-async def library_page(request: Request):
+async def library_page(request: Request, page: int = 1):
     from qobuz_librarian.library import hidden as hidden_mod
     from qobuz_librarian.library import scan_checkpoint
     creds_ok = bool(_read_creds().get("auth_token"))
-    # Resume hint — same pattern /repair uses: only surface when a checkpoint
-    # exists AND no library scan is currently running (mid-scan the dashboard's
-    # "scanning…" indicator already covers it).
-    cp = scan_checkpoint.pending()
-    library_resume = (cp if cp is not None and _active_scan("library") is None
-                      else None)
     from qobuz_librarian.library import new_releases
-    return _tr(request, "library.html", {
+    if request.query_params.get("noselection"):
+        notice = "Nothing is selected on that tab yet."
+    elif request.query_params.get("approved"):
+        notice = "Download started — it's running in the queue."
+    else:
+        notice = ""
+    ctx = {
         "creds_ok": creds_ok, "qobuz_ready": _qobuz_ready(), "page": "library",
-        "library_resume": library_resume,
         "library_scan_state": _library_scan_state(),
+        "library_notice": notice,
         "error": request.query_params.get("error", ""),
         # Freshness line: when a full gap scan last completed, and whether one
         # ever has (the new-release baseline is only seeded by a clean finish).
         "last_full_scan": _last_scan_age(),
         "baseline_complete": new_releases.is_baseline_complete(),
-        "hidden_count": hidden_mod.count(hidden_mod.SCOPE_MISSING)})
+        "hidden_count": hidden_mod.count(hidden_mod.SCOPE_MISSING),
+        "JobStatus": job_mgr.JobStatus,
+    }
+    # Single-surface rule (same as /repair): a scan in flight or a parked
+    # review renders inline right here, so results never hide behind the
+    # launcher and never live under the Queue nav.
+    ljob = _library_current_job()
+    ctx["library_job"] = ljob
+    if ljob is not None:
+        ctx["queue_wait"] = _queue_wait(ljob)
+        ctx.update(_review_context(ljob, page))
+        ctx["library_resume"] = None
+    else:
+        # Resume hint: only when an interrupted baseline checkpoint exists and
+        # nothing is running above.
+        cp = scan_checkpoint.pending()
+        ctx["library_resume"] = cp if cp is not None else None
+    return _tr(request, "library.html", ctx)
 
 
 @app.post("/library")
@@ -2530,7 +2577,7 @@ async def library_scan(
         if job is None:    # lock handed to the terminal during the submit
             return _lock_busy_response(request) or RedirectResponse(
                 url="/settings?mode=cli", status_code=303)
-        return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
+        return RedirectResponse(url="/library", status_code=303)
     scan_state = _library_scan_state()
     if not scan_state["ready"]:
         msg = scan_state["message"]
@@ -2556,7 +2603,8 @@ async def library_scan(
     if job is None:
         return _lock_busy_response(request) or RedirectResponse(
             url="/settings?mode=cli", status_code=303)
-    return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
+    # Land back on /library — the scan is watched and reviewed right here.
+    return RedirectResponse(url="/library", status_code=303)
 
 
 @app.post("/library/skip-setup")
@@ -3010,20 +3058,39 @@ async def job_page(request: Request, job_id: str, approved: bool = False,
     return _tr(request, "job.html", ctx)
 
 
-def _review_context(job, page=1, query=""):
+def _review_context(job, page=1, query="", tab=""):
     """Template vars for a paginated awaiting-review body: the current page's
     artist groups, the page number/count, and the authoritative whole-set
     counts. Cheap no-op for non-review states (no candidates → one empty page).
+
+    A library review always splits into its two tabs — Missing Albums and Gap
+    Fill — and ``tab`` picks one. With no explicit pick, land on Missing Albums
+    unless it's empty and Gap Fill isn't. Other review kinds render untabbed.
     """
     from qobuz_librarian.ui_cli.colors import format_size
-    groups = _review_artist_groups(job, query)
+    tab_counts = None
+    if job.execute_kind == "library":
+        totals = _review_tab_totals(job)
+        if totals["missing"] or totals["gaps"]:
+            tab_counts = totals
+    if tab_counts:
+        if tab not in ("missing", "gaps"):
+            tab = ("gaps" if tab_counts["gaps"] and not tab_counts["missing"]
+                   else "missing")
+    else:
+        tab = ""
+    groups = _review_artist_groups(job, query, tab)
     page_groups, page, n_pages = _paginate_groups(groups, page)
     counts = job.selection_counts()
+    from qobuz_librarian.library import hidden as hidden_mod
     return {
         "review_groups": page_groups,
         "review_page": page,
         "review_pages": n_pages,
         "review_query": query,
+        "review_tab": tab,
+        "review_tab_counts": tab_counts,
+        "review_hidden_count": hidden_mod.count(_hide_scope(job.execute_kind)),
         "review_counts": counts,
         "review_reclaimable_label": (format_size(counts["reclaimable"])
                                      if counts["reclaimable"] else ""),
@@ -3052,18 +3119,48 @@ async def job_content(request: Request, job_id: str, page: int = 1):
 
 @app.get("/jobs/{job_id}/review", response_class=HTMLResponse)
 async def job_review_page(request: Request, job_id: str, page: int = 1,
-                          q: str = ""):
+                          q: str = "", tab: str = ""):
     """One page of the paginated review list (groups + pager + summary), for
-    Prev/Next and the whole-set artist filter. Rendered from saved selection
-    flags, so ticks persist and span pages."""
+    Prev/Next, the whole-set artist filter, and a library review's tab switch.
+    Rendered from saved selection flags, so ticks persist and span pages."""
     job = job_mgr.registry.get(job_id)
     if not job:
         job = job_mgr.load_historical_job(job_id)
         if job is None:
             return HTMLResponse("", status_code=404)
     ctx = {"job": job, "JobStatus": job_mgr.JobStatus}
-    ctx.update(_review_context(job, page, q))
+    ctx.update(_review_context(job, page, q, tab))
     return _tr(request, "_review_page.html", ctx)
+
+
+def _split_off_inactive_tab(job, tab):
+    """Before a tab-scoped approve: move the tab the user ISN'T looking at into
+    its own parked review job, so downloading one tab never consumes the other
+    tab's un-reviewed candidates or their saved ticks. Returns the parked job,
+    or None when the inactive tab is empty (nothing to protect)."""
+    from qobuz_librarian.web import flows, job_persistence
+    gap_active = tab == "gaps"
+    with job._lock:
+        keep, split = [], []
+        for c in job.candidates:
+            (keep if flows.is_gap_candidate(c) == gap_active else split).append(c)
+        if not split:
+            return None
+        job.candidates = keep
+    other = job_mgr.Job(title=job.title, kind=job.kind,
+                        execute_kind=job.execute_kind,
+                        execute_args=dict(job.execute_args or {}),
+                        review_verb=job.review_verb,
+                        status=job_mgr.JobStatus.AWAITING_REVIEW)
+    other.candidates = split  # cids, seqs, and saved ticks ride along
+    factory = _RESUME_EXECUTE.get(other.execute_kind)
+    if factory is not None:
+        other._execute_fn = factory(other, other.execute_args)
+    job_mgr.registry.add(other)
+    job_persistence.persist(other)
+    job_persistence.persist(job)
+    job.notify_review_changed()
+    return other
 
 
 @app.post("/jobs/{job_id}/approve")
@@ -3074,9 +3171,14 @@ async def job_approve(request: Request, job_id: str):
     job = job_mgr.registry.get(job_id)
     if not job:
         return RedirectResponse(url="/queue", status_code=303)
-    # Repair stays on its single surface (/repair) through the repairing phase;
-    # every other kind keeps using the job page.
-    dest = "/repair" if job.execute_kind == "repair" else f"/jobs/{job_id}"
+    # Repair and Library stay on their single surfaces through the executing
+    # phase; every other kind keeps using the job page.
+    if job.execute_kind == "repair":
+        dest = "/repair"
+    elif job.execute_kind in _LIBRARY_SURFACE_KINDS:
+        dest = "/library"
+    else:
+        dest = f"/jobs/{job_id}"
     # Guard a zero-selection approve: with nothing ticked, approving would flip
     # the job to done over an empty set and flash success while quietly
     # discarding the whole review. The submit button is disabled client-side, but
@@ -3084,9 +3186,27 @@ async def job_approve(request: Request, job_id: str):
     # say so instead.
     if job.status == job_mgr.JobStatus.AWAITING_REVIEW:
         job = _sync_saved_review_before_approve(job)
-    if job.status == job_mgr.JobStatus.AWAITING_REVIEW and not any(
-            c.get("selected") for c in job.candidates):
-        return RedirectResponse(url=f"{dest}?noselection=1", status_code=303)
+    # A library review approves per tab: the button acts on the tab the user is
+    # looking at, and only that tab. Zero-selection is judged within the tab,
+    # and the other tab's candidates split into their own parked review before
+    # the download consumes this job. No tab posted (older page, direct POST)
+    # keeps the whole-review behavior.
+    form = await request.form()
+    tab = (form.get("tab") or "").strip()
+    if job.execute_kind != "library" or tab not in ("missing", "gaps"):
+        tab = ""
+    if job.status == job_mgr.JobStatus.AWAITING_REVIEW:
+        from qobuz_librarian.web import flows
+        if tab:
+            gap_active = tab == "gaps"
+            with job._lock:
+                has_pick = any(
+                    c.get("selected") for c in job.candidates
+                    if flows.is_gap_candidate(c) == gap_active)
+        else:
+            has_pick = any(c.get("selected") for c in job.candidates)
+        if not has_pick:
+            return RedirectResponse(url=f"{dest}?noselection=1", status_code=303)
     # Selection is saved server-side as the user ticks (the paginated review no
     # longer carries every checkbox in the form), so approve runs against the
     # saved flags — passing None keeps them as-is rather than reading the form.
@@ -3095,7 +3215,13 @@ async def job_approve(request: Request, job_id: str):
     # (freezing every SSE stream / other request) for a large parked review —
     # the same reason /select was offloaded.
     loop = asyncio.get_running_loop()
-    approved = await loop.run_in_executor(None, lambda: job_mgr.approve(job, None))
+
+    def _split_and_approve():
+        if tab and job.status == job_mgr.JobStatus.AWAITING_REVIEW:
+            _split_off_inactive_tab(job, tab)
+        return job_mgr.approve(job, None)
+
+    approved = await loop.run_in_executor(None, _split_and_approve)
     flag = "approved=1" if approved else "stale=1"
     return RedirectResponse(url=f"{dest}?{flag}", status_code=303)
 
@@ -3137,16 +3263,20 @@ def _artist_sort_key(name: str) -> str:
     return low
 
 
-def _review_artist_groups(job, query=""):
+def _review_artist_groups(job, query="", tab=""):
     """Candidates grouped by artist for the review screen, in a deterministic
     order so pagination is stable across reloads. ``query`` filters across the
     WHOLE set (artist name or any album title), so the filter spans pages, not
-    just the one on screen. Returns a list of (artist, items) pairs."""
+    just the one on screen. ``tab`` narrows a library review to one side of its
+    Missing Albums / Gap Fill split. Returns a list of (artist, items) pairs."""
+    from qobuz_librarian.web import flows
     with job._lock:
         cands = list(job.candidates)
     q = (query or "").strip().lower()
     groups: dict = {}
     for c in cands:
+        if tab and flows.is_gap_candidate(c) != (tab == "gaps"):
+            continue
         artist = c.get("artist") or ""
         if q:
             hay = artist + " " + (c.get("title") or "")
@@ -3185,13 +3315,39 @@ def _selection_payload(job):
     its counts from the server instead of recounting a partial DOM."""
     from qobuz_librarian.ui_cli.colors import format_size
     c = job.selection_counts()
-    return {
+    payload = {
         "selected": c["selected"],
         "total": c["total"],
         "artists": c["artists"],
         "reclaimable": c["reclaimable"],
         "reclaimable_label": format_size(c["reclaimable"]) if c["reclaimable"] else "",
     }
+    if job.execute_kind == "library":
+        totals = _review_tab_totals(job)
+        payload["missing_total"] = totals["missing"]
+        payload["gap_total"] = totals["gaps"]
+        payload["missing_selected"] = totals["missing_selected"]
+        payload["gap_selected"] = totals["gaps_selected"]
+    return payload
+
+
+def _review_tab_totals(job):
+    """Whole-set totals and selected counts behind a library review's Missing
+    Albums / Gap Fill tabs, ignoring the page filter so the tab labels stay
+    truthful. Selected counts feed the tab-scoped bulk bar: what the user sees
+    on the active tab is exactly what Download/Dismiss will act on."""
+    from qobuz_librarian.web import flows
+    gaps = gaps_sel = missing_sel = 0
+    with job._lock:
+        total = len(job.candidates)
+        for c in job.candidates:
+            if flows.is_gap_candidate(c):
+                gaps += 1
+                gaps_sel += 1 if c.get("selected") else 0
+            elif c.get("selected"):
+                missing_sel += 1
+    return {"missing": total - gaps, "gaps": gaps,
+            "missing_selected": missing_sel, "gaps_selected": gaps_sel}
 
 
 @app.post("/jobs/{job_id}/select")
@@ -3228,6 +3384,16 @@ async def job_select_all(request: Request, job_id: str):
     on = (form.get("on") or "").strip().lower() in ("1", "true", "on", "yes")
     scope = (form.get("scope") or "all").strip().lower()
     cids = form.getlist("cid")[:100000] if scope == "page" else None
+    # Tab scoping: on a library review, select-all flips only the active tab's
+    # candidates — never the tab the user can't see.
+    tab = (form.get("tab") or "").strip()
+    if (cids is None and job.execute_kind == "library"
+            and tab in ("missing", "gaps")):
+        from qobuz_librarian.web import flows
+        gap_active = tab == "gaps"
+        with job._lock:
+            cids = [c["cid"] for c in job.candidates
+                    if flows.is_gap_candidate(c) == gap_active]
     if job.set_all_selected(on, cids=cids):
         await asyncio.get_running_loop().run_in_executor(
             None, job_persistence.persist, job)
@@ -3257,10 +3423,18 @@ async def job_hide(request: Request, job_id: str):
         from qobuz_librarian.web import flows
         form = await request.form()
         artist = (form.get("artist") or "").strip()
+        # A library review split into Missing Albums / Gap Fill tabs scopes the
+        # hide to the tab whose rows the button sat next to; the other tab's
+        # candidates for this artist are untouched.
+        tab = (form.get("tab") or "").strip()
+        if job.execute_kind != "library" or tab not in ("missing", "gaps"):
+            tab = ""
+        gap_only = (tab == "gaps") if tab else None
         # Selection is server-backed, so hide keeps this artist's ticked albums
         # and drops the rest — no form keep-set, which under pagination would
         # only carry the visible page and clobber other pages' selections.
-        n = flows.dismiss_albums(job, artist, scope=_hide_scope(job.execute_kind))
+        n = flows.dismiss_albums(job, artist, scope=_hide_scope(job.execute_kind),
+                                 gap_only=gap_only)
         if n:
             job.notify_review_changed()  # keep other open tabs in sync
         # Dismissing the last album completes the review — drop AWAITING_REVIEW so
@@ -3269,11 +3443,13 @@ async def job_hide(request: Request, job_id: str):
         if job_mgr.finalize_review_if_empty(job):
             return HTMLResponse("", headers={"HX-Refresh": "true"})
         with job._lock:
-            remaining = [c for c in job.candidates if c.get("artist") == artist]
+            remaining = [c for c in job.candidates if c.get("artist") == artist
+                         and (gap_only is None
+                              or flows.is_gap_candidate(c) == gap_only)]
         if remaining:
             resp = _tr(request, "_review_group.html",
                        {"job": job, "artist": artist, "items": remaining,
-                        "triage": True, "open": True})
+                        "triage": True, "open": True, "review_tab": tab})
         else:
             resp = HTMLResponse("")  # whole artist hidden — outerHTML drops it
         if n:
@@ -3299,6 +3475,13 @@ async def job_dismiss_rest(request: Request, job_id: str):
 
     from qobuz_librarian.web import flows
     scope = _hide_scope(job.execute_kind)
+    # Tab scoping: "Dismiss unselected" on a library review only drops the
+    # active tab's unselected candidates.
+    form = await request.form()
+    tab = (form.get("tab") or "").strip()
+    if job.execute_kind != "library" or tab not in ("missing", "gaps"):
+        tab = ""
+    gap_only = (tab == "gaps") if tab else None
     # Snapshot the artists that still have an unticked album. dismiss_albums
     # re-reads each artist's saved ticks, so a tick that lands after this
     # snapshot is still honoured and its album isn't dropped.
@@ -3306,6 +3489,8 @@ async def job_dismiss_rest(request: Request, job_id: str):
         artists, seen = [], set()
         for c in job.candidates:
             if c.get("selected"):
+                continue
+            if gap_only is not None and flows.is_gap_candidate(c) != gap_only:
                 continue
             name = c.get("artist") or ""
             if name not in seen:
@@ -3317,7 +3502,9 @@ async def job_dismiss_rest(request: Request, job_id: str):
     # stream for a large scan.
     loop = asyncio.get_running_loop()
     hidden_count = await loop.run_in_executor(
-        None, lambda: sum(flows.dismiss_albums(job, a, scope=scope) for a in artists))
+        None, lambda: sum(flows.dismiss_albums(job, a, scope=scope,
+                                               gap_only=gap_only)
+                          for a in artists))
     if hidden_count:
         job.notify_review_changed()
     payload = _selection_payload(job)
@@ -3562,6 +3749,8 @@ async def job_cancel(request: Request, job_id: str):
     # stops cooperatively → keep them on the job page to watch it wind down.
     if job.execute_kind == "repair":
         dest = "/repair"
+    elif job.execute_kind in _LIBRARY_SURFACE_KINDS:
+        dest = "/library"
     else:
         dest = "/queue" if (was_review or was_pending) else f"/jobs/{job_id}"
     return RedirectResponse(url=dest, status_code=303)

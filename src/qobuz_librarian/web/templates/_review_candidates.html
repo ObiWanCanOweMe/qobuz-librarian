@@ -3,58 +3,65 @@
      data-job-id="{{ job.id }}"
      data-review-total="{{ review_counts.total }}"
      data-review-selected="{{ review_counts.selected }}"
+     {% if review_tab %}data-review-missing-total="{{ review_tab_counts.missing }}"
+     data-review-missing-selected="{{ review_tab_counts.missing_selected }}"
+     data-review-gap-total="{{ review_tab_counts.gaps }}"
+     data-review-gap-selected="{{ review_tab_counts.gaps_selected }}"{% endif %}
      data-review-item-singular="{{ labels.review_item_singular(job) }}"
      data-review-item-plural="{{ labels.review_item_plural(job) }}"
      data-review-dismiss-singular="{% if job.execute_kind == 'upgrade' %}upgrade{% elif job.execute_kind == 'library' %}album or Gap Fill candidate{% else %}album{% endif %}"
      data-review-dismiss-plural="{% if job.execute_kind == 'upgrade' %}upgrades{% elif job.execute_kind == 'library' %}albums and Gap Fill candidates{% else %}albums{% endif %}">
   {% set triage = job.execute_kind in ('library', 'upgrade', 'new_releases', 'downsample') %}
-  {% set preselected = job.execute_kind in ('repair', 'migration') %}
   {% set _hidden_url = '/upgrade/hidden' if job.execute_kind == 'upgrade'
                        else '/downsample/hidden' if job.execute_kind == 'downsample'
                        else '/library/hidden' %}
-  {% set _hidden_label = 'Kept hi-res' if job.execute_kind == 'downsample'
-                         else ('Dismissed upgrades' if job.execute_kind == 'upgrade'
-                               else ('Dismissed albums and Gap Fill' if job.execute_kind == 'library' else 'Dismissed albums')) %}
-  {% set _triage_note = 'Kept hi-res albums can be restored later.' if job.execute_kind == 'downsample'
-                        else 'Dismissed upgrades can be restored later.' if job.execute_kind == 'upgrade'
-                        else 'Dismissed albums and Gap Fill candidates can be restored later.' %}
+  {% set _hidden_label = 'Kept hi-res' if job.execute_kind == 'downsample' else 'Dismissed' %}
+
+  {% if review_tab %}
+  <nav class="ql-page-tabs ql-review-tabs" aria-label="Result type" data-review-tabs>
+    <button type="button" data-review-tab="missing"
+            class="{% if review_tab == 'missing' %}is-active{% endif %}"
+            {% if review_tab == 'missing' %}aria-current="true"{% endif %}>
+      Missing Albums <span class="ql-tab-count" data-tab-count="missing">{{ review_tab_counts.missing }}</span>
+    </button>
+    <button type="button" data-review-tab="gaps"
+            class="{% if review_tab == 'gaps' %}is-active{% endif %}"
+            {% if review_tab == 'gaps' %}aria-current="true"{% endif %}>
+      Gap Fill <span class="ql-tab-count" data-tab-count="gaps">{{ review_tab_counts.gaps }}</span>
+    </button>
+  </nav>
+  {% endif %}
+
   <div id="review-summary-row"
        class="ql-review-summary-row{% if not review_counts.total %} hidden{% endif %}">
-    <div class="ql-review-summary-copy">
-      <p>
-        <span data-summary-count>{{ labels.review_summary_count(job, review_counts.total, review_counts.artists) }}</span>{% if job.execute_kind == 'downsample' %}<span data-downsample-total class="ql-review-reclaimable">{% if review_reclaimable_label %} · ~{{ review_reclaimable_label }} reclaimable{% endif %}</span>{% endif %}
-      </p>
-      {% if job.execute_kind == 'new_releases' %}
-      <p>New to your saved baseline.</p>
-      {% elif preselected %}
-      <p>All selected; untick anything you want to skip.</p>
-      {% endif %}
-      {% if job.execute_kind in ('library', 'upgrade', 'new_releases', 'downsample') %}
-      <a href="{{ _hidden_url }}" class="ql-inline-link">{{ _hidden_label }}</a>
-      {% endif %}
+    <div id="review-filter-row" class="ql-review-filter-row{% if review_counts.artists < 4 %} hidden{% endif %}">
+      <input type="search" id="review-filter" autocomplete="off"
+             placeholder="{% if job.execute_kind == 'migration' %}Filter by artist or folder&hellip;{% else %}Filter by artist or album&hellip;{% endif %}"
+             aria-label="{% if job.execute_kind == 'migration' %}Filter the whole review list by artist or folder{% else %}Filter the whole review list by artist or album{% endif %}"
+             class="ql-input ql-review-filter-input">
     </div>
+    {% if not review_tab %}
+    <p class="ql-review-count">
+      <span data-summary-count>{{ labels.review_summary_count(job, review_counts.total, review_counts.artists) }}</span>{% if job.execute_kind == 'downsample' %}<span data-downsample-total class="ql-review-reclaimable">{% if review_reclaimable_label %} · ~{{ review_reclaimable_label }} reclaimable{% endif %}</span>{% endif %}
+    </p>
+    {% endif %}
     <div class="ql-review-summary-actions">
-      <button type="button" class="ql-btn ql-btn-secondary ql-btn-sm ql-secondary-action" aria-label="Select every {{ labels.review_item_singular(job) }} across all pages"
+      <button type="button" class="ql-review-tool" aria-label="Select every {{ labels.review_item_singular(job) }}{% if review_tab %} on this tab{% endif %}"
               data-select-all="1">Select all</button>
       {% if review_pages > 1 %}
-      <button type="button" class="ql-btn ql-btn-secondary ql-btn-sm ql-secondary-action" aria-label="Select every {{ labels.review_item_singular(job) }} on this page only"
+      <button type="button" class="ql-review-tool" aria-label="Select every {{ labels.review_item_singular(job) }} on this page only"
               data-select-page="1">Select page</button>
       {% endif %}
-      <button type="button" class="ql-btn ql-btn-secondary ql-btn-sm ql-secondary-action" aria-label="Deselect every {{ labels.review_item_singular(job) }}"
-              data-select-all="0">Deselect all</button>
+      <button type="button" class="ql-review-tool" aria-label="Deselect every {{ labels.review_item_singular(job) }}{% if review_tab %} on this tab{% endif %}"
+              data-select-all="0">Deselect</button>
+      <span class="ql-review-tool-sep" aria-hidden="true"></span>
+      <button type="button" class="ql-review-tool" data-expand-all="1">Expand all</button>
+      <button type="button" class="ql-review-tool" data-expand-all="0">Collapse all</button>
+      {% if triage %}
+      <span class="ql-review-tool-sep" aria-hidden="true"></span>
+      <a href="{{ _hidden_url }}" class="ql-inline-link ql-review-dismissed-link">{{ _hidden_label }} ({{ review_hidden_count }})</a>
+      {% endif %}
     </div>
-  </div>
-
-  {% if triage and review_counts.total %}
-  <p class="ql-review-note">
-    Selections are saved automatically. {{ _triage_note }}
-  </p>
-  {% endif %}
-  <div id="review-filter-row" class="ql-review-filter-row{% if review_counts.artists < 4 %} hidden{% endif %}">
-    <input type="search" id="review-filter" autocomplete="off"
-           placeholder="{% if job.execute_kind == 'migration' %}Filter by artist or folder…{% elif job.execute_kind == 'upgrade' %}Filter by artist or upgrade…{% elif job.execute_kind == 'library' %}Filter by artist, album, or Gap Fill…{% else %}Filter by artist or album…{% endif %}"
-           aria-label="{% if job.execute_kind == 'migration' %}Filter the whole review list by artist or folder{% elif job.execute_kind == 'upgrade' %}Filter the whole review list by artist or upgrade{% elif job.execute_kind == 'library' %}Filter the whole review list by artist, album, or Gap Fill{% else %}Filter the whole review list by artist or album{% endif %}"
-           class="ql-input ql-review-filter-input">
   </div>
 
   {% if job.execute_kind == 'downsample' %}

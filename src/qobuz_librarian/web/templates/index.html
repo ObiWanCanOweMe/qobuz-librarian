@@ -246,7 +246,7 @@
               <span class="ql-status-chip">{{ labels.job_activity(j) }}</span>
               <span id="dash-reconnect-{{ j.id }}" class="ql-status-chip is-warning hidden">Reconnecting</span>
             </div>
-            <a href="{{ '/repair' if j.execute_kind == 'repair' else '/jobs/' ~ j.id }}" class="ql-row-title ql-row-link">
+            <a href="{{ '/repair' if j.execute_kind == 'repair' else ('/library' if j.execute_kind in ('library', 'new_releases') else '/jobs/' ~ j.id) }}" class="ql-row-title ql-row-link">
               {% if j.artist %}{{ j.artist }} · {% endif %}{{ j.title }}
             </a>
             <p id="dash-prog-{{ j.id }}" class="ql-row-meta">

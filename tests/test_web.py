@@ -1994,6 +1994,97 @@ def test_library_hide_then_restore_round_trip(client, monkeypatch, tmp_path):
         _remove_job(job)
 
 
+def test_library_hide_scoped_to_review_tab(client, monkeypatch, tmp_path):
+    """A library review with both missing albums and Gap Fill splits into tabs,
+    and dismissing an artist's unselected rows from one tab must not silently
+    drop that artist's candidates on the other tab."""
+    from qobuz_librarian.library import hidden
+    monkeypatch.setattr("qobuz_librarian.config.HIDDEN_FILE", tmp_path / "h.json")
+
+    job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
+    job.execute_kind = "library"
+    job.add_candidate(kind="album", title="Third", artist="Portishead",
+                      payload={"year": "2008"}, selected=False)
+    job.add_candidate(kind="album", title="Dummy", artist="Portishead",
+                      detail="1994 · CD 16-bit/44.1kHz · gap-fill: 2 missing of 11",
+                      payload={"year": "1994", "gap_fill": 2}, selected=False)
+    try:
+        r = client.get(f"/jobs/{job.id}")
+        assert r.status_code == 200
+        assert "Missing Albums" in r.text and "Gap Fill" in r.text
+        # The default tab shows only the missing album, not the gap fill row.
+        assert "Third" in r.text and "Dummy" not in r.text
+        r = client.get(f"/jobs/{job.id}/review", params={"tab": "gaps"},
+                       headers={"HX-Request": "true"})
+        assert "Dummy" in r.text and "Third" not in r.text
+
+        r = client.post(f"/jobs/{job.id}/hide",
+                        data={"artist": "Portishead", "tab": "missing"})
+        assert r.status_code == 200
+        assert [c["title"] for c in job.candidates] == ["Dummy"]
+        store = hidden.load()
+        assert hidden.is_hidden(hidden.SCOPE_MISSING, "Portishead", "Third", store)
+        assert not hidden.is_hidden(hidden.SCOPE_MISSING, "Portishead", "Dummy", store)
+    finally:
+        _remove_job(job)
+
+
+def test_library_approve_scoped_to_tab_splits_off_other_tab(client, monkeypatch):
+    """Downloading from one tab must consume only that tab: the other tab's
+    candidates (and their saved ticks) split into their own parked review
+    instead of dying with the executing job."""
+    monkeypatch.setattr(jm._scan_queue, "put", lambda item: None)
+    job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
+    job.execute_kind = "library"
+    job.review_verb = "Download"
+    job._execute_fn = lambda j, chosen: None
+    job.add_candidate(kind="album", title="Third", artist="Portishead",
+                      payload={"year": "2008"}, selected=True)
+    job.add_candidate(kind="album", title="Dummy", artist="Portishead",
+                      payload={"year": "1994", "gap_fill": 2}, selected=True)
+    job.add_candidate(kind="album", title="Untrue", artist="Burial",
+                      payload={"year": "2007", "gap_fill": 1}, selected=False)
+    split = None
+    try:
+        r = client.post(f"/jobs/{job.id}/approve", data={"tab": "missing"},
+                        follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/library?approved=1"
+        # The approved job carries only the active tab's candidates.
+        assert [c["title"] for c in job.candidates] == ["Third"]
+        assert job.status != jm.JobStatus.AWAITING_REVIEW
+        # The gap candidates live on in a new parked review, ticks intact.
+        split = next(j for j in jm.registry.all()
+                     if j is not job and j.execute_kind == "library"
+                     and j.status == jm.JobStatus.AWAITING_REVIEW)
+        titles = {c["title"]: c["selected"] for c in split.candidates}
+        assert titles == {"Dummy": True, "Untrue": False}
+        assert split._execute_fn is not None
+    finally:
+        _remove_job(job)
+        if split is not None:
+            _remove_job(split)
+
+
+def test_library_select_all_scoped_to_tab(client):
+    job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
+    job.execute_kind = "library"
+    job.add_candidate(kind="album", title="Third", artist="Portishead",
+                      payload={"year": "2008"}, selected=False)
+    job.add_candidate(kind="album", title="Dummy", artist="Portishead",
+                      payload={"year": "1994", "gap_fill": 2}, selected=False)
+    try:
+        r = client.post(f"/jobs/{job.id}/select-all",
+                        data={"on": "1", "scope": "all", "tab": "missing"})
+        assert r.status_code == 200
+        c = r.json()
+        assert (c["missing_selected"], c["gap_selected"]) == (1, 0)
+        flags = {x["title"]: x["selected"] for x in job.candidates}
+        assert flags == {"Third": True, "Dummy": False}
+    finally:
+        _remove_job(job)
+
+
 def test_review_zero_selection_has_clear_disabled_action(client):
     job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
     job.execute_kind = "library"
@@ -2062,14 +2153,17 @@ def test_review_footer_renders_all_actions(client):
         assert 'id="review-dismiss-rest"' in r.text
         assert "Dismiss unselected (1)" in r.text
         assert "Dismissed albums and Gap Fill" in r.text
-        assert ">Back to queue</a>" in r.text
+        assert ">Back to Library</a>" in r.text
         assert ">Discard library review</button>" in r.text
         assert 'href="/library/hidden"' in r.text
     finally:
         _remove_job(job)
 
 
-def test_review_artist_header_keeps_actions_outside_summary(client):
+def test_review_artist_header_carries_group_controls(client):
+    # The select-artist checkbox lives in the group header (its own activation
+    # runs instead of the summary's); the dismiss button must stay OUTSIDE the
+    # summary, where a click can't fold the group.
     job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
     job.execute_kind = "library"
     job.review_verb = "Download"
@@ -2082,9 +2176,8 @@ def test_review_artist_header_keeps_actions_outside_summary(client):
 
         assert r.status_code == 200
         summary = r.text.split('<summary class="ql-review-summary">', 1)[1].split("</summary>", 1)[0]
-        assert "data-artist-select" not in summary
+        assert 'data-artist-select value="Portishead"' in summary
         assert "data-hide" not in summary
-        assert 'data-artist-select value="Portishead"' in r.text
         assert 'data-hide data-artist="Portishead"' in r.text
     finally:
         _remove_job(job)

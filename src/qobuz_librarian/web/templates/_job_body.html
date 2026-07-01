@@ -6,10 +6,13 @@
   data-progress-item-plural="{{ labels.progress_item_plural(job) }}"
   {%- if job.status.value == 'awaiting_review' %} data-job-view="review"
   {%- elif job.status.value in ('pending', 'scanning', 'running') %} data-job-view="progress"{% endif %}>
+  {# The Library surface renders this body under its own "Library" heading, so
+     it skips the job header. Everywhere else the header is de-jargoned: plain
+     names, no job ids or scan-mode strings. #}
+  {% if not embedded_surface|default(false) %}
   <header class="ql-page-header ql-page-header--actions ql-job-header">
     <div class="ql-job-heading">
-      <h1 class="ql-job-title">{% if job.artist %}{{ job.artist }} — {% endif %}{{ job.title }}</h1>
-      <p class="ql-job-id">Job {{ job.id }}</p>
+      <h1 class="ql-job-title">{% if job.execute_kind == 'library' %}Library scan{% elif job.execute_kind == 'new_releases' %}New releases{% else %}{% if job.artist %}{{ job.artist }} — {% endif %}{{ job.title }}{% endif %}</h1>
     </div>
     <span id="job-status-badge" class="ql-status-chip ql-job-status
       {%- if job.status.value == 'done' %} is-success
@@ -19,6 +22,7 @@
       {%- elif job.status.value == 'running' %} is-active
       {%- else %} is-warning{% endif %}">{% if job.status.value == 'running' %}{{ labels.job_activity(job) }}{% else %}{{ {'done': 'Done', 'failed': 'Failed', 'canceled': 'Cancelled', 'awaiting_review': 'Needs review', 'scanning': 'Scanning', 'pending': 'Queued'}.get(job.status.value, job.status.value.replace('_', ' ')) }}{% endif %}</span>
   </header>
+  {% endif %}
 
   {% if job.execute_kind == 'repair' %}
   {% set _st = job.status.value %}
@@ -36,31 +40,44 @@
   {% set s = job.status.value %}
   {% set _historical = historical|default(false) %}
   {% set _review_thing = labels.discard_review_label(job) %}
-  {% set _back_href = '/repair' if job.execute_kind == 'repair' else '/queue' %}
-  {% set _back_label = 'Back to repair' if job.execute_kind == 'repair' else 'Back to queue' %}
+  {% set _back_href = '/repair' if job.execute_kind == 'repair' else ('/library' if job.execute_kind in ('library', 'new_releases') else '/queue') %}
+  {% set _back_label = 'Back to repair' if job.execute_kind == 'repair' else ('Back to Library' if job.execute_kind in ('library', 'new_releases') else 'Back to queue') %}
 
   {% if s == 'awaiting_review' %}
-    {% if job.summary %}
+    {# The review tools row already states the live count; repeating the scan
+       summary above it printed the same fact twice. Keep the box only when it
+       carries the candidate-cap warning, which exists nowhere else. #}
+    {% if job.summary and job.candidate_cap_hit %}
     <div class="ql-job-summary ql-job-summary--review"><span>{{ job.summary }}</span></div>
     {% endif %}
 
+    {# Tab scoping: on a library review the bulk bar acts on the ACTIVE tab
+       only, so its counts come from the tab, not the whole set. #}
+    {% if review_tab %}
+    {% set _bar_total = review_tab_counts['gaps' if review_tab == 'gaps' else 'missing'] %}
+    {% set _bar_selected = review_tab_counts['gaps_selected' if review_tab == 'gaps' else 'missing_selected'] %}
+    {% else %}
+    {% set _bar_total = review_counts.total %}
+    {% set _bar_selected = review_counts.selected %}
+    {% endif %}
     <form id="review-form" action="/jobs/{{ job.id }}/approve" method="post"
           data-job-id="{{ job.id }}" data-review-kind="{{ job.execute_kind }}">
       <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+      {% if review_tab %}<input type="hidden" name="tab" id="review-tab-field" value="{{ review_tab }}">{% endif %}
       {% include "_review_candidates.html" %}
       <div class="ql-review-footer">
         <div class="ql-review-footer-actions">
           <button type="submit" id="review-submit" class="ql-btn ql-btn-primary ql-review-footer-primary"
             data-review-verb="{{ job.review_verb }}"
             data-empty-label="{{ labels.review_empty_label(job) }}"
-            {% if not review_counts.selected %} disabled{% endif %}
+            {% if not _bar_selected %} disabled{% endif %}
             {%- if job.execute_kind == 'downsample' %} data-confirm="Downsample the selected albums now? This cannot be undone. Each file is rewritten in place at 44.1 / 48 kHz and hi-res originals are not kept."
             {%- elif job.execute_kind == 'migration' and job.review_verb == 'Move' %} data-confirm="Move the selected files now? This relocates your originals instead of copying them, and removes the folders it empties."
-            {%- endif %}>{% if review_counts.selected %}{{ job.review_verb }} {{ review_counts.selected }} selected{% else %}{{ labels.review_empty_label(job) }}{% endif %}</button>
+            {%- endif %}>{% if _bar_selected %}{{ job.review_verb }} {{ _bar_selected }} selected{% else %}{{ labels.review_empty_label(job) }}{% endif %}</button>
           {% if job.execute_kind in ('library', 'upgrade', 'new_releases', 'downsample') %}
           {% set _dismiss_rest_label = 'Keep hi-res' if job.execute_kind == 'downsample' else 'Dismiss unselected' %}
           <button type="button" id="review-dismiss-rest"
-                  class="ql-btn ql-btn-secondary ql-btn-sm ql-review-footer-secondary{% if review_counts.selected >= review_counts.total %} hidden{% endif %}">{{ _dismiss_rest_label }} ({{ review_counts.total - review_counts.selected }})</button>
+                  class="ql-btn ql-btn-secondary ql-btn-sm ql-review-footer-secondary{% if _bar_selected >= _bar_total %} hidden{% endif %}">{{ _dismiss_rest_label }} ({{ _bar_total - _bar_selected }})</button>
           {% endif %}
           {% set _result_count = review_counts.total %}
           {% if job.execute_kind == 'migration' %}
@@ -69,7 +86,9 @@
             {% set _discard_confirm = 'Discard this ' ~ _review_thing ~ '? No files will change. Run the scan again to see these results later.' %}
           {% endif %}
           <div class="ql-review-footer-secondary-group">
+            {% if not embedded_surface|default(false) %}
             <a href="{{ _back_href }}" class="ql-btn ql-btn-secondary ql-btn-sm">{{ _back_label }}</a>
+            {% endif %}
             <button type="submit" formaction="/jobs/{{ job.id }}/cancel"
                     class="ql-btn ql-btn-danger ql-btn-sm"
                     data-confirm="{{ _discard_confirm }}">Discard {{ _review_thing }}</button>
