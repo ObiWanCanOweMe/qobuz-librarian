@@ -5,7 +5,7 @@ const CACHE = 'qobuz-librarian-' + VERSION;
 const PRECACHE = [
   '/static/dist/app.css?v=' + VERSION,
   '/static/app.js?v=' + VERSION,
-  '/static/vendor/htmx-1.9.12.min.js',
+  '/static/vendor/htmx-2.0.4.min.js',
   '/static/vendor/inter/inter-latin.woff2',
   '/static/vendor/inter/inter-latin-ext.woff2',
   '/static/icon.png',
