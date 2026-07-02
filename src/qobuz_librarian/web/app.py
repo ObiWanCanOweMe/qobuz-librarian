@@ -4,6 +4,7 @@ import concurrent.futures
 import hashlib
 import html
 import json
+import shutil
 import threading
 import time
 import tomllib
@@ -3995,7 +3996,19 @@ def _settings_response(request, *, saved=False, queued=False, connected=False,
     creds_from_env = bool(cfg.QOBUZ_USER_AUTH_TOKEN)
     cli_only_env = os.environ.get("QL_CLI_ONLY", "").strip().lower() in (
         "1", "true", "yes", "on")
+    music_storage = None
+    try:
+        du = shutil.disk_usage(cfg.MUSIC_ROOT)
+        def _tb(n):
+            return f"{n / 1e12:.2f} TB" if n >= 1e12 else f"{n / 1e9:.0f} GB"
+        music_storage = {
+            "used": _tb(du.used), "free": _tb(du.free),
+            "pct": round(du.used / du.total * 100, 1) if du.total else 0,
+        }
+    except OSError:
+        pass
     return _tr(request, "settings.html", {
+        "music_storage": music_storage,
         "user_id": creds.get("user_id", "") if user_id is None else user_id,
         "auth_token_set": bool(creds.get("auth_token")),
         "auth_token_prefill": auth_token_prefill,

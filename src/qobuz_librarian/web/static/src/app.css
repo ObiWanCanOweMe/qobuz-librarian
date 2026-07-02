@@ -4171,12 +4171,17 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
 .ql-settings-section {
   overflow: hidden;
   border: 1px solid var(--ql-line);
-  border-radius: var(--ql-radius-lg);
+  border-radius: 16px;
   background:
     linear-gradient(180deg,
       color-mix(in oklab, var(--ql-surface) 92%, var(--ql-bg)) 0%,
       var(--ql-surface) 100%);
   box-shadow: var(--ql-shadow-soft);
+}
+[data-theme="night"] .ql-settings-section {
+  border-color: rgba(228, 169, 78, 0.13);
+  background: linear-gradient(180deg, #1d160d 0%, #191309 100%);
+  box-shadow: 0 24px 50px -30px rgba(0, 0, 0, 0.95), inset 0 1px 0 rgba(255, 255, 255, 0.035);
 }
 .ql-settings-section-primary {
   border-color: color-mix(in oklab, var(--ql-gold) 24%, var(--ql-line));
@@ -4208,9 +4213,52 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
 .ql-settings-section-copy h2 {
   margin: 0;
   color: var(--ql-text);
-  font-size: 1.05rem;
-  font-weight: 760;
+  font-family: var(--ql-font-display);
+  font-size: 1.19rem;
+  font-weight: 600;
   line-height: 1.25;
+}
+.ql-conn-line {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  color: var(--ql-text-2);
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+.ql-conn-line .ql-conn-dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--ql-owned);
+  box-shadow: 0 0 8px color-mix(in oklab, var(--ql-owned) 60%, transparent);
+}
+.ql-conn-line .ql-conn-who {
+  color: var(--ql-text-3);
+  font-family: var(--ql-font-mono);
+  font-size: 0.76rem;
+}
+.ql-storage {
+  margin-top: 0.35rem;
+}
+.ql-storage-meta {
+  color: var(--ql-text-3);
+  font-family: var(--ql-font-mono);
+  font-size: 0.78rem;
+}
+.ql-storage-bar {
+  height: 6px;
+  margin-top: 0.5rem;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--ql-text) 8%, transparent);
+  overflow: hidden;
+}
+.ql-storage-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #c98a28, var(--ql-gold));
 }
 .ql-settings-section-copy p {
   max-width: 68ch;

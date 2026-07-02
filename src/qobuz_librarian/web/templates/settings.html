@@ -7,7 +7,6 @@
 <div class="ql-settings-page">
 <header class="ql-page-header ql-settings-header">
   <h1>Settings</h1>
-  <p>Manage Qobuz access, download behaviour, library paths, and diagnostics.</p>
 </header>
 
 {% if connected %}
@@ -97,7 +96,7 @@
         </p>
       </div>
       {% if auth_token_set %}
-      <span class="ql-badge ql-badge-success">Token saved</span>
+      <span class="ql-conn-line"><span class="ql-conn-dot"></span>Connected{% if user_id %} <span class="ql-conn-who">{{ user_id }}</span>{% endif %}</span>
       {% else %}
       <span class="ql-badge ql-badge-primary">Required for search</span>
       {% endif %}
@@ -316,6 +315,12 @@
       </div>
       {% endfor %}
     </dl>
+    {% if music_storage %}
+    <div class="ql-storage">
+      <p class="ql-storage-meta">Music folder: {{ music_storage.used }} used · {{ music_storage.free }} free</p>
+      <div class="ql-storage-bar"><i style="width: {{ music_storage.pct }}%"></i></div>
+    </div>
+    {% endif %}
   </div>
 </section>
 

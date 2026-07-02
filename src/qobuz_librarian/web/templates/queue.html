@@ -97,10 +97,10 @@
   {% set _discard_confirm = 'Discard this ' ~ _thing ~ '? No files will change. Run the scan again to see these results later.' %}
   {% endif %}
   <div class="ql-activity-actions">
-    <a href="{{ '/repair' if job.execute_kind == 'repair' else ('/library' if job.execute_kind in ('library', 'new_releases') else '/jobs/' ~ job.id) }}" class="ql-btn ql-btn-sm ql-btn-primary">Review</a>
+    <a href="{{ '/repair' if job.execute_kind == 'repair' else ('/library' if job.execute_kind in ('library', 'new_releases') else '/jobs/' ~ job.id) }}" class="ql-btn ql-btn-sm ql-btn-secondary ql-secondary-action">Review</a>
     <form action="/jobs/{{ job.id }}/cancel" method="post">
       <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-      <button type="submit" class="ql-btn ql-btn-sm ql-btn-danger"
+      <button type="submit" class="ql-btn ql-btn-sm ql-btn-ghost-danger"
               title="Discard {{ _thing }}" aria-label="Discard {{ _thing }}"
               data-confirm="{{ _discard_confirm }}">Discard</button>
     </form>
