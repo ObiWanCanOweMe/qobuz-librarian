@@ -148,6 +148,11 @@ class Job:
     progress_total: int   = 0
     progress_item: str    = ""
     progress_found: int   = 0   # running tally of results found so far
+    # Artists with at least one find so far — the server-side count behind the
+    # scan page's "across N artists". Client-side counting lost the tally on an
+    # SSE reconnect (per-artist hits aren't replayed), so the cumulative number
+    # rides every progress payload and the reconnect snapshot instead.
+    progress_found_artists: int = 0
     # What current/total are counting, so the UI can label a bare "12 / 350"
     # ("artist", "album", "track"). Empty → no unit shown (e.g. downloads, where
     # the album title + track item already make the count's meaning obvious).
@@ -273,6 +278,9 @@ class Job:
             self.progress_item = item
             self.progress_found = found
             self.progress_unit = unit
+            if hit and hit.get("albums"):
+                self.progress_found_artists += 1
+            found_artists = self.progress_found_artists
         payload = {"phase": phase, "current": current, "total": total,
                    "item": item, "found": found}
         # Optional keys mirror `hit`: kept out of the payload when unset so the
@@ -281,6 +289,8 @@ class Job:
             payload["unit"] = unit
         if hit:
             payload["hit"] = hit
+        if found_artists:
+            payload["found_artists"] = found_artists
         self._fan_out(PROGRESS_PREFIX + json.dumps(payload))
 
     def notify_review_changed(self, origin: str = ""):
@@ -302,6 +312,8 @@ class Job:
             "found": self.progress_found}
         if self.progress_unit:
             snap["unit"] = self.progress_unit
+        if self.progress_found_artists:
+            snap["found_artists"] = self.progress_found_artists
         return PROGRESS_PREFIX + json.dumps(snap)
 
     # Cap replay so a late subscriber doesn't get thousands of historical

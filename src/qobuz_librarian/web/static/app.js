@@ -721,8 +721,13 @@
       if (bar) { if (p.total > 0) { bar.max = 100; bar.value = Math.round(p.current / p.total * 100); } else { bar.removeAttribute("value"); } }
       if (item) item.textContent = p.item || "";
       if (typeof p.found === "number" && p.found > foundAlbums) foundAlbums = p.found;
-      if (p.hit && p.hit.albums > 0) { foundArtists += 1; showFound(); }
-      else if (typeof p.found === "number") showFound();
+      // Both tallies come cumulative from the server (found_artists rides the
+      // reconnect snapshot too), so a dropped-and-reopened stream picks the
+      // line back up instead of restarting the artist count at zero.
+      if (typeof p.found_artists === "number" && p.found_artists > foundArtists) {
+        foundArtists = p.found_artists;
+      }
+      if (typeof p.found === "number" || p.hit) showFound();
     });
     src.addEventListener("done", function () {
       src.close();
