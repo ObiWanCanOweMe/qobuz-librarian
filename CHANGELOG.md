@@ -2,6 +2,36 @@
 
 All notable changes to Qobuz Librarian are recorded here, newest first. The project follows [semantic versioning](https://semver.org/); dates are when each version was tagged during local development.
 
+## [0.10.0] - 2026-07-02
+
+**A new web interface**
+
+- The web UI has been redesigned end to end: a night theme built on gold and espresso, a matching all-light winter theme, a persistent sidebar on desktop, and a bottom tab bar on phones. Search is the front page, and the logo, app icons, and favicon are new to match.
+- Search results group each album with its other pressings in an expandable version tree, with cover art, per-release quality, and bulk select. Albums you own are marked "In library", with a toggle to hide them.
+- Every page moved onto the same design system: the Library review with its Missing Albums and Gap Fill tabs, Activity with live job tiles, History split into job cards and a downloads table, a restyled Settings that shows music-folder storage, and matching login, setup, and error pages.
+
+**One scan for the whole library**
+
+- "Scan library" now refreshes everything in one pass — missing albums, Gap Fill, quality upgrades, and downsample candidates share a single baseline instead of four separate scans. Quick passes skip unchanged artist folders, an interrupted scan resumes where it stopped, and a scan that couldn't check every artist says so instead of reporting a clean finish.
+- The Library page owns the whole flow: the scan launcher, live progress, and the parked review all live there, with dismissed candidates recoverable from its Dismissed page.
+- The per-artist Artist page and its scan routes are gone; artist discovery lives in Search, and whole-library work lives on each tool's page. An old parked per-artist review restores as failed with a hint to re-run the scan.
+
+**Downloads verify their quality**
+
+- Each download's staged FLACs are checked against what your quality tier implies before import. When Qobuz under-delivers, the download retries once from the highest source, and a retry that comes back less complete than the first rip is discarded rather than trusted. Anything unresolved is flagged in History instead of slipping into the library silently.
+
+**Fixes**
+
+- Rapid review ticks no longer get lost while the same review is open in another tab, and cross-tab sync stays live.
+- Saving Settings stores only the fields you changed, so later edits to `.env`/Compose values keep applying.
+- A scan page that reconnects keeps its "across N artists" tally instead of restarting the count.
+- The job log console matches the app theme, live updates on Library and Repair no longer reintroduce a duplicate page header, and a mixed-quality upgrade candidate names its low end instead of reading as a no-op.
+- The browser theme-color, favicon, and app icons follow the active theme and cache-bust on release, so a stale icon doesn't linger after an update.
+
+**Internals**
+
+- beets 2.12, htmx 2.0.4, and refreshed dependency locks; slimmer logo, icon, and font assets (the mono font ships as WOFF2).
+
 ## [0.9.4] - 2026-06-25
 
 **Search and review**
