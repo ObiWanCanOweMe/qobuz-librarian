@@ -499,3 +499,53 @@ def test_consolidate_albums_is_a_noop_under_dry_run(monkeypatch):
     album = {"id": "x", "title": "Revolver", "artist": {"name": "The Beatles"}}
     assert cmod.consolidate_albums(album, Namespace(dry_run=True, consolidate=True,
                                                     yes=False)) == 0
+
+
+def test_downsample_stash_copies_and_marks_the_undo_window(tmp_path, monkeypatch):
+    from qobuz_librarian.library import backup as bk
+    monkeypatch.setattr("qobuz_librarian.config.UPGRADE_BACKUP_DIR", tmp_path / "bk")
+    album = tmp_path / "music" / "A" / "Album (2020)"
+    (album / "CD1").mkdir(parents=True)
+    f1 = album / "01.flac"
+    f1.write_bytes(b"HIRES-1")
+    f2 = album / "CD1" / "02.flac"
+    f2.write_bytes(b"HIRES-2")
+    bp, copied = bk.stash_downsample_originals([f1, f2], album)
+    assert copied == {f1, f2}
+    assert (bp / "01.flac").read_bytes() == b"HIRES-1"
+    # Disc subfolder layout survives, so a restore lands per-disc files home.
+    assert (bp / "CD1" / "02.flac").read_bytes() == b"HIRES-2"
+    assert (bp / bk._REAP_AFTER_RETENTION_SENTINEL).is_file()
+    assert bk._read_backup_origin(bp) == album
+    # Copies, not moves — the rewrite still needs the originals in place.
+    assert f1.read_bytes() == b"HIRES-1"
+
+
+def test_retention_sweep_reaps_an_expired_undo_copy_by_age_alone(tmp_path, monkeypatch):
+    # An undo copy's origin deliberately holds the SMALLER rewrite, so the
+    # redundancy proof can never pass — without the sentinel special-case the
+    # sweep would keep these forever and diagnostics would nag about them.
+    import time as _time
+
+    from qobuz_librarian.library import backup as bk
+    monkeypatch.setattr("qobuz_librarian.config.UPGRADE_BACKUP_DIR", tmp_path / "bk")
+    monkeypatch.setattr("qobuz_librarian.config.DATA_DIR", tmp_path / "data")
+    base = tmp_path / "bk"
+    old = base / "20200101_000000_000000_downsample_Album"
+    old.mkdir(parents=True)
+    (old / "01.flac").write_bytes(b"HIRES")
+    (old / bk._ORIGIN_SIDECAR).write_text(str(tmp_path / "gone"), encoding="utf-8")
+    (old / bk._REAP_AFTER_RETENTION_SENTINEL).write_text("undo", encoding="utf-8")
+    fresh = base / (_time.strftime("%Y%m%d_%H%M%S") + "_000000_downsample_Album2")
+    fresh.mkdir()
+    (fresh / "01.flac").write_bytes(b"HIRES2")
+    (fresh / bk._ORIGIN_SIDECAR).write_text(str(tmp_path / "gone2"), encoding="utf-8")
+    (fresh / bk._REAP_AFTER_RETENTION_SENTINEL).write_text("undo", encoding="utf-8")
+    n = bk.cleanup_old_upgrade_backups(retention_days=7, force=True)
+    assert n == 1
+    assert not old.exists() and fresh.exists()
+    # A within-window undo copy is a state the user asked for, not an orphan:
+    # it stays out of the only-copy alarm and shows on its own list instead.
+    bk._only_copy_cache = None
+    assert all(p != fresh for p, _ in bk.find_only_copy_backups())
+    assert [p for p, _ in bk.list_undo_copies()] == [fresh]

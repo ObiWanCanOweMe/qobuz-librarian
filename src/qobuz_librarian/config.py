@@ -511,6 +511,11 @@ SUPPRESS_SINGLE_TRACK_GAPS = _env_bool("SUPPRESS_SINGLE_TRACK_GAPS", False)
 # Off by default: most people want the file Qobuz delivers. Opt in if you
 # prefer to grab hi-res mixes and downsample them to 44.1/48 kHz to save space.
 DOWNSAMPLE_HIRES_ENABLED = _env_bool("DOWNSAMPLE_HIRES_ENABLED", False)
+# Off by default: downsampling exists to reclaim space, and the copies cost
+# that space back while they last. On, the on-demand Downsample parks each
+# hi-res original in the backup area for UPGRADE_BACKUP_RETENTION_DAYS, so
+# the rewrite can be undone from Settings until the window closes.
+DOWNSAMPLE_KEEP_ORIGINALS = _env_bool("DOWNSAMPLE_KEEP_ORIGINALS", False)
 
 # Album-version / library-structure preferences. CLI and web both read these,
 # so shared options behave the same across interfaces.

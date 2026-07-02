@@ -1314,7 +1314,8 @@ def execute_downsamples(job, chosen, token=None, args=None):
         try:
             with staging_lock():
                 res = downsample_dir(album_dir, verbose=True,
-                                     base_dir=album_dir, log=log.info)
+                                     base_dir=album_dir, log=log.info,
+                                     keep_originals=cfg.DOWNSAMPLE_KEEP_ORIGINALS)
         except Exception as e:
             log.info(f"  failed: {e}")
             total_errors += 1

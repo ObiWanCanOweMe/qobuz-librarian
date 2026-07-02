@@ -12,7 +12,7 @@ from pathlib import Path
 from qobuz_librarian import config as cfg
 from qobuz_librarian.integrations.rip import flac_audio_ok
 from qobuz_librarian.ui_cli.colors import C, fmt
-from qobuz_librarian.ui_cli.logging import log
+from qobuz_librarian.ui_cli.logging import log, vlog
 
 
 def _backup_dir_name(album_dir: Path, *, kind: str = "") -> str:
@@ -179,8 +179,16 @@ _PARTIAL_RESTORE_SENTINEL = ".ql_partial_restore"
 # explicit "don't reap" marker on top of the content-presence proof.
 _UNVERIFIED_UPGRADE_SENTINEL = ".ql_upgrade_unverified"
 
+# Dropped into a backup that exists only as an undo window — the downsample
+# keep-originals copy. Its origin deliberately holds the SMALLER rewrite, so
+# the content-presence proof below can never call it redundant; without this
+# marker the sweep would keep it forever and the diagnostics would nag about
+# a state the user asked for. It inverts the default: age alone reaps it.
+_REAP_AFTER_RETENTION_SENTINEL = ".ql_reap_after_retention"
+
 # Files a backup carries that aren't backed-up tracks.
-_SIDECARS = (_ORIGIN_SIDECAR, _PARTIAL_RESTORE_SENTINEL, _UNVERIFIED_UPGRADE_SENTINEL)
+_SIDECARS = (_ORIGIN_SIDECAR, _PARTIAL_RESTORE_SENTINEL,
+             _UNVERIFIED_UPGRADE_SENTINEL, _REAP_AFTER_RETENTION_SENTINEL)
 
 
 def _write_backup_origin(bp: Path, origin: Path) -> bool:
@@ -309,6 +317,12 @@ def find_only_copy_backups():
                 # real backup; a committed backup whose album name merely ends in
                 # '.partial' DOES carry the origin sidecar and must still surface.
                 if entry.name.endswith(".partial") and not (entry / _ORIGIN_SIDECAR).is_file():
+                    continue
+                # A deliberate undo copy (downsample originals): its origin
+                # holds the smaller rewrite on purpose, so it always looks
+                # "not redundant" here — but it isn't orphaned, and the
+                # diagnostics list it feeds shows it separately.
+                if (entry / _REAP_AFTER_RETENTION_SENTINEL).is_file():
                     continue
                 if not _backup_safe_to_reap(entry):
                     out.append((entry, _read_backup_origin(entry)))
@@ -559,6 +573,93 @@ def backup_gap_fill_files(file_paths, album_dir: Path):
             return bp
         return None  # everything restored to album_dir; bp is empty
     return bp
+
+
+def list_undo_copies():
+    """Deliberate undo copies (downsample originals) still inside their
+    retention window, as (backup_path, origin). Shown on the diagnostics list
+    with a Restore button — separate from the orphaned-backup alarm, because
+    this state is one the user asked for, not a failure."""
+    out = []
+    if not cfg.UPGRADE_BACKUP_DIR.exists():
+        return out
+    try:
+        for entry in cfg.UPGRADE_BACKUP_DIR.iterdir():
+            if (entry.is_dir()
+                    and (entry / _REAP_AFTER_RETENTION_SENTINEL).is_file()):
+                out.append((entry, _read_backup_origin(entry)))
+    except OSError:
+        pass
+    return out
+
+
+def stash_downsample_originals(files, album_dir):
+    """Copy the hi-res originals about to be rewritten in place into a
+    timestamped backup, so the downsample can be undone until the retention
+    sweep clears it. Returns (backup_path_or_None, set_of_files_copied).
+
+    Copies, never moves — the originals stay put for the rewrite itself. The
+    caller must leave any file NOT in the returned set untouched: the whole
+    point of keep-originals is that nothing is rewritten without its copy, so
+    a failed copy downgrades that file to "skipped", never to "unprotected".
+    Each copy is content-verified (sha256) before it counts, because the undo
+    path later trusts these bytes with an overwrite."""
+    files = [Path(f) for f in files]
+    if not files:
+        return None, set()
+    try:
+        cfg.UPGRADE_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        bp = cfg.UPGRADE_BACKUP_DIR / _backup_dir_name(album_dir, kind="downsample")
+        bp.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.info(fmt(C.YELLOW,
+            f"  ⚠  Couldn't create the keep-originals dir ({e}); "
+            "leaving every file untouched."))
+        return None, set()
+    copied = set()
+    for src in files:
+        try:
+            rel = src.relative_to(album_dir)
+        except ValueError:
+            rel = Path(src.name)
+        dst = bp / rel
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            digest = _file_digest(src)
+            shutil.copy2(str(src), str(dst))
+            if _file_digest(dst) != digest:
+                dst.unlink(missing_ok=True)
+                raise OSError("copy content mismatch (verification failed)")
+            copied.add(src)
+        except (OSError, shutil.Error) as e:
+            log.info(fmt(C.YELLOW,
+                f"  ⚠  Couldn't keep a copy of {src.name} ({e}); "
+                "it will be left untouched."))
+            try:
+                dst.unlink(missing_ok=True)
+            except OSError:
+                pass
+    if not copied:
+        shutil.rmtree(bp, ignore_errors=True)
+        return None, set()
+    if not _write_backup_origin(bp, album_dir):
+        # Without the origin the Restore button has no destination; treat the
+        # stash as failed and leave everything untouched rather than promise
+        # an undo that can't run.
+        log.info(fmt(C.RED,
+            "  ✗  Couldn't record where these copies came from; "
+            "leaving the originals untouched."))
+        shutil.rmtree(bp, ignore_errors=True)
+        return None, set()
+    try:
+        (bp / _REAP_AFTER_RETENTION_SENTINEL).write_text(
+            "downsample originals — an undo copy; the age sweep clears it "
+            "after the retention window", encoding="utf-8")
+    except OSError as e:
+        # Degrades to the always-keep default: the sweep holds it and the
+        # orphan list surfaces it — untidy, never unsafe.
+        vlog(f"couldn't mark the undo copy age-reapable: {e}")
+    return bp, copied
 
 
 def restore_gap_fill_backup(backup_path: Path, album_dir: Path,
@@ -938,6 +1039,16 @@ def cleanup_old_upgrade_backups(retention_days: int | None = None,
                 f"timestamp prefix; leaving it alone."))
             continue
         if ts < cutoff:
+            if (entry / _REAP_AFTER_RETENTION_SENTINEL).is_file():
+                # A deliberate undo copy whose origin holds the smaller
+                # rewrite ON PURPOSE — the redundancy proof below can never
+                # pass for it, and age alone is its whole contract.
+                try:
+                    shutil.rmtree(entry)
+                    n_removed += 1
+                except OSError:
+                    pass
+                continue
             if not _backup_safe_to_reap(entry):
                 # We can't PROVE this backup is redundant (origin gone, a track
                 # not back at it, unreadable, or an explicit keep marker), so it

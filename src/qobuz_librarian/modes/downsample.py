@@ -7,6 +7,7 @@ file is decode-verified before it replaces anything.
 """
 import sys
 
+from qobuz_librarian import config as cfg
 from qobuz_librarian.integrations.downsample_engine import HAVE_DOWNSAMPLE, downsample_dir
 from qobuz_librarian.library import downsample_state
 from qobuz_librarian.library import hidden as hidden_mod
@@ -130,7 +131,8 @@ def run_downsample_walk_mode(args):
                     f"  [{j}/{n_albums}] {truncate(c.title, 55)}"))
                 artist_attempted = True
                 res = downsample_dir(c.album_dir, verbose=True,
-                                     base_dir=c.album_dir, log=log.info)
+                                     base_dir=c.album_dir, log=log.info,
+                                     keep_originals=cfg.DOWNSAMPLE_KEEP_ORIGINALS)
                 if res.get("resampled"):
                     n_albums_done += 1
                     mark_local_album_capped(c.album_dir)

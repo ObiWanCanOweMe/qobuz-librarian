@@ -35,6 +35,10 @@ BEHAVIOR_FIELDS = [
     ("DOWNSAMPLE_HIRES_ENABLED", "Downsample new hi-res downloads",
      "Before import, reduce newly downloaded hi-res FLACs to 44.1 or 48 kHz. "
      "The hi-res files are not kept."),
+    ("DOWNSAMPLE_KEEP_ORIGINALS", "Keep originals when downsampling",
+     "Park a copy of each hi-res original before the Downsample page rewrites "
+     "it, so the rewrite can be undone from Settings until the backup "
+     "retention window ends. Uses that much extra disk while the copies last."),
     ("SUPPRESS_SINGLE_TRACK_GAPS", "Treat track downloads as singles",
      "Hide the rest of an album from gap scans after you download one track. "
      "Leave this off if a track download should not affect future album offers."),

@@ -165,7 +165,7 @@ On first run the Search page *offers* a one-time baseline scan (`AUTO_LIBRARY_SC
 
 - **Library gap-fill** can add missing albums or missing tracks after review; it does not overwrite existing tracks.
 - **After a download**, it re-checks the new album's track lengths against Qobuz and flags **Repair** if one is short. Read-only (a clean truncation can still decode).
-- **Upgrade** and **Downsample** change files only when you start them. Upgrade backs up the originals first (`UPGRADE_BACKUP_RETENTION_DAYS`); Downsample rewrites in place after verifying each file decodes.
+- **Upgrade** and **Downsample** change files only when you start them. Upgrade backs up the originals first (`UPGRADE_BACKUP_RETENTION_DAYS`); Downsample rewrites in place after verifying each file decodes — or, with *Keep originals when downsampling* on (`DOWNSAMPLE_KEEP_ORIGINALS`), parks the hi-res copies in the backup area first so the rewrite can be undone from Settings → Diagnostics until the retention window ends.
 - **Lyrics** writes tags or `.lrc` sidecars, not the audio.
 - **Consolidation** (`CONSOLIDATE`, off) merges duplicate folders, CLI-only (it needs per-folder confirmation).
 - **`MIGRATE_MULTI_ARTIST`** (off) re-files `A, B/Album` under `A/Album` after import.

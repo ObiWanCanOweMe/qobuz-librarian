@@ -4209,6 +4209,29 @@ def _diagnostics_fragment(request: Request) -> str:
             f'data-confirm="Move these files back to {dest}?">Restore</button>'
             f'</form></div></div>'
         )
+    try:
+        from qobuz_librarian.library.backup import list_undo_copies
+        undo = list_undo_copies()
+    except Exception:
+        undo = []
+    for path, origin in undo:
+        name = html.escape(path.name)
+        dest = html.escape(str(origin)) if origin else "its album folder"
+        rows.append(
+            f'<div class="ql-diagnostic-row">'
+            f'<span class="ql-diagnostic-status ql-diagnostic-status-ok" aria-label="OK">OK</span>'
+            f'<div class="min-w-0"><div class="ql-diagnostic-label">Downsample originals: {name}</div>'
+            f'<div class="ql-diagnostic-detail">Hi-res copies kept so the rewrite '
+            f'can be undone; cleared automatically after '
+            f'{cfg.UPGRADE_BACKUP_RETENTION_DAYS} day(s).</div>'
+            f'<form hx-post="/backups/restore" hx-target="#diagnostics-list" class="mt-2">'
+            f'<input type="hidden" name="_csrf_token" value="{tok}">'
+            f'<input type="hidden" name="backup" value="{name}">'
+            f'<button type="submit" class="ql-btn ql-btn-sm" '
+            f'data-confirm="Put the hi-res originals back at {dest}? '
+            f'This undoes the downsample.">Restore</button>'
+            f'</form></div></div>'
+        )
     return "\n".join(rows)
 
 

@@ -495,13 +495,19 @@ def sweep_stale_encodes(directory):
     return removed
 
 
-def downsample_dir(directory, *, verbose=True, base_dir=None, log=print):
+def downsample_dir(directory, *, verbose=True, base_dir=None, log=print,
+                   keep_originals=False):
     """Resample any high-sample-rate FLACs inside `directory` (recursive).
 
     Probes each file's sample rate, resamples the ones above CD rate, and
     leaves the rest untouched. `base_dir` is the root paths are taken relative
     to (defaults to MUSIC_ROOT); pass the album/staging dir when the files
     aren't on the canonical music tree yet.
+
+    keep_originals: park a verified copy of each original in the backup area
+    before its rewrite, so the run can be undone until the retention sweep. A
+    file whose copy can't be made is left untouched (counted as an error) —
+    the mode's promise is that nothing is rewritten without its safety copy.
 
     Returns dict: {"resampled": int, "errors": int, "saved_bytes": int}.
     Never raises; on bad input returns zero counts.
@@ -535,6 +541,23 @@ def downsample_dir(directory, *, verbose=True, base_dir=None, log=print):
     if verbose:
         log(f"  ⇳ downsample: {len(candidates)} file(s) in {directory.name}")
 
+    n_uncopied = 0
+    if keep_originals:
+        from qobuz_librarian.library.backup import stash_downsample_originals
+        kept_dir, copied = stash_downsample_originals(
+            [_bd / rel for rel, _, _ in candidates], directory)
+        protected = [c for c in candidates if _bd / c[0] in copied]
+        n_uncopied = len(candidates) - len(protected)
+        if n_uncopied:
+            log(f"  ⚠ downsample: {n_uncopied} file(s) have no safety copy — "
+                "left untouched.")
+        candidates = protected
+        if kept_dir is not None and candidates and verbose:
+            log(f"  ⤷ originals kept {cfg.UPGRADE_BACKUP_RETENTION_DAYS} "
+                f"day(s): restore from Settings → Diagnostics")
+        if not candidates:
+            return {"resampled": 0, "errors": n_uncopied, "saved_bytes": 0}
+
     saved_total = 0
     errors = 0
     resampled = 0
@@ -563,5 +586,5 @@ def downsample_dir(directory, *, verbose=True, base_dir=None, log=print):
             f"saved {human(saved_total)}")
 
     return {"resampled": resampled,
-            "errors": errors,
+            "errors": errors + n_uncopied,
             "saved_bytes": saved_total}
