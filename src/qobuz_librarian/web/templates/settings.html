@@ -338,20 +338,7 @@
               hx-indicator="#diag-spinner">Recheck</button>
     </div>
     <div id="diagnostics-list" class="ql-diagnostics-list" aria-live="polite">
-      {% for d in diagnostics %}
-      <div class="ql-diagnostic-row">
-        <span class="ql-diagnostic-status {% if d.ok %}ql-diagnostic-status-ok{% else %}ql-diagnostic-status-error{% endif %}"
-              aria-label="{% if d.ok %}OK{% else %}Needs attention{% endif %}">
-          {% if d.ok %}OK{% else %}Issue{% endif %}
-        </span>
-        <div class="min-w-0">
-          <div class="ql-diagnostic-label">{{ d.label }}</div>
-          {% if d.detail %}
-          <div class="ql-diagnostic-detail">{{ d.detail }}</div>
-          {% endif %}
-        </div>
-      </div>
-      {% endfor %}
+      {{ diagnostics_html | safe }}
     </div>
     <span id="diag-spinner" class="htmx-indicator ql-spinner ql-spinner-xs mt-2"></span>
   </div>

@@ -29,7 +29,7 @@
     <div class="ql-work-card-copy">
       <p class="ql-work-card-kicker">Local rewrite</p>
       <p class="ql-work-card-title">Review before changes</p>
-      <p class="ql-work-card-text">The scan only lists albums. Selected albums are rewritten in place; hi-res originals are not kept.</p>
+      <p class="ql-work-card-text">The scan only lists albums. Selected albums are rewritten in place{% if keeps_ds_originals() %}; the hi-res originals are kept for {{ backup_retention_days }} day{{ 's' if backup_retention_days != 1 }} so a rewrite can be undone from Settings{% else %}; hi-res originals are not kept{% endif %}.</p>
     </div>
   </section>
 

@@ -804,6 +804,10 @@ templates.env.globals["repo_url"] = "https://github.com/jarynclouatre/qobuz-libr
 # Server epoch at render, so a live elapsed clock can tick from a client-side
 # baseline instead of trusting the browser's wall clock against a server epoch.
 templates.env.globals["now_ts"] = time.time
+# Callable, not a snapshot: the toggle lives in Settings and the downsample
+# warnings have to describe whichever mode is active when the page renders.
+templates.env.globals["keeps_ds_originals"] = lambda: bool(cfg.DOWNSAMPLE_KEEP_ORIGINALS)
+templates.env.globals["backup_retention_days"] = cfg.UPGRADE_BACKUP_RETENTION_DAYS
 
 
 def _fmt_clock(ts):
@@ -4016,7 +4020,7 @@ def _settings_response(request, *, saved=False, queued=False, connected=False,
         "text_fields": settings_store.TEXT_FIELDS,
         "option_labels": settings_store.ENUM_OPTION_LABELS,
         "behavior": values,
-        "diagnostics": diagnostics if diagnostics is not None else _diagnostics(),
+        "diagnostics_html": _diagnostics_fragment(request, diagnostics),
     })
 
 
@@ -4233,13 +4237,14 @@ _SSE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=cfg.SSE_MAX_WORKERS, thread_name_prefix="sse")
 
 
-def _diagnostics_fragment(request: Request) -> str:
+def _diagnostics_fragment(request: Request, checks: list | None = None) -> str:
     """The diagnostics list items, plus a Restore row per orphaned backup.
 
-    Shared by the GET partial (initial load + the Recheck button) and the
-    restore POST below, which re-renders the list in place so a restored
-    backup disappears from it without a page reload."""
-    checks = _diagnostics()
+    Shared by the Settings page render, the Recheck partial, and the restore
+    POST below, which re-renders the list in place so a restored backup
+    disappears from it without a page reload."""
+    if checks is None:
+        checks = _diagnostics()
     rows = []
     for d in checks:
         icon = "OK" if d["ok"] else "!"
