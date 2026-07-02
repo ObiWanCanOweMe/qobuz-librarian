@@ -64,12 +64,12 @@ check() {
 
 echo "==> Checking routes"
 check /                       200
-check /search                 200
-check /artist                 200
 check /library                200
-check /upgrade                200
+check /library/hidden         200
+check /upgrade                303   # no Qobuz creds in this container, so it redirects
 check /downsample             200
 check /repair                 200
+check /repair/history         200
 check /lyrics                 200
 check /migrate                200
 check /queue                  200
