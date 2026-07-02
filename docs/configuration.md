@@ -13,7 +13,7 @@ Use the **Settings** page for day-to-day behaviour:
 - beets folder layout
 - scan cadence
 
-These settings apply to new jobs. Lower-level options stay in `.env` or `compose.yaml` and may need a restart, including timeouts, worker counts, cache and pacing tunables, `WEB_AUTH*`, host bind, and `LOG_LEVEL`.
+These settings apply to new jobs. A field you change on the Settings page keeps that value across restarts and wins over `.env` for that field; fields you never change there keep following `.env`. Lower-level options stay in `.env` or `compose.yaml` and may need a restart, including timeouts, worker counts, cache and pacing tunables, `WEB_AUTH*`, host bind, and `LOG_LEVEL`.
 
 ## Host paths
 

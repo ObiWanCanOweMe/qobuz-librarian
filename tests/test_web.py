@@ -698,6 +698,38 @@ def test_settings_save_defers_apply_when_job_is_active(tmp_path, monkeypatch):
     assert cfg.DOWNSAMPLE_HIRES_ENABLED is True  # idempotent
 
 
+def test_settings_save_only_pins_changed_fields(tmp_path, monkeypatch):
+    """Saving the Settings form must not freeze untouched fields into the
+    settings file — the file wins over env on load, so writing a field that
+    merely matched its current value would silently stop that env var from
+    ever applying again. Only real changes (and fields saved before) persist."""
+    import json
+
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.web import settings_store as ss
+
+    monkeypatch.setattr(ss, "SETTINGS_FILE", tmp_path / "s.json")
+    monkeypatch.setattr(cfg, "LYRICS_ENABLED", True)
+    monkeypatch.setattr(cfg, "PREFER_HIRES", True)
+    monkeypatch.setattr(cfg, "STREAMRIP_QUALITY", 4)
+    monkeypatch.setattr(ss, "_any_active_job", lambda: False)
+    with ss._pending_lock:
+        ss._pending_apply = None
+
+    # The form posts every field; only LYRICS_ENABLED actually changed.
+    ok, _ = ss.save({"LYRICS_ENABLED": False, "PREFER_HIRES": True,
+                     "STREAMRIP_QUALITY": "4"})
+    assert ok is True
+    on_disk = json.loads((tmp_path / "s.json").read_text())
+    assert on_disk == {"LYRICS_ENABLED": False}
+
+    # A field that was saved before stays in the file even when a later save
+    # posts it unchanged — the user set it deliberately, so it keeps winning.
+    ok, _ = ss.save({"LYRICS_ENABLED": False, "PREFER_HIRES": False})
+    on_disk = json.loads((tmp_path / "s.json").read_text())
+    assert on_disk == {"LYRICS_ENABLED": False, "PREFER_HIRES": False}
+
+
 def test_review_changed_nudge_names_its_origin():
     """The review-sync fan-out carries the originating tab's id, so that tab
     can skip reloading a page its own action already updated — reloading the

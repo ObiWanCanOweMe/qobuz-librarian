@@ -358,6 +358,12 @@ def _atomic_write_settings(data: dict) -> bool:
 def save(values: dict):
     """Apply settings and persist them atomically. Returns (ok, warnings).
 
+    Only real changes land in the settings file: a posted value that matches
+    what's already in effect — and was never saved before — stays out, so that
+    field keeps tracking its env var / default instead of being silently
+    pinned forever by an unrelated Settings save. Once a field HAS been saved
+    it stays in the file, and the file wins on load, as documented.
+
     If a job is already active, the in-memory apply is deferred until the
     worker idles (drain_pending). Persistence to disk still happens
     immediately so the new values survive a restart. `ok` is False only if
@@ -372,11 +378,14 @@ def save(values: dict):
 
 
 def _save_locked(values: dict):
-    merged = current()
+    # What the user currently sees (cfg overlaid with any deferred save) — the
+    # baseline that decides whether a posted value is actually a change.
+    baseline = current()
+    clean = {}
     warnings = []
     for k in BEHAVIOR_KEYS:
         if k in values:
-            merged[k] = bool(values[k])
+            clean[k] = bool(values[k])
     for key, _, _, kind, choices, _ in TEXT_FIELDS:
         if key not in values:
             continue
@@ -389,28 +398,43 @@ def _save_locked(values: dict):
                 v = "2"  # lossy tiers the FLAC pipeline discards (see _apply)
             if v not in choices:
                 continue
-            merged[key] = v  # persist the normalised value, matching cfg
-            continue
+            clean[key] = v  # persist the normalised value, matching cfg
         elif kind == "list":
             raw = values[key]
             items = _str_to_list(raw) if isinstance(raw, str) else list(raw or [])
             kept, dropped = _validate_list(key, items)
-            merged[key] = ",".join(kept)
+            clean[key] = ",".join(kept)
             if dropped:
                 warnings.append(_dropped_warning(key, dropped))
-            continue
-        merged[key] = values[key]
+        else:
+            # Match _apply's strip so an incidental trailing space doesn't
+            # read as a change and pin the field.
+            clean[key] = str(values[key] or "").strip()
+
+    persisted = {}
+    try:
+        if SETTINGS_FILE.exists():
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                persisted = data
+    except (OSError, ValueError):
+        pass  # unreadable file — start over, the same way load() does
+    for k, v in clean.items():
+        if k in persisted or v != baseline.get(k):
+            persisted[k] = v
 
     with _pending_lock:
         global _pending_apply
         if _any_active_job():
-            _pending_apply = merged
+            # Merge onto any change still waiting, so this save can't drop an
+            # earlier deferred one.
+            _pending_apply = {**(_pending_apply or {}), **clean}
         else:
-            # merged already folds in any deferred change (current() overlaid
-            # it), so applying it now supersedes _pending_apply — clear it so a
-            # drain firing right after can't roll those fields back to the old
-            # deferred copy. Apply under the lock, like drain_pending does.
+            # Fold in any deferred change and clear the slot under the lock,
+            # so a drain firing right after can't roll these fields back to
+            # the old deferred copy.
+            merged = {**(_pending_apply or {}), **clean}
             _pending_apply = None
             _apply(merged)
 
-    return _atomic_write_settings(merged), warnings
+    return _atomic_write_settings(persisted), warnings
