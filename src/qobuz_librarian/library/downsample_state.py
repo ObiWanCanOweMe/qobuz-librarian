@@ -126,8 +126,12 @@ def _write_state(data):
         finally:
             if os.path.exists(tmp):
                 os.unlink(tmp)
-    except OSError:
-        pass
+    except OSError as e:
+        # The Downsample view reads this snapshot; a failed write means it
+        # shows stale candidates until the next scan. Surface it (verbose)
+        # instead of staying silent on a full/read-only volume.
+        from qobuz_librarian.ui_cli.logging import vlog
+        vlog(f"downsample state write failed ({e}); saved downsample view may be stale")
 
 
 def _state_from_result(result: RefreshResult):

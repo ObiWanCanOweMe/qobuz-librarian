@@ -85,8 +85,11 @@ def _write_state(data):
         finally:
             if os.path.exists(tmp):
                 os.unlink(tmp)
-    except OSError:
-        pass
+    except OSError as e:
+        # Losing this file only costs a slower next scan, but say so (verbose)
+        # rather than going stale with zero signal on a full/read-only volume.
+        from qobuz_librarian.ui_cli.logging import vlog
+        vlog(f"library scan state write failed ({e}); next scan re-crawls")
 
 
 def _clean_artist_state(entry):
