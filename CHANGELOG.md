@@ -20,6 +20,14 @@ All notable changes to Qobuz Librarian are recorded here, newest first. The proj
 
 - Each download's staged FLACs are checked against what your quality tier implies before import. When Qobuz under-delivers, the download retries once from the highest source, and a retry that comes back less complete than the first rip is discarded rather than trusted. Anything unresolved is flagged in History instead of slipping into the library silently.
 
+**Quality of life**
+
+- The Library page shows a quality census once a baseline exists: track counts and disk use by tier (CD, hi-res to 96 kHz, hi-res to 192 kHz), which artists hold the most hi-res data, and roughly how much a downsample pass would reclaim. All read from the scan cache — no network.
+- New *Keep originals when downsampling* setting (`DOWNSAMPLE_KEEP_ORIGINALS`): the on-demand Downsample parks a verified copy of each hi-res original in the backup area, and Settings → Diagnostics grows a Restore button that undoes the rewrite until the retention window ends. The same button also recovers backups orphaned by a hard kill, which previously required a terminal command.
+- New-release checks now run on a background timer, so `NEW_RELEASE_CHECK_INTERVAL` holds on a headless box instead of waiting for someone to open the dashboard.
+- `POST_JOB_HOOK` also fires once when the saved Qobuz token stops being accepted (`status: auth_lost`), the image now bundles `curl` so one-line ntfy/Discord hooks work as documented, and the configuration docs gained ready-made recipes.
+- Pressing `/` jumps to the search box from anywhere, and the installed app's icon offers Library and Queue shortcuts on a long-press.
+
 **Fixes**
 
 - Rapid review ticks no longer get lost while the same review is open in another tab, and cross-tab sync stays live.
