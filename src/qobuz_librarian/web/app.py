@@ -451,7 +451,6 @@ def _review_job_from_downsample_state(state):
 # the rebound function reads the current token rather than baking in the
 # (possibly-rotated) one from the prior session.
 _RESUME_EXECUTE: dict = {
-    "album":        _resume_album_download,
     "library":      _resume_album_download,
     "new_releases": _resume_album_download,
     "upgrade":      _resume_upgrade,
@@ -1638,14 +1637,6 @@ async def lyric_retry(request: Request):
     return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
 
 
-@app.get("/search")
-async def search_page():
-    # Search lives on the dashboard now (it leads with the search bar), so this
-    # path redirects to the current search surface instead of serving a second
-    # page with no nav home.
-    return RedirectResponse(url="/", status_code=307)
-
-
 def _qobuz_quality_bits_rate(primary: dict | None,
                              fallback: dict | None = None) -> tuple[int, int]:
     """Return Qobuz source quality as (bits, sample_rate_hz)."""
@@ -2449,61 +2440,6 @@ async def queue_download(request: Request, album_id: str = Form(""),
         return RedirectResponse(url=f"/queue?error={msg}", status_code=303)
 
 
-@app.get("/artist")
-async def artist_page(request: Request, artist: str = ""):
-    # The public UI no longer has a separate Artist jobs page. Preserve old
-    # direct links by landing on dashboard search in Artist mode.
-    prefill = "".join(c for c in artist if c not in "<>\x00").strip()[:200]
-    params = {"kind": "artist"}
-    if prefill:
-        params["q"] = prefill
-    return RedirectResponse(url="/?" + urllib.parse.urlencode(params),
-                            status_code=303)
-
-
-def _clean_artist_name(artist):
-    """Strip + length-cap + reject control chars. Returns (name, error_redirect).
-
-    error_redirect is None on success, or a RedirectResponse back to dashboard
-    artist search. Used by the artist scan + the per-artist power routes so
-    they all reject the same way."""
-    name = (artist or "").strip()[:200]
-    if not name:
-        return None, RedirectResponse(
-            url="/?kind=artist",
-            status_code=303,
-        )
-    if any(c in name for c in ("<", ">", "\x00")):
-        return None, RedirectResponse(
-            url="/?kind=artist",
-            status_code=303,
-        )
-    return name, None
-
-
-@app.post("/artist")
-async def artist_scan(request: Request, artist: str = Form("")):
-    busy = _lock_busy_response(request)
-    if busy is not None:
-        return busy
-    name, err = _clean_artist_name(artist)
-    if err is not None:
-        return err
-    try:
-        _get_token()
-    except (SystemExit, NoCredsError):
-        return _no_creds_response(request)
-    from qobuz_librarian.web import flows
-    job = job_mgr.Job(title="Artist scan", artist=name)
-    job.execute_kind = "album"
-    job = await _submit_scan_deduped_async(
-        job,
-        lambda j: flows.scan_artist(j, name, _get_token()),
-        lambda j, chosen: flows.execute_albums(j, chosen, _get_token()),
-        "album")
-    return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
-
-
 @app.get("/library", response_class=HTMLResponse)
 async def library_page(request: Request, page: int = 1):
     from qobuz_librarian.library import hidden as hidden_mod
@@ -2720,20 +2656,6 @@ async def upgrade_review(request: Request):
     return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
 
 
-@app.post("/upgrade")
-async def upgrade_review_legacy(request: Request):
-    if not _upgrade_available():
-        return _upgrade_unavailable_response()
-    return await upgrade_review(request)
-
-
-@app.post("/upgrade/artist")
-async def upgrade_scan_artist():
-    if not _upgrade_available():
-        return _upgrade_unavailable_response()
-    return RedirectResponse(url="/upgrade", status_code=303)
-
-
 @app.get("/downsample", response_class=HTMLResponse)
 async def downsample_page(request: Request):
     from qobuz_librarian.integrations.downsample_engine import HAVE_DOWNSAMPLE
@@ -2797,11 +2719,6 @@ async def downsample_scan(request: Request):
     return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
 
 
-@app.post("/downsample/artist")
-async def downsample_scan_artist(request: Request, artist: str = Form("")):
-    return RedirectResponse(url="/downsample", status_code=303)
-
-
 @app.get("/repair", response_class=HTMLResponse)
 async def repair_page(request: Request, page: int = 1):
     from qobuz_librarian.library import scan_checkpoint
@@ -2853,33 +2770,6 @@ async def repair_scan(request: Request):
     # behind another scan). When the scan finishes, the card's SSE done-handler
     # forwards to the job page's flagged-album review.
     return RedirectResponse(url="/repair", status_code=303)
-
-
-@app.post("/repair/artist")
-async def repair_scan_artist(request: Request, artist: str = Form("")):
-    """Scan one artist's albums for ISRC-verified truncated FLACs. No
-    checkpoint here (the focused single-artist run is fast); the whole-library
-    sweep keeps its checkpoint because it can run for hours."""
-    busy = _lock_busy_response(request)
-    if busy is not None:
-        return busy
-    name, err = _clean_artist_name(artist)
-    if err is not None:
-        return err
-    try:
-        _get_token()
-    except (SystemExit, NoCredsError):
-        return _no_creds_response(request)
-    from qobuz_librarian.web import flows
-    job = job_mgr.Job(title="Repair scan", artist=name)
-    job.execute_kind = "repair"
-    job.review_verb = "Repair"  # the action refills damaged tracks, not a download
-    job = await _submit_scan_deduped_async(
-        job,
-        lambda j: flows.scan_repairs_for_artist(j, name, _get_token()),
-        lambda j, chosen: flows.execute_repairs(j, chosen, _get_token()),
-        "repair")
-    return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
 
 
 @app.get("/repair/history", response_class=HTMLResponse)
@@ -2936,33 +2826,6 @@ async def lyrics_scan(request: Request):
     job_mgr.submit(
         job,
         lambda j: flows.run_library_lyrics(j, rescan=rescan, synced_only=synced_only),
-    )
-    return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
-
-
-@app.post("/lyrics/artist")
-async def lyrics_scan_artist(request: Request, artist: str = Form("")):
-    """Fetch lyrics for one artist's library tracks only. Same state file as
-    the whole-library run, so this still skips tracks an earlier run resolved."""
-    busy = _lock_busy_response(request)
-    if busy is not None:
-        return busy
-    name, err = _clean_artist_name(artist)
-    if err is not None:
-        return err
-    form = await request.form()
-    rescan = bool(form.get("rescan"))
-    synced_only = bool(form.get("synced_only"))
-    existing = _active_scan("lyrics", statuses=("pending", "running"))
-    if existing is not None:
-        return RedirectResponse(url=f"/jobs/{existing.id}", status_code=303)
-    from qobuz_librarian.web import flows
-    job = job_mgr.Job(title="Lyrics scan", artist=name)
-    job.execute_kind = "lyrics"
-    job_mgr.submit(
-        job,
-        lambda j: flows.run_lyrics_for_artist(
-            j, name, rescan=rescan, synced_only=synced_only),
     )
     return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
 
@@ -3259,11 +3122,8 @@ async def job_approve(request: Request, job_id: str):
 # share one review screen; hidden-store scope decides where dismissals land.
 _TRIAGE_KINDS = ("library", "upgrade", "new_releases", "downsample")
 
-# Kinds whose review screen has server-backed per-candidate selection. Artist
-# ("album") scans render the same checkboxes and approve from the saved flags,
-# so their ticks must persist too — without "album" here every tick 404s and
-# the user's edits never reach the server.
-_SELECTABLE_KINDS = _TRIAGE_KINDS + ("repair", "migration", "album")
+# Kinds whose review screen has server-backed per-candidate selection.
+_SELECTABLE_KINDS = _TRIAGE_KINDS + ("repair", "migration")
 
 
 def _hide_scope(execute_kind):

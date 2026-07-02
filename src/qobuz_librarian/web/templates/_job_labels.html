@@ -13,8 +13,6 @@
     Library migration
   {%- elif job.execute_kind == 'library' -%}
     Library scan
-  {%- elif job.execute_kind == 'album' -%}
-    Missing albums scan
   {%- else -%}
     {{ job.title }}
   {%- endif -%}
@@ -35,8 +33,6 @@
     {{ n }} Gap Fill candidate{{ 's' if n != 1 }} found
   {%- elif job.execute_kind == 'library' -%}
     {{ n }} candidate{{ 's' if n != 1 }} found
-  {%- elif job.execute_kind == 'album' -%}
-    {{ n }} missing album{{ 's' if n != 1 }} found
   {%- else -%}
     {{ n }} result{{ 's' if n != 1 }} found
   {%- endif -%}
@@ -55,7 +51,7 @@
     Gap Fill candidate
   {%- elif job.execute_kind == 'library' -%}
     candidate
-  {%- elif job.execute_kind in ('new_releases', 'album') -%}
+  {%- elif job.execute_kind == 'new_releases' -%}
     album
   {%- else -%}
     result
@@ -75,7 +71,7 @@
     Gap Fill candidates
   {%- elif job.execute_kind == 'library' -%}
     candidates
-  {%- elif job.execute_kind in ('new_releases', 'album') -%}
+  {%- elif job.execute_kind == 'new_releases' -%}
     albums
   {%- else -%}
     results
@@ -153,8 +149,6 @@
     downsample review
   {%- elif job.execute_kind == 'new_releases' -%}
     new-release review
-  {%- elif job.execute_kind == 'album' -%}
-    missing-albums review
   {%- else -%}
     library review
   {%- endif -%}
@@ -173,7 +167,7 @@
     Fetching lyrics
   {%- elif job.execute_kind == 'migration' -%}
     Migrating
-  {%- elif job.kind == 'download' or job.execute_kind in ('album', 'library', 'new_releases') -%}
+  {%- elif job.kind == 'download' or job.execute_kind in ('library', 'new_releases') -%}
     Downloading
   {%- else -%}
     Running

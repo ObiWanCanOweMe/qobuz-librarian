@@ -135,12 +135,3 @@ def touch_run(when=None) -> None:
         state["last_run"] = float(when) if when is not None else time.time()
         save(state)
 
-
-def record_artist_seen(artist_id, album_ids) -> None:
-    """Update one artist's baseline without touching last_run (that's the
-    whole-library check's throttle). Used by the per-artist Artist-page scan so
-    its new-release flagging shares the same baseline as the library check."""
-    with _lock:
-        state = load()
-        state.setdefault("seen", {})[str(artist_id)] = list(album_ids)
-        save(state)

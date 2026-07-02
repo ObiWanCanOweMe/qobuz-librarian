@@ -220,11 +220,6 @@ def _add_candidate_spec(job, spec):
     )
 
 
-def _add_album_candidate(job, album, artist_name, selected=True, is_new=False):
-    return _add_candidate_spec(
-        job, _album_candidate_spec(album, artist_name, selected, is_new))
-
-
 def _readd_candidate(job, c):
     """Re-add a candidate restored from a scan checkpoint, with a fresh cid."""
     _add_candidate_spec(job, c)
@@ -449,63 +444,6 @@ def dismiss_albums(job, artist, scope=hidden_mod.SCOPE_MISSING, gap_only=None):
 
 
 # ── Scans ─────────────────────────────────────────────────────────────────────
-
-def scan_artist(job, query, token):
-    clear_scan_caches()
-    log.info(f"Resolving artist '{query}'…")
-    # Fresh: an explicit single-artist scan should see just-released albums, not
-    # a week-old cached catalog. No hidden filter — asking for an artist by name
-    # is a deliberate request to see everything, dismissed albums included.
-    seen = new_releases_mod.load().get("seen") or {}
-    result = find_missing_for_artist(
-        query, token=token, opts=DiscoveryOpts(prefer_hires=cfg.PREFER_HIRES),
-        single_store=hidden_mod.load(), fresh=True)
-    if not result.artist_id:
-        log.info(f"  No confident Qobuz match for '{query}'.")
-        job.summary = (f"No Qobuz match for “{query}”. Check the spelling, or "
-                       "try the artist's exact name as Qobuz lists it.")
-        return
-    log.info(f"  Matched: {result.artist_name}. Scanning catalog for gaps…")
-    # Badge albums released since the last check (sharing the library-wide
-    # new-release baseline + cutoff). Everything stays unticked — one artist can
-    # have dozens of albums, so a single click must not queue the lot.
-    aid = str(result.artist_id)
-    baseline = seen.get(aid)
-    known = set(baseline or [])
-    n_new = 0
-    for gap in result.gaps:
-        # New = appeared since this artist was last baselined. Everything stays
-        # un-ticked so one click can't queue the lot; the badge marks the new ones.
-        is_new = baseline is not None and str(gap.qobuz_album.get("id")) not in known
-        if is_new:
-            n_new += 1
-        _add_gap_candidate(job, gap, result.artist_name,
-                           selected=False, is_new=is_new)
-    # Don't overwrite this artist's baseline from a transient short-page fetch —
-    # a partial discography would dump the dropped albums as "new" next check.
-    if not result.catalog_incomplete:
-        current_ids = [str(a["id"]) for a in result.catalog
-                       if is_lossless_album(a) and a.get("id") is not None]
-        new_releases_mod.record_artist_seen(aid, current_ids)
-    msg = f"  {plural(len(result.gaps), 'missing album')} found for {result.artist_name}"
-    if n_new:
-        msg += f", {n_new} new to the saved baseline"
-    log.info(msg + ".")
-    # Frame the review the way every other scan kind does: say what these are
-    # (albums you don't own), not just a bare list. The page shows job.summary
-    # above the candidates; without it an artist scan opened straight to an
-    # unexplained checklist.
-    n = len(result.gaps)
-    if n:
-        job.summary = (f"{plural(n, 'album')} {result.artist_name} has on Qobuz "
-                       "that aren't in your library")
-        if n_new:
-            job.summary += f", {n_new} new to your saved baseline"
-    else:
-        job.summary = (f"No missing albums for {result.artist_name}; your library "
-                       "already has everything Qobuz lists.")
-    flush_resolve_cache()
-    _record_last_scan()
 
 
 def _scan_library_artist(artist_dir, token, partial_only, hidden):
@@ -1051,17 +989,6 @@ def execute_albums(job, chosen, token):
 
 # ── Upgrade flow ──────────────────────────────────────────────────────────────
 
-def _scan_artist_upgrades(artist_dir, token, args, capped):
-    """Worker: collect upgrade candidates for one artist. Runs in a pool
-    thread (its own HTTP session); returns plain data so the caller adds
-    candidates serially — keeping job.candidates single-writer."""
-    from qobuz_librarian.quality.decision import scan_artist_for_upgrades
-    name = artist_dir.name
-    cands = scan_artist_for_upgrades(name, artist_dir, token, args,
-                                     capped=capped)
-    return name, cands
-
-
 def scan_upgrades(job, token):
     """Scan the library for albums Qobuz can serve at higher quality."""
     from qobuz_librarian.quality.decision import load_capped
@@ -1150,75 +1077,6 @@ def scan_upgrades(job, token):
                        "No upgrades; every album is already at the best quality "
                        "Qobuz offers.")
     log.info(job.summary)
-
-
-def scan_upgrades_for_artist(job, artist_name, token):
-    """Same upgrade scan as ``scan_upgrades`` but scoped to one artist's folder.
-
-    Mirrors the per-artist library scan in shape: deliberate single-artist
-    request, so the Hidden-upgrades store is NOT consulted (asking by name is
-    "show me everything for this artist"). No pool — one artist is the whole
-    job, so the parallel fan-out the whole-library scan needs is overkill.
-    """
-    from qobuz_librarian.library.discovery import resolve_artist_dir
-    from qobuz_librarian.quality.decision import load_capped
-
-    if not cfg.UPGRADE_SCAN_ENABLED:
-        review_badges.set_ready("upgrade", False)
-        job.summary = "Upgrade scanning is turned off."
-        log.info(job.summary)
-        return
-    clear_scan_caches()
-    artist_dir = resolve_artist_dir(artist_name)
-    if artist_dir is None:
-        job.summary = (f"No library folder for “{artist_name}”. "
-                       "Check the spelling, or scan the whole library.")
-        log.info(job.summary)
-        return
-    name = artist_dir.name
-    args = build_args()
-    capped = load_capped()
-    log.info(f"Scanning {name} for quality upgrades")
-    # The per-artist scans are single-step (one artist, one fetch), so push a
-    # start frame so the SSE consumer's progress header reads "Checking for
-    # upgrades · 0/1" instead of staying on whatever the previous job left,
-    # then push the matching end frame at the close — keeps the running-job
-    # page in sync with what the user thinks is happening.
-    job.push_progress("Checking for upgrades", 0, 1, name)
-    try:
-        _, cands = _scan_artist_upgrades(artist_dir, token, args, capped)
-    except (AuthLost, QobuzUnavailable):
-        raise
-    except Exception as e:
-        # Set a terminal status + error so submit_scan's wrapper doesn't read the
-        # zero-candidate SCANNING job as a clean run and report "Nothing to do".
-        from qobuz_librarian.web.jobs import JobStatus
-        log.info(f"  scan failed for {name}: {e}")
-        job.error = f"Scan failed: {e}"
-        job.summary = "Scan failed; see the log."
-        job.status = JobStatus.FAILED
-        return
-    added = 0
-    for c in cands:
-        album = c["qobuz_album"]
-        title = album.get("title") or "?"
-        np_, nt = c.get("n_present", 0), c.get("n_total", 0)
-        part = f" · {np_}/{nt} tracks" if nt and np_ < nt else ""
-        job.add_candidate(
-            kind="upgrade",
-            title=title,
-            artist=name,
-            detail=f"{c.get('existing_quality_label','?')} → "
-                   f"{c.get('target_quality_label','?')}{part}",
-            payload={"album_id": album.get("id"), "year": album_year(album),
-                     "cover": _album_cover(album)},
-            selected=False,
-        )
-        added += 1
-    job.push_progress("Checking for upgrades", 1, 1, name, found=added)
-    log.info(f"  {name} — {plural(added, 'album')} to upgrade")
-    if not added:
-        job.summary = f"No upgrades found for {name}."
 
 
 def execute_upgrades(job, chosen, token):
@@ -1407,54 +1265,6 @@ def scan_downsamples(job):
                        if total else
                        "No hi-res files; every album is already at CD rate or lower.")
     log.info(job.summary)
-
-
-def scan_downsamples_for_artist(job, artist_name):
-    """Same downsample scan as ``scan_downsamples`` but scoped to one artist.
-
-    Local-only (off-disk read, no token). The Hidden-downsample store is NOT
-    consulted — a deliberate per-artist request means "show me everything for
-    this artist", same convention as the upgrade and library variants.
-    """
-    from qobuz_librarian.library.discovery import resolve_artist_dir
-    from qobuz_librarian.library.downsample import scan_artist_for_downsample
-
-    clear_scan_caches()
-    artist_dir = resolve_artist_dir(artist_name)
-    if artist_dir is None:
-        job.summary = (f"No library folder for “{artist_name}”. "
-                       "Check the spelling, or scan the whole library.")
-        log.info(job.summary)
-        return
-    name = artist_dir.name
-    log.info(f"Scanning {name} for hi-res files to downsample")
-    job.push_progress("Scanning for hi-res files", 0, 1, name)
-    try:
-        cands = scan_artist_for_downsample(artist_dir)
-    except Exception as e:
-        # Set a terminal status + error so submit_scan's wrapper doesn't read the
-        # zero-candidate SCANNING job as a clean run and report "Nothing to do".
-        from qobuz_librarian.web.jobs import JobStatus
-        log.info(f"  scan failed for {name}: {e}")
-        job.error = f"Scan failed: {e}"
-        job.summary = "Scan failed; see the log."
-        job.status = JobStatus.FAILED
-        return
-    added = 0
-    for c in cands:
-        job.add_candidate(
-            kind="downsample",
-            title=c.title,
-            artist=name,
-            detail=c.detail,
-            payload={"album_dir": str(c.album_dir), "est_saving": c.est_saving},
-            selected=False,
-        )
-        added += 1
-    job.push_progress("Scanning for hi-res files", 1, 1, name, found=added)
-    log.info(f"  {name} — {plural(added, 'album')} above CD rate")
-    if not added:
-        job.summary = f"Nothing above CD rate for {name}."
 
 
 def execute_downsamples(job, chosen, token=None, args=None):
@@ -1783,48 +1593,6 @@ def scan_repairs(job, token):
     log.info(job.summary)
 
 
-def scan_repairs_for_artist(job, artist_name, token):
-    """Same repair scan as ``scan_repairs`` but scoped to one artist's albums.
-
-    A focused single-artist sweep so no checkpointing — the whole-library run
-    needs it because it goes for hours. Builds each album's outcome with the
-    same _repair_album_outcome the library sweep uses, so both flag truncations
-    and ID-unverifiable damage identically.
-    """
-    from qobuz_librarian.library.discovery import resolve_artist_dir
-
-    clear_scan_caches()
-    artist_dir = resolve_artist_dir(artist_name)
-    if artist_dir is None:
-        job.summary = (f"No library folder for “{artist_name}”. "
-                       "Check the spelling, or scan the whole library.")
-        log.info(job.summary)
-        return
-    name = artist_dir.name
-    album_dirs = list_artist_album_dirs(artist_dir)
-    if not album_dirs:
-        job.summary = f"No albums under {name} to check."
-        log.info(job.summary)
-        return
-    log.info(f"Scanning {plural(len(album_dirs), 'album')} under {name}")
-    total = 0
-    for i, album_dir in enumerate(album_dirs, 1):
-        if job.cancel_requested:
-            log.info("Cancelled. Stopping scan.")
-            return
-        job.push_progress("Checking for damaged files", i, len(album_dirs),
-                          album_dir.name, found=total, unit="album")
-        outcome = _repair_album_outcome(album_dir, name, token)
-        for spec in outcome.get("specs", []):
-            job.add_candidate(**spec)
-            total += 1
-        for w in outcome.get("warns", []):
-            log.info(w)
-    log.info(f"Done. {plural(total, 'album')} flagged.")
-    if not total:
-        job.summary = f"No damaged files found for {name}."
-
-
 def _redownload_damaged_album(payload, token):
     """Re-fetch a whole album whose damaged file couldn't be ID-verified.
 
@@ -2048,62 +1816,6 @@ def run_library_lyrics(job, *, rescan=False, synced_only=False):
     not_found = res.get("not-found", 0)
     unavailable = res.get("providers-unavailable", 0)
     parts = [f"{plural(total, 'track')} scanned", f"{wrote} got lyrics"]
-    if not_found:
-        parts.append(f"{not_found} not found")
-    if unavailable:
-        parts.append(f"{unavailable} couldn't reach a provider (re-run later)")
-    job.summary = " · ".join(parts) + "."
-    log.info(job.summary)
-
-
-def run_lyrics_for_artist(job, artist_name, *, rescan=False, synced_only=False):
-    """Same lyric backfill as ``run_library_lyrics`` but scoped to one artist.
-
-    Walks only that artist's albums (the engine's iter_library_flacs takes the
-    list now). Shares the same state file, so a per-artist run still skips
-    tracks an earlier whole-library run already resolved.
-    """
-    from qobuz_librarian.library.discovery import resolve_artist_dir
-    from qobuz_librarian.library.lyrics import HAVE_LYRICS
-    from qobuz_librarian.library.lyrics import run_library_lyrics as engine
-
-    if not HAVE_LYRICS:
-        job.summary = "Lyric fetching isn't available; the syncedlyrics library isn't installed."
-        log.info(job.summary)
-        return
-    artist_dir = resolve_artist_dir(artist_name)
-    if artist_dir is None:
-        job.summary = (f"No library folder for “{artist_name}”. "
-                       "Check the spelling, or run the whole-library backfill.")
-        log.info(job.summary)
-        return
-    name = artist_dir.name
-    log.info(f"Fetching lyrics for {name} "
-             f"(writing {(cfg.LYRICS_FORMAT or 'embed').lower()}).")
-    if rescan:
-        log.info("Re-checking every track (ignoring saved state).")
-    # Hold the staging lock: the engine rewrites library FLACs in place, which
-    # must not race the scan-lane downsample/repair/upgrade work on the same tree.
-    from qobuz_librarian.web.jobs import staging_lock
-    with staging_lock():
-        res = engine(rescan=rescan, synced_only=synced_only,
-                     should_stop=lambda: job.cancel_requested, log=log,
-                     artist_dirs=[artist_dir])
-
-    total = res.get("total", 0)
-    if not total:
-        job.summary = f"No FLAC files found for {name}."
-        log.info(job.summary)
-        return
-    if res.get("stopped"):
-        job.summary = f"Stopped after scanning {plural(total, 'track')}."
-        return
-
-    wrote = (res.get("wrote-synced", 0) + res.get("wrote-plain", 0)
-             + res.get("dry:wrote-synced", 0) + res.get("dry:wrote-plain", 0))
-    not_found = res.get("not-found", 0)
-    unavailable = res.get("providers-unavailable", 0)
-    parts = [f"{plural(total, 'track')} scanned for {name}", f"{wrote} got lyrics"]
     if not_found:
         parts.append(f"{not_found} not found")
     if unavailable:

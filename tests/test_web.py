@@ -733,9 +733,7 @@ def test_lock_busy_refuses_destructive_routes(monkeypatch):
 
         for path, data in [
             ("/download", {"album_id": "1"}),
-            ("/artist", {"artist": "Radiohead"}),
             ("/library", {}),
-            ("/upgrade", {}),
             ("/downsample", {}),
             ("/repair", {}),
             ("/lyrics", {}),
@@ -1598,30 +1596,6 @@ def test_incomplete_downsample_state_is_not_reviewable(client, monkeypatch):
     assert job_mgr.registry.awaiting_review() == []
 
 
-def test_downsample_artist_route_does_not_start_separate_scan(client):
-    r = client.post("/downsample/artist", data={"artist": "Portishead"},
-                    follow_redirects=False)
-
-    assert r.status_code == 303
-    assert r.headers["location"] == "/downsample"
-    assert jm.registry.awaiting_review() == []
-
-
-def test_upgrade_artist_route_does_not_start_separate_scan(
-        client, monkeypatch):
-    from qobuz_librarian.web import app as webapp
-
-    monkeypatch.setattr(webapp, "_read_creds",
-                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
-
-    r = client.post("/upgrade/artist", data={"artist": "Portishead"},
-                    follow_redirects=False)
-
-    assert r.status_code == 303
-    assert r.headers["location"] == "/upgrade"
-    assert jm.registry.awaiting_review() == []
-
-
 def test_search_bar_stays_usable_on_phones(client, monkeypatch):
     from qobuz_librarian.web import app as webapp
 
@@ -1720,13 +1694,6 @@ def test_library_force_full_post_starts_forced_scan(client, monkeypatch):
     assert started == {"partial_only": False, "force_full": True}
 
 
-def test_search_path_redirects_to_the_dashboard(client):
-    # Search is on the dashboard; /search redirects there.
-    r = client.get("/search", follow_redirects=False)
-    assert r.status_code in (302, 307, 308)
-    assert r.headers["location"] == "/"
-
-
 def test_non_htmx_search_post_returns_to_dashboard(client, monkeypatch):
     import qobuz_librarian.api.search as search_mod
     import qobuz_librarian.web.app as app_mod
@@ -1739,21 +1706,6 @@ def test_non_htmx_search_post_returns_to_dashboard(client, monkeypatch):
 
     assert r.status_code == 303
     assert r.headers["location"] == "/"
-
-
-def test_artist_page_redirects_to_dashboard_artist_search(client):
-    r = client.get("/artist", follow_redirects=False)
-
-    assert r.status_code == 303
-    assert r.headers["location"] == "/?kind=artist"
-
-
-def test_artist_page_redirect_preserves_artist_query(client):
-    r = client.get("/artist?artist=Paysage%20d%27Hiver",
-                   follow_redirects=False)
-
-    assert r.status_code == 303
-    assert r.headers["location"] == "/?kind=artist&q=Paysage+d%27Hiver"
 
 
 def test_queue_empty_state_has_clear_actions(client):
