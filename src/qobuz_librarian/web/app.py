@@ -2476,6 +2476,58 @@ async def queue_download(request: Request, album_id: str = Form(""),
         return RedirectResponse(url=f"/queue?error={msg}", status_code=303)
 
 
+_census_cache: tuple | None = None
+_CENSUS_TTL = 300.0
+
+
+def _census_view():
+    """Quality-census context for the Library page, shaped from the scan
+    cache. One table walk over every cached tag row — cheap, but not
+    per-request cheap on a big library, so the shaped result is memoized for
+    a few minutes. None hides the panel (cache off, or nothing scanned yet)."""
+    global _census_cache
+    now = time.time()
+    if _census_cache is not None and now - _census_cache[0] < _CENSUS_TTL:
+        return _census_cache[1]
+    from qobuz_librarian.library import flac_cache
+    from qobuz_librarian.ui_cli.colors import format_size
+    raw = flac_cache.census()
+    view = None
+    if raw:
+        labels = {
+            "cd": "CD quality (16-bit / 44.1–48 kHz)",
+            "hires96": "Hi-res up to 96 kHz",
+            "hires192": "Hi-res up to 192 kHz",
+            "unknown": "Other formats",
+        }
+        seg = {"cd": "cd", "hires96": "h96", "hires192": "h192",
+               "unknown": "other"}
+        total_bytes = raw["total_bytes"] or 1
+        rows, bar = [], []
+        for tier in ("cd", "hires96", "hires192", "unknown"):
+            n, size = raw["tiers"][tier]
+            if not n:
+                continue
+            rows.append({"key": seg[tier], "label": labels[tier],
+                         "tracks": f"{n:,} track{'s' if n != 1 else ''}",
+                         "size": format_size(size)})
+            bar.append({"key": seg[tier],
+                        "pct": max(1, round(100 * size / total_bytes))})
+        view = {
+            "total": f"{raw['total_tracks']:,} tracks · "
+                     f"{format_size(raw['total_bytes'])}",
+            "rows": rows,
+            "bar": bar,
+            "top": [{"name": a, "size": format_size(b)}
+                    for a, b in raw["top_hires_artists"]],
+            # Below ~100 MB the line is noise, not an offer.
+            "reclaim": (format_size(raw["reclaim_bytes"])
+                        if raw["reclaim_bytes"] >= 100 * 1024 * 1024 else ""),
+        }
+    _census_cache = (now, view)
+    return view
+
+
 @app.get("/library", response_class=HTMLResponse)
 async def library_page(request: Request, page: int = 1):
     from qobuz_librarian.library import hidden as hidden_mod
@@ -2512,6 +2564,7 @@ async def library_page(request: Request, page: int = 1):
     # launcher and never live under the Queue nav.
     ljob = _library_current_job()
     ctx["library_job"] = ljob
+    ctx["census"] = None
     if ljob is not None:
         ctx["queue_wait"] = _queue_wait(ljob)
         ctx.update(_review_context(ljob, page))
@@ -2521,6 +2574,9 @@ async def library_page(request: Request, page: int = 1):
         # nothing is running above.
         cp = scan_checkpoint.pending()
         ctx["library_resume"] = cp if cp is not None else None
+        if ctx["baseline_complete"]:
+            loop = asyncio.get_running_loop()
+            ctx["census"] = await loop.run_in_executor(None, _census_view)
     return _tr(request, "library.html", ctx)
 
 

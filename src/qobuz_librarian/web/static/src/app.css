@@ -4346,6 +4346,92 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
     width: auto;
   }
 }
+.ql-census {
+  margin-top: 1rem;
+  border: 1px solid color-mix(in oklab, var(--ql-gold) 13%, transparent);
+  border-radius: 1rem;
+  padding: 1.25rem 1.375rem;
+  background:
+    linear-gradient(180deg,
+      color-mix(in oklab, var(--ql-surface-2) 30%, var(--ql-surface)) 0%,
+      color-mix(in oklab, var(--ql-surface) 92%, var(--ql-bg)) 100%);
+}
+.ql-census-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem 0.75rem;
+  margin-bottom: 0.875rem;
+}
+.ql-census-total {
+  color: var(--ql-text-2);
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+}
+.ql-census-bar {
+  display: flex;
+  height: 0.625rem;
+  border-radius: 0.3125rem;
+  overflow: hidden;
+  border: 1px solid var(--ql-line-soft);
+  margin-bottom: 1rem;
+}
+.ql-census-bar i {
+  display: block;
+  height: 100%;
+}
+.ql-census-seg-cd    { background: color-mix(in oklab, var(--ql-gold) 14%, var(--ql-surface-2)); }
+.ql-census-seg-h96   { background: color-mix(in oklab, var(--ql-gold) 48%, transparent); }
+.ql-census-seg-h192  { background: color-mix(in oklab, var(--ql-gold) 88%, var(--ql-surface)); }
+.ql-census-seg-other { background: color-mix(in oklab, var(--ql-text-3) 35%, var(--ql-surface-2)); }
+.ql-census-rows {
+  display: grid;
+  gap: 0.5rem;
+}
+.ql-census-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.375rem 0.625rem;
+  font-size: 0.875rem;
+  font-variant-numeric: tabular-nums;
+}
+.ql-census-dot {
+  width: 0.5625rem;
+  height: 0.5625rem;
+  border-radius: 0.1875rem;
+  flex: none;
+}
+.ql-census-name { color: var(--ql-text); min-width: min(14em, 60%); }
+.ql-census-n { color: var(--ql-text-2); }
+.ql-census-gb { margin-left: auto; color: var(--ql-text); }
+.ql-census-rule {
+  border: 0;
+  border-top: 1px solid var(--ql-line-soft);
+  margin: 1rem 0 0.875rem;
+}
+.ql-census-subhead {
+  color: var(--ql-text-2);
+  font-size: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+.ql-census-artists {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem 0.875rem;
+  font-size: 0.8125rem;
+  color: var(--ql-text-2);
+}
+.ql-census-artists b {
+  font-weight: 600;
+  color: var(--ql-text);
+}
+.ql-census-foot {
+  margin-top: 1rem;
+  color: var(--ql-text-2);
+  font-size: 0.8125rem;
+}
 .ql-secondary-row {
   display: flex;
   flex-wrap: wrap;

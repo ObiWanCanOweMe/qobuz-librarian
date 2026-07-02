@@ -324,6 +324,70 @@ def prune_missing(force: bool = False) -> int:
     return len(gone)
 
 
+def census():
+    """Aggregate the cached tag rows into a quality census: per-tier track
+    counts and bytes, hi-res bytes per artist, and a rough downsample-reclaim
+    figure. Reads only rows the scanner already stored, so it costs one table
+    walk and no file I/O; rows from before the cache carried sizes count
+    toward their tier but not the byte totals. Returns None when the cache is
+    off or holds nothing."""
+    if not _ensure():
+        return None
+    flush_pending()
+    tiers = {"cd": [0, 0], "hires96": [0, 0], "hires192": [0, 0],
+             "unknown": [0, 0]}
+    artists: dict = {}
+    reclaim = 0
+    music_root = str(cfg.MUSIC_ROOT).rstrip("/") + "/"
+    try:
+        rows = _conn().execute("SELECT path, payload FROM files").fetchall()
+    except sqlite3.Error as e:
+        vlog(f"flac cache census read failed: {e}")
+        _handle_db_error(e)
+        return None
+    for path, payload in rows:
+        try:
+            meta = json.loads(payload)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(meta, dict) or meta.get("__neg__"):
+            continue
+        bits = int(meta.get("bits") or 0)
+        sr = int(meta.get("sample_rate") or 0)
+        size = int(meta.get("size") or 0)
+        if not bits or not sr:
+            tier = "unknown"
+        elif bits <= 16:
+            tier = "cd"
+        elif sr <= 96000:
+            tier = "hires96"
+        else:
+            tier = "hires192"
+        tiers[tier][0] += 1
+        tiers[tier][1] += size
+        if tier in ("hires96", "hires192"):
+            # The integer-ratio family the resampler targets: 88.2/176.4 land
+            # on 44.1, everything else on 48. A 24-bit file already at 44.1/48
+            # has no rate to cut, so it adds nothing to the reclaim figure.
+            target = 44100 if sr % 44100 == 0 else 48000
+            if sr > target:
+                reclaim += int(size * (1 - target / sr))
+            if path.startswith(music_root):
+                artist = path[len(music_root):].split("/", 1)[0]
+                if artist:
+                    artists[artist] = artists.get(artist, 0) + size
+    total_n = sum(v[0] for v in tiers.values())
+    if not total_n:
+        return None
+    return {
+        "tiers": tiers,
+        "total_tracks": total_n,
+        "total_bytes": sum(v[1] for v in tiers.values()),
+        "top_hires_artists": sorted(artists.items(), key=lambda kv: -kv[1])[:5],
+        "reclaim_bytes": reclaim,
+    }
+
+
 def _reset_for_tests() -> None:
     global _initialized, _generation
     conn = getattr(_local, "conn", None)
