@@ -64,7 +64,7 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Build CSS assets (catches a broken Tailwind/daisyUI build)
+      - name: Build CSS assets (catches a broken Tailwind build)
         run: |
           npm ci --no-audit --no-fund
           npm run build
