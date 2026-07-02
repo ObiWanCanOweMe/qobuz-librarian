@@ -642,7 +642,33 @@ async def _lifespan(_app: FastAPI):
     # of leaving stale green until the user happens to retry the failed action.
     from qobuz_librarian.api.auth import register_auth_state_listener
     register_auth_state_listener(_on_auth_state)
+
+    # The dashboard kicks off _maybe_auto_check_new_releases on load, but a
+    # headless box nobody opens would never check at all — making
+    # NEW_RELEASE_CHECK_INTERVAL a dead letter exactly where it matters most.
+    # Tick the same helper in the background so the documented interval holds
+    # without a visitor; every skip condition (interval off, no token, no
+    # baseline, CLI mode, active work, not yet due) lives in the helper itself,
+    # so this loop stays a dumb clock.
+    async def _auto_check_ticker():
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(900)
+            try:
+                await loop.run_in_executor(None, _maybe_auto_check_new_releases)
+            except Exception as e:
+                _log.warning("background new-release tick failed: %s", e)
+
+    # Always armed: the helper reads NEW_RELEASE_CHECK_INTERVAL live, so a
+    # Settings change (off to on, or a new interval) takes effect at the next
+    # tick without a restart.
+    ticker = asyncio.create_task(_auto_check_ticker())
+    if cfg.NEW_RELEASE_CHECK_INTERVAL > 0:
+        _log.info("New-release checks run in the background every "
+                  "%d hour(s); set NEW_RELEASE_CHECK_INTERVAL=0 to turn them off.",
+                  max(1, round(cfg.NEW_RELEASE_CHECK_INTERVAL / 3600)))
     yield
+    ticker.cancel()
     # Release the flock explicitly — assigning None alone relies on GC
     # closing the file, which may not happen if any caller still holds
     # a reference.

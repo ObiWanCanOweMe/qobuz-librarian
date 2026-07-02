@@ -161,7 +161,7 @@ Anything that accepts an HTTP request works the same way: Gotify, Slack, Home As
 
 ## What the app does on its own
 
-On first run the Search page *offers* a one-time baseline scan (`AUTO_LIBRARY_SCAN`) rather than starting it for you. Once that baseline exists, periodic new-release checks (`NEW_RELEASE_CHECK_INTERVAL`) run on their own, read-only. Both park a review list; nothing is downloaded or changed until you act on it.
+On first run the Search page *offers* a one-time baseline scan (`AUTO_LIBRARY_SCAN`) rather than starting it for you. Once that baseline exists, periodic new-release checks (`NEW_RELEASE_CHECK_INTERVAL`) run on their own, read-only — on a background timer, so they keep to the interval even when nobody has the app open. Both park a review list; nothing is downloaded or changed until you act on it.
 
 - **Library gap-fill** can add missing albums or missing tracks after review; it does not overwrite existing tracks.
 - **After a download**, it re-checks the new album's track lengths against Qobuz and flags **Repair** if one is short. Read-only (a clean truncation can still decode).
