@@ -5545,12 +5545,13 @@ details[open] > .ql-disclosure-summary::after {
 
 /* Log/scan console follows the active theme. */
 .log-console {
-  font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+  font-family: var(--ql-font-mono);
   font-size: 0.78rem;
   line-height: 1.5;
-  background: #0d1117;
-  color: #c9d1d9;
-  border-radius: 0.5rem;
+  background: color-mix(in oklab, var(--ql-bg) 74%, black);
+  color: var(--ql-text-2);
+  border: 1px solid var(--ql-line-soft);
+  border-radius: var(--ql-radius);
   padding: 1rem;
   overflow-y: auto;
   max-height: min(60vh, 400px);
@@ -5564,13 +5565,13 @@ details[open] > .ql-disclosure-summary::after {
 .log-console--job {
   margin-top: 0.5rem;
 }
-.log-console:empty::before { content: "Waiting for output…"; color: #484f58; }
+.log-console:empty::before { content: "Waiting for output…"; color: var(--ql-text-3); }
 [data-theme="winter"] .log-console {
-  background: #f6f8fa;
-  color: #1f2328;
-  border: 1px solid #d0d7de;
+  background: color-mix(in oklab, var(--ql-surface-2) 72%, var(--ql-bg));
+  color: var(--ql-text);
+  border: 1px solid var(--ql-line);
 }
-[data-theme="winter"] .log-console:empty::before { color: #8c959f; }
+[data-theme="winter"] .log-console:empty::before { color: var(--ql-text-3); }
 
 /* Quality chips: Hi-Res is the only gold one; CD stays neutral so the gold
    budget holds. Lossy keeps a muted warning tint. */
