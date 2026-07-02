@@ -78,12 +78,14 @@ LABEL com.qobuzlibrarian.app-code-license="MIT"
 # embedded cover art, which ffmpeg's decoder does not. gosu: clean PUID/PGID
 # drop. procps: ps/top for operators debugging from inside the container.
 # libchromaprint-tools: fpcalc, for the optional beets `chroma` (AcoustID)
-# plugin used to identify untagged files.
+# plugin used to identify untagged files. curl: POST_JOB_HOOK one-liners
+# (ntfy, Discord, …) run inside this container, so it has to be here.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         flac \
         gosu \
         procps \
+        curl \
         libchromaprint-tools \
     && rm -rf /var/lib/apt/lists/*
 

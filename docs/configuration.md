@@ -124,6 +124,41 @@ sudo chown -R 1000:1000 ./music ./staging ./upgrade_backups
 
 **Hardening.** The bundled `compose.yaml` ships with `mem_limit: 1g`, `pids_limit: 256`, `no-new-privileges`, `cap_drop: [ALL]`, and `0600` token files. It adds back only the capabilities needed for the PUID/PGID handover. The built-in login is a single shared credential with per-IP brute-force limiting (5 failures an hour before a 429), which is appropriate for a trusted network; use a proxy, VPN, or Tailscale for internet exposure. The image is multi-arch (`linux/amd64`, `linux/arm64`), so arm64 NAS boxes run natively, and a `--read-only` rootfs works with `--tmpfs /tmp` (or `APP_HOME=/var/tmp` with `--tmpfs /var/tmp`). See [SECURITY.md](../SECURITY.md).
 
+## Notifications
+
+`POST_JOB_HOOK` runs a command of your choice every time a job finishes — downloads, scans, repairs, all of it. The job's final state arrives as JSON on stdin (`id`, `status`, `title`, `artist`, `error`, `finished_at`), and `POST_JOB_HOOK_TIMEOUT` (default 10s) caps a slow endpoint. The command runs inside the container, which bundles `curl` and Python for exactly this.
+
+The simplest form pushes the raw JSON to an [ntfy](https://ntfy.sh) topic, straight from `.env`:
+
+```bash
+POST_JOB_HOOK=curl -s -o /dev/null -H "Title: Qobuz Librarian" -d @- https://ntfy.sh/your-topic
+```
+
+For a readable message, point the hook at a small script in the config volume instead (`POST_JOB_HOOK=/config/notify.sh`, made executable with `chmod +x`):
+
+```sh
+#!/bin/sh
+# ntfy, one line per finished job: "done: Bonobo - Black Sands"
+msg=$(python3 -c 'import json,sys
+j = json.load(sys.stdin)
+line = j["status"] + ": " + " - ".join(x for x in (j.get("artist"), j.get("title")) if x)
+print(line + (" (" + j["error"] + ")" if j.get("error") else ""))')
+curl -s -o /dev/null -H "Title: Qobuz Librarian" -d "$msg" https://ntfy.sh/your-topic
+```
+
+The same shape works for a Discord webhook — build the JSON body and post it:
+
+```sh
+#!/bin/sh
+python3 -c 'import json,sys
+j = json.load(sys.stdin)
+line = j["status"] + ": " + " - ".join(x for x in (j.get("artist"), j.get("title")) if x)
+print(json.dumps({"content": "Qobuz Librarian — " + line}))' \
+  | curl -s -o /dev/null -H "Content-Type: application/json" -d @- "https://discord.com/api/webhooks/YOUR/WEBHOOK"
+```
+
+Anything that accepts an HTTP request works the same way: Gotify, Slack, Home Assistant webhooks, or a plain script that writes to a file.
+
 ## What the app does on its own
 
 On first run the Search page *offers* a one-time baseline scan (`AUTO_LIBRARY_SCAN`) rather than starting it for you. Once that baseline exists, periodic new-release checks (`NEW_RELEASE_CHECK_INTERVAL`) run on their own, read-only. Both park a review list; nothing is downloaded or changed until you act on it.
