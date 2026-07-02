@@ -1473,3 +1473,54 @@ def test_new_release_scan_ignores_single_store_when_suppression_off(
     flows.scan_new_releases(job, "tok")
 
     assert seen == [None]
+
+def test_incomplete_baseline_scan_summary_reports_unchecked_artists(
+        tmp_path, monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.library import downsample_state
+    from qobuz_librarian.quality import upgrade_state
+    from qobuz_librarian.web import flows
+
+    monkeypatch.setattr(cfg, "LIBRARY_SCAN_STATE_FILE",
+                        tmp_path / "library_scan.json")
+    monkeypatch.setattr(cfg, "SCAN_CHECKPOINT_FILE",
+                        tmp_path / "checkpoint.json")
+    good_dir = tmp_path / "Good"
+    bad_dir = tmp_path / "Bad"
+    good_dir.mkdir()
+    bad_dir.mkdir()
+
+    monkeypatch.setattr(cfg, "ARTIST_SCAN_WORKERS", 1)
+    monkeypatch.setattr(flows, "list_library_artists", lambda: [good_dir, bad_dir])
+    monkeypatch.setattr(
+        flows.downsample_state,
+        "refresh_for_artists",
+        lambda *_a, **_k: downsample_state.RefreshResult([], [], {}, True),
+    )
+    monkeypatch.setattr(
+        flows.upgrade_state,
+        "refresh_for_artists",
+        lambda *_a, **_k: upgrade_state.RefreshResult([], [], {}, True),
+    )
+    monkeypatch.setattr(flows.scan_checkpoint, "load", lambda _kind: None)
+    monkeypatch.setattr(flows.scan_checkpoint, "save", lambda *a, **k: None)
+    monkeypatch.setattr(flows.scan_checkpoint, "clear", lambda _kind: None)
+    monkeypatch.setattr(flows, "_record_last_scan", lambda: None)
+    monkeypatch.setattr(flows, "_flag_new_since_last_scan", lambda *a, **k: None)
+    monkeypatch.setattr(flows, "flush_resolve_cache", lambda: None)
+    monkeypatch.setattr(flows.new_releases_mod, "is_baseline_complete", lambda: True)
+
+    def fake_scan_artist(ad, token, partial_only, hidden):
+        if ad.name == "Bad":
+            raise RuntimeError("artist failed")
+        return ad.name, ad.name, [], f"{ad.name}-id", [f"{ad.name}-album"]
+
+    monkeypatch.setattr(flows, "_scan_library_artist", fake_scan_artist)
+
+    job = jm.Job(title="baseline")
+    flows.scan_library(job, "tok")
+
+    # One artist errored, so the checkpoint stays and the crawl was partial —
+    # the summary must say so instead of a clean-sounding definitive total.
+    assert "1 artist" in job.summary
+    assert "resume" in job.summary.lower()

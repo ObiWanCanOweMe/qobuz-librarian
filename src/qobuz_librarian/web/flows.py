@@ -839,6 +839,14 @@ def scan_library(job, token, partial_only=False, force_full=False):
                        + _cap_note(job)
                        if total else
                        "No missing albums found for artists in your library.")
+    # Artists that errored or came back with a short catalog page aren't in
+    # state_artists; the checkpoint stays for them and the last-scan stamp is
+    # withheld. Say so — otherwise the summary reads as a clean, definitive
+    # total and the resume prompt that follows looks unexplained.
+    unchecked = len(artists) - len(state_artists)
+    if not job.cancel_requested and unchecked > 0:
+        job.summary += (f" {plural(unchecked, 'artist')} couldn't be checked; "
+                        "scan again to resume from where it left off.")
     log.info(job.summary)
 
 
