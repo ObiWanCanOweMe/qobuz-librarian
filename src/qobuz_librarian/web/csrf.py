@@ -90,7 +90,7 @@ class CSRFMiddleware(BaseHTTPMiddleware):
 # the few inline blocks we mint with this request's nonce do. The SSE/progress
 # logic that htmx swaps in lives in the external app.js ('self'); a nonce can't
 # survive an htmx swap because the fragment's nonce wouldn't match the live
-# document's. style-src keeps 'unsafe-inline': the Tailwind/daisyUI build and
+# document's. style-src keeps 'unsafe-inline': the Tailwind build and
 # htmx's indicator styles lean on inline style, and autoescape is the real XSS
 # guard — locking styles down is a separate, far larger surface.
 def _csp(nonce: str) -> str:
