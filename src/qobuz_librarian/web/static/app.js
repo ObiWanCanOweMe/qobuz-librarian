@@ -579,6 +579,11 @@
       var txt = fmtProgress(p, status === "scanning" ? "Scanning" : (p.phase || runFallback),
                             surface !== "dashboard");
       if (txt) el.textContent = txt;
+      var bar = document.getElementById("card-bar-" + id);
+      if (bar && p.total > 0) {
+        var fill = bar.querySelector("i");
+        if (fill) fill.style.width = Math.min(100, (p.current / p.total) * 100) + "%";
+      }
     });
     src.addEventListener("done", function (e) {
       shut();

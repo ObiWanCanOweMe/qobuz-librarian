@@ -2451,9 +2451,9 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
 }
 .ql-activity-section-header h2 {
   margin: 0;
-  color: var(--ql-text);
-  font-size: 0.98rem;
-  font-weight: 720;
+  color: var(--ql-text-3);
+  font-size: 0.8125rem;
+  font-weight: 500;
   line-height: 1.25;
 }
 .ql-activity-section-header p,
@@ -2463,42 +2463,99 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
   font-size: 0.84rem;
   line-height: 1.35;
 }
+.ql-mono-meta {
+  font-family: var(--ql-font-mono);
+  font-size: 0.76rem !important;
+  color: var(--ql-text-3);
+}
 .ql-activity-count {
   display: inline-flex;
-  min-width: 1.85rem;
-  min-height: 1.65rem;
+  min-width: 1.6rem;
+  min-height: 1.4rem;
   align-items: center;
   justify-content: center;
-  border: 1px solid color-mix(in oklab, var(--ql-text) 12%, transparent);
-  border-radius: var(--ql-radius-sm);
-  background-color: color-mix(in oklab, var(--ql-surface-2) 70%, transparent);
+  border-radius: 999px;
+  background-color: color-mix(in oklab, var(--ql-text) 8%, transparent);
   color: var(--ql-text-2);
   font-family: var(--ql-font-mono);
-  font-size: 0.76rem;
+  font-size: 0.72rem;
+  font-weight: 600;
   line-height: 1;
+  padding-inline: 0.45rem;
 }
 .ql-activity-list {
   display: grid;
-  background:
-    linear-gradient(180deg,
-      color-mix(in oklab, var(--ql-gold) 3.5%, transparent) 0%,
-      transparent 42%),
-    color-mix(in oklab, var(--ql-surface) 92%, var(--ql-bg));
 }
-[data-theme="night"] .ql-activity-list {
-  background:
-    linear-gradient(180deg,
-      color-mix(in oklab, var(--ql-gold) 5%, transparent) 0%,
-      transparent 48%),
-    color-mix(in oklab, var(--ql-surface) 88%, #000);
+.ql-panelize {
+  background: linear-gradient(180deg, #1d160d 0%, #191309 100%);
+  border: 1px solid rgba(228, 169, 78, 0.13);
+  border-radius: 16px;
+  overflow: hidden;
+  box-shadow: 0 24px 50px -30px rgba(0, 0, 0, 0.95), inset 0 1px 0 rgba(255, 255, 255, 0.035);
+}
+[data-theme="winter"] .ql-panelize {
+  background: var(--ql-surface);
+  border-color: var(--ql-line);
+  box-shadow: var(--ql-shadow-soft);
 }
 .ql-activity-row {
   display: grid;
   min-width: 0;
-  grid-template-columns: minmax(5.4rem, auto) minmax(0, 1fr) auto;
-  align-items: start;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
   gap: 0.85rem 1rem;
-  padding: 0.95rem 1rem;
+  padding: 0.95rem 1.1rem;
+}
+.ql-job-tile {
+  display: flex;
+  width: 44px;
+  height: 44px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9px;
+  border: 1px solid color-mix(in oklab, var(--ql-gold) 18%, transparent);
+  background: color-mix(in oklab, var(--ql-gold) 8%, transparent);
+  align-self: center;
+}
+.ql-job-tile svg {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: var(--ql-gold);
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.ql-job-tile--done {
+  border-color: color-mix(in oklab, var(--ql-text) 10%, transparent);
+  background: color-mix(in oklab, var(--ql-text) 5%, transparent);
+}
+.ql-job-tile--done svg {
+  stroke: var(--ql-text-2);
+}
+.ql-history-row--compact .ql-job-tile {
+  width: 34px;
+  height: 34px;
+}
+.ql-history-row--compact .ql-job-tile svg {
+  width: 16px;
+  height: 16px;
+}
+.ql-progress {
+  height: 5px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--ql-text) 8%, transparent);
+  overflow: hidden;
+  margin-top: 0.55rem;
+}
+.ql-progress i {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #c98a28, #f0bc66);
+  box-shadow: 0 0 10px color-mix(in oklab, var(--ql-gold) 50%, transparent);
+  transition: width 400ms ease;
 }
 .ql-activity-row + .ql-activity-row {
   border-top: 1px solid var(--ql-line-soft);
@@ -2507,13 +2564,18 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
   border-top-color: var(--ql-line);
 }
 .ql-activity-row.is-running {
-  background-color: color-mix(in oklab, var(--ql-gold) 5%, transparent);
+  background-color: color-mix(in oklab, var(--ql-gold) 4%, transparent);
 }
 .ql-activity-row.is-review {
-  background-color: color-mix(in oklab, var(--ql-info) 5%, transparent);
+  background-color: color-mix(in oklab, var(--ql-gold) 6%, transparent);
+  box-shadow: inset 3px 0 0 var(--ql-gold);
 }
 .ql-activity-row.is-error {
-  background-color: color-mix(in oklab, var(--ql-danger) 5%, transparent);
+  background:
+    linear-gradient(180deg,
+      color-mix(in oklab, var(--ql-warning) 9%, transparent) 0%,
+      color-mix(in oklab, var(--ql-warning) 4%, transparent) 100%);
+  box-shadow: inset 3px 0 0 color-mix(in oklab, var(--ql-warning) 70%, transparent);
 }
 .ql-activity-state {
   min-width: 0;
@@ -2546,22 +2608,26 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
   line-height: 1.2;
   white-space: nowrap;
 }
-.ql-history-title-line {
-  display: flex;
-  min-width: 0;
-  align-items: baseline;
-  gap: 0.5rem;
+.ql-history-row--compact {
+  padding-block: 0.6rem;
 }
-.ql-activity-kind {
-  flex: none;
-  border: 1px solid color-mix(in oklab, var(--ql-text) 12%, transparent);
-  border-radius: 0.25rem;
-  padding: 0.12rem 0.35rem;
-  color: var(--ql-text-3);
-  font-size: 0.72rem;
-  font-weight: 650;
-  line-height: 1.15;
+.ql-history-row--compact .ql-row-title {
+  font-size: 0.84rem;
+}
+.ql-history-row .ql-activity-side {
+  grid-template-columns: auto auto;
+  align-items: center;
+  gap: 0.7rem;
+}
+.ql-row-open {
+  color: var(--ql-text-2);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  text-decoration: none;
   white-space: nowrap;
+}
+.ql-row-open:hover {
+  color: var(--ql-text);
 }
 .ql-row-meta--error {
   color: color-mix(in oklab, var(--ql-danger) 84%, var(--ql-text));
@@ -2585,15 +2651,7 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  border: 1px solid color-mix(in oklab, var(--color-error) 22%, transparent);
-  border-radius: 0.5rem;
-  background-color: color-mix(in oklab, var(--color-error) 5%, var(--color-base-100));
-  padding: 1rem;
-}
-[data-theme="night"] .ql-activity-maintenance,
-[data-theme="night"] .ql-queue-maintenance {
-  border-color: color-mix(in oklab, var(--color-error) 28%, transparent);
-  background-color: color-mix(in oklab, var(--color-error) 8%, var(--color-base-100));
+  padding: 0.5rem 0.25rem 0;
 }
 @media (min-width: 640px) {
   .ql-empty-actions {
@@ -3233,6 +3291,7 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
 @media (min-width: 640px) {
   .ql-page-header--actions {
     grid-template-columns: minmax(0, 1fr) auto;
+    align-items: end;
   }
 }
 .ql-page-header h1 {

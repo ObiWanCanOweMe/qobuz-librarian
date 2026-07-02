@@ -154,6 +154,17 @@
   color: color-mix(in oklab, var(--ql-danger) 86%, var(--ql-text));
 }
 
+.ql-btn-ghost-danger {
+  border-color: transparent;
+  background: transparent;
+  color: color-mix(in oklab, var(--ql-danger) 72%, var(--ql-text));
+}
+
+.ql-btn-ghost-danger:hover:not(:disabled):not(.is-disabled) {
+  border-color: color-mix(in oklab, var(--ql-danger) 30%, transparent);
+  background-color: color-mix(in oklab, var(--ql-danger) 9%, transparent);
+}
+
 .ql-btn-sm {
   min-height: 2rem;
   padding: 0.42rem 0.68rem;

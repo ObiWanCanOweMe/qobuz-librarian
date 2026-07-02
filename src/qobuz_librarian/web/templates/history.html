@@ -5,10 +5,7 @@
 {% set active_tab = 'history' %}
 <div class="ql-list-page ql-activity-page">
 <header class="ql-page-header ql-page-header--actions">
-  <div>
-    <h1>History</h1>
-    <p>Finished jobs stay here after they leave the queue.</p>
-  </div>
+  <h1>Activity</h1>
   <div>
     {% include "_queue_tabs.html" %}
   </div>
@@ -26,44 +23,59 @@
   {%- endif -%}
 {%- endmacro %}
 
+{% macro kind_tile(job) -%}
+<span class="ql-job-tile ql-job-tile--done" aria-hidden="true">
+  {% if job.execute_kind in ('library', 'new_releases') %}
+  <svg viewBox="0 0 24 24"><path d="M4 4v16M9 4v16M14 5.5l4.5 14"/></svg>
+  {% elif job.execute_kind == 'repair' %}
+  <svg viewBox="0 0 24 24"><path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14 13l-3-3 3.7-3.7z"/></svg>
+  {% elif job.execute_kind == 'lyrics' %}
+  <svg viewBox="0 0 24 24"><path d="M9 18V6l8-2v12"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="14.5" cy="16" r="2.5"/></svg>
+  {% elif job.execute_kind == 'upgrade' %}
+  <svg viewBox="0 0 24 24"><path d="M12 19V6"/><path d="M6 12l6-6 6 6"/></svg>
+  {% elif job.execute_kind == 'downsample' %}
+  <svg viewBox="0 0 24 24"><path d="M12 5v13"/><path d="M6 12l6 6 6-6"/></svg>
+  {% elif job.execute_kind == 'migration' %}
+  <svg viewBox="0 0 24 24"><path d="M4 7h11M4 12h11M4 17h11"/><path d="M18 9l3 3-3 3"/></svg>
+  {% else %}
+  <svg viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>
+  {% endif %}
+</span>
+{%- endmacro %}
+
 {% if jobs %}
 <div class="ql-activity-toolbar">
-  <p>{{ total }} finished job{% if total != 1 %}s{% endif %}</p>
+  <p class="ql-mono-meta">{{ total }} finished job{% if total != 1 %}s{% endif %}</p>
   <form action="/queue/clear" method="post">
     <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-    <button type="submit" class="ql-btn ql-btn-sm ql-btn-danger"
+    <button type="submit" class="ql-btn ql-btn-sm ql-btn-ghost-danger"
             data-confirm="Clear all {{ total }} finished job{% if total != 1 %}s{% endif %} from history? This permanently removes the records and cannot be undone.">Clear history</button>
   </form>
 </div>
 
-<div class="ql-activity-list ql-history-list">
+<div class="ql-activity-list ql-history-list ql-panelize">
   {% for job in jobs %}
-  <article class="ql-activity-row ql-history-row{% if job.status == 'failed' %} is-error{% endif %}">
-    <div class="ql-activity-state">
-      {% if job.status == 'done' %}
-        <span class="ql-status-chip is-success">Done</span>
-      {% elif job.status == 'canceled' %}
-        <span class="ql-status-chip is-neutral">Cancelled</span>
-      {% else %}
-        <span class="ql-status-chip is-error">Failed</span>
-      {% endif %}
-    </div>
+  {% set _bulk = job.execute_kind in ('library', 'new_releases', 'upgrade', 'downsample', 'repair', 'lyrics', 'migration') %}
+  <article class="ql-activity-row ql-history-row{% if _bulk %} ql-history-row--bulk{% else %} ql-history-row--compact{% endif %}{% if job.status == 'failed' %} is-error{% endif %}">
+    {{ kind_tile(job) }}
     <div class="ql-activity-main">
-      <div class="ql-history-title-line">
-        <p class="ql-row-title">
-          <a href="/jobs/{{ job.id }}" class="ql-row-link">{% if job.artist %}{{ job.artist }} — {% endif %}{{ job.title }}</a>
-        </p>
-        <span class="ql-activity-kind">{{ history_kind(job) }}</span>
-      </div>
+      <p class="ql-row-title">
+        <a href="/jobs/{{ job.id }}" class="ql-row-link">{% if job.artist %}{{ job.artist }} — {% endif %}{{ job.title }}</a>
+      </p>
       {% if job.error %}
       <p class="ql-row-meta ql-row-meta--error">{{ job.error }}</p>
-      {% elif job.summary %}
+      {% elif _bulk and job.summary %}
       <p class="ql-row-meta">{{ job.summary }}</p>
-      {% else %}
-      <p class="ql-row-meta">No summary recorded.</p>
       {% endif %}
     </div>
     <div class="ql-activity-side">
+      {% if job.status == 'done' %}
+        <span class="ql-status-chip is-success">done</span>
+      {% elif job.status == 'canceled' %}
+        <span class="ql-status-chip is-neutral">cancelled</span>
+      {% else %}
+        <span class="ql-status-chip is-error">failed</span>
+      {% endif %}
       <span class="ql-activity-time tabular-nums">{{ job.when }}</span>
       <div class="ql-activity-actions">
         {% if job.status == 'failed' and job.album_id and job.id in retryable_ids %}
@@ -72,7 +84,7 @@
           <button type="submit" class="ql-btn ql-btn-sm ql-btn-secondary ql-secondary-action" title="Retry">Retry</button>
         </form>
         {% endif %}
-        <a href="/jobs/{{ job.id }}" class="ql-btn ql-btn-sm ql-btn-secondary ql-secondary-action">Open</a>
+        <a href="/jobs/{{ job.id }}" class="ql-row-open">Open →</a>
       </div>
     </div>
   </article>

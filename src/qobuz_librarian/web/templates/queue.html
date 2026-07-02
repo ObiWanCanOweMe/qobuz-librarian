@@ -6,29 +6,36 @@
 
 {% set active_tab = 'queue' %}
 <header class="ql-page-header ql-page-header--actions">
-  <div>
-    <h1>Queue</h1>
-    <p>Review scans, current jobs, and work waiting to start.</p>
-  </div>
+  <h1>Activity</h1>
   <div>
     {% include "_queue_tabs.html" %}
   </div>
 </header>
 
+{% macro kind_tile(job) -%}
+<span class="ql-job-tile{% if job.status.value in ('running', 'scanning') %} is-live{% endif %}" aria-hidden="true">
+  {% if job.execute_kind in ('library', 'new_releases') %}
+  <svg viewBox="0 0 24 24"><path d="M4 4v16M9 4v16M14 5.5l4.5 14"/></svg>
+  {% elif job.execute_kind == 'repair' %}
+  <svg viewBox="0 0 24 24"><path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14 13l-3-3 3.7-3.7z"/></svg>
+  {% elif job.execute_kind == 'lyrics' %}
+  <svg viewBox="0 0 24 24"><path d="M9 18V6l8-2v12"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="14.5" cy="16" r="2.5"/></svg>
+  {% elif job.execute_kind == 'upgrade' %}
+  <svg viewBox="0 0 24 24"><path d="M12 19V6"/><path d="M6 12l6-6 6 6"/></svg>
+  {% elif job.execute_kind == 'downsample' %}
+  <svg viewBox="0 0 24 24"><path d="M12 5v13"/><path d="M6 12l6 6 6-6"/></svg>
+  {% elif job.execute_kind == 'migration' %}
+  <svg viewBox="0 0 24 24"><path d="M4 7h11M4 12h11M4 17h11"/><path d="M18 9l3 3-3 3"/></svg>
+  {% else %}
+  <svg viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>
+  {% endif %}
+</span>
+{%- endmacro %}
+
 {% macro queue_job_row(job) -%}
 <article class="ql-activity-row ql-activity-row--queue{% if job.status.value == 'running' %} is-running{% endif %}{% if job.status.value == 'awaiting_review' %} is-review{% endif %}"
      {% if job.status.value in ('running', 'scanning', 'pending') %}data-job-card data-job-id="{{ job.id }}" data-job-surface="queue" data-job-status="{{ job.status.value }}" data-job-kind="{{ job.execute_kind or job.kind }}"{% endif %}>
-  <div class="ql-activity-state">
-    {% if job.status.value == 'awaiting_review' %}
-      <span class="ql-status-chip is-info">Review</span>
-    {% elif job.status.value == 'running' %}
-      <span class="ql-status-chip is-active">{{ labels.job_activity(job) }}</span>
-    {% elif job.status.value == 'scanning' %}
-      <span class="ql-status-chip">Scanning</span>
-    {% else %}
-      <span class="ql-status-chip is-neutral">Queued</span>
-    {% endif %}
-  </div>
+  {{ kind_tile(job) }}
 
   <div class="ql-activity-main">
     <p class="ql-row-title">
@@ -75,6 +82,11 @@
       {%- endif -%}
     </p>
     {% endif %}
+    {% if job.status.value in ('running', 'scanning') %}
+    <div class="ql-progress" id="card-bar-{{ job.id }}">
+      <i style="width: {% if job.progress_total > 0 %}{{ ((job.progress_current / job.progress_total) * 100) | round(1) }}{% else %}0{% endif %}%"></i>
+    </div>
+    {% endif %}
   </div>
 
   {% if job.status.value == 'awaiting_review' %}
@@ -97,7 +109,7 @@
   <form action="/jobs/{{ job.id }}/cancel" method="post" class="ql-activity-actions">
     <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
     {% set _act = 'Remove' if job.status.value == 'pending' else 'Cancel' %}
-    <button type="submit" class="ql-btn ql-btn-sm{% if job.status.value == 'pending' %} ql-btn-secondary ql-secondary-action{% else %} ql-btn-danger{% endif %}"
+    <button type="submit" class="ql-btn ql-btn-sm{% if job.status.value == 'pending' %} ql-btn-secondary ql-secondary-action{% else %} ql-btn-ghost-danger{% endif %}"
             title="{{ _act }} {{ 'job' if job.status.value != 'pending' else 'from queue' }}"
             aria-label="{{ _act }} {{ 'job' if job.status.value != 'pending' else 'from queue' }}"
             data-confirm="{% if job.status.value == 'pending' %}Remove this waiting job from the queue?{% else %}Cancel this job? It will stop after the current safe step.{% endif %}">{{ _act }}</button>
@@ -118,13 +130,10 @@
   {% if review_jobs %}
   <section class="ql-activity-section" aria-labelledby="queue-review-heading">
     <header class="ql-activity-section-header">
-      <div>
-        <h2 id="queue-review-heading">Needs review</h2>
-        <p>Scans waiting for your decision.</p>
-      </div>
+      <h2 id="queue-review-heading">Needs review</h2>
       <span class="ql-activity-count">{{ review_jobs | length }}</span>
     </header>
-    <div class="ql-activity-list">
+    <div class="ql-activity-list ql-panelize">
       {% for job in review_jobs %}{{ queue_job_row(job) }}{% endfor %}
     </div>
   </section>
@@ -133,13 +142,10 @@
   {% if active_jobs %}
   <section class="ql-activity-section" aria-labelledby="queue-active-heading">
     <header class="ql-activity-section-header">
-      <div>
-        <h2 id="queue-active-heading">Running now</h2>
-        <p>Current work in progress.</p>
-      </div>
+      <h2 id="queue-active-heading">Running now</h2>
       <span class="ql-activity-count">{{ active_jobs | length }}</span>
     </header>
-    <div class="ql-activity-list">
+    <div class="ql-activity-list ql-panelize">
       {% for job in active_jobs %}{{ queue_job_row(job) }}{% endfor %}
     </div>
   </section>
@@ -148,13 +154,10 @@
   {% if waiting_jobs %}
   <section class="ql-activity-section" aria-labelledby="queue-waiting-heading">
     <header class="ql-activity-section-header">
-      <div>
-        <h2 id="queue-waiting-heading">Waiting</h2>
-        <p>Jobs that will start automatically.</p>
-      </div>
+      <h2 id="queue-waiting-heading">Waiting</h2>
       <span class="ql-activity-count">{{ waiting_jobs | length }}</span>
     </header>
-    <div class="ql-activity-list">
+    <div class="ql-activity-list ql-panelize">
       {% for job in waiting_jobs %}{{ queue_job_row(job) }}{% endfor %}
     </div>
   </section>
@@ -162,10 +165,7 @@
 </div>
 {% if pending | length > 1 %}
 <div class="ql-activity-maintenance">
-  <div>
-    <p class="font-medium">Clear queued work and parked reviews</p>
-    <p class="ql-row-meta">Removes waiting jobs and review lists. Running jobs are asked to stop after the current safe step.</p>
-  </div>
+  <p class="ql-row-meta">Removes waiting jobs and review lists. Running jobs stop after the current safe step.</p>
   <form action="/queue/cancel-pending" method="post">
     <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
     <button type="submit" class="ql-btn ql-btn-sm ql-btn-danger w-full sm:w-auto"
@@ -181,7 +181,7 @@
     </svg>
   </div>
   <p class="font-medium text-base-content/70">Queue is empty.</p>
-  <p class="text-sm mt-1 text-base-content/50">Downloads, scans, and reviews appear here while they need attention or are still running.</p>
+  <p class="text-sm mt-1 text-base-content/50">Downloads, scans, and reviews appear here while they run.</p>
   <div class="ql-empty-actions">
     <a href="/" class="ql-btn ql-btn-primary w-full sm:w-auto">Search Qobuz</a>
     <a href="/queue/history" class="ql-btn ql-btn-secondary w-full sm:w-auto">View history</a>
