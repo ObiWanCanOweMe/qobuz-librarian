@@ -412,11 +412,16 @@ def scan_artist_for_upgrades(artist_name, artist_dir, token, args, capped=None):
             bb, rr = existing_track_quality(t)
             if bb and rr:
                 _qcounts[(bb, rr)] = _qcounts.get((bb, rr), 0) + 1
-        if _qcounts:
-            eb, er = max(_qcounts, key=_qcounts.get)
+        if len(_qcounts) > 1:
+            # Mixed qualities on disk. A majority label can EQUAL the target
+            # (one stray CD track in a hi-res album), which reads as a no-op
+            # upgrade — name the low end instead, since that's what the
+            # upgrade fixes.
+            lo_b, lo_r = min(_qcounts)
+            existing_label = f"mixed, down to {lo_b}-bit/{lo_r / 1000:g}kHz"
+        elif _qcounts:
+            eb, er = next(iter(_qcounts))
             existing_label = f"{eb}-bit/{er / 1000:g}kHz"
-            if len(_qcounts) > 1:
-                existing_label = "~" + existing_label
         else:
             existing_label = "lower quality"
 
