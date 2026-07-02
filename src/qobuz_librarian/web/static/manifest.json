@@ -24,5 +24,17 @@
       "type": "image/png",
       "purpose": "any"
     }
+  ],
+  "shortcuts": [
+    {
+      "name": "Library",
+      "url": "/library",
+      "icons": [{ "src": "/static/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Queue",
+      "url": "/queue",
+      "icons": [{ "src": "/static/icon-192.png", "sizes": "192x192" }]
+    }
   ]
 }

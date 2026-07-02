@@ -96,6 +96,20 @@
     }, 360);
   });
 
+  // "/" jumps to the search box from anywhere, unless you're already typing
+  // in a field (so slashes in queries and paths still land).
+  document.addEventListener("keydown", function (evt) {
+    if (evt.key !== "/" || evt.ctrlKey || evt.metaKey || evt.altKey) return;
+    var t = evt.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" ||
+              t.tagName === "SELECT" || t.isContentEditable)) return;
+    var box = document.querySelector('input[name="q"]');
+    if (!box) return;
+    evt.preventDefault();
+    box.focus();
+    box.select();
+  });
+
   // Plain POST forms need immediate feedback while the redirect starts.
   document.addEventListener("submit", function (evt) {
     var form = evt.target;
