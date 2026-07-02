@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="csrf-token" content="{{ request.state.csrf_token }}">
   <title>{% block title %}Qobuz Librarian{% endblock %}</title>
-  <link rel="icon" type="image/png" href="/static/icon-192.png">
-  <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="icon" type="image/png" href="/static/icon-192.png?v={{ asset_version }}">
+  <link rel="apple-touch-icon" href="/static/icon-192.png?v={{ asset_version }}">
   <link rel="manifest" href="/static/manifest.json">
   <meta name="theme-color" content="#0f0b07">
   <script nonce="{{ request.state.csp_nonce }}">
