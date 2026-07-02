@@ -802,8 +802,10 @@ app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 async def favicon():
     """Serve the app icon at the well-known path so the browser's automatic
     /favicon.ico probe (allowlisted past auth in web/auth.py) doesn't 404. The
-    HTML pages also carry a <link rel="icon">; this covers the bare probe."""
-    return FileResponse(static_dir / "icon.png", media_type="image/png")
+    HTML pages also carry a <link rel="icon">; this covers the bare probe.
+    The 192px icon, not the 512px one — a favicon renders at 16-32px and the
+    full-size PNG is dead weight on every cold load."""
+    return FileResponse(static_dir / "icon-192.png", media_type="image/png")
 
 
 def _asset_version() -> str:

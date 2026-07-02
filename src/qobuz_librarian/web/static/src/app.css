@@ -30,7 +30,7 @@
   font-style: normal;
   font-weight: 400;
   font-display: swap;
-  src: url("/static/vendor/plex-mono/ibm-plex-mono-400.ttf") format("truetype");
+  src: url("/static/vendor/plex-mono/ibm-plex-mono-400.woff2") format("woff2");
 }
 
 @font-face {
@@ -38,7 +38,7 @@
   font-style: normal;
   font-weight: 600;
   font-display: swap;
-  src: url("/static/vendor/plex-mono/ibm-plex-mono-600.ttf") format("truetype");
+  src: url("/static/vendor/plex-mono/ibm-plex-mono-600.woff2") format("woff2");
 }
 
 /* Display serif for page titles and the brand wordmark. */
