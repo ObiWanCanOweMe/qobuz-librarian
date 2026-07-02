@@ -522,7 +522,7 @@ def _query_provider(query: str, prov: str, log: logging.Logger, **kwargs) -> Opt
         with _breaker_lock:
             _provider_fails[prov] = 0
     elif not _PROVIDER_ERROR_RE.search(chatter):
-        # L4: Clean "not found" — not a connection failure, reset any stale fail count.
+        # Clean "not found" — not a connection failure, reset any stale fail count.
         with _breaker_lock:
             _provider_fails[prov] = 0
     return result
@@ -596,7 +596,7 @@ def should_process(
         # provider has gained synced lyrics for the track.
         return not skip_existing_plain
     if st.status in ("not_found", "error", "skipped"):
-        # L1: "skipped" (long-track, missing-tags) now expires like not_found
+        # "skipped" (long-track, missing-tags) expires like not_found
         # instead of being re-opened on every run.
         age_days = (time.time() - st.last_seen) / 86400
         return age_days >= RECHECK_AFTER_DAYS

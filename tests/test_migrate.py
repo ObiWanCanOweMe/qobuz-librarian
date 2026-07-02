@@ -186,7 +186,7 @@ def test_fingerprint_lookup_resolves_album_year_and_is_placeable():
     assert meta["album"] == "Black Sands"      # Album type preferred over Single
     assert meta["year"] == 2010                # earliest release year
     assert meta["albumartist"] == "Bonobo"
-    assert m.is_placeable(meta)                # the whole point of F1: now placeable
+    assert m.is_placeable(meta)                # the whole point: now placeable
 
 
 def test_run_migrate_gates_on_insufficient_destination_space(tmp_path, monkeypatch):

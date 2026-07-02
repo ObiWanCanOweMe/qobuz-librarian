@@ -451,7 +451,7 @@ def _resolve_queue_item(item, args, imported_globally):
             # the rebuilt folder must be verifiably at least as complete as the
             # original (track count + playtime), not merely decode-clean. The
             # artist/upgrade walks run their bulk upgrades through this executor,
-            # so without this they'd skip the C01/C02 completeness gate.
+            # so without this they'd skip the completeness gate.
             from qobuz_librarian.modes.process import (
                 _carry_non_audio_from_backup,
                 _upgrade_replacement_verified,
