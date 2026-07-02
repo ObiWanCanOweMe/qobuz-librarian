@@ -1,0 +1,27 @@
+# Monthly, grouped, so dependency PRs arrive as one digest per ecosystem
+# instead of a drip — the pins are deliberate (see docker/image-lock.txt),
+# this is the reminder they exist.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      python-deps:
+        patterns: ["*"]
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      build-deps:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: monthly

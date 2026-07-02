@@ -1,0 +1,45 @@
+name: Bug report
+description: Something broke or behaves wrong
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What did you do, what did you expect, what happened instead?
+      placeholder: I started a library scan and …
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Bottom of the sidebar in the web UI, or `qobuz-librarian --version`.
+      placeholder: v0.10.0
+    validations:
+      required: true
+  - type: dropdown
+    id: deploy
+    attributes:
+      label: How it's running
+      options:
+        - Docker (compose.yaml from this repo)
+        - Docker (my own compose/run setup)
+        - pip / pipx install
+        - Source checkout
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Paste the output of `docker logs qobuz-librarian` around the time it happened (or the relevant part of `qobuz-librarian.log` from the data volume). Strip your token if it appears.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: compose
+    attributes:
+      label: compose.yaml / settings (if relevant)
+      description: Only needed for setup, permission, or path problems. Remove any credentials before pasting.
+      render: yaml
