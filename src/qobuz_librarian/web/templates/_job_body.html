@@ -2,6 +2,7 @@
 
 <div id="job-content" class="ql-job-shell" data-job-id="{{ job.id }}"
   data-job-kind="{{ job.execute_kind }}"
+  {%- if embedded_surface|default(false) %} data-embedded="1"{% endif %}
   data-progress-item-singular="{{ labels.progress_item_singular(job) }}"
   data-progress-item-plural="{{ labels.progress_item_plural(job) }}"
   {%- if job.status.value == 'awaiting_review' %} data-job-view="review"

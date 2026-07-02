@@ -721,7 +721,9 @@
       document.title = baseTitle;
       if (window.qlDismissAllFlashes) window.qlDismissAllFlashes();
       if (window.htmx) {
-        window.htmx.ajax("GET", "/jobs/" + id + "/content", { target: "#job-content", swap: "outerHTML" });
+        var jc = document.getElementById("job-content");
+        var embedded = jc && jc.dataset.embedded ? "?embedded=1" : "";
+        window.htmx.ajax("GET", "/jobs/" + id + "/content" + embedded, { target: "#job-content", swap: "outerHTML" });
       } else { location.reload(); }
     });
   }
@@ -1174,7 +1176,9 @@
       }
       shutReview();
       if (window.htmx) {
-        window.htmx.ajax("GET", "/jobs/" + id + "/content", { target: "#job-content", swap: "outerHTML" });
+        var jc = document.getElementById("job-content");
+        var embedded = jc && jc.dataset.embedded ? "?embedded=1" : "";
+        window.htmx.ajax("GET", "/jobs/" + id + "/content" + embedded, { target: "#job-content", swap: "outerHTML" });
       } else { location.reload(); }
     });
     rsrc.onerror = function () {

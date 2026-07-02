@@ -2977,10 +2977,14 @@ def _review_context(job, page=1, query="", tab=""):
 
 
 @app.get("/jobs/{job_id}/content", response_class=HTMLResponse)
-async def job_content(request: Request, job_id: str, page: int = 1):
+async def job_content(request: Request, job_id: str, page: int = 1,
+                      embedded: bool = False):
     """The job page's state-specific body, on its own. The live page swaps
     this in when the SSE stream reports the job finished, so the terminal
-    view has one render path — the server's — instead of a faked-up bar."""
+    view has one render path — the server's — instead of a faked-up bar.
+    ``embedded`` mirrors the embedding surface's flag (Library/Repair render
+    the body under their own page heading), so the swapped-in body doesn't
+    reintroduce the job header the full-page render suppressed."""
     job = job_mgr.registry.get(job_id)
     historical = False
     if not job:
@@ -2990,6 +2994,7 @@ async def job_content(request: Request, job_id: str, page: int = 1):
         historical = True
     ctx = {"job": job, "JobStatus": job_mgr.JobStatus,
            "historical": historical,
+           "embedded_surface": embedded,
            "queue_wait": _queue_wait(job)}
     ctx.update(_review_context(job, page))
     return _tr(request, "_job_body.html", ctx)
