@@ -2608,6 +2608,12 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
   line-height: 1.2;
   white-space: nowrap;
 }
+.ql-history-cards {
+  max-height: 27rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border-radius: 16px;
+}
 .ql-history-row--compact {
   padding-block: 0.6rem;
 }

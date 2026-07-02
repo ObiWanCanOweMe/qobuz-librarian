@@ -43,31 +43,7 @@
 </span>
 {%- endmacro %}
 
-{% if jobs %}
-<div class="ql-activity-toolbar">
-  <p class="ql-mono-meta">{{ total }} finished job{% if total != 1 %}s{% endif %}</p>
-  <form action="/queue/clear" method="post">
-    <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-    <button type="submit" class="ql-btn ql-btn-sm ql-btn-ghost-danger"
-            data-confirm="Clear all {{ total }} finished job{% if total != 1 %}s{% endif %} from history? This permanently removes the records and cannot be undone.">Clear history</button>
-  </form>
-</div>
-
-<div class="ql-activity-list ql-history-list ql-panelize">
-  {% for job in jobs %}
-  {% set _bulk = job.execute_kind in ('library', 'new_releases', 'upgrade', 'downsample', 'repair', 'lyrics', 'migration') %}
-  <article class="ql-activity-row ql-history-row{% if _bulk %} ql-history-row--bulk{% else %} ql-history-row--compact{% endif %}{% if job.status == 'failed' %} is-error{% endif %}">
-    {{ kind_tile(job) }}
-    <div class="ql-activity-main">
-      <p class="ql-row-title">
-        <a href="/jobs/{{ job.id }}" class="ql-row-link">{% if job.artist %}{{ job.artist }} — {% endif %}{{ job.title }}</a>
-      </p>
-      {% if job.error %}
-      <p class="ql-row-meta ql-row-meta--error">{{ job.error }}</p>
-      {% elif _bulk and job.summary %}
-      <p class="ql-row-meta">{{ job.summary }}</p>
-      {% endif %}
-    </div>
+{% macro job_side(job) -%}
     <div class="ql-activity-side">
       {% if job.status == 'done' %}
         <span class="ql-status-chip is-success">done</span>
@@ -87,9 +63,71 @@
         <a href="/jobs/{{ job.id }}" class="ql-row-open">Open →</a>
       </div>
     </div>
-  </article>
-  {% endfor %}
+{%- endmacro %}
+
+{% if bulk_jobs or jobs %}
+<div class="ql-activity-toolbar">
+  <p class="ql-mono-meta">{{ (bulk_jobs | length) + total }} finished job{% if (bulk_jobs | length) + total != 1 %}s{% endif %}</p>
+  <form action="/queue/clear" method="post">
+    <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+    <button type="submit" class="ql-btn ql-btn-sm ql-btn-ghost-danger"
+            data-confirm="Clear all finished jobs from history? This permanently removes the records and cannot be undone.">Clear history</button>
+  </form>
 </div>
+
+{% if bulk_jobs %}
+<section class="ql-activity-section" aria-labelledby="history-jobs-heading">
+  <header class="ql-activity-section-header">
+    <h2 id="history-jobs-heading">Jobs</h2>
+    <span class="ql-activity-count">{{ bulk_jobs | length }}</span>
+  </header>
+  <div class="ql-history-cards">
+    <div class="ql-activity-list ql-panelize">
+      {% for job in bulk_jobs %}
+      <article class="ql-activity-row ql-history-row ql-history-row--bulk{% if job.status == 'failed' %} is-error{% endif %}">
+        {{ kind_tile(job) }}
+        <div class="ql-activity-main">
+          <p class="ql-row-title">
+            <a href="/jobs/{{ job.id }}" class="ql-row-link">{% if job.artist %}{{ job.artist }} — {% endif %}{{ job.title }}</a>
+          </p>
+          {% if job.error %}
+          <p class="ql-row-meta ql-row-meta--error">{{ job.error }}</p>
+          {% elif job.summary %}
+          <p class="ql-row-meta">{{ job.summary }}</p>
+          {% endif %}
+        </div>
+        {{ job_side(job) }}
+      </article>
+      {% endfor %}
+    </div>
+  </div>
+</section>
+{% endif %}
+
+{% if jobs %}
+<section class="ql-activity-section" aria-labelledby="history-downloads-heading">
+  <header class="ql-activity-section-header">
+    <h2 id="history-downloads-heading">Downloads</h2>
+    <span class="ql-activity-count">{{ total }}</span>
+  </header>
+  <div class="ql-activity-list ql-panelize">
+    {% for job in jobs %}
+    <article class="ql-activity-row ql-history-row ql-history-row--compact{% if job.status == 'failed' %} is-error{% endif %}">
+      {{ kind_tile(job) }}
+      <div class="ql-activity-main">
+        <p class="ql-row-title">
+          <a href="/jobs/{{ job.id }}" class="ql-row-link">{% if job.artist %}{{ job.artist }} — {% endif %}{{ job.title }}</a>
+        </p>
+        {% if job.error %}
+        <p class="ql-row-meta ql-row-meta--error">{{ job.error }}</p>
+        {% endif %}
+      </div>
+      {{ job_side(job) }}
+    </article>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
 
 {% if pages > 1 %}
 <nav class="ql-activity-pagination" aria-label="History pages">

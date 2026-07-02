@@ -285,24 +285,49 @@ def prune_finished(keep: int) -> None:
 _TERMINAL_SQL = "status IN ('done', 'failed', 'canceled')"
 
 
-def history_count() -> int:
+# History splits finished work into two layers: meaningful jobs get cards,
+# plain downloads get a compact table. The kinds below are the card layer.
+BULK_KINDS = ("library", "new_releases", "upgrade", "downsample", "repair",
+              "lyrics", "migration")
+
+_BULK_MARKS = ",".join("?" for _ in BULK_KINDS)
+
+
+def _kind_clause(bulk):
+    # Downloads always carry the album they fetched; scans and other bulk work
+    # never do. That split survives legacy rows whose execute_kind is empty.
+    if bulk is None:
+        return "", ()
+    if bulk:
+        return (f"AND (execute_kind IN ({_BULK_MARKS}) "
+                "OR COALESCE(album_id, '') = '') ", BULK_KINDS)
+    return (f"AND execute_kind NOT IN ({_BULK_MARKS}) "
+            "AND COALESCE(album_id, '') != '' ", BULK_KINDS)
+
+
+def history_count(bulk: Optional[bool] = None) -> int:
     """How many finished jobs are on disk — for paginating the History view."""
+    clause, params = _kind_clause(bulk)
     with _lock:
         conn = _get_conn()
         if conn is None:
             return 0
         try:
             return conn.execute(
-                f"SELECT COUNT(*) FROM jobs WHERE {_TERMINAL_SQL}").fetchone()[0]
+                f"SELECT COUNT(*) FROM jobs WHERE {_TERMINAL_SQL} {clause}",
+                params).fetchone()[0]
         except sqlite3.Error:
             return 0
 
 
-def history_page(limit: int, offset: int) -> list[dict]:
+def history_page(limit: int, offset: int,
+                 bulk: Optional[bool] = None) -> list[dict]:
     """A page of finished jobs, newest first — the browsable record behind the
     History view. Lighter than ``load_all`` (no candidates/args): just what a
     history row shows, plus the id to open the full job. The ``id`` tiebreaker
-    keeps paging stable when finish times collide."""
+    keeps paging stable when finish times collide. ``bulk`` narrows to the
+    card layer (True), the downloads table (False), or everything (None)."""
+    clause, params = _kind_clause(bulk)
     with _lock:
         conn = _get_conn()
         if conn is None:
@@ -311,10 +336,10 @@ def history_page(limit: int, offset: int) -> list[dict]:
             rows = conn.execute(
                 "SELECT id, title, artist, album_id, status, error, summary, "
                 "execute_kind, created_at, finished_at FROM jobs "
-                f"WHERE {_TERMINAL_SQL} "
+                f"WHERE {_TERMINAL_SQL} {clause}"
                 "ORDER BY COALESCE(finished_at, created_at) DESC, id DESC "
                 "LIMIT ? OFFSET ?",
-                (limit, offset),
+                (*params, limit, offset),
             ).fetchall()
         except sqlite3.Error as e:
             _log.debug("history_page failed: %s", e)

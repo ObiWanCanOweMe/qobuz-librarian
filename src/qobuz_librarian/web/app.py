@@ -3804,6 +3804,8 @@ async def queue_page(request: Request, error: str = ""):
 
 
 _HISTORY_PER_PAGE = 30
+# The card layer scrolls instead of paginating; enough for weeks of scans.
+_HISTORY_BULK_CAP = 40
 
 
 @app.get("/queue/history", response_class=HTMLResponse)
@@ -3815,25 +3817,33 @@ async def queue_history(request: Request, p: int = 1):
     from qobuz_librarian.web import job_persistence
     p = max(1, p)
 
-    def _load_page(page):
-        total = job_persistence.history_count()
-        pages = max(1, (total + _HISTORY_PER_PAGE - 1) // _HISTORY_PER_PAGE)
-        page = min(max(1, page), pages)
-        rows = job_persistence.history_page(_HISTORY_PER_PAGE, (page - 1) * _HISTORY_PER_PAGE)
+    def _stamp(rows):
         for r in rows:
             ts = r.get("finished_at") or r.get("created_at")
             r["when"] = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else ""
-        return total, pages, page, rows
+        return rows
+
+    def _load_page(page):
+        # Two layers: meaningful jobs as a scrollable card region, plain
+        # downloads as the paginated table underneath.
+        bulk = _stamp(job_persistence.history_page(_HISTORY_BULK_CAP, 0, bulk=True))
+        total = job_persistence.history_count(bulk=False)
+        pages = max(1, (total + _HISTORY_PER_PAGE - 1) // _HISTORY_PER_PAGE)
+        page = min(max(1, page), pages)
+        rows = _stamp(job_persistence.history_page(
+            _HISTORY_PER_PAGE, (page - 1) * _HISTORY_PER_PAGE, bulk=False))
+        return bulk, total, pages, page, rows
 
     loop = asyncio.get_running_loop()
-    total, pages, p, rows = await loop.run_in_executor(None, lambda: _load_page(p))
+    bulk_jobs, total, pages, p, rows = await loop.run_in_executor(None, lambda: _load_page(p))
     retryable_ids = [
         j.id for j in job_mgr.registry.all()
         if j.status == job_mgr.JobStatus.FAILED and j.album_id
     ]
     return _tr(request, "history.html", {
         "page": "queue", "active_tab": "history",
-        "jobs": rows, "cur_page": p, "pages": pages, "total": total,
+        "bulk_jobs": bulk_jobs, "jobs": rows,
+        "cur_page": p, "pages": pages, "total": total,
         "retryable_ids": retryable_ids,
     })
 
