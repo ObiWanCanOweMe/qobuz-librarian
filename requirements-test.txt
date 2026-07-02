@@ -6,21 +6,21 @@ annotated-doc==0.0.4
     # via fastapi
 annotated-types==0.7.0
     # via pydantic
-anyio==4.13.0
+anyio==4.14.1
     # via
     #   httpx
     #   starlette
     #   watchfiles
-certifi==2026.4.22
+certifi==2026.6.17
     # via
     #   httpcore
     #   httpx
     #   requests
 charset-normalizer==3.4.7
     # via requests
-click==8.4.0
+click==8.4.2
     # via uvicorn
-fastapi==0.136.1
+fastapi==0.139.0
     # via qobuz-librarian (pyproject.toml)
 h11==0.16.0
     # via
@@ -28,11 +28,11 @@ h11==0.16.0
     #   uvicorn
 httpcore==1.0.9
     # via httpx
-httptools==0.7.1
+httptools==0.8.0
     # via uvicorn
 httpx==0.28.1
     # via qobuz-librarian (pyproject.toml)
-idna==3.15
+idna==3.18
     # via
     #   anyio
     #   httpx
@@ -43,7 +43,7 @@ jinja2==3.1.6
     # via qobuz-librarian (pyproject.toml)
 markupsafe==3.0.3
     # via jinja2
-mutagen==1.47.0
+mutagen==1.48.1
     # via qobuz-librarian (pyproject.toml)
 packaging==26.2
     # via pytest
@@ -55,7 +55,7 @@ pydantic-core==2.46.4
     # via pydantic
 pygments==2.20.0
     # via pytest
-pytest==9.0.3
+pytest==9.1.1
     # via qobuz-librarian (pyproject.toml)
 python-dotenv==1.2.2
     # via uvicorn
@@ -65,7 +65,7 @@ pyyaml==6.0.3
     # via uvicorn
 requests==2.34.2
     # via qobuz-librarian (pyproject.toml)
-ruff==0.15.14
+ruff==0.15.20
     # via qobuz-librarian (pyproject.toml)
 starlette==1.3.1
     # via fastapi
@@ -85,7 +85,7 @@ typing-inspection==0.4.2
     #   pydantic
 urllib3==2.7.0
     # via requests
-uvicorn==0.47.0
+uvicorn==0.49.0
     # via qobuz-librarian (pyproject.toml)
 uvloop==0.22.1
     # via uvicorn

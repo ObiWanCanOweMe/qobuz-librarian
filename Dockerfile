@@ -25,7 +25,7 @@ WORKDIR /app
 # beets is pinned to a verified minor.
 # Bump policy: track nathom/streamrip's dev branch, refresh quarterly or
 # when a Qobuz-side schema change forces it; verify with scripts/smoke_test.sh
-# before changing the SHA. Last verified: 2026-04 against streamrip dev.
+# before changing the SHA. Last verified: 2026-07 against streamrip dev.
 #
 # streamrip and beets install --no-deps: both cap a few helpers (Pillow,
 # aiofiles, tomlkit) far below the versions the librarian runs and verifies, so
@@ -40,7 +40,7 @@ WORKDIR /app
 COPY docker/image-lock.txt ./image-lock.txt
 RUN pip install --no-cache-dir --no-deps \
         "streamrip @ git+https://github.com/nathom/streamrip.git@e3291615ba6be34aa76df19da8aeb6f41673c6a0" \
- && pip install --no-cache-dir --no-deps "beets==2.11.0" \
+ && pip install --no-cache-dir --no-deps "beets==2.12.0" \
  && pip install --no-cache-dir -r image-lock.txt
 
 # App source. image-lock.txt already installed the app's dependencies above, so
