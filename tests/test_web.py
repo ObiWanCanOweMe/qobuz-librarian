@@ -2820,3 +2820,19 @@ def test_restore_backup_moves_the_files_home(client, tmp_path, monkeypatch):
     assert (origin / "01 - Song.flac").read_bytes() == b"data"
     assert not bk.exists()
     assert "Restored the album" in r.text
+
+
+def test_auth_loss_fires_the_hook_once_per_transition(monkeypatch):
+    # Only the healthy→rejected edge should push a notification; the 401s
+    # that follow are the same outage, and a recovery re-arms it.
+    from qobuz_librarian.web import app as app_mod
+    calls = []
+    monkeypatch.setattr(app_mod.job_mgr, "fire_auth_lost_hook",
+                        lambda: calls.append(1))
+    monkeypatch.setattr(app_mod, "_TOKEN_VALID", None)
+    app_mod._on_auth_state(False)
+    app_mod._on_auth_state(False)
+    assert len(calls) == 1
+    app_mod._on_auth_state(True)
+    app_mod._on_auth_state(False)
+    assert len(calls) == 2

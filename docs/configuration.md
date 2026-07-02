@@ -159,6 +159,8 @@ print(json.dumps({"content": "Qobuz Librarian — " + line}))' \
 
 Anything that accepts an HTTP request works the same way: Gotify, Slack, Home Assistant webhooks, or a plain script that writes to a file.
 
+The hook also fires once if the saved Qobuz token stops being accepted (`status` is `auth_lost`), so an unattended box tells you the moment downloads would start failing instead of leaving it for you to discover.
+
 ## What the app does on its own
 
 On first run the Search page *offers* a one-time baseline scan (`AUTO_LIBRARY_SCAN`) rather than starting it for you. Once that baseline exists, periodic new-release checks (`NEW_RELEASE_CHECK_INTERVAL`) run on their own, read-only — on a background timer, so they keep to the interval even when nobody has the app open. Both park a review list; nothing is downloaded or changed until you act on it.

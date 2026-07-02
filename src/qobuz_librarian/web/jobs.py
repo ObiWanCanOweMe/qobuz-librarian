@@ -692,10 +692,10 @@ def _run_task(job: Job, fn):
         job.end_stream()
 
 
-def _fire_post_job_hook(job):
-    """Run the POST_JOB_HOOK command (if set) with the job's final state on
-    stdin as JSON. Errors are logged via vlog and never raised — a broken
-    hook can't kill the worker."""
+def _run_post_job_hook(payload: dict) -> None:
+    """Run the POST_JOB_HOOK command (if set) with ``payload`` as JSON on
+    stdin. Errors are logged via vlog and never raised — a broken hook
+    can't kill the worker."""
     import json
     import os
     import subprocess
@@ -704,14 +704,6 @@ def _fire_post_job_hook(job):
     cmd = os.environ.get("POST_JOB_HOOK", "").strip()
     if not cmd:
         return
-    payload = json.dumps({
-        "id": job.id,
-        "status": job.status.value,
-        "title": job.title,
-        "artist": job.artist,
-        "error": job.error,
-        "finished_at": job.finished_at,
-    })
     from qobuz_librarian import config as _cfg
     try:
         proc = subprocess.Popen(
@@ -724,13 +716,48 @@ def _fire_post_job_hook(job):
         vlog(f"post-job hook failed: {e}")
         return
     try:
-        proc.communicate(payload.encode("utf-8"), timeout=_cfg.POST_JOB_HOOK_TIMEOUT)
+        proc.communicate(json.dumps(payload).encode("utf-8"),
+                         timeout=_cfg.POST_JOB_HOOK_TIMEOUT)
     except subprocess.TimeoutExpired:
         # communicate() doesn't kill or reap on timeout — without this the shell
         # child and its open stdin pipe linger as a zombie under PID 1.
         proc.kill()
         proc.communicate()
         vlog("post-job hook timed out")
+
+
+def _fire_post_job_hook(job):
+    """Send the job's final state through POST_JOB_HOOK."""
+    _run_post_job_hook({
+        "id": job.id,
+        "status": job.status.value,
+        "title": job.title,
+        "artist": job.artist,
+        "error": job.error,
+        "finished_at": job.finished_at,
+    })
+
+
+def fire_auth_lost_hook():
+    """Tell the operator's hook that the saved Qobuz token stopped working.
+
+    Fired once per healthy-to-rejected transition by the web auth listener; an
+    unattended box otherwise fails its jobs quietly until somebody looks. Runs
+    on its own thread so the request that hit the 401 doesn't also wait out a
+    slow webhook. The payload keeps the job shape, so an existing hook script
+    renders it without special-casing."""
+    import threading
+    from datetime import datetime, timezone
+    payload = {
+        "id": "qobuz-auth",
+        "status": "auth_lost",
+        "title": "Qobuz token rejected — replace it on the Settings page",
+        "artist": None,
+        "error": "Qobuz returned 401 for the saved token",
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+    }
+    threading.Thread(target=_run_post_job_hook, args=(payload,),
+                     daemon=True).start()
 
 
 def _worker_loop(work_queue: "queue.Queue"):

@@ -707,7 +707,15 @@ def _on_auth_state(valid: bool) -> None:
     """Listener registered with api.auth so a 401 mid-session flips the
     dashboard banner without waiting for the next page-load probe."""
     global _TOKEN_VALID
+    was = _TOKEN_VALID
     _TOKEN_VALID = bool(valid)
+    # A working (or not-yet-probed) token turning rejected is the one event
+    # worth pushing through the notification hook — an unattended box
+    # otherwise fails jobs quietly until somebody opens the UI. Only the
+    # transition fires: the 401s that follow are False→False, and a recovery
+    # re-arms it, so a flapping token can't spam.
+    if was is not False and not valid:
+        job_mgr.fire_auth_lost_hook()
 
 
 def _qobuz_ready() -> bool:
