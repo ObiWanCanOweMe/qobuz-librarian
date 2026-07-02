@@ -2793,3 +2793,30 @@ def test_session_tokens_are_per_login_and_revocable():
     web_auth.revoke_all_sessions()               # e.g. on a password change
     assert not web_auth.verify_session(t2)
     assert web_auth.verify_session("") is False
+
+
+def test_restore_backup_rejects_path_shaped_names(client, tmp_path, monkeypatch):
+    # The Restore form posts a bare directory name; anything path-shaped is a
+    # probe, not a backup the diagnostics list rendered — it must not resolve
+    # outside the backup dir or restore anything.
+    from qobuz_librarian import config as cfg
+    monkeypatch.setattr(cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    (tmp_path / "backups").mkdir()
+    r = client.post("/backups/restore", data={"backup": "../../etc"})
+    assert r.status_code == 200
+    assert "isn't there anymore" in r.text
+
+
+def test_restore_backup_moves_the_files_home(client, tmp_path, monkeypatch):
+    from qobuz_librarian import config as cfg
+    monkeypatch.setattr(cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    origin = tmp_path / "music" / "Artist" / "Album (2020)"
+    bk = tmp_path / "backups" / "20260101_000000_000000_Album (2020)"
+    bk.mkdir(parents=True)
+    (bk / "01 - Song.flac").write_bytes(b"data")
+    (bk / ".ql_backup_origin").write_text(str(origin), encoding="utf-8")
+    r = client.post("/backups/restore", data={"backup": bk.name})
+    assert r.status_code == 200
+    assert (origin / "01 - Song.flac").read_bytes() == b"data"
+    assert not bk.exists()
+    assert "Restored the album" in r.text

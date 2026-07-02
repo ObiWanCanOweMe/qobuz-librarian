@@ -3852,11 +3852,9 @@ def _diagnostics():
     except Exception:
         orphans = []
     if orphans:
-        first = orphans[0]
-        hint = f" e.g. restore {first[0].name!r} → {first[1]}" if first[1] else ""
         checks.append({"label": "Orphaned backups (only copy)", "ok": False,
                        "detail": f"{len(orphans)} backup(s) hold tracks missing "
-                                 f"from their album folder.{hint}"})
+                                 f"from their album folder — restore them below."})
     else:
         checks.append({"label": "Orphaned backups (only copy)", "ok": True,
                        "detail": "none"})
@@ -4171,11 +4169,13 @@ _SSE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=cfg.SSE_MAX_WORKERS, thread_name_prefix="sse")
 
 
-@app.get("/api/diagnostics", response_class=HTMLResponse)
-async def api_diagnostics(request: Request):
-    """Htmx partial — returns just the diagnostics list items for the Recheck button."""
-    loop = asyncio.get_running_loop()
-    checks = await loop.run_in_executor(None, _diagnostics)
+def _diagnostics_fragment(request: Request) -> str:
+    """The diagnostics list items, plus a Restore row per orphaned backup.
+
+    Shared by the GET partial (initial load + the Recheck button) and the
+    restore POST below, which re-renders the list in place so a restored
+    backup disappears from it without a page reload."""
+    checks = _diagnostics()
     rows = []
     for d in checks:
         icon = "OK" if d["ok"] else "!"
@@ -4188,7 +4188,102 @@ async def api_diagnostics(request: Request):
             f'<div class="min-w-0"><div class="ql-diagnostic-label">{html.escape(d["label"])}</div>{detail}</div>'
             f'</div>'
         )
-    return HTMLResponse("\n".join(rows))
+    try:
+        from qobuz_librarian.library.backup import find_only_copy_backups
+        orphans = find_only_copy_backups()
+    except Exception:
+        orphans = []
+    tok = html.escape(request.state.csrf_token)
+    for path, origin in orphans:
+        name = html.escape(path.name)
+        dest = html.escape(str(origin)) if origin else "its album folder"
+        rows.append(
+            f'<div class="ql-diagnostic-row">'
+            f'<span class="ql-diagnostic-status ql-diagnostic-status-error" aria-label="Needs attention">!</span>'
+            f'<div class="min-w-0"><div class="ql-diagnostic-label">Backup: {name}</div>'
+            f'<div class="ql-diagnostic-detail">Holds files missing from {dest}.</div>'
+            f'<form hx-post="/backups/restore" hx-target="#diagnostics-list" class="mt-2">'
+            f'<input type="hidden" name="_csrf_token" value="{tok}">'
+            f'<input type="hidden" name="backup" value="{name}">'
+            f'<button type="submit" class="ql-btn ql-btn-sm" '
+            f'data-confirm="Move these files back to {dest}?">Restore</button>'
+            f'</form></div></div>'
+        )
+    return "\n".join(rows)
+
+
+@app.get("/api/diagnostics", response_class=HTMLResponse)
+async def api_diagnostics(request: Request):
+    """Htmx partial — returns just the diagnostics list items for the Recheck button."""
+    loop = asyncio.get_running_loop()
+    return HTMLResponse(await loop.run_in_executor(
+        None, _diagnostics_fragment, request))
+
+
+def _restore_backup_sync(request: Request, backup: str) -> str:
+    from qobuz_librarian.library.backup import (
+        _read_backup_origin,
+        restore_gap_fill_backup,
+        restore_upgrade_backup,
+    )
+    name = (backup or "").strip()
+    base = Path(str(cfg.UPGRADE_BACKUP_DIR))
+    target = base / name
+    # The form posts a bare directory name; anything path-shaped (separators,
+    # dot-dirs) is someone probing, not a backup this page listed.
+    if (not name or name != Path(name).name or name.startswith(".")
+            or not target.is_dir()):
+        return (_ql_notice_html("error", "That backup isn't there anymore — "
+                                "it may already be restored or cleaned up.")
+                + _diagnostics_fragment(request))
+    origin = _read_backup_origin(target)
+    if origin is None:
+        return (_ql_notice_html("error", "This backup doesn't record where its "
+                                "files came from; move it back by hand.")
+                + _diagnostics_fragment(request))
+    lock = job_mgr.staging_lock()
+    if not lock.acquire(blocking=False):
+        return (_ql_notice_html("warning", "A job is working in the library "
+                                "right now — try again once it finishes.")
+                + _diagnostics_fragment(request))
+    try:
+        if "_gapfill_" in name or "_downsample_" in name:
+            # These backups hold the good originals; the destination may hold a
+            # partial or a rewritten copy, so the backup always wins the swap.
+            n = restore_gap_fill_backup(target, origin, keep_larger_dst=False)
+            if n and not target.exists():
+                note = _ql_notice_html(
+                    "success", f"Restored {n} file(s) to {html.escape(str(origin))}.")
+            elif n:
+                note = _ql_notice_html(
+                    "warning", f"Restored {n} file(s); the rest couldn't be "
+                    "moved and stay in the backup.")
+            else:
+                note = _ql_notice_html(
+                    "error", "Nothing could be restored — the backup is "
+                    "untouched; check the log.")
+        else:
+            ok = restore_upgrade_backup(target, origin)
+            note = (_ql_notice_html(
+                        "success", f"Restored the album to {html.escape(str(origin))}.")
+                    if ok else
+                    _ql_notice_html(
+                        "error", "Couldn't restore automatically — the backup "
+                        "is untouched; the log has the manual command."))
+    finally:
+        lock.release()
+    return note + _diagnostics_fragment(request)
+
+
+@app.post("/backups/restore", response_class=HTMLResponse)
+async def restore_backup(request: Request, backup: str = Form("")):
+    """Move an orphaned backup's files home — the button on the diagnostics list."""
+    busy = _lock_busy_response(request)
+    if busy is not None:
+        return busy
+    loop = asyncio.get_running_loop()
+    return HTMLResponse(await loop.run_in_executor(
+        None, _restore_backup_sync, request, backup))
 
 
 @app.get("/api/jobs/{job_id}/stream")
