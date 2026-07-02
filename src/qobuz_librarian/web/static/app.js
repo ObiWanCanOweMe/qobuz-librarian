@@ -206,7 +206,8 @@
     document.documentElement.setAttribute("data-theme", next);
     try { localStorage.setItem("ql-theme", next); } catch (e) { /* private mode */ }
     var m = document.querySelector('meta[name="theme-color"]');
-    if (m) m.setAttribute("content", next === "winter" ? "#f7f2e8" : "#100d09");
+    // Matches --ql-bg in tokens.css and the boot script in base.html.
+    if (m) m.setAttribute("content", next === "winter" ? "#f3ecdf" : "#0f0b07");
   });
 
   // Keep the mobile drawer aria-expanded in step with the actual open state.
