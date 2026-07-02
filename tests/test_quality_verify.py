@@ -123,3 +123,31 @@ def test_redownload_fallback_restores_first_rip_on_interrupt(tmp_path):
             collect_staged_dirs=lambda: [])
 
     assert (first / "01.flac").read_bytes() == b"first rip"
+
+def test_redownload_fallback_restores_first_rip_when_retry_less_complete(
+        tmp_path):
+    staging = tmp_path / "staging"
+    first = staging / "Artist" / "Album"
+    first.mkdir(parents=True)
+    for n in ("01", "02", "03"):
+        (first / f"{n}.flac").write_bytes(b"first rip")
+
+    def discard_retry_output():
+        shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True, exist_ok=True)
+
+    def run_retry():
+        first.mkdir(parents=True, exist_ok=True)
+        (first / "01.flac").write_bytes(b"retry rip")
+
+    dirs, retry_kept = verify.redownload_with_staged_fallback(
+        [first],
+        discard_retry_output=discard_retry_output,
+        run_retry=run_retry,
+        collect_staged_dirs=lambda: [first])
+
+    assert dirs == [first]
+    assert retry_kept is False
+    assert sorted(p.name for p in first.iterdir()) == [
+        "01.flac", "02.flac", "03.flac"]
+    assert (first / "01.flac").read_bytes() == b"first rip"

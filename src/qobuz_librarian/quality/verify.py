@@ -3,8 +3,10 @@ import shutil
 import tempfile
 from pathlib import Path
 
+from qobuz_librarian import config as cfg
 from qobuz_librarian.library.catalog import read_album_dir
 from qobuz_librarian.quality.decision import album_max_quality
+from qobuz_librarian.ui_cli.logging import log
 
 
 def staged_track_qualities(staged_dirs):
@@ -58,9 +60,27 @@ def verify_and_recover(qobuz_album, staged_dirs, *, redownload_at_max,
     }
 
 
+def _staged_audio_count(dirs):
+    """Audio files across staged dirs — the completeness yardstick for
+    comparing the first rip against a retry."""
+    n = 0
+    for d in dirs:
+        p = Path(d)
+        try:
+            if p.is_dir():
+                n += sum(1 for f in p.rglob("*")
+                         if f.is_file() and f.suffix.lower() in cfg.AUDIO_EXTS)
+            elif p.is_file() and p.suffix.lower() in cfg.AUDIO_EXTS:
+                n += 1
+        except OSError:
+            continue
+    return n
+
+
 def redownload_with_staged_fallback(staged_dirs, *, discard_retry_output,
                                     run_retry, collect_staged_dirs):
-    """Retry without losing the first usable staged rip if retry lands nothing.
+    """Retry without losing the first usable staged rip if retry lands nothing
+    — or lands less of the album than the first rip did.
 
     Returns ``(staged_dirs, retry_kept)``.
     """
@@ -68,6 +88,7 @@ def redownload_with_staged_fallback(staged_dirs, *, discard_retry_output,
     if not originals:
         run_retry()
         return collect_staged_dirs(), True
+    first_rip_tracks = _staged_audio_count(originals)
 
     def restore(moved):
         restored = []
@@ -90,10 +111,21 @@ def redownload_with_staged_fallback(staged_dirs, *, discard_retry_output,
 
     with tempfile.TemporaryDirectory(prefix="qobuz-quality-retry-") as tmp:
         moved = []
-        for idx, original in enumerate(originals):
-            parked = Path(tmp) / str(idx)
-            shutil.move(str(original), str(parked))
-            moved.append((original, parked))
+        try:
+            for idx, original in enumerate(originals):
+                parked = Path(tmp) / str(idx)
+                shutil.move(str(original), str(parked))
+                moved.append((original, parked))
+        except BaseException:
+            # Parking itself failed (tmp full, permissions). Put back what was
+            # already parked — NOT via restore(): no retry ran, and its
+            # discard_retry_output diff would count the still-unparked
+            # originals as retry output and delete the only rip.
+            for original, parked in moved:
+                if parked.exists() and not original.exists():
+                    original.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(parked), str(original))
+            raise
         try:
             run_retry()
             fresh = collect_staged_dirs()
@@ -101,5 +133,11 @@ def redownload_with_staged_fallback(staged_dirs, *, discard_retry_output,
             restore(moved)
             raise
         if fresh:
-            return fresh, True
+            if _staged_audio_count(fresh) >= first_rip_tracks:
+                return fresh, True
+            # The max-tier retry landed fewer tracks than the first rip.
+            # Trading a complete album for a partial higher-quality one loses
+            # tracks the user already had — keep the first rip.
+            log.info("  Higher-quality retry came back with fewer tracks than "
+                     "the first rip; keeping the first rip.")
         return restore(moved), False
