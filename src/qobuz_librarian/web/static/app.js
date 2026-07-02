@@ -829,6 +829,11 @@
       }
       cont.dataset.reviewTotal = c.total;
       cont.dataset.reviewSelected = c.selected;
+      var master = cont.querySelector("[data-select-master]");
+      if (master) {
+        master.checked = tc.total > 0 && tc.selected >= tc.total;
+        master.indeterminate = tc.selected > 0 && tc.selected < tc.total;
+      }
       // A library review's tabs carry per-tab totals; keep the tab count
       // chips honest as hides and dismissals shrink the sets.
       if (c.missing_total !== undefined) {
@@ -1075,8 +1080,17 @@
         if (box) {
           box.querySelectorAll("details[data-artist]").forEach(function (d) { d.open = openAll; });
         }
+        // The one control flips between the two actions.
+        expBtn.setAttribute("data-expand-all", openAll ? "0" : "1");
+        expBtn.textContent = openAll ? "Collapse all" : "Expand all";
         return;
       }
+    });
+    cont.addEventListener("change", function (evt) {
+      var master = evt.target.closest && evt.target.closest("[data-select-master]");
+      if (!master) return;
+      var btn = cont.querySelector('[data-select-all="' + (master.checked ? "1" : "0") + '"]');
+      if (btn) btn.click();
     });
     if (dismissRest) {
       dismissRest.addEventListener("click", function () {

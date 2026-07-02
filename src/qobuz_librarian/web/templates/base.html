@@ -27,8 +27,6 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="Qobuz Librarian">
   <link rel="preload" href="/static/vendor/inter/inter-latin.woff2" as="font" type="font/woff2" crossorigin>
-  <link rel="preload" href="/static/vendor/plex-mono/ibm-plex-mono-400.ttf" as="font" type="font/ttf" crossorigin>
-  <link rel="preload" href="/static/vendor/fraunces/fraunces-latin-600.woff2" as="font" type="font/woff2" crossorigin>
   <link href="/static/dist/app.css?v={{ asset_version }}" rel="stylesheet">
   <script src="/static/vendor/htmx-2.0.4.min.js"></script>
   <script nonce="{{ request.state.csp_nonce }}">
@@ -66,7 +64,7 @@
     <aside class="ql-sidebar hidden lg:flex" aria-label="Primary navigation">
       <div class="ql-sidebar-top">
         <a href="/" class="ql-sidebar-brand">
-          <img src="/static/qobuz-librarian-mark.png" alt="" class="ql-brand-mark">
+          <img src="/static/qobuz-librarian-mark.png?v={{ asset_version }}" alt="" class="ql-brand-mark">
           <span>Qobuz Librarian</span>
         </a>
 
@@ -162,7 +160,7 @@
     <div class="ql-app-content">
       <header class="ql-mobilebar lg:hidden">
         <a href="/" class="ql-mobile-brand">
-          <img src="/static/qobuz-librarian-mark.png" alt="" class="ql-brand-mark">
+          <img src="/static/qobuz-librarian-mark.png?v={{ asset_version }}" alt="" class="ql-brand-mark">
           <span class="ql-brand-full">Qobuz Librarian</span>
           <span class="ql-brand-short hidden">Qobuz</span>
         </a>

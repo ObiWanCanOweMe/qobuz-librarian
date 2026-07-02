@@ -41,7 +41,7 @@ docker buildx build --platform linux/amd64 -t qobuz-librarian:dev .
 
 **Smoke test.** `scripts/smoke_test.sh` builds the image, boots the container, and checks the web routes respond and the bundled tools are present; no credentials needed (override the test port with `PORT=...`). It verifies that the release image starts and serves expected routes; it is not an end-to-end download test.
 
-**Logo.** `scripts/make_logo.py` regenerates `assets/logo.png`. It requires `Pillow`; run it outside the container.
+**Logo.** The logo artwork lives in `assets/` as `logo-dark.png` and `logo-light.png`; the README serves whichever matches the viewer's colour scheme.
 
 ## Behavioural changes
 

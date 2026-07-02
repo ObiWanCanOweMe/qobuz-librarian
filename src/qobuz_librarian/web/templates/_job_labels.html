@@ -12,7 +12,7 @@
   {%- elif job.execute_kind == 'migration' -%}
     Library migration
   {%- elif job.execute_kind == 'library' -%}
-    {{ job.title }}
+    Library scan
   {%- elif job.execute_kind == 'album' -%}
     Missing albums scan
   {%- else -%}
@@ -34,7 +34,7 @@
   {%- elif job.title == 'Gap-fill scan' or job.title == 'Gap Fill scan' -%}
     {{ n }} Gap Fill candidate{{ 's' if n != 1 }} found
   {%- elif job.execute_kind == 'library' -%}
-    {{ n }} missing album{{ 's' if n != 1 }} or Gap Fill candidate{{ 's' if n != 1 }} found
+    {{ n }} candidate{{ 's' if n != 1 }} found
   {%- elif job.execute_kind == 'album' -%}
     {{ n }} missing album{{ 's' if n != 1 }} found
   {%- else -%}
@@ -54,7 +54,7 @@
   {%- elif job.title == 'Gap-fill scan' or job.title == 'Gap Fill scan' -%}
     Gap Fill candidate
   {%- elif job.execute_kind == 'library' -%}
-    missing album or Gap Fill candidate
+    candidate
   {%- elif job.execute_kind in ('new_releases', 'album') -%}
     album
   {%- else -%}
@@ -74,7 +74,7 @@
   {%- elif job.title == 'Gap-fill scan' or job.title == 'Gap Fill scan' -%}
     Gap Fill candidates
   {%- elif job.execute_kind == 'library' -%}
-    missing albums or Gap Fill candidates
+    candidates
   {%- elif job.execute_kind in ('new_releases', 'album') -%}
     albums
   {%- else -%}
@@ -100,7 +100,7 @@
   {%- elif job.execute_kind == 'downsample' -%}
     Select albums to downsample
   {%- elif job.execute_kind == 'library' -%}
-    Select missing albums or Gap Fill candidates to {{ job.review_verb|lower }}
+    Select candidates to {{ job.review_verb|lower }}
   {%- else -%}
     Select albums to {{ job.review_verb|lower }}
   {%- endif -%}
@@ -118,7 +118,7 @@
   {%- elif job.title == 'Gap-fill scan' or job.title == 'Gap Fill scan' -%}
     Gap Fill candidate
   {%- elif job.execute_kind == 'library' -%}
-    missing album or Gap Fill candidate
+    candidate
   {%- else -%}
     album
   {%- endif -%}
@@ -136,7 +136,7 @@
   {%- elif job.title == 'Gap-fill scan' or job.title == 'Gap Fill scan' -%}
     Gap Fill candidates
   {%- elif job.execute_kind == 'library' -%}
-    missing albums or Gap Fill candidates
+    candidates
   {%- else -%}
     albums
   {%- endif -%}

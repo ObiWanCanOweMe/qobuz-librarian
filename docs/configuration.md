@@ -34,7 +34,7 @@ These settings apply to new jobs. Lower-level options stay in `.env` or `compose
 | `LYRICS_FORMAT` | `embed` | `embed` (FLAC tag), `sidecar` (.lrc), or `both` |
 | `LYRICS_PROVIDERS` | `Lrclib,NetEase,Musixmatch` | Ordered comma list |
 | `ARTWORK` | `sidecar` | Cover art: `sidecar`, `embed`, or `both` |
-| `AUTO_LIBRARY_SCAN` | `true` | Offer the one-time baseline scan on the dashboard on first run (`false` hides the offer entirely) |
+| `AUTO_LIBRARY_SCAN` | `true` | Offer the one-time baseline scan on the Search page on first run (`false` hides the offer entirely) |
 | `NEW_RELEASE_CHECK_INTERVAL` | `86400` | How often (seconds) to auto-check for new releases; daily (also on Settings) |
 | `ARTIST_CATALOG_CACHE_TTL` | `604800` | How long (seconds) artist album-lists stay cached; 7 days |
 | `REPAIR_CACHE_ENABLED` | `true` | Cache the repair scan's Qobuz ISRC lookups (files are still decode-tested fresh every scan) |
@@ -126,7 +126,7 @@ sudo chown -R 1000:1000 ./music ./staging ./upgrade_backups
 
 ## What the app does on its own
 
-On first run the dashboard *offers* a one-time baseline scan (`AUTO_LIBRARY_SCAN`) rather than starting it for you. Once that baseline exists, periodic new-release checks (`NEW_RELEASE_CHECK_INTERVAL`) run on their own, read-only. Both park a review list; nothing is downloaded or changed until you act on it.
+On first run the Search page *offers* a one-time baseline scan (`AUTO_LIBRARY_SCAN`) rather than starting it for you. Once that baseline exists, periodic new-release checks (`NEW_RELEASE_CHECK_INTERVAL`) run on their own, read-only. Both park a review list; nothing is downloaded or changed until you act on it.
 
 - **Library gap-fill** can add missing albums or missing tracks after review; it does not overwrite existing tracks.
 - **After a download**, it re-checks the new album's track lengths against Qobuz and flags **Repair** if one is short. Read-only (a clean truncation can still decode).

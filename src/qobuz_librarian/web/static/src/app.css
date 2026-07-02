@@ -405,22 +405,27 @@ h1, h2, h3 {
 
 /* Bottom navigation on phones and tablets. */
 .ql-tabbar {
-  position: fixed;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  z-index: 40;
-  display: grid;
-  grid-template-columns: repeat(5, 1fr);
-  border-top: 1px solid var(--ql-line-soft);
-  background: color-mix(in oklab, var(--ql-bg) 97%, #000);
-  padding: 0.375rem 0.375rem calc(0.5rem + env(safe-area-inset-bottom));
+  display: none;
+}
+@media (max-width: 1023.98px) {
+  .ql-tabbar {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 40;
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    border-top: 1px solid var(--ql-line-soft);
+    background: color-mix(in oklab, var(--ql-bg) 97%, #000);
+    padding: 0.375rem 0.375rem calc(0.5rem + env(safe-area-inset-bottom));
+  }
 }
 [data-theme="winter"] .ql-tabbar {
   background: #efe6d4;
   border-top-color: var(--ql-line);
 }
-.ql-tab {
+.ql-tabbar .ql-tab {
   position: relative;
   display: flex;
   flex-direction: column;
@@ -434,20 +439,20 @@ h1, h2, h3 {
   line-height: 1;
   cursor: pointer;
 }
-.ql-tab svg {
+.ql-tabbar .ql-tab svg {
   width: 1.35rem;
   height: 1.35rem;
 }
-.ql-tab.is-active {
+.ql-tabbar .ql-tab.is-active {
   color: var(--ql-gold);
 }
-[data-theme="night"] .ql-tab.is-active {
+[data-theme="night"] .ql-tabbar .ql-tab.is-active {
   text-shadow: 0 0 14px color-mix(in oklab, var(--ql-gold) 45%, transparent);
 }
-[data-theme="winter"] .ql-tab.is-active {
+[data-theme="winter"] .ql-tabbar .ql-tab.is-active {
   color: var(--ql-gold-strong);
 }
-.ql-tab-dot {
+.ql-tabbar .ql-tab-dot {
   position: absolute;
   top: 0.2rem;
   left: calc(50% + 0.55rem);
@@ -457,7 +462,7 @@ h1, h2, h3 {
   background: var(--ql-gold);
   box-shadow: 0 0 8px color-mix(in oklab, var(--ql-gold) 60%, transparent);
 }
-.ql-tab-count {
+.ql-tabbar .ql-tab-count {
   position: absolute;
   top: 0;
   left: calc(50% + 0.4rem);
@@ -472,7 +477,7 @@ h1, h2, h3 {
   text-align: center;
   padding-inline: 0.22rem;
 }
-.ql-tab-count.is-warning {
+.ql-tabbar .ql-tab-count.is-warning {
   background: var(--ql-warning);
 }
 .ql-tab-more {
@@ -3464,6 +3469,19 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
 }
 
 /* Focused maintenance tools, used where a page has one primary action. */
+.ql-tool-page--wide {
+  width: min(100%, 70rem) !important;
+}
+.ql-review-master {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--ql-text-2);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  cursor: pointer;
+  user-select: none;
+}
 .ql-tool-page {
   display: grid;
   width: min(100%, 56rem);

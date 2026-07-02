@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="assets/logo.png" alt="Qobuz Librarian" width="520">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.png">
+    <img src="assets/logo-light.png" alt="Qobuz Librarian" width="520">
+  </picture>
 </p>
 
 <p align="center"><em>Build and maintain a complete, lossless library from Qobuz.</em></p>
@@ -11,16 +14,17 @@
   <img src="https://img.shields.io/badge/python-3.12+-blue.svg" alt="Python 3.12+">
 </p>
 
-Qobuz Librarian searches Qobuz for artists, albums, and tracks, downloads what you choose, and imports it with [beets](https://beets.io/). It also scans your local library for missing albums, track gaps, quality upgrades, damaged files, and missing lyrics.
+Qobuz Librarian searches Qobuz for artists, albums, and tracks, downloads what you choose, and imports it with [beets](https://beets.io/). It also scans your local library for missing albums, albums missing tracks, quality upgrades, damaged files, and missing lyrics.
 
 <p align="center">
-  <img src="assets/screenshot-dashboard.png" alt="Web UI dashboard" width="800">
+  <img src="assets/screenshot-search.png" alt="Search results in the web UI" width="800">
 </p>
 
 ## Features
 
-- **Library gap-fill.** Run a Library scan to find missing albums from artists already in your library and track gaps in albums you own. Download only what you choose. Matching is edition-aware, so remasters and deluxe versions are not re-downloaded as duplicates. When an album is already in your library, search folds other pressings under **other versions**; pick **Download** to keep a remaster or deluxe alongside it.
+- **Missing albums and Gap Fill.** Run a Library scan to find missing albums from artists already in your library, plus albums you own that are missing tracks (Gap Fill). Download only what you choose. Matching is edition-aware, so remasters and deluxe versions are not re-downloaded as duplicates. When an album is already in your library, search folds other pressings under **other versions**; pick **Download** to keep a remaster or deluxe alongside it.
 - **Single tracks.** Switch search to **Track** to download an individual track. By default this does not hide the rest of the album from future gap scans; there is a setting if you want single-track downloads treated as deliberate singles.
+- **Verified quality.** Every download is checked against the actual FLACs Qobuz served. If they come in below what your quality setting implies, the app retries once from the higher source; anything it cannot resolve is flagged in History instead of slipping into your library silently.
 - **Quality upgrades.** The Library refresh finds albums Qobuz can now serve at higher quality. Review and queue them from **Upgrade**, or set `UPGRADE_SCAN_ENABLED=false` to hide Upgrade and skip that pass entirely.
 - **Downsample.** Convert hi-res FLACs to 44.1 / 48 kHz FLAC to reclaim space. Run it on demand, or apply it automatically to new downloads.
 - **New releases.** A periodic pass lists new albums by artists in your library for review and leaves them un-ticked so they cannot all be queued by accident.
@@ -37,14 +41,14 @@ Most scan modes work the same way: **scan → review → act.** A scan runs in t
 
 | Page | What it does |
 |---|---|
-| **Dashboard search** | Find artists, albums, or tracks and download from the results |
-| **Library** | Find missing albums and track gaps, then check for new releases |
+| **Search** | Find artists, albums, or tracks and download from the results |
+| **Library** | Find missing albums and Gap Fill candidates, then check for new releases |
 | **Upgrade** | Re-rip albums Qobuz can now serve at higher quality |
 | **Downsample** | Bring hi-res files down to 44.1 / 48 kHz (local, no login) |
 | **Repair** | Refill truncated or partial FLACs (ISRC-verified) |
 | **Lyrics** | Fetch lyrics for tracks missing them (local, no login) |
 | **Migrate** | Reorganise an existing library into the folder structure `Artist/Album (Year)` (copies by default; optional move mode) |
-| **Queue** | Live progress and reviews awaiting approval |
+| **Queue / History** | Running and waiting work, plus a record of finished jobs |
 | **Settings** | Qobuz credentials, behaviour toggles, paths, and diagnostics |
 
 By default, new downloads use tier 4: the best quality Qobuz serves for the release (24-bit up to 192 kHz, down to CD lossless). Change the tier on **Settings** or with `STREAMRIP_QUALITY`; see [Configuration](docs/configuration.md#download-quality).
@@ -60,7 +64,7 @@ cp .env.example .env
 docker compose up -d
 ```
 
-Then open <http://localhost:8666>. The first visit sets a web username and password; sign in, paste your Qobuz token on **Settings** (see below), and search for an artist, album, or track. After you connect, the dashboard offers a one-time baseline scan to learn what is already in your library; run it or skip it.
+Then open <http://localhost:8666>. The first visit sets a web username and password; sign in, paste your Qobuz token on **Settings** (see below), and search for an artist, album, or track. After you connect, the Search page offers a one-time baseline scan to learn what is already in your library; run it or skip it.
 
 > **Point `QL_MUSIC_DIR` at a dedicated music library**, not your home folder or a drive with other files mixed in. The app moves and merges files within that tree, and Upgrade replaces files in place.
 

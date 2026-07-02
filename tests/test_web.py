@@ -1803,7 +1803,7 @@ def test_queue_job_actions_use_clear_labels(client):
         assert ">Clear queue and reviews</button>" in r.text
         assert "Queued jobs are removed, reviews are discarded" in r.text
         assert "Starts automatically after the current job finishes." in r.text
-        assert "1 missing album or Gap Fill candidate found." in r.text
+        assert "1 candidate found." in r.text
         assert "1 album can be downsampled." in r.text
         assert "Migration preview ready." in r.text
         assert "hi-res album to review" not in r.text
@@ -2192,7 +2192,7 @@ def test_review_zero_selection_has_clear_disabled_action(client):
     try:
         r = client.get(f"/jobs/{job.id}")
         assert r.status_code == 200
-        assert "Select missing albums or Gap Fill candidates to download" in r.text
+        assert "Select candidates to download" in r.text
         assert "Download 1 selected" not in r.text
     finally:
         _remove_job(job)

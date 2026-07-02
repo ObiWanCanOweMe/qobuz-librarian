@@ -1488,7 +1488,7 @@ def _start_library_scan(partial_only=False, force_full=False):
         if existing is not None:
             return existing
         from qobuz_librarian.web import flows
-        title = "Gap Fill scan" if partial_only else "Missing-albums scan"
+        title = "Gap Fill scan" if partial_only else "Library scan"
         job = job_mgr.Job(title=title)
         job.execute_kind = "library"
         job_mgr.submit_scan(
