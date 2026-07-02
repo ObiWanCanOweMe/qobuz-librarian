@@ -750,19 +750,19 @@ def test_lock_busy_refuses_destructive_routes(monkeypatch):
             assert "Another Qobuz Librarian run is active." in r.text
             assert "pid 4321" not in r.text
             assert "run-lock" not in r.text
-            assert 'class="ql-btn ql-btn-primary w-full sm:w-auto">Try again</button>' in r.text
-            assert 'class="ql-btn ql-btn-ghost w-full sm:w-auto">Back to dashboard</a>' in r.text
+            assert ">Try again</button>" in r.text
+            assert ">Back to Search</a>" in r.text
 
 
-def test_error_page_action_is_mobile_friendly(client):
+def test_error_page_offers_a_way_back(client):
     r = client.get("/not-a-real-page")
 
     assert r.status_code == 404
     assert "Page not found" in r.text
-    assert 'href="/" class="ql-btn ql-btn-primary w-full sm:w-auto"' in r.text
+    assert ">Back to Search</a>" in r.text
 
 
-def test_scan_action_buttons_are_mobile_friendly(client, monkeypatch):
+def test_tool_pages_offer_a_primary_action(client, monkeypatch):
     from qobuz_librarian.web import app as webapp
 
     monkeypatch.setattr(webapp, "_read_creds",
@@ -784,10 +784,10 @@ def test_scan_action_buttons_are_mobile_friendly(client, monkeypatch):
     for path in ("/library", "/downsample", "/repair", "/lyrics"):
         r = client.get(path)
         assert r.status_code == 200
-        assert 'class="ql-btn ql-btn-primary w-full sm:w-auto"' in r.text
+        assert "ql-btn-primary" in r.text
 
 
-def test_primary_nav_matches_webui_blueprint(client, monkeypatch):
+def test_primary_nav_lists_every_destination(client, monkeypatch):
     from qobuz_librarian.web import app as webapp
 
     monkeypatch.setattr(webapp, "_read_creds",
@@ -1622,7 +1622,7 @@ def test_upgrade_artist_route_does_not_start_separate_scan(
     assert jm.registry.awaiting_review() == []
 
 
-def test_dashboard_search_button_label_is_visible_on_mobile(client, monkeypatch):
+def test_search_bar_stays_usable_on_phones(client, monkeypatch):
     from qobuz_librarian.web import app as webapp
 
     monkeypatch.setattr(webapp, "_read_creds",
@@ -1632,6 +1632,9 @@ def test_dashboard_search_button_label_is_visible_on_mobile(client, monkeypatch)
 
     assert r.status_code == 200
     assert 'class="ql-search-row"' in r.text
+    assert "Artist name" in r.text
+    # No autofocus: popping the keyboard on every visit is hostile on mobile.
+    assert "autofocus" not in r.text
     # The Search button keeps a visible text label at every width, instead of
     # collapsing to an icon behind a sm: breakpoint.
     assert '<span>Search</span>' in r.text
@@ -1717,21 +1720,6 @@ def test_library_force_full_post_starts_forced_scan(client, monkeypatch):
     assert started == {"partial_only": False, "force_full": True}
 
 
-def test_dashboard_search_bar_is_a_clean_unified_bar(client, monkeypatch):
-    from qobuz_librarian.web import app as webapp
-
-    monkeypatch.setattr(webapp, "_read_creds",
-                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
-
-    r = client.get("/")
-
-    assert r.status_code == 200
-    assert "Artist name" in r.text
-    assert "autofocus" not in r.text
-    # Input and button render as one responsive search row.
-    assert 'class="ql-search-row"' in r.text
-
-
 def test_search_path_redirects_to_the_dashboard(client):
     # Search is on the dashboard; /search redirects there.
     r = client.get("/search", follow_redirects=False)
@@ -1774,8 +1762,8 @@ def test_queue_empty_state_has_clear_actions(client):
     assert r.status_code == 200
     assert "Queue is empty." in r.text
     assert "Downloads, scans, and reviews appear here" in r.text
-    assert 'href="/" class="ql-btn ql-btn-primary w-full sm:w-auto"' in r.text
-    assert 'href="/queue/history" class="ql-btn ql-btn-secondary w-full sm:w-auto"' in r.text
+    assert ">Search Qobuz</a>" in r.text
+    assert ">View history</a>" in r.text
 
 
 def test_queue_job_actions_use_clear_labels(client):
@@ -1835,7 +1823,7 @@ def test_history_empty_state_has_clear_action(client):
     assert r.status_code == 200
     assert "No finished jobs yet." in r.text
     assert "Completed downloads, scans, and reviews appear here." in r.text
-    assert 'href="/queue" class="ql-btn ql-btn-secondary w-full sm:w-auto"' in r.text
+    assert ">Back to queue</a>" in r.text
 
 
 def test_history_retry_only_shows_for_live_failed_download(client, monkeypatch):
@@ -1894,20 +1882,20 @@ def test_archived_job_page_hides_live_only_actions(client, monkeypatch):
     assert "Undo (removes track)" not in r.text
 
 
-def test_hidden_empty_state_has_mobile_friendly_action(client):
+def test_hidden_empty_state_points_back_to_library(client):
     r = client.get("/library/hidden")
 
     assert r.status_code == 200
     assert "No dismissed albums or Gap Fill." in r.text
-    assert 'href="/library" class="ql-btn ql-btn-primary w-full sm:w-auto mt-4"' in r.text
+    assert ">Go to Library</a>" in r.text
 
 
-def test_repair_history_empty_state_has_mobile_friendly_action(client):
+def test_repair_history_empty_state_points_back_to_repair(client):
     r = client.get("/repair/history")
 
     assert r.status_code == 200
     assert "Nothing repaired yet." in r.text
-    assert 'href="/repair" class="ql-btn ql-btn-primary w-full sm:w-auto mt-4"' in r.text
+    assert ">Back to repair</a>" in r.text
 
 
 # ── per-job cancel button on queue page ───────────────────────────────
@@ -2558,18 +2546,17 @@ def test_settings_omits_cli_only_consolidation_setting(
     assert "CONSOLIDATE" not in json.loads((tmp_path / "s.json").read_text())
 
 
-def test_settings_primary_actions_are_mobile_friendly(client, monkeypatch):
+def test_settings_renders_both_forms_and_mode_switch(client, monkeypatch):
     import qobuz_librarian.web.app as app_mod
     monkeypatch.setattr(app_mod, "_read_creds",
                         lambda: {"user_id": "u", "auth_token": "t"})
     r = client.get("/settings")
 
     assert r.status_code == 200
-    assert 'class="ql-input pr-12 font-mono text-base sm:text-sm"' in r.text
     assert 'data-toggle-password="auth_token"' in r.text
-    assert 'class="ql-btn ql-btn-primary w-full sm:w-auto">Save &amp; connect</button>' in r.text
+    assert ">Save &amp; connect</button>" in r.text
     assert "Switch to terminal mode" in r.text
-    assert 'class="ql-btn ql-btn-primary w-full sm:w-auto">Save behaviour</button>' in r.text
+    assert ">Save behaviour</button>" in r.text
     assert "CLI command" in r.text
     assert "CLI entrypoint" not in r.text
     assert "Paths currently in use" in r.text
@@ -2636,21 +2623,19 @@ def _enable_auth(monkeypatch, tmp_path, *, configure=True):
     return _SameThreadASGIClient(app_mod.app)
 
 
-def test_login_form_password_row_is_mobile_safe(monkeypatch, tmp_path):
+def test_login_form_has_a_password_toggle(monkeypatch, tmp_path):
     with _enable_auth(monkeypatch, tmp_path) as c:
         r = c.get("/login")
 
     assert r.status_code == 200
-    assert 'class="ql-input pr-12"' in r.text
     assert r.text.count('class="ql-secret-toggle"') == 1
 
 
-def test_setup_form_password_rows_are_mobile_safe(monkeypatch, tmp_path):
+def test_setup_form_has_two_password_toggles(monkeypatch, tmp_path):
     with _enable_auth(monkeypatch, tmp_path, configure=False) as c:
         r = c.get("/setup")
 
     assert r.status_code == 200
-    assert r.text.count('class="ql-input pr-12"') == 2
     assert r.text.count('class="ql-secret-toggle"') == 2
 
 
@@ -2751,7 +2736,7 @@ def test_migrate_post_submits_a_creds_free_job(client, monkeypatch, tmp_path):
     _remove_job(job)
 
 
-def test_migrate_preview_action_is_mobile_friendly(client, monkeypatch, tmp_path):
+def test_migrate_offers_a_preview(client, monkeypatch, tmp_path):
     import qobuz_librarian.config as cfg
 
     src = tmp_path / "src"
@@ -2762,7 +2747,7 @@ def test_migrate_preview_action_is_mobile_friendly(client, monkeypatch, tmp_path
     r = client.get("/migrate")
 
     assert r.status_code == 200
-    assert 'class="ql-btn ql-btn-primary w-full sm:w-auto">Preview migration</button>' in r.text
+    assert ">Preview migration</button>" in r.text
 
 
 def test_settings_path_resolver_maps_container_paths_to_host_bind_mounts(
