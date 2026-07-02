@@ -38,7 +38,7 @@ All notable changes to Qobuz Librarian are recorded here, newest first. The proj
 
 **Internals**
 
-- beets 2.12, htmx 2.0.4, and refreshed dependency locks; slimmer logo, icon, and font assets (the mono font ships as WOFF2).
+- The image runs on Python 3.14; beets 2.12, htmx 2.0.4, and refreshed dependency locks; slimmer logo, icon, and font assets (the mono font ships as WOFF2).
 
 ## [0.9.4] - 2026-06-25
 
