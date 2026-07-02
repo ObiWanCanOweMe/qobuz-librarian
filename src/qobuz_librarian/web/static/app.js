@@ -5,6 +5,15 @@
   var REDUCE = window.matchMedia
     && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
+  // This tab's id, sent on review mutations so the server's review-changed
+  // nudge can name where a change came from. The tab that made the change
+  // skips the reload (its DOM is already current from the action's own
+  // response) — reloading it too replaced the page mid-interaction and ate
+  // the next tick of anyone working quickly down a review list.
+  var TAB_ID = Math.random().toString(36).slice(2, 10)
+    + Date.now().toString(36);
+  window.qlTabId = TAB_ID;
+
   // Animate removals without layout jumps.
   function collapse(el, done) {
     if (!el || el.dataset.qlCollapsing === "1") return;
@@ -861,6 +870,7 @@
         headers: {
           "Content-Type": "application/x-www-form-urlencoded",
           "X-CSRF-Token": csrf(),
+          "X-QL-Origin": TAB_ID,
         },
         body: body,
       });
@@ -1160,7 +1170,11 @@
       if (e.detail && e.detail.target && e.detail.target.id === "job-content") shutReview();
     }
     document.addEventListener("htmx:beforeSwap", onReviewSwap);
-    rsrc.addEventListener("review", function () {
+    rsrc.addEventListener("review", function (e) {
+      // Our own change echoing back — the DOM and counts are already current
+      // from the action's response, and reloading now would swap the page out
+      // from under the user's next click.
+      if ((e.data || "") === TAB_ID) return;
       loadPage(curPage(), curQuery());
       post("/jobs/" + id + "/select", "cid=&checked=0")  // no-op tick → returns counts
         .then(function (r) { return r.ok ? r.json() : null; })

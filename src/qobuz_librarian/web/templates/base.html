@@ -30,10 +30,13 @@
   <link href="/static/dist/app.css?v={{ asset_version }}" rel="stylesheet">
   <script src="/static/vendor/htmx-2.0.4.min.js"></script>
   <script nonce="{{ request.state.csp_nonce }}">
-    // Attach the CSRF token to htmx requests.
+    // Attach the CSRF token (and this tab's id, so review-changed nudges can
+    // name their origin) to htmx requests. app.js mints the id; it has loaded
+    // by the time any request fires.
     document.addEventListener('htmx:configRequest', function(evt) {
       var m = document.querySelector('meta[name="csrf-token"]');
       if (m) evt.detail.headers['X-CSRF-Token'] = m.content;
+      if (window.qlTabId) evt.detail.headers['X-QL-Origin'] = window.qlTabId;
     });
   </script>
   <script src="/static/app.js?v={{ asset_version }}"></script>

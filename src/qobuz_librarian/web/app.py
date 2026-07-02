@@ -3194,6 +3194,18 @@ def _paginate_groups(groups, page):
     return groups[start:start + REVIEW_PAGE_ARTISTS], page, n_pages
 
 
+def _review_origin(request) -> str:
+    """The requesting tab's self-assigned id, for review-changed fan-outs.
+
+    app.js mints one per page load and sends it on every review mutation, so
+    the SSE nudge can name where a change came from and the originating tab can
+    skip reloading itself (its DOM is already current — reloading would swallow
+    the user's next tick mid-swap). Clamped to a token-safe alphabet so a forged
+    header can't smuggle SSE framing into the stream."""
+    raw = request.headers.get("X-QL-Origin", "")
+    return "".join(c for c in raw if c.isalnum())[:32]
+
+
 def _get_reviewable_job(job_id):
     """A job from the live registry, or rehydrated from disk if it has been
     evicted — so a restored/archived awaiting-review job's selection and pager
@@ -3262,7 +3274,7 @@ async def job_select(request: Request, job_id: str):
         # loop so a single checkbox tick doesn't stall every other request.
         await asyncio.get_running_loop().run_in_executor(
             None, job_persistence.persist, job)
-        job.notify_review_changed()
+        job.notify_review_changed(_review_origin(request))
     return JSONResponse(_selection_payload(job))
 
 
@@ -3291,7 +3303,7 @@ async def job_select_all(request: Request, job_id: str):
     if job.set_all_selected(on, cids=cids):
         await asyncio.get_running_loop().run_in_executor(
             None, job_persistence.persist, job)
-        job.notify_review_changed()
+        job.notify_review_changed(_review_origin(request))
     return JSONResponse(_selection_payload(job))
 
 
@@ -3330,7 +3342,9 @@ async def job_hide(request: Request, job_id: str):
         n = flows.dismiss_albums(job, artist, scope=_hide_scope(job.execute_kind),
                                  gap_only=gap_only)
         if n:
-            job.notify_review_changed()  # keep other open tabs in sync
+            # Keep other open tabs in sync; the originator already gets the
+            # swapped group + fresh counts from this response.
+            job.notify_review_changed(_review_origin(request))
         # Dismissing the last album completes the review — drop AWAITING_REVIEW so
         # the dashboard "new releases" banner clears and this page stops showing an
         # empty "awaiting review". HX-Refresh reloads to the finished view.
@@ -3400,7 +3414,7 @@ async def job_dismiss_rest(request: Request, job_id: str):
                                                gap_only=gap_only)
                           for a in artists))
     if hidden_count:
-        job.notify_review_changed()
+        job.notify_review_changed(_review_origin(request))
     payload = _selection_payload(job)
     payload["hidden"] = hidden_count
     payload["review_done"] = job_mgr.finalize_review_if_empty(job)
@@ -4184,7 +4198,7 @@ async def job_stream(job_id: str):
                         yield ("event: progress\ndata: "
                                + line[len(job_mgr.PROGRESS_PREFIX):] + "\n\n")
                         continue
-                    if line == job_mgr.REVIEW_CHANGED:
+                    if line.startswith(job_mgr.REVIEW_CHANGED):
                         continue  # review-sync nudge — handled by the review stream
                     escaped = line.replace("\n", " ").replace("\r", "")
                     yield f"data: {escaped}\n\n"
@@ -4238,8 +4252,12 @@ async def job_review_stream(job_id: str):
                 try:
                     line = await loop.run_in_executor(
                         _SSE_EXECUTOR, lambda: sub.get(timeout=0.5))
-                    if line == job_mgr.REVIEW_CHANGED:
-                        yield "event: review\ndata: changed\n\n"
+                    if line.startswith(job_mgr.REVIEW_CHANGED):
+                        # The data names the originating tab (or "changed" for a
+                        # server-side sync) so that tab can skip reloading a DOM
+                        # its own action already brought up to date.
+                        origin = line[len(job_mgr.REVIEW_CHANGED):]
+                        yield f"event: review\ndata: {origin or 'changed'}\n\n"
                     # All other fanned-out lines (log/progress/end) are ignored
                     # here — this channel only carries review-sync nudges.
                 except _queue.Empty:

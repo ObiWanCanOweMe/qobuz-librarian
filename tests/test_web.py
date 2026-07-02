@@ -698,6 +698,24 @@ def test_settings_save_defers_apply_when_job_is_active(tmp_path, monkeypatch):
     assert cfg.DOWNSAMPLE_HIRES_ENABLED is True  # idempotent
 
 
+def test_review_changed_nudge_names_its_origin():
+    """The review-sync fan-out carries the originating tab's id, so that tab
+    can skip reloading a page its own action already updated — reloading the
+    originator swapped the DOM mid-interaction and ate rapid ticks."""
+    from qobuz_librarian.web import jobs as job_mgr
+
+    job = job_mgr.Job(title="t")
+    sub = job.subscribe()
+    try:
+        job.notify_review_changed("tab42")
+        line = sub.get(timeout=1)
+        assert line == job_mgr.REVIEW_CHANGED + "tab42"
+        job.notify_review_changed()
+        assert sub.get(timeout=1) == job_mgr.REVIEW_CHANGED
+    finally:
+        job.unsubscribe(sub)
+
+
 # ── CSRF middleware ───────────────────────────────────────────────────────────
 
 def test_csrf_post_without_token_is_rejected():

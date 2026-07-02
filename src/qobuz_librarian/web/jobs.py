@@ -283,13 +283,17 @@ class Job:
             payload["hit"] = hit
         self._fan_out(PROGRESS_PREFIX + json.dumps(payload))
 
-    def notify_review_changed(self):
+    def notify_review_changed(self, origin: str = ""):
         """Tell every open review tab that selection/candidates changed, so a
         second tab (or phone) reflects a tick/untick/hide without a manual
         reload. Fanned out as a distinct event the SSE layer maps to
-        `event: review`; carries nothing but a nudge — the tab re-fetches the
-        authoritative counts itself."""
-        self._fan_out(REVIEW_CHANGED)
+        `event: review`, carrying the originating tab's id (when the change came
+        from a tab at all) so that tab can skip the reload — its DOM is already
+        current from the action's own response, and reloading it anyway would
+        replace the page mid-interaction and eat the next tick of someone
+        working quickly down a list. Other tabs still re-fetch the
+        authoritative counts themselves."""
+        self._fan_out(REVIEW_CHANGED + origin)
 
     def _progress_snapshot(self) -> str:
         snap = {
