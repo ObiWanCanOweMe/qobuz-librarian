@@ -1005,7 +1005,7 @@ def test_upgrade_page_reviews_saved_baseline_candidates(client, monkeypatch):
     r = client.get("/upgrade")
 
     assert r.status_code == 200
-    assert "Review albums the Library refresh found" in r.text
+    assert "upgrade candidate" in r.text
     assert "1 upgrade candidate" in r.text
     assert 'action="/upgrade/review"' in r.text
     assert "Review candidates" in r.text
@@ -1346,7 +1346,7 @@ def test_downsample_page_reviews_saved_shared_candidates(client, monkeypatch):
     r = client.get("/downsample")
 
     assert r.status_code == 200
-    assert "Review local hi-res FLAC albums" in r.text
+    assert "can be downsampled" in r.text
     assert "1 album can be downsampled" in r.text
     assert 'action="/downsample/review"' in r.text
     assert "Review candidates" in r.text

@@ -33,26 +33,26 @@
 }
 
 [data-theme="winter"] {
-  --ql-bg: #f7f1e7;
-  --ql-bg-2: #eee3d2;
-  --ql-surface: #fffaf1;
-  --ql-surface-2: #f4e8d5;
-  --ql-surface-hover: #ead9bf;
-  --ql-line: #d3bd9a;
-  --ql-line-soft: #e4d2b6;
-  --ql-text: #261d12;
-  --ql-text-2: #6b5a43;
-  --ql-text-3: #927d5f;
-  --ql-gold: #b9791f;
-  --ql-gold-strong: #955f16;
-  --ql-gold-ink: #fff7e8;
+  --ql-bg: #f3ecdf;
+  --ql-bg-2: #ece2cf;
+  --ql-surface: #fbf7ee;
+  --ql-surface-2: #f1e7d3;
+  --ql-surface-hover: #e9dcc4;
+  --ql-line: rgba(146, 94, 20, 0.24);
+  --ql-line-soft: rgba(146, 94, 20, 0.13);
+  --ql-text: #2b2013;
+  --ql-text-2: #6d5a41;
+  --ql-text-3: #94805f;
+  --ql-gold: #b97e1e;
+  --ql-gold-strong: #a86b12;
+  --ql-gold-ink: #fff8e9;
   --ql-gold-dim: #ead8b4;
-  --ql-owned: #667d32;
+  --ql-owned: #64803a;
   --ql-danger: #b84935;
-  --ql-warning: #b77b21;
+  --ql-warning: #a8741a;
   --ql-info: #5e7f8d;
-  --ql-shadow: 0 12px 22px -18px rgb(64 42 15 / 0.34);
-  --ql-shadow-soft: 0 8px 18px -16px rgb(64 42 15 / 0.24);
+  --ql-shadow: 0 14px 30px -20px rgb(84 56 15 / 0.4);
+  --ql-shadow-soft: 0 8px 18px -14px rgb(84 56 15 / 0.28);
 
   --color-base-100: var(--ql-bg);
   --color-base-200: var(--ql-surface);
@@ -111,6 +111,17 @@
 .ql-btn-primary:hover:not(:disabled):not(.is-disabled) {
   border-color: rgba(0, 0, 0, 0.3);
   background: linear-gradient(180deg, #f8cd85 0%, #ecb45c 45%, var(--ql-gold-strong) 100%);
+}
+
+[data-theme="winter"] .ql-btn-primary {
+  background: linear-gradient(180deg, #d59a3a 0%, #bc7f1c 55%, #a86b12 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.3), inset 0 -1px 0 rgba(0, 0, 0, 0.16), 0 6px 18px -8px rgba(168, 107, 18, 0.5);
+  color: #fff8e9;
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.2);
+}
+
+[data-theme="winter"] .ql-btn-primary:hover:not(:disabled):not(.is-disabled) {
+  background: linear-gradient(180deg, #dda748 0%, #c78a24 55%, #b2761a 100%);
 }
 
 /* A disabled primary drops the brass entirely — dimmed gold still reads as

@@ -15,12 +15,6 @@
 <header class="ql-page-header ql-page-header--actions">
   <div>
     <h1>{{ heading }}</h1>
-    <p>
-      {% if is_upgrade %}Upgrades you've dismissed. A higher-quality Qobuz copy won't be suggested for these again.
-      {% elif is_downsample %}Albums kept in hi-res will not be suggested for downsampling again.
-      {% else %}Missing albums and Gap Fill candidates you've dismissed. They won't be suggested again.{% endif %}
-      Nothing here is deleted; restore an entry to bring it back.
-    </p>
   </div>
   {% if groups %}
   <a href="{{ back_url }}" class="ql-btn ql-btn-secondary ql-btn-sm w-full sm:w-auto">Back to {{ back_label }}</a>

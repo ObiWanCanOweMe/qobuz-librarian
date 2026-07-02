@@ -297,6 +297,18 @@ h1, h2, h3 {
   border-radius: 0 3px 3px 0;
   background: var(--ql-gold);
 }
+[data-theme="winter"] .ql-nav-link.is-active {
+  background: linear-gradient(180deg, #d59a3a 0%, #bc7f1c 55%, #a86b12 100%);
+  color: #fff8e9;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.28),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.14),
+    0 4px 14px -6px rgba(168, 107, 18, 0.5);
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.18);
+}
+[data-theme="winter"] .ql-nav-link.is-active::before {
+  background: #a86b12;
+}
 .ql-nav-link svg,
 .ql-sidebar-action svg,
 .ql-icon-button svg,
@@ -2557,6 +2569,15 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
   box-shadow: 0 0 10px color-mix(in oklab, var(--ql-gold) 50%, transparent);
   transition: width 400ms ease;
 }
+[data-theme="winter"] .ql-progress i {
+  background: linear-gradient(90deg, #a86b12, #d59a3a);
+  box-shadow: none;
+}
+[data-theme="winter"] .ql-search-submit {
+  background: linear-gradient(180deg, #d59a3a 0%, #bc7f1c 55%, #a86b12 100%);
+  color: #fff8e9;
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.2);
+}
 .ql-activity-row + .ql-activity-row {
   border-top: 1px solid var(--ql-line-soft);
 }
@@ -2783,11 +2804,14 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
   gap: 0.75rem;
 }
 .ql-auth-logo {
-  width: 2.25rem;
-  height: 2.25rem;
+  width: 2.4rem;
+  height: 2.4rem;
   flex: none;
-  border-radius: 0.375rem;
   object-fit: contain;
+  object-position: top;
+}
+[data-theme="night"] .ql-auth-logo {
+  filter: drop-shadow(0 0 10px color-mix(in oklab, var(--ql-gold) 35%, transparent));
 }
 .ql-auth-title {
   min-width: 0;
@@ -2795,8 +2819,9 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
 .ql-auth-title h1 {
   margin: 0;
   color: var(--ql-text);
-  font-size: 1.1rem;
-  font-weight: 780;
+  font-family: var(--ql-font-display);
+  font-size: 1.2rem;
+  font-weight: 600;
   line-height: 1.2;
 }
 .ql-auth-title p,

@@ -7,7 +7,6 @@
   <header class="ql-page-header ql-page-header--actions">
     <div>
       <h1>Repair</h1>
-      <p>Find damaged or truncated FLACs and review verified repair options.</p>
     </div>
     <a href="/repair/history" class="ql-btn ql-btn-secondary ql-btn-sm ql-secondary-action ql-page-action">View history</a>
   </header>
@@ -49,7 +48,7 @@
 {% else %}
 {% if qobuz_ready %}
 {% if repair_job %}
-{% with job = repair_job %}{% include "_job_body.html" %}{% endwith %}
+{% with job = repair_job, embedded_surface = true %}{% include "_job_body.html" %}{% endwith %}
 {% endif %}
 {% endif %}
 {% endif %}
