@@ -66,7 +66,7 @@ echo "==> Checking routes"
 check /                       200
 check /library                200
 check /library/hidden         200
-check /upgrade                303   # no Qobuz creds in this container, so it redirects
+check /upgrade                200   # renders the connect card when Qobuz creds are absent
 check /downsample             200
 check /repair                 200
 check /repair/history         200

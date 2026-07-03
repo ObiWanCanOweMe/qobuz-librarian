@@ -2706,7 +2706,10 @@ async def library_hidden_restore(request: Request):
 async def upgrade_page(request: Request):
     from qobuz_librarian.library import hidden as hidden_mod
     creds_ok = bool(_read_creds().get("auth_token"))
-    if not _upgrade_available(creds_ok):
+    # Without credentials the page still renders, showing the connect card —
+    # bouncing to Search reads as a broken button. Only the env kill-switch
+    # hides the surface entirely.
+    if not getattr(cfg, "UPGRADE_SCAN_ENABLED", True):
         return _upgrade_unavailable_response()
     state = _upgrade_state_summary()
     return _tr(request, "upgrade.html", {
