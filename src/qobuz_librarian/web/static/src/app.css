@@ -320,15 +320,10 @@ h1, h2, h3 {
   flex: none;
   fill: currentColor;
 }
-.ql-nav-link .ql-nav-icon-stroke,
-.ql-sidebar-action .ql-nav-icon-stroke {
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.8;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-.ql-icon-button .ql-nav-icon-stroke {
+/* By name, not by container: the class means "line icon" wherever it sits,
+   and scoping it to the desktop nav left the phone tab bar rendering raw
+   black fills. */
+.ql-nav-icon-stroke {
   fill: none;
   stroke: currentColor;
   stroke-width: 1.8;
@@ -540,9 +535,6 @@ h1, h2, h3 {
   gap: 0.125rem;
 }
 @media (max-width: 1023.98px) {
-  .ql-main {
-    padding-bottom: calc(5rem + env(safe-area-inset-bottom));
-  }
   .ql-review-footer {
     bottom: calc(3.6rem + env(safe-area-inset-bottom));
   }
@@ -713,6 +705,13 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
 @media (min-width: 768px) {
   .ql-main {
     padding: 2.15rem 2.35rem 2.75rem;
+  }
+}
+/* After the padding shorthands above, so it actually wins: while the fixed
+   tab bar is on screen the page needs room to scroll past it. */
+@media (max-width: 1023.98px) {
+  .ql-main {
+    padding-bottom: calc(6.5rem + env(safe-area-inset-bottom));
   }
 }
 .ql-footer {
@@ -3008,6 +3007,25 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
 .ql-auth-details {
   min-width: 0;
 }
+/* A footnote, not a control: this is an escape hatch for people who read the
+   docs, so it must not compete with the form above it. */
+.ql-auth-details-summary {
+  width: fit-content;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  color: var(--ql-text-3);
+  font-size: 0.78rem;
+  border-bottom: 1px dotted color-mix(in oklab, currentColor 55%, transparent);
+  transition: color 150ms ease;
+}
+.ql-auth-details-summary::-webkit-details-marker {
+  display: none;
+}
+.ql-auth-details-summary:hover,
+.ql-auth-details[open] .ql-auth-details-summary {
+  color: var(--ql-text-2);
+}
 .ql-auth-details-copy {
   margin-top: 0.55rem;
 }
@@ -4616,6 +4634,19 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
 }
 .ql-settings-details-copy {
   margin-top: 0.55rem;
+}
+/* The defaults drawer sits between slim toggle rows and the save button, so
+   it stays a compact row and keeps clear air above the button. */
+.ql-settings-defaults {
+  margin-bottom: 1.15rem;
+}
+.ql-settings-defaults > .ql-disclosure-summary {
+  min-height: 0;
+  padding: 0.45rem 0.7rem;
+  font-size: 0.8rem;
+}
+.ql-settings-defaults .ql-settings-summary-row span:last-child {
+  font-size: 0.7rem;
 }
 .ql-settings-notice-title {
   margin: 0;
