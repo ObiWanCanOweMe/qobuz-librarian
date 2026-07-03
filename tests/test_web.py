@@ -174,6 +174,26 @@ def test_download_dedup_respects_new_edition_and_single_track_intent():
     assert app_mod._duplicate_download_job("Y") is None
 
 
+def test_new_release_review_never_owns_the_library_surface():
+    # New-release results live on their own job page; a parked check must not
+    # displace the Missing Albums / Gap Fill review on /library.
+    from qobuz_librarian.web import app as app_mod
+
+    library = jm.Job(title="Library scan")
+    library.execute_kind = "library"
+    library.status = jm.JobStatus.AWAITING_REVIEW
+    library.created_at = 100.0
+    jm.registry.add(library)
+
+    check = jm.Job(title="New-release check")
+    check.execute_kind = "new_releases"
+    check.status = jm.JobStatus.AWAITING_REVIEW
+    check.created_at = 200.0  # newer, would win under most-recent rules
+    jm.registry.add(check)
+
+    assert app_mod._library_current_job() is library
+
+
 def test_parked_review_candidate_does_not_swallow_a_download():
     # An album that merely appears among a parked review's candidates is not
     # queued for anything — refusing an explicit /download with "already

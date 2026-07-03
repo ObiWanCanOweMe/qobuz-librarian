@@ -30,6 +30,7 @@ Fixes from the first day of running 0.10.0 against a full-size library.
 - Switching to terminal mode works while reviews sit parked — the handoff guard treated a parked review as an active job and refused with a message about a download that wasn't running. Only genuinely running work blocks the switch.
 - Downloading an album from Search works even when that album appears among a parked review's candidates — it used to refuse with "Already queued" although nothing was queued. Approving the review later still skips anything that already landed.
 - Search's download confirmation uses the app's own dialog like everywhere else instead of the browser's plain popup.
+- New-release check results live on their own review page instead of taking over the Library page — the Missing Albums / Gap Fill review stays put, and the dashboard shows a "N new releases" notice that opens the check's results.
 - Search deep links with an album or track kind run the search on load like artist links do, the "/" shortcut reaches the search box from any page, the grouped album view names both numbers when editions fold ("94 albums · 99 releases"), and the phone's More sheet closes on Escape.
 
 ## [0.10.0] - 2026-07-02

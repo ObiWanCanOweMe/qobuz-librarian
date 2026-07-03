@@ -31,7 +31,7 @@
           <button type="submit" class="ql-btn ql-btn-sm ql-btn-secondary ql-secondary-action" title="Retry">Retry</button>
         </form>
         {% endif %}
-        <a href="{{ '/repair' if job.execute_kind == 'repair' else ('/library' if job.execute_kind in ('library', 'new_releases') else '/jobs/' ~ job.id) }}" class="ql-row-open">Open →</a>
+        <a href="{{ '/repair' if job.execute_kind == 'repair' else ('/library' if job.execute_kind == 'library' else '/jobs/' ~ job.id) }}" class="ql-row-open">Open →</a>
       </div>
     </div>
 {%- endmacro %}

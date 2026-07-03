@@ -1437,17 +1437,19 @@ _LIBRARY_SURFACE_KINDS = ("library", "new_releases")
 
 
 def _library_current_job():
-    """The scan that owns the /library surface right now (baseline or
-    new-release check, still pending / scanning / awaiting-review / running),
-    or None when the surface is idle and shows the launcher. A parked review
-    outranks running work: after a tab-scoped download splits the review, the
-    user stays on the tab still waiting for them while the download runs in
-    the queue."""
+    """The baseline scan that owns the /library surface right now (still
+    pending / scanning / awaiting-review / running), or None when the surface
+    is idle and shows the launcher. New-release checks never own it — their
+    results live on their own job page (operator ruling 2026-07-03), so the
+    Missing Albums / Gap Fill review can't be displaced by an overnight
+    check. A parked review outranks running work: after a tab-scoped download
+    splits the review, the user stays on the tab still waiting for them while
+    the download runs in the queue."""
     states = (job_mgr.JobStatus.PENDING, job_mgr.JobStatus.SCANNING,
               job_mgr.JobStatus.AWAITING_REVIEW, job_mgr.JobStatus.RUNNING)
     cur = None
     for j in job_mgr.registry.all():
-        if (getattr(j, "execute_kind", "") not in _LIBRARY_SURFACE_KINDS
+        if (getattr(j, "execute_kind", "") != "library"
                 or j.status not in states):
             continue
         if cur is None:
@@ -2649,12 +2651,13 @@ async def library_scan(
             return RedirectResponse(
                 url="/library?error=" + urllib.parse.quote(msg), status_code=303)
         # Same job the dashboard auto-check submits; its own execute_kind so the
-        # review screen badges the new releases (left un-ticked) and labels the surface.
+        # review screen badges the new releases (left un-ticked). Its results
+        # live on their own job page, never over the Library tabs.
         job = await loop.run_in_executor(None, _start_new_release_check)
         if job is None:    # lock handed to the terminal during the submit
             return _lock_busy_response(request) or RedirectResponse(
                 url="/settings?mode=cli", status_code=303)
-        return RedirectResponse(url="/library", status_code=303)
+        return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
     scan_state = _library_scan_state()
     if not scan_state["ready"]:
         msg = scan_state["message"]
@@ -3197,10 +3200,11 @@ async def job_approve(request: Request, job_id: str):
     if not job:
         return RedirectResponse(url="/queue", status_code=303)
     # Repair and Library stay on their single surfaces through the executing
-    # phase; every other kind keeps using the job page.
+    # phase; every other kind — new-release checks included — keeps using the
+    # job page.
     if job.execute_kind == "repair":
         dest = "/repair"
-    elif job.execute_kind in _LIBRARY_SURFACE_KINDS:
+    elif job.execute_kind == "library":
         dest = "/library"
     else:
         dest = f"/jobs/{job_id}"
