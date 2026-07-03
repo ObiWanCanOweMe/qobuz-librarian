@@ -1886,7 +1886,7 @@ def test_hidden_empty_state_points_back_to_library(client):
     r = client.get("/library/hidden")
 
     assert r.status_code == 200
-    assert "No dismissed albums or Gap Fill." in r.text
+    assert "No dismissed results." in r.text
     assert ">Go to Library</a>" in r.text
 
 

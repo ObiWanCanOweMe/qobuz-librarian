@@ -2,8 +2,8 @@
 {% set is_upgrade = scope == 'upgrade' %}
 {% set is_downsample = scope == 'downsample' %}
 {% set noun = 'upgrade' if is_upgrade else ('album' if is_downsample else 'item') %}
-{% set heading = 'Dismissed upgrades' if is_upgrade else ('Kept hi-res' if is_downsample else 'Dismissed albums and Gap Fill') %}
-{% set kept_label = 'albums kept hi-res' if is_downsample else ('dismissed upgrades' if is_upgrade else 'dismissed albums and Gap Fill') %}
+{% set heading = 'Dismissed upgrades' if is_upgrade else ('Kept hi-res' if is_downsample else 'Dismissed results') %}
+{% set kept_label = 'albums kept hi-res' if is_downsample else ('dismissed upgrades' if is_upgrade else 'dismissed results') %}
 {% set restore_all_label = 'album kept hi-res' if is_downsample else noun %}
 {% set restore_all_label_plural = 'albums kept hi-res' if is_downsample else noun ~ 's' %}
 {% set back_label = 'Upgrade' if is_upgrade else ('Downsample' if is_downsample else 'Library') %}
@@ -12,17 +12,15 @@
 {% block content %}
 
 <div class="ql-list-page">
-<header class="ql-page-header ql-page-header--actions">
-  <div>
-    <h1>{{ heading }}</h1>
-  </div>
-  {% if groups %}
-  <a href="{{ back_url }}" class="ql-btn ql-btn-secondary ql-btn-sm w-full sm:w-auto">Back to {{ back_label }}</a>
-  {% endif %}
+<header class="ql-page-header">
+  <h1>{{ heading }}</h1>
 </header>
 
 {% if groups %}
-<p class="ql-hidden-overview">{{ groups | length }} artist{% if groups | length != 1 %}s{% endif %} with {{ kept_label }}</p>
+<div class="ql-work-status">
+  <span>{{ groups | length }} artist{% if groups | length != 1 %}s{% endif %} with {{ kept_label }}.</span>
+  <a href="{{ back_url }}">Back to {{ back_label }}</a>
+</div>
 
 <div class="ql-hidden-groups">
   {% for g in groups %}
@@ -76,8 +74,8 @@
       <path d="M9.5 17.5h5"/>
     </svg>
   </span>
-  <p class="ql-empty-title">{% if is_downsample %}No hi-res albums kept.{% elif is_upgrade %}No dismissed upgrades.{% else %}No dismissed albums or Gap Fill.{% endif %}</p>
-  <p class="ql-empty-text">{% if is_downsample %}Albums you keep hi-res appear here so you can downsample them later.{% elif is_upgrade %}Dismissed upgrades appear here so you can restore them.{% else %}Dismissed albums and Gap Fill candidates appear here so you can restore them.{% endif %}</p>
+  <p class="ql-empty-title">{% if is_downsample %}No hi-res albums kept.{% elif is_upgrade %}No dismissed upgrades.{% else %}No dismissed results.{% endif %}</p>
+  <p class="ql-empty-text">{% if is_downsample %}Albums you keep hi-res appear here so you can downsample them later.{% elif is_upgrade %}Dismissed upgrades appear here so you can restore them.{% else %}Results you dismiss from the Library review appear here so you can restore them.{% endif %}</p>
   <a href="{{ back_url }}" class="ql-btn ql-btn-primary w-full sm:w-auto mt-4">Go to {{ back_label }}</a>
 </div>
 {% endif %}
