@@ -463,6 +463,10 @@
         root.querySelectorAll("[data-search-view]").forEach(function (btn) {
           btn.classList.toggle("is-active", btn.dataset.searchView === name);
         });
+        try { localStorage.setItem("ql-search-view", name); } catch (e) {}
+      }
+      function savedSearchView() {
+        try { return localStorage.getItem("ql-search-view") || "table"; } catch (e) { return "table"; }
       }
       root.addEventListener("change", function (evt) {
         var cb = evt.target.closest && evt.target.closest("[data-search-select]");
@@ -580,7 +584,7 @@
           showToast(parts.length ? parts.join(", ") + "." : "Nothing queued.", failed ? "error" : "success");
         });
       }
-      setView("table");
+      setView(savedSearchView());
       syncBoxes();
     });
   }
