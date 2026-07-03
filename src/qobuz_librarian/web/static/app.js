@@ -337,6 +337,9 @@
     var dd = btn.closest(".ql-mobile-drawer");
     if (dd) closeDrawer(dd);
   });
+  document.addEventListener("keydown", function (evt) {
+    if (evt.key === "Escape") window.qlCloseDropdowns();
+  });
 
   // One-shot flash flags should not stay in the URL after first paint.
   var FLASH_PARAMS = ["approved", "stale", "saved", "queued", "connected",
