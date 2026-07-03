@@ -174,6 +174,26 @@ def test_download_dedup_respects_new_edition_and_single_track_intent():
     assert app_mod._duplicate_download_job("Y") is None
 
 
+def test_parked_review_candidate_does_not_swallow_a_download():
+    # An album that merely appears among a parked review's candidates is not
+    # queued for anything — refusing an explicit /download with "already
+    # queued" over it would be false. Approve re-checks the disk later, so
+    # downloading now cannot double up.
+    from qobuz_librarian.web import app as app_mod
+
+    review = jm.Job(title="Library scan")
+    review.execute_kind = "library"
+    review.status = jm.JobStatus.AWAITING_REVIEW
+    review.add_candidate(kind="album", title="Wanted", artist="Artist",
+                         payload={"album_id": "Z"}, selected=False)
+    jm.registry.add(review)
+
+    assert app_mod._duplicate_download_job("Z") is None
+    # Once approved and running, the same album folds again.
+    review.status = jm.JobStatus.RUNNING
+    assert app_mod._duplicate_download_job("Z") is review
+
+
 def test_direct_album_download_refreshes_saved_quality_state(
         monkeypatch, tmp_path):
     from qobuz_librarian.modes import process as process_mod

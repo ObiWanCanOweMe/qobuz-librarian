@@ -198,6 +198,18 @@
     });
   }, true);
 
+  // hx-confirm attributes go through the same styled dialog instead of the
+  // browser's native popup (htmx asks via this event before it would call
+  // window.confirm itself).
+  document.addEventListener("htmx:confirm", function (evt) {
+    var q = evt.detail && evt.detail.question;
+    if (!q) return;
+    evt.preventDefault();
+    window.qlConfirm(q).then(function (ok) {
+      if (ok) evt.detail.issueRequest(true);
+    });
+  });
+
   // Lock-busy retry button.
   document.addEventListener("click", function (evt) {
     if (evt.target.closest && evt.target.closest("[data-reload]")) {

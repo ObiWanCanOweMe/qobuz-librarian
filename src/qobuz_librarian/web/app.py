@@ -1191,11 +1191,21 @@ _DOWNLOAD_SUBMIT_LOCK = threading.Lock()
 
 
 def _find_job_touching_album(album_id: str, skip_single_track: bool = False):
-    """Return a pending/running/awaiting-review job that already covers
-    album_id, either as its direct subject or as one of its candidates.
-    ``skip_single_track`` ignores one-track downloads, so a full-album download
-    doesn't fold onto a job that only downloaded one track from the album."""
+    """Return a pending/running job that already covers album_id, either as
+    its direct subject or as one of its candidates.
+
+    Parked reviews don't count: an album merely listed among a review's
+    candidates isn't queued for anything, so refusing an explicit download
+    with "already queued" over it would be false — and with a whole-library
+    review parked, its candidates are exactly the albums the user is most
+    likely to search for. Approve re-checks the disk and drops candidates
+    that landed in the meantime, so downloading now can't double up later.
+
+    ``skip_single_track`` ignores one-track downloads, so a full-album
+    download doesn't fold onto a job that only downloaded one track."""
     for j in job_mgr.registry.pending_and_running():
+        if j.status == job_mgr.JobStatus.AWAITING_REVIEW:
+            continue
         if skip_single_track and (getattr(j, "single", None) or {}).get("track_id"):
             continue
         if j.album_id == album_id:
@@ -2321,12 +2331,11 @@ async def queue_download(request: Request, album_id: str = Form(""),
     # rather than being skipped or replacing it.
     download_as_new_edition = str(as_new_edition).strip().lower() in (
         "1", "true", "yes", "on")
-    # Refuse true duplicates — same album already active or pending — but only of
-    # the SAME intent (see _duplicate_download_job). Includes scan-flow jobs
-    # awaiting review that have the album as one of their candidates, so a
-    # search-then-download for an album the user just approved in an artist scan
-    # still folds. A deliberate new-edition copy or a single-track download is its own
-    # request and isn't swallowed by an unrelated job for the same album.
+    # Refuse true duplicates — same album already active or pending — but only
+    # of the SAME intent (see _duplicate_download_job). A parked review naming
+    # the album doesn't count (nothing is queued there), and a deliberate
+    # new-edition copy or a single-track download is its own request and isn't
+    # swallowed by an unrelated job for the same album.
     existing = _duplicate_download_job(album_id, track_id, download_as_new_edition)
     if existing:
         if _is_htmx(request):
