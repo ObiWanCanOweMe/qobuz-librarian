@@ -3838,7 +3838,12 @@ async def queue_clear():
 
 @app.post("/queue/cancel-pending")
 async def queue_cancel_pending():
+    # Parked reviews are deliberately exempt: the queue page no longer shows
+    # them, and a bulk clear must never take something the user can't see.
+    # Each review has its own Discard on its own page.
     for j in list(job_mgr.registry.pending_and_running()):
+        if j.status == job_mgr.JobStatus.AWAITING_REVIEW:
+            continue
         job_mgr.request_cancel(j)
     return RedirectResponse(url="/queue", status_code=303)
 

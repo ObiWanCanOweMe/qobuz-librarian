@@ -1793,8 +1793,8 @@ def test_queue_job_actions_use_clear_labels(client):
         assert "Downsample scan" not in r.text
         assert 'id="queue-active-heading"' in r.text and "Running now" in r.text
         assert 'id="queue-waiting-heading"' in r.text and "Waiting" in r.text
-        assert ">Clear queue and reviews</button>" in r.text
-        assert "Queued jobs are removed, reviews are discarded" in r.text
+        assert ">Clear the queue</button>" in r.text
+        assert "parked reviews are untouched" in r.text
         assert "Starts automatically after the current job finishes." in r.text
         assert "hi-res album to review" not in r.text
         assert "album folder to review" not in r.text

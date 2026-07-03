@@ -154,13 +154,13 @@
   </section>
   {% endif %}
 </div>
-{% if pending | length > 1 %}
+{% if (active_jobs | length) + (waiting_jobs | length) > 1 %}
 <div class="ql-activity-maintenance">
-  <p class="ql-row-meta">Removes waiting jobs and review lists. Running jobs stop after the current safe step.</p>
+  <p class="ql-row-meta">Removes waiting jobs. Running jobs stop after the current safe step.</p>
   <form action="/queue/cancel-pending" method="post">
     <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
     <button type="submit" class="ql-btn ql-btn-sm ql-btn-danger w-full sm:w-auto"
-            data-confirm="Clear queue and reviews? Queued jobs are removed, reviews are discarded, and running jobs stop after their current step. Completed work remains.">Clear queue and reviews</button>
+            data-confirm="Clear the queue? Waiting jobs are removed and running jobs stop after their current step. Completed work and parked reviews are untouched.">Clear the queue</button>
   </form>
 </div>
 {% endif %}

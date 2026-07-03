@@ -66,11 +66,40 @@ _MAX_TRACKED_USERS = 1024
 
 # Active session tokens: a random per-login token (the cookie value) → expiry
 # epoch seconds. The cookie carries one of THESE, not the credential secret, so
-# logout and password changes can revoke sessions (one or all). In-memory: a
-# restart logs every browser out — acceptable for a self-hosted app and strictly
-# safer than a single 30-day shared, non-revocable bearer token.
-_sessions: dict[str, float] = {}
+# logout and password changes can revoke sessions (one or all). The table is
+# mirrored to disk as SHA-256 digests — image updates and restarts are routine
+# for a self-hosted app, and re-typing the password after every one teaches
+# people to pick a weak one. A leaked file exposes digests, not cookie values.
+_SESSIONS_FILE = cfg.DATA_DIR / ".qobuz_web_sessions.json"
 _sessions_lock = threading.Lock()
+
+
+def _token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _load_sessions() -> dict[str, float]:
+    try:
+        raw = json.loads(_SESSIONS_FILE.read_text(encoding="utf-8"))
+        now = time.time()
+        return {str(k): float(v) for k, v in raw.items() if float(v) > now}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def _save_sessions_locked() -> None:
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(cfg.DATA_DIR),
+                                   prefix=".qobuz_web_sessions.", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(_sessions, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _SESSIONS_FILE)
+    except OSError:
+        pass
+
+
+_sessions: dict[str, float] = _load_sessions()
 
 
 def auth_disabled() -> bool:
@@ -283,7 +312,8 @@ def mint_session() -> str:
         for t, exp in list(_sessions.items()):
             if exp <= now:
                 del _sessions[t]
-        _sessions[token] = now + _COOKIE_MAX_AGE
+        _sessions[_token_digest(token)] = now + _COOKIE_MAX_AGE
+        _save_sessions_locked()
     return token
 
 
@@ -292,13 +322,15 @@ def revoke_session(token: str) -> None:
     if not token:
         return
     with _sessions_lock:
-        _sessions.pop(token, None)
+        _sessions.pop(_token_digest(token), None)
+        _save_sessions_locked()
 
 
 def revoke_all_sessions() -> None:
     """Invalidate every session (e.g. on a password change)."""
     with _sessions_lock:
         _sessions.clear()
+        _save_sessions_locked()
 
 
 def verify_session(cookie_value: str) -> bool:
@@ -306,11 +338,13 @@ def verify_session(cookie_value: str) -> bool:
         return False
     now = time.time()
     with _sessions_lock:
-        exp = _sessions.get(cookie_value)
+        digest = _token_digest(cookie_value)
+        exp = _sessions.get(digest)
         if exp is None:
             return False
         if exp <= now:
-            del _sessions[cookie_value]
+            del _sessions[digest]
+            _save_sessions_locked()
             return False
         return True
 

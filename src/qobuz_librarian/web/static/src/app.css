@@ -1047,12 +1047,18 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
 }
 .ql-search-input {
   min-width: 0;
+  width: 100%;
   flex: 1 1 auto;
   min-height: 0;
   padding: 0;
   border: 0;
   background: transparent;
-  font-size: 0.9375rem;
+  color: var(--ql-text);
+  /* The wrapper's focus-within glow is the focus affordance; the input must
+     never paint its own pill inside it. */
+  outline: none;
+  box-shadow: none;
+  font-size: 1rem;
   font-weight: 480;
   color: var(--ql-text);
   outline: none;
