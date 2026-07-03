@@ -25,21 +25,12 @@
     {% endif %}
   </div>
 
-  <section class="ql-work-card ql-work-card-warning ql-quality-safety-card">
-    <div class="ql-work-card-copy">
-      <p class="ql-work-card-kicker">Local rewrite</p>
-      <p class="ql-work-card-title">Review before changes</p>
-      <p class="ql-work-card-text">The scan only lists albums. Selected albums are rewritten in place{% if keeps_ds_originals() %}; the hi-res originals are kept for {{ backup_retention_days }} day{{ 's' if backup_retention_days != 1 }} so a rewrite can be undone from Settings{% else %}; hi-res originals are not kept{% endif %}.</p>
-    </div>
-  </section>
-
   {% if have_downsample %}
     {% if downsample_state.count %}
     <section class="ql-work-card ql-work-card-primary ql-quality-entry-card">
       <div class="ql-work-card-copy">
-        <p class="ql-work-card-kicker">Saved review</p>
         <p class="ql-work-card-title">{{ downsample_state.count }} album{% if downsample_state.count != 1 %}s{% endif %} can be downsampled</p>
-        <p class="ql-work-card-text">Choose which albums to rewrite on the review screen.</p>
+        <p class="ql-work-card-text">Pick the albums on the review screen. Files are rewritten in place at 44.1 / 48 kHz{% if keeps_ds_originals() %}, and the hi-res originals are kept for {{ backup_retention_days }} day{{ 's' if backup_retention_days != 1 }} so a rewrite can be undone from Settings{% else %} and the hi-res originals are not kept{% endif %}.</p>
       </div>
       <div class="ql-work-card-actions">
         <form action="/downsample/review" method="post" data-busy-submit>
@@ -47,20 +38,18 @@
           <button type="submit" class="ql-btn ql-btn-primary w-full sm:w-auto"
                   data-confirm="Review saved downsample candidates? Nothing changes until you approve selected albums.">Review candidates</button>
         </form>
+        <form action="/downsample" method="post" data-busy-submit>
+          <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+          <button type="submit" class="ql-btn ql-btn-secondary ql-secondary-action w-full sm:w-auto"
+                  data-confirm="Refresh local downsample candidates? You review and choose what to downsample before anything changes.">Refresh candidates</button>
+        </form>
       </div>
     </section>
-
-    <form action="/downsample" method="post" data-busy-submit class="ql-secondary-form">
-      <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-      <button type="submit" class="ql-btn ql-btn-secondary ql-secondary-action w-full sm:w-auto"
-              data-confirm="Refresh local downsample candidates? You review and choose what to downsample before anything changes.">Refresh candidates</button>
-    </form>
     {% else %}
     <section class="ql-work-card ql-empty-work ql-quality-entry-card">
       <div class="ql-work-card-copy">
-        <p class="ql-work-card-kicker">Saved review</p>
         <p class="ql-work-card-title">No downsample candidates saved</p>
-        <p class="ql-work-card-text">Refresh local candidates, or run Library to refresh the shared baseline.</p>
+        <p class="ql-work-card-text">Refresh checks the files already on disk{% if keeps_ds_originals() %} — rewrites keep their hi-res originals for {{ backup_retention_days }} day{{ 's' if backup_retention_days != 1 }}{% endif %}. Scan library on the Library page rebuilds every candidate list in one pass.</p>
       </div>
       <div class="ql-work-card-actions">
         <form action="/downsample" method="post" data-busy-submit>

@@ -23,7 +23,7 @@
       {% if upgrade_state.count %}Review ready{% else %}No saved candidates{% endif %}
     </span>
     <span>
-      {% if upgrade_state.updated %}Baseline refreshed {{ upgrade_state.updated }}.{% elif last_run %}Library refreshed {{ last_run }}.{% else %}Run Library first to refresh upgrade candidates.{% endif %}
+      {% if upgrade_state.updated %}Baseline refreshed {{ upgrade_state.updated }}.{% elif last_run %}Last library scan {{ last_run }}.{% else %}Scan library on the Library page to build upgrade candidates.{% endif %}
     </span>
     {% if hidden_count %}
     <a href="/upgrade/hidden">
@@ -35,7 +35,6 @@
   {% if upgrade_state.count %}
   <section class="ql-work-card ql-work-card-primary ql-quality-entry-card">
     <div class="ql-work-card-copy">
-      <p class="ql-work-card-kicker">Saved review</p>
       <p class="ql-work-card-title">{{ upgrade_state.count }} upgrade candidate{% if upgrade_state.count != 1 %}s{% endif %}</p>
       <p class="ql-work-card-text">Choose which albums to replace on the review screen.</p>
     </div>
@@ -50,9 +49,8 @@
   {% else %}
   <section class="ql-work-card ql-empty-work ql-quality-entry-card">
     <div class="ql-work-card-copy">
-      <p class="ql-work-card-kicker">Saved review</p>
       <p class="ql-work-card-title">No upgrade candidates saved</p>
-      <p class="ql-work-card-text">Run Library to refresh missing albums, Gap Fill candidates, upgrades, and downsample candidates.</p>
+      <p class="ql-work-card-text">Scan library on the Library page refreshes missing albums, Gap Fill, upgrades, and downsample candidates in one pass.</p>
     </div>
     <div class="ql-work-card-actions">
       <a href="/library" class="ql-btn ql-btn-primary w-full sm:w-auto">Open Library</a>
