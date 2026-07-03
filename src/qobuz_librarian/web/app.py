@@ -1026,10 +1026,15 @@ def _tr(request, name, context, *, status_code=200):
     """
     if "pending_job_count" not in context or "queue_has_running" not in context:
         active = context.get("pending") or job_mgr.registry.pending_and_running()
-        context.setdefault("pending_job_count", len(active))
+        # The badge counts work in flight, not parked reviews — those sit for
+        # weeks by design and have their own review-ready dots, so counting
+        # them would pin a permanent "1" to the Queue tab.
+        in_flight = [j for j in active
+                     if j.status != job_mgr.JobStatus.AWAITING_REVIEW]
+        context.setdefault("pending_job_count", len(in_flight))
         context.setdefault(
             "queue_has_running",
-            any(j.status.value in ('running', 'scanning') for j in active),
+            any(j.status.value in ('running', 'scanning') for j in in_flight),
         )
     context.setdefault("cli_mode", _CLI_MODE)
     # Error/utility renders (e.g. the 404 page) don't name a nav section; an
@@ -4527,7 +4532,8 @@ async def queue_count():
     nav Queue badge stays in sync without a page reload. The badge is otherwise
     server-rendered once per page, which left it stale (e.g. reading "1" next to
     an empty Queue) after a job finished while you sat on another page."""
-    active = job_mgr.registry.pending_and_running()
+    active = [j for j in job_mgr.registry.pending_and_running()
+              if j.status != job_mgr.JobStatus.AWAITING_REVIEW]
     return JSONResponse({
         "count": len(active),
         "running": any(j.status.value in ("running", "scanning") for j in active),

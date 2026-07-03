@@ -468,24 +468,24 @@ h1, h2, h3 {
 }
 .ql-tabbar .ql-tab-count {
   position: absolute;
-  top: -0.2rem;
-  left: calc(50% + 0.45rem);
-  min-width: 1.05rem;
+  top: -0.3rem;
+  left: calc(50% + 0.55rem);
+  min-width: 0.95rem;
   border-radius: 999px;
   background: var(--ql-gold);
   color: var(--ql-gold-ink);
   font-family: var(--ql-font-mono);
-  font-size: 0.62rem;
+  font-size: 0.58rem;
   font-weight: 700;
-  line-height: 1.05rem;
+  line-height: 0.95rem;
   text-align: center;
-  padding-inline: 0.22rem;
-  /* Ring in the bar's own color, so the pill reads as a badge sitting on the
-     icon instead of a blob merged into it. */
-  box-shadow: 0 0 0 2px color-mix(in oklab, var(--ql-bg) 97%, #000);
+  padding-inline: 0.18rem;
+  /* Ring in the bar's own color, so the pill reads as a badge sitting near
+     the icon instead of a blob merged into it. */
+  box-shadow: 0 0 0 1.5px color-mix(in oklab, var(--ql-bg) 97%, #000);
 }
 [data-theme="winter"] .ql-tabbar .ql-tab-count {
-  box-shadow: 0 0 0 2px #efe6d4;
+  box-shadow: 0 0 0 1.5px #efe6d4;
 }
 .ql-tabbar .ql-tab-count.is-warning {
   background: var(--ql-warning);
