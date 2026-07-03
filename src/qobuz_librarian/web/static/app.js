@@ -138,11 +138,18 @@
     });
   });
 
-  // Shared confirm prompt for destructive submits and links.
+  // Shared confirm prompt for destructive submits and links. A {count}
+  // placeholder picks up the number shown in the control's own label, so the
+  // review submit can say how many albums a tap is really about to queue.
   document.addEventListener("click", function (evt) {
     var el = evt.target.closest && evt.target.closest("[data-confirm]");
     if (!el) return;
-    if (!window.confirm(el.getAttribute("data-confirm"))) {
+    var msg = el.getAttribute("data-confirm");
+    if (msg.indexOf("{count}") !== -1) {
+      var m = (el.textContent || "").match(/[\d,]+/);
+      msg = msg.replace("{count}", m ? m[0] : "the");
+    }
+    if (!window.confirm(msg)) {
       evt.preventDefault();
       evt.stopPropagation();
     }
