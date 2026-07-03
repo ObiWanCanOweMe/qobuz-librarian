@@ -706,16 +706,20 @@ def _run_task(job: Job, fn):
         app_logger.removeHandler(handler)
         if job.status in TERMINAL:
             job.finished_at = time.time()
-            _fire_post_job_hook(job)
-        # Persist outside the post-job hook (and after AWAITING_REVIEW
-        # transitions inside scan_fn) so the saved row matches what the user
-        # would see on /queue, including candidate lists for review jobs.
+        # Persist BEFORE the hook fires: durability must never wait on a
+        # webhook, and a stalled hook was able to leave a finished job saying
+        # "running" on disk for its whole timeout.
         # Skip if the job was evicted from the registry while we ran — a
         # terminal transition above can race a concurrent Clear-History (which
         # deletes the row), and a blind persist would re-insert the just-cleared
         # job onto the History page.
         if registry.get(job.id) is not None:
             job_persistence.persist(job)
+        if job.status in TERMINAL:
+            # Threaded for the same reason: the lane must move on to its next
+            # job even when someone's notification endpoint is slow.
+            threading.Thread(target=_fire_post_job_hook, args=(job,),
+                             daemon=True).start()
         job.end_stream()
 
 
