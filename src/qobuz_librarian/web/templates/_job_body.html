@@ -39,7 +39,6 @@
   {% endif %}
 
   {% set s = job.status.value %}
-  {% set _historical = historical|default(false) %}
   {% set _review_thing = labels.discard_review_label(job) %}
   {# Back points at the surface that owns the job; finished jobs came from
      History, so they go back there. #}
@@ -183,13 +182,13 @@
     <p class="ql-job-muted">No log output was retained for this job.</p>
     {% endif %}
     <div class="ql-job-actions">
-      {% if not _historical and s == 'failed' and job.album_id %}
+      {% if s == 'failed' and job.album_id %}
       <form action="/jobs/{{ job.id }}/retry" method="post">
         <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
         <button type="submit" class="ql-btn ql-btn-primary ql-btn-sm">Retry</button>
       </form>
       {% endif %}
-      {% if not _historical and s == 'done' and job.single and job.single.get('dir') and not job.single.get('removed') %}
+      {% if s == 'done' and job.single and job.single.get('dir') and not job.single.get('removed') %}
       <form action="/jobs/{{ job.id }}/undo" method="post"
             hx-post="/jobs/{{ job.id }}/undo" hx-target="#job-content" hx-swap="outerHTML"
             data-confirm="Remove the downloaded track and undo the single?">

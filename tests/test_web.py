@@ -1973,7 +1973,8 @@ def test_history_empty_state_has_clear_action(client):
     assert ">Back to Queue</a>" in r.text
 
 
-def test_history_retry_only_shows_for_live_failed_download(client, monkeypatch):
+def test_history_retry_shows_for_archived_failed_download_too(
+        client, monkeypatch):
     from qobuz_librarian.web import job_persistence
 
     monkeypatch.setattr(job_persistence, "_disabled", False)
@@ -1995,12 +1996,12 @@ def test_history_retry_only_shows_for_live_failed_download(client, monkeypatch):
 
         assert r.status_code == 200
         assert f'action="/jobs/{live.id}/retry"' in r.text
-        assert f'action="/jobs/{archived.id}/retry"' not in r.text
+        assert f'action="/jobs/{archived.id}/retry"' in r.text
     finally:
         _remove_job(live)
 
 
-def test_archived_job_page_hides_live_only_actions(client, monkeypatch):
+def test_archived_job_page_keeps_retry_and_undo(client, monkeypatch):
     from qobuz_librarian.web import job_persistence
 
     monkeypatch.setattr(job_persistence, "_disabled", False)
@@ -2022,11 +2023,65 @@ def test_archived_job_page_hides_live_only_actions(client, monkeypatch):
     r = client.get(f"/jobs/{failed.id}")
     assert r.status_code == 200
     assert "This job is archived." in r.text
-    assert ">Retry</button>" not in r.text
+    assert ">Retry</button>" in r.text
 
     r = client.get(f"/jobs/{single.id}")
     assert r.status_code == 200
-    assert "Undo (removes track)" not in r.text
+    assert f'action="/jobs/{single.id}/undo"' in r.text
+
+
+def test_retry_rebuilds_archived_failed_download(client, monkeypatch):
+    from qobuz_librarian.web import app as webapp
+    from qobuz_librarian.web import job_persistence
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+
+    archived = jm.Job(title="Dummy", artist="Portishead", album_id="al1")
+    archived.status = jm.JobStatus.FAILED
+    archived.finished_at = time.time() - 10
+    job_persistence.persist(archived)
+
+    monkeypatch.setattr(webapp, "_get_token", lambda: "tok")
+    monkeypatch.setattr(
+        "qobuz_librarian.api.search.get_album",
+        lambda album_id, token: {"title": "Dummy",
+                                 "artist": {"name": "Portishead"},
+                                 "tracks": {"items": []}})
+    monkeypatch.setattr(webapp, "_make_download_run",
+                        lambda album, token: lambda j: None)
+
+    r = client.post(f"/jobs/{archived.id}/retry", follow_redirects=False)
+
+    assert r.status_code == 303
+    new_id = r.headers["location"].removeprefix("/jobs/")
+    assert new_id and new_id != archived.id
+    new_job = jm.registry.get(new_id)
+    assert new_job is not None and new_job.album_id == "al1"
+    _remove_job(new_job)
+
+
+def test_undo_burns_the_one_shot_in_the_archive(client, monkeypatch, tmp_path):
+    from qobuz_librarian.web import job_persistence
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+
+    gone = tmp_path / "Portishead" / "Dummy"
+    job = jm.Job(title="Dummy", artist="Portishead")
+    job.status = jm.JobStatus.DONE
+    job.single = {"dir": str(gone), "track_id": "t1", "title": "Glory Box"}
+    job.finished_at = time.time()
+    job_persistence.persist(job)
+
+    r = client.post(f"/jobs/{job.id}/undo", follow_redirects=False)
+
+    assert r.status_code == 303
+    row = job_persistence.load_one(job.id)
+    assert row is not None
+    assert row["single"].get("removed") is True
 
 
 def test_hidden_empty_state_points_back_to_library(client):

@@ -3514,6 +3514,7 @@ async def job_hide(request: Request, job_id: str):
             # hidden_total keeps the toolbar's "Dismissed (N)" link current —
             # it's rendered once with the page and has no other refresh path.
             import json as _json
+
             from qobuz_librarian.library import hidden as hidden_mod
             counts = _selection_payload(job)
             counts["hidden_total"] = hidden_mod.count(
@@ -3582,7 +3583,10 @@ async def job_retry(request: Request, job_id: str):
     busy = _lock_busy_response(request)
     if busy is not None:
         return busy
-    job = job_mgr.registry.get(job_id)
+    # Retry rebuilds the download from the persisted album_id, so it works as
+    # well for a job evicted from the registry (restart, or 50 jobs later) as
+    # for a live one — fall back to the archive instead of silently bouncing.
+    job = job_mgr.registry.get(job_id) or job_mgr.load_historical_job(job_id)
     if not job or job.status != job_mgr.JobStatus.FAILED or not job.album_id:
         return RedirectResponse(url="/queue", status_code=303)
     album_id = job.album_id
@@ -3665,7 +3669,10 @@ async def job_undo(request: Request, job_id: str):
             return HTMLResponse(
                 f'<div id="job-content">{busy.body.decode()}</div>')
         return busy
-    job = job_mgr.registry.get(job_id)
+    # The single payload is persisted, so Undo keeps working after the job
+    # ages out of the registry — the file checks below already handle a track
+    # that vanished in the meantime.
+    job = job_mgr.registry.get(job_id) or job_mgr.load_historical_job(job_id)
     info = dict(getattr(job, "single", None) or {}) if job else {}
     if not job or not info.get("dir") or info.get("removed"):
         if _is_htmx(request):
@@ -3790,6 +3797,10 @@ async def job_undo(request: Request, job_id: str):
         else:
             job.summary = (f"Couldn't find “{info.get('title')}” by ISRC/track number. "
                            "Delete it manually if needed.")
+    # Write the burned one-shot (and summary) back to the archive; without this
+    # a restart resurrects the Undo button for a single that's already gone.
+    from qobuz_librarian.web import job_persistence
+    await loop.run_in_executor(None, lambda: job_persistence.persist(job))
     if _is_htmx(request):
         return _tr(request, "_job_body.html", {"job": job})
     return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
@@ -3874,15 +3885,10 @@ async def queue_history(request: Request, p: int = 1):
 
     loop = asyncio.get_running_loop()
     bulk_jobs, total, pages, p, rows = await loop.run_in_executor(None, lambda: _load_page(p))
-    retryable_ids = [
-        j.id for j in job_mgr.registry.all()
-        if j.status == job_mgr.JobStatus.FAILED and j.album_id
-    ]
     return _tr(request, "history.html", {
         "page": "queue", "active_tab": "history",
         "bulk_jobs": bulk_jobs, "jobs": rows,
         "cur_page": p, "pages": pages, "total": total,
-        "retryable_ids": retryable_ids,
     })
 
 
