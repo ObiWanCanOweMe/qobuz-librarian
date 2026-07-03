@@ -2805,6 +2805,10 @@ async def downsample_page(request: Request):
         "creds_ok": bool(_read_creds().get("auth_token")),
         "downsample_state": state,
         "review_parked": review_parked,
+        # A standalone refresh in flight — so the page shows "scan running"
+        # instead of the idle launcher (which read as if nothing was happening).
+        "downsample_running": _active_scan(
+            "downsample", statuses=("pending", "scanning", "running")),
         "last_run": _tool_last_run_age("downsample"),
         "hidden_count": hidden_mod.count(hidden_mod.SCOPE_DOWNSAMPLE)})
 
@@ -2941,6 +2945,10 @@ async def lyrics_page(request: Request):
         "have_lyrics": AVAILABLE,
         "creds_ok": bool(_read_creds().get("auth_token")),
         "last_run": _tool_last_run_age("lyrics"),
+        # A library-wide lyrics scan in flight — so the page says so instead of
+        # showing the idle "Ready · Start lyrics scan" launcher while one runs.
+        "lyrics_running": _active_scan(
+            "lyrics", statuses=("pending", "running")),
         "lyrics_format": lyrics_format_label,
         "providers": providers,
     })

@@ -32,7 +32,12 @@
   </div>
 
   {% if have_downsample %}
-    {% if downsample_state.count %}
+    {% if downsample_running %}
+    <div class="ql-tool-note ql-tool-note-info">
+      <p class="ql-tool-note-title">Downsample scan running</p>
+      <p>Checking your files for albums that can be downsampled. <a href="/jobs/{{ downsample_running.id }}" class="ql-inline-link">Watch progress →</a></p>
+    </div>
+    {% elif downsample_state.count %}
     <section class="ql-work-card ql-work-card-primary ql-quality-entry-card">
       <div class="ql-work-card-copy">
         <p class="ql-work-card-title">{{ downsample_state.count }} album{% if downsample_state.count != 1 %}s{% endif %} can be downsampled</p>

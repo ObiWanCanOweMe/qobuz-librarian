@@ -9,21 +9,27 @@
   </header>
 
   <div class="ql-work-status">
-    <span class="ql-status-chip {% if have_lyrics %}is-neutral{% else %}is-warning{% endif %}">
-      {% if have_lyrics %}Ready{% else %}Unavailable{% endif %}
+    <span class="ql-status-chip {% if lyrics_running %}is-info{% elif have_lyrics %}is-neutral{% else %}is-warning{% endif %}">
+      {% if lyrics_running %}Scanning{% elif have_lyrics %}Ready{% else %}Unavailable{% endif %}
     </span>
     <span>
-      {% if last_run %}Last lyrics scan {{ last_run }}.{% else %}No lyrics scan has finished yet.{% endif %}
+      {% if lyrics_running %}Fetching lyrics across your library…{% elif last_run %}Last lyrics scan {{ last_run }}.{% else %}No lyrics scan has finished yet.{% endif %}
     </span>
-    {% if have_lyrics %}
+    {% if have_lyrics and not lyrics_running %}
     <span>
       Output: {{ lyrics_format }}. Providers: {{ providers }}.
-      <a href="/settings">Change</a>
+      <a href="/settings#behaviour">Change</a>
     </span>
     {% endif %}
   </div>
 
   {% if have_lyrics %}
+  {% if lyrics_running %}
+  <div class="ql-tool-note ql-tool-note-info">
+    <p class="ql-tool-note-title">Lyrics scan running</p>
+    <p>Fetching missing lyrics across your library. <a href="/jobs/{{ lyrics_running.id }}" class="ql-inline-link">Watch progress →</a></p>
+  </div>
+  {% else %}
   <form action="/lyrics" method="post" data-busy-submit>
     <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
     <div class="ql-option-stack">
@@ -55,6 +61,7 @@
               data-confirm="Start a library-wide lyrics scan? This can take a while on a large library.">Start lyrics scan</button>
     </section>
   </form>
+  {% endif %}
   {% else %}
   <section class="ql-work-card ql-work-card-warning">
     <div class="ql-work-card-copy">
