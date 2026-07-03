@@ -1836,7 +1836,7 @@ def test_history_empty_state_has_clear_action(client):
     assert r.status_code == 200
     assert "No finished jobs yet." in r.text
     assert "Completed downloads, scans, and reviews appear here." in r.text
-    assert ">Back to queue</a>" in r.text
+    assert ">Back to Queue</a>" in r.text
 
 
 def test_history_retry_only_shows_for_live_failed_download(client, monkeypatch):
@@ -1908,7 +1908,7 @@ def test_repair_history_empty_state_points_back_to_repair(client):
 
     assert r.status_code == 200
     assert "Nothing repaired yet." in r.text
-    assert ">Back to repair</a>" in r.text
+    assert ">Back to Repair</a>" in r.text
 
 
 # ── per-job cancel button on queue page ───────────────────────────────

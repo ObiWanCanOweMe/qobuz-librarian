@@ -2992,7 +2992,9 @@ def _migrate_checks(src, dest):
 async def migrate_page(request: Request):
     src, dest = cfg.MIGRATE_SRC, cfg.MIGRATE_DEST
     return _tr(request, "migrate.html", {
-        "page": "migrate",
+        # No nav item of its own — it's reached from Settings, so Settings
+        # stays lit.
+        "page": "settings",
         "src": src,
         "dest": dest,
         "configured": bool(src and dest),
@@ -3019,7 +3021,7 @@ async def migrate_scan(request: Request):
         err = engine.validate_paths(Path(src), Path(dest), in_place=in_place)
     if err:
         return _tr(request, "migrate.html", {
-            "page": "migrate", "src": src, "dest": dest,
+            "page": "settings", "src": src, "dest": dest,
             "configured": bool(src and dest), "error": err,
             "migrate_checks": _migrate_checks(src, dest)})
     from qobuz_librarian.web import flows
@@ -3050,7 +3052,11 @@ async def job_page(request: Request, job_id: str, approved: bool = False,
         if job is None:
             return RedirectResponse(url="/queue", status_code=303)
         historical = True
-    ctx = {"job": job, "page": "queue",
+    # An upgrade/downsample job page is that tool's surface, so its nav item
+    # lights up (and its review dot counts as seen — the user is looking at it).
+    nav_page = (job.execute_kind
+                if job.execute_kind in ("upgrade", "downsample") else "queue")
+    ctx = {"job": job, "page": nav_page,
            "approved": approved, "stale": stale, "noselection": noselection,
            "historical": historical,
            "queue_wait": _queue_wait(job),

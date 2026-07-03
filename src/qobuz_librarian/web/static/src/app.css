@@ -2651,8 +2651,6 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
   gap: 0.75rem;
 }
 .ql-activity-section-header {
-  /* The count belongs to the word, not the far edge — a chip floating at the
-     opposite side of the page read as disconnected. */
   justify-content: flex-start;
   align-items: center;
   gap: 0.5rem;
@@ -2839,15 +2837,11 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
   font-size: 0.84rem;
 }
 .ql-history-row .ql-activity-side {
-  /* chip · time · open on one line; the old two-column grid wrapped the Open
-     link onto its own ragged row. */
   grid-template-columns: auto auto auto;
   align-items: center;
   gap: 0.7rem;
 }
 .ql-history-row .ql-activity-time {
-  /* Relative stamps ("2 hr ago") speak the same voice as the tool pages —
-     prose, not a log line. */
   font-family: inherit;
   font-size: 0.8rem;
 }
@@ -3658,8 +3652,6 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
 }
 .ql-repair-phase {
   display: flex;
-  /* Capped: stretched across the full content width the three steps read as
-     lost punctuation, not one unit. */
   max-width: 26rem;
   align-items: center;
   gap: 0.5rem;
@@ -5002,8 +4994,6 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
 }
 
 .ql-mode-row {
-  /* A divider row, not a box — the old bordered panel nested a card inside
-     the section card. */
   display: flex;
   min-width: 0;
   flex-direction: column;
@@ -5508,9 +5498,6 @@ details[open] > .ql-disclosure-summary::after {
   }
 }
 @media (max-width: 639.98px) {
-  /* One loud thing in the footer. The secondary actions keep their tap
-     targets but drop the button chrome, so the bar stays one button tall
-     instead of stacking two full-width slabs. */
   .ql-review-footer-secondary-group {
     justify-content: center;
     gap: 1.25rem;

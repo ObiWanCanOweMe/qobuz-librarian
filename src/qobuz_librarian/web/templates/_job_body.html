@@ -44,8 +44,21 @@
   {# Finished jobs are reached from History, not the queue — send people back
      to where they actually came from. #}
   {% set _finished = s in ('done', 'failed', 'canceled') %}
-  {% set _back_href = '/repair' if job.execute_kind == 'repair' else ('/library' if job.execute_kind in ('library', 'new_releases') else ('/queue/history' if _finished else '/queue')) %}
-  {% set _back_label = 'Back to repair' if job.execute_kind == 'repair' else ('Back to Library' if job.execute_kind in ('library', 'new_releases') else ('Back to History' if _finished else 'Back to queue')) %}
+  {# Back always points at the surface that owns the job; finished jobs are
+     reached from History. #}
+  {% if job.execute_kind == 'repair' %}
+  {% set _back_href, _back_label = '/repair', 'Back to Repair' %}
+  {% elif job.execute_kind in ('library', 'new_releases') %}
+  {% set _back_href, _back_label = '/library', 'Back to Library' %}
+  {% elif _finished %}
+  {% set _back_href, _back_label = '/queue/history', 'Back to History' %}
+  {% elif job.execute_kind in ('upgrade', 'downsample') %}
+  {% set _back_href, _back_label = '/' ~ job.execute_kind, 'Back to ' ~ job.execute_kind | capitalize %}
+  {% elif job.execute_kind == 'migration' %}
+  {% set _back_href, _back_label = '/migrate', 'Back to Migration' %}
+  {% else %}
+  {% set _back_href, _back_label = '/queue', 'Back to Queue' %}
+  {% endif %}
 
   {% if s == 'awaiting_review' %}
     {# The review tools row already states the live count; repeating the scan
