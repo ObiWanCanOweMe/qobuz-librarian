@@ -50,6 +50,8 @@
   {% set _back_href, _back_label = '/library', 'Back to Library' %}
   {% elif _finished %}
   {% set _back_href, _back_label = '/queue/history', 'Back to History' %}
+  {% elif job.execute_kind == 'upgrade' and not upgrade_available %}
+  {% set _back_href, _back_label = '/queue/history', 'Back to History' %}
   {% elif job.execute_kind in ('upgrade', 'downsample') %}
   {% set _back_href, _back_label = '/' ~ job.execute_kind, 'Back to ' ~ job.execute_kind | capitalize %}
   {% elif job.execute_kind == 'migration' %}

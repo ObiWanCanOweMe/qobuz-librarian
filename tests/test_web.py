@@ -1406,6 +1406,43 @@ def test_upgrade_approve_resyncs_saved_review_before_execution(
     assert job.candidates == []
 
 
+def test_approve_refuses_parked_upgrade_review_without_credentials(
+        client, monkeypatch):
+    from qobuz_librarian.web import app as webapp
+    from qobuz_librarian.web import jobs as job_mgr
+
+    monkeypatch.setattr(webapp, "_get_token", lambda: "tok")
+    creds = {"auth_token": "dummy", "user_id": "dummy"}
+    monkeypatch.setattr(webapp, "_read_creds", lambda: dict(creds))
+    monkeypatch.setattr(
+        "qobuz_librarian.quality.upgrade_state.load",
+        lambda: {
+            "updated_at": time.time(),
+            "complete": True,
+            "candidates": [{
+                "title": "Dummy",
+                "artist": "Portishead",
+                "detail": "16-bit/44.1 kHz -> 24-bit/96 kHz",
+                "payload": {"album_id": "up1", "year": "1994", "cover": ""},
+            }],
+        },
+    )
+
+    first = client.post("/upgrade/review", follow_redirects=False)
+    job_id = first.headers["location"].removeprefix("/jobs/")
+    job = job_mgr.registry.get(job_id)
+    client.post(f"/jobs/{job.id}/select",
+                data={"cid": job.candidates[0]["cid"], "checked": "1"})
+    creds.clear()
+
+    r = client.post(f"/jobs/{job.id}/approve", follow_redirects=False)
+
+    assert r.status_code == 303
+    assert r.headers["location"] == "/"
+    assert job.status == job_mgr.JobStatus.AWAITING_REVIEW
+    assert any(c.get("selected") for c in job.candidates)
+
+
 def test_incomplete_upgrade_state_is_not_reviewable(client, monkeypatch):
     from qobuz_librarian.web import app as webapp
     from qobuz_librarian.web import jobs as job_mgr
@@ -1680,6 +1717,42 @@ def test_downsample_approve_resyncs_saved_review_before_execution(
     assert r.headers["location"] == f"/jobs/{job.id}?noselection=1"
     assert job.status == job_mgr.JobStatus.AWAITING_REVIEW
     assert job.candidates == []
+
+
+def test_approve_refuses_parked_downsample_review_without_engine(
+        client, monkeypatch):
+    from qobuz_librarian.web import jobs as job_mgr
+
+    monkeypatch.setattr(
+        "qobuz_librarian.integrations.downsample_engine.HAVE_DOWNSAMPLE", True)
+    monkeypatch.setattr(
+        "qobuz_librarian.library.downsample_state.load",
+        lambda: {
+            "updated_at": time.time(),
+            "complete": True,
+            "candidates": [{
+                "title": "Dummy",
+                "artist": "Portishead",
+                "detail": "24-bit / 96 kHz -> 16-bit / 48 kHz",
+                "album_dir": "/music/Portishead/Dummy",
+                "est_saving": 1234,
+            }],
+        },
+    )
+
+    first = client.post("/downsample/review", follow_redirects=False)
+    job_id = first.headers["location"].removeprefix("/jobs/")
+    job = job_mgr.registry.get(job_id)
+    client.post(f"/jobs/{job.id}/select",
+                data={"cid": job.candidates[0]["cid"], "checked": "1"})
+    monkeypatch.setattr(
+        "qobuz_librarian.integrations.downsample_engine.HAVE_DOWNSAMPLE", False)
+
+    r = client.post(f"/jobs/{job.id}/approve", follow_redirects=False)
+
+    assert r.status_code == 303
+    assert r.headers["location"] == "/downsample"
+    assert job.status == job_mgr.JobStatus.AWAITING_REVIEW
 
 
 def test_incomplete_downsample_state_is_not_reviewable(client, monkeypatch):

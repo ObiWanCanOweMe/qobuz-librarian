@@ -3062,8 +3062,12 @@ async def job_page(request: Request, job_id: str, approved: bool = False,
         historical = True
     # An upgrade/downsample job page is that tool's surface, so its nav item
     # lights up (and its review dot counts as seen — the user is looking at it).
+    # Unless the tool is unavailable: then the nav hides Upgrade, and lighting a
+    # hidden item points at nothing — fall back to Queue.
     nav_page = (job.execute_kind
                 if job.execute_kind in ("upgrade", "downsample") else "queue")
+    if nav_page == "upgrade" and not _upgrade_available():
+        nav_page = "queue"
     ctx = {"job": job, "page": nav_page,
            "approved": approved, "stale": stale, "noselection": noselection,
            "historical": historical,
@@ -3191,6 +3195,17 @@ async def job_approve(request: Request, job_id: str):
     job = job_mgr.registry.get(job_id)
     if not job:
         return RedirectResponse(url="/queue", status_code=303)
+    # A parked review can outlive its feature: credentials can be pulled after
+    # an upgrade review parks, and the downsample engine can vanish across a
+    # restart. The tool's own routes refuse in that state, so the approve door
+    # refuses the same way — otherwise the run launches straight into a doomed
+    # token or engine lookup.
+    if job.execute_kind == "upgrade" and not _upgrade_available():
+        return _upgrade_unavailable_response()
+    if job.execute_kind == "downsample":
+        from qobuz_librarian.integrations.downsample_engine import HAVE_DOWNSAMPLE
+        if not HAVE_DOWNSAMPLE:
+            return RedirectResponse(url="/downsample", status_code=303)
     # Repair and Library stay on their single surfaces through the executing
     # phase; every other kind — new-release checks included — keeps using the
     # job page.
