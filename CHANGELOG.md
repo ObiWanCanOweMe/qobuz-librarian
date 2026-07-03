@@ -11,6 +11,9 @@ Fixes from the first day of running 0.10.0 against a full-size library.
 - The first library scan reports what it's doing from the start — reading albums on disk, checking upgrade quality, fingerprinting folders — instead of sitting on "waiting for output" for minutes while it worked through the pre-scan passes.
 - Phone fixes: the bottom tab bar's icons render again (their stroke style was scoped to the desktop nav), pages scroll clear of the bar, the queue badge reads as a badge and hides properly when the count is zero (`hidden` now beats component display rules), whole queue cards are tap targets, and the reconnect notice waits five seconds so backgrounding the app doesn't flash a warning.
 - The Upgrade page shows the connect card when Qobuz isn't linked instead of bouncing to Search; the Queue and History pages stopped calling themselves "Activity"; downsample's three overlapping cards merged into one with both actions; scan copy says "Scan library" instead of "run Library"; the setup page's no-login note is a footnote instead of a fake dropdown; and the settings defaults drawer no longer crowds the save button.
+- The queue is work in flight: parked reviews moved off it into History (with an Open link back to their review), the Queue badge counts only running and waiting jobs instead of pinning a permanent "1" while a review sits parked, and opening a review no longer asks for confirmation — it's navigation, not an action.
+- Big-review handling: each artist row can be dismissed without expanding it, the review tools (select, expand, dismiss unselected, dismissed link) live in one row so the sticky footer holds just the download button, and "Load more artists" loads itself as you scroll.
+- Once Qobuz is connected, the Settings credential fields collapse behind "Change account or token" instead of sitting as an open form.
 
 ## [0.10.0] - 2026-07-02
 
