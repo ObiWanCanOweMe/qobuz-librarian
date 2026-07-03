@@ -525,13 +525,20 @@ def scan_library(job, token, partial_only=False, force_full=False):
         and previous_scan.get("complete")
         and previous_scan.get("hidden_signature", "") == hidden_sig
     )
+    # The two refreshes and the fingerprint pass below run before the main
+    # artist loop, and on a first scan of a large library each takes real
+    # minutes — without progress ticks the job sits on "Waiting for output"
+    # looking hung the whole time.
     downsample_refresh_started_at = time.time()
+    log.info(f"Reading albums from {plural(len(artists), 'artist folder')} on disk…")
     downsample_refresh = downsample_state.refresh_for_artists(
         artists,
         hidden=hidden,
         cancel_check=lambda: bool(job.cancel_requested),
         persist=False,
         skip_unchanged=cheap_refresh,
+        on_artist=lambda ad, _specs, _err, done_i, total_i: job.push_progress(
+            "Reading albums on disk", done_i, total_i, ad.name, unit="artist"),
     )
     upgrade_refresh = None
     upgrade_refresh_started_at = None
@@ -539,6 +546,7 @@ def scan_library(job, token, partial_only=False, force_full=False):
         from qobuz_librarian.quality.decision import load_capped
         from qobuz_librarian.web.jobs import pool_initializer_kwargs
         upgrade_refresh_started_at = time.time()
+        log.info("Comparing owned albums against the editions Qobuz can serve…")
         upgrade_refresh = upgrade_state.refresh_for_artists(
             artists,
             token=token,
@@ -550,12 +558,19 @@ def scan_library(job, token, partial_only=False, force_full=False):
             pool_kwargs=pool_initializer_kwargs(),
             skip_unchanged=cheap_refresh,
             persist=False,
+            on_artist=lambda ad, _specs, _err, done_i, total_i: job.push_progress(
+                "Checking upgrade quality", done_i, total_i, ad.name, unit="artist"),
         )
     elif not cfg.UPGRADE_SCAN_ENABLED:
         review_badges.set_ready("upgrade", False)
     target = "Gap Fill candidates in owned albums" if partial_only else "missing albums"
     log.info(f"Scanning {plural(len(artists), 'library artist')} for {target}")
-    fingerprints = {ad.name: artist_fingerprint(ad) for ad in artists}
+    fingerprints = {}
+    for _i, _ad in enumerate(artists, 1):
+        fingerprints[_ad.name] = artist_fingerprint(_ad)
+        if _i % 25 == 0 or _i == len(artists):
+            job.push_progress("Fingerprinting artist folders", _i, len(artists),
+                              _ad.name, unit="folder")
     previous_artists = (previous_scan.get("artists") or {}) if cheap_refresh else {}
     state_artists: dict[str, dict] = {}
     if resuming:
