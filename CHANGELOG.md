@@ -2,6 +2,16 @@
 
 All notable changes to Qobuz Librarian are recorded here, newest first. The project follows [semantic versioning](https://semver.org/); dates are when each version was tagged during local development.
 
+## [0.10.1] - 2026-07-03
+
+Fixes from the first day of running 0.10.0 against a full-size library.
+
+- Approving a review now asks before it queues anything, with the real count in the question — previously one tap on the review button could start every selected download unprompted. Repair reviews confirm the same way.
+- Review checkboxes respond immediately on large libraries: each tick used to serialize and write the entire candidate list (tens of megabytes at tens of thousands of candidates) before answering; saves now coalesce in the background.
+- The first library scan reports what it's doing from the start — reading albums on disk, checking upgrade quality, fingerprinting folders — instead of sitting on "waiting for output" for minutes while it worked through the pre-scan passes.
+- Phone fixes: the bottom tab bar's icons render again (their stroke style was scoped to the desktop nav), pages scroll clear of the bar, the queue badge reads as a badge and hides properly when the count is zero (`hidden` now beats component display rules), whole queue cards are tap targets, and the reconnect notice waits five seconds so backgrounding the app doesn't flash a warning.
+- The Upgrade page shows the connect card when Qobuz isn't linked instead of bouncing to Search; the Queue and History pages stopped calling themselves "Activity"; downsample's three overlapping cards merged into one with both actions; scan copy says "Scan library" instead of "run Library"; the setup page's no-login note is a footnote instead of a fake dropdown; and the settings defaults drawer no longer crowds the save button.
+
 ## [0.10.0] - 2026-07-02
 
 **A new web interface**
