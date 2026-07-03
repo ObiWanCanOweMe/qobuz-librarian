@@ -173,6 +173,7 @@
       <form action="/search" method="post"
             hx-post="/search" hx-target="#search-results" hx-swap="innerHTML"
             hx-indicator="#dashboard-search-spinner"
+            {% if auto_search %}hx-trigger="submit, load"{% endif %}
             class="ql-search-form">
         <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
         <div class="ql-segmented" role="group" aria-label="Search for">

@@ -1666,6 +1666,10 @@ async def dashboard(request: Request, q: str = "", kind: str = "artist"):
         "lock_busy_pid": _LOCK_BUSY_PID,
         "search_q": search_q,
         "search_kind": search_kind,
+        # Album/track deep links can't be pre-rendered the way artist ones are
+        # (their pipeline lives in POST /search), so the form submits itself on
+        # load instead of sitting prefilled and inert.
+        "auto_search": bool(search_q) and search_kind in ("album", "track"),
         "initial_search_results": initial_search_results,
         "page": "dashboard",
         **disk,

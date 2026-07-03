@@ -97,18 +97,32 @@
   });
 
   // "/" jumps to the search box from anywhere, unless you're already typing
-  // in a field (so slashes in queries and paths still land).
+  // in a field (so slashes in queries and paths still land). Pages without a
+  // search box go to Search, carrying a hash so it lands focused.
   document.addEventListener("keydown", function (evt) {
     if (evt.key !== "/" || evt.ctrlKey || evt.metaKey || evt.altKey) return;
     var t = evt.target;
     if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" ||
               t.tagName === "SELECT" || t.isContentEditable)) return;
-    var box = document.querySelector('input[name="q"]');
-    if (!box) return;
     evt.preventDefault();
+    var box = document.querySelector('input[name="q"]');
+    if (!box) {
+      window.location.href = "/#search";
+      return;
+    }
     box.focus();
     box.select();
   });
+  function focusSearchFromHash() {
+    if (window.location.hash !== "#search") return;
+    var landBox = document.querySelector('input[name="q"]');
+    if (landBox) landBox.focus();
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", focusSearchFromHash);
+  } else {
+    focusSearchFromHash();
+  }
 
   // Plain POST forms need immediate feedback while the redirect starts.
   document.addEventListener("submit", function (evt) {
