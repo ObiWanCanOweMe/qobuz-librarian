@@ -83,10 +83,14 @@
 }
 
 /* The component rules below are unlayered, so they outrank Tailwind's layered
-   utilities — including `hidden`, which anything with its own `display` was
-   silently defeating (the empty Queue badge dot). Hidden must always mean
-   gone, no matter what the element is. */
-.hidden {
+   utilities — including `hidden`, which badge and button rules that set their
+   own `display` were silently defeating (the empty Queue badge dot). Scoped to
+   those cases only: a global important `hidden` would also beat the
+   `hidden lg:flex` reveal pattern and take the desktop sidebar with it. */
+.ql-tab-count.hidden,
+.ql-queue-badge.hidden,
+.ql-review-tool.hidden,
+.ql-btn.hidden {
   display: none !important;
 }
 
