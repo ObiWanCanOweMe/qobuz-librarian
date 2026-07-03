@@ -3000,10 +3000,8 @@ async def migrate_page(request: Request):
     src, dest = cfg.MIGRATE_SRC, cfg.MIGRATE_DEST
     return _tr(request, "migrate.html", {
         # No nav item of its own — it's reached from Settings, so Settings
-        # stays lit.
+        # stays lit. The paths surface through migrate_checks, not directly.
         "page": "settings",
-        "src": src,
-        "dest": dest,
         "configured": bool(src and dest),
         "migrate_checks": _migrate_checks(src, dest),
     })
@@ -3028,7 +3026,7 @@ async def migrate_scan(request: Request):
         err = engine.validate_paths(Path(src), Path(dest), in_place=in_place)
     if err:
         return _tr(request, "migrate.html", {
-            "page": "settings", "src": src, "dest": dest,
+            "page": "settings",
             "configured": bool(src and dest), "error": err,
             "migrate_checks": _migrate_checks(src, dest)})
     from qobuz_librarian.web import flows
