@@ -1608,7 +1608,6 @@ async def dashboard(request: Request, q: str = "", kind: str = "artist"):
     def _gather_disk_state():
         from qobuz_librarian.integrations.lyrics import load_lyric_retry
         from qobuz_librarian.library import new_releases, scan_checkpoint
-        from qobuz_librarian.ui_cli.prompts import _read_fetch_log
         # These read state files and may submit a background job, so they run
         # here (off the event loop) alongside the other disk work. Resume an
         # interrupted scan first (the new-release check is gated on the baseline).
@@ -1628,7 +1627,6 @@ async def dashboard(request: Request, q: str = "", kind: str = "artist"):
             # active_jobs) so the scan the auto-trigger just submitted shows.
             "baseline_complete": new_releases.is_baseline_complete(),
             "setup_scanning": _active_library_scan() is not None,
-            "scan_resumable": scan_checkpoint.pending() is not None,
             "library_scan_state": library_scan_state,
             # An interrupted gap-scan, surfaced on the dashboard the way /library
             # already does — gated on no scan running. The setup banner above
@@ -1637,28 +1635,13 @@ async def dashboard(request: Request, q: str = "", kind: str = "artist"):
             "library_resume": (lambda cp: cp if cp is not None
                                and _active_library_scan() is None else None)(
                                    scan_checkpoint.pending()),
-            # tail-only read so a long-running install with a multi-MB fetch log
-            # doesn't slurp the whole file on every dashboard load. Hide the
-            # no-op results (already complete / already best / skipped / no
-            # change) so this lists actual downloads, not scans that found
-            # nothing to fetch.
-            "recent": list(reversed([
-                e for e in _read_fetch_log(limit_tail=60)
-                if e.get("result") not in {
-                    "already_complete", "skipped_already_higher_quality",
-                    "skipped_has_extras", "nothing_landed",
-                }
-            ]))[:8],
             # First-run nudge: a fresh install has no creds, so every search/scan
             # would fail cryptically — surface it up front. Filesystem-only.
             "creds_ok": bool(_read_creds().get("auth_token")),
             "qobuz_ready": _qobuz_ready(),
-            "recent_empty_hint": _recent_empty_hint(),
             "lyric_retry_count":
                 len(load_lyric_retry()) if _cfg.LYRIC_RETRY_FILE.exists() else 0,
             "staging_album_count": 0 if active_jobs else _staging_album_count(),
-            "last_library_scan": _last_scan_age(),
-            "last_new_release_check": _last_new_release_check_age(),
         }
 
     loop = asyncio.get_running_loop()
