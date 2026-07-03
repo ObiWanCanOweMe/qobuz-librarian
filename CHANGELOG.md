@@ -26,6 +26,8 @@ Fixes from the first day of running 0.10.0 against a full-size library.
 - On phones the review footer is one button tall — Discard keeps its tap target but drops the button chrome so downloading stays the only loud action.
 - Repair's Scan–Review–Repair steps no longer stretch across the whole page, and the Settings Mode panel lost its box-in-a-box border.
 - The Upgrade/Downsample switcher hides when upgrades are unavailable (the nav already did), and status chips use the same capitalisation and names everywhere — History now says "Needs review" like the job page does.
+- Settings saves apply immediately when the only outstanding work is a parked review — previously they were silently held until some future job finished, while the page showed the new values as if live. Saves still defer under a genuinely running job.
+- Search deep links with an album or track kind run the search on load like artist links do, the "/" shortcut reaches the search box from any page, the grouped album view names both numbers when editions fold ("94 albums · 99 releases"), and the phone's More sheet closes on Escape.
 
 ## [0.10.0] - 2026-07-02
 
