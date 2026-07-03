@@ -22,6 +22,10 @@ Fixes from the first day of running 0.10.0 against a full-size library.
 - Downsample's "Refresh candidates" says up front when it will replace a review you already have parked, and the toolbar's "Dismissed (N)" link updates as you dismiss instead of waiting for a reload.
 - Library migration is reachable from Settings → Library paths (it previously existed only as a direct URL), approving a copy migration asks about copying rather than "downloading", and discarding an Upgrade, Downsample, or migration review returns you to its page instead of the queue.
 - The library census notes that its counts come from the last scan.
+- History reads like the rest of the app: timestamps say "2 hr ago" (or a short date once they're old, with the exact time in a tooltip), long job summaries trim to three lines, and each row's status, time, and Open link sit on one line instead of stacking. Section counts sit beside their heading rather than floating at the far edge.
+- On phones the review footer is one button tall — Discard keeps its tap target but drops the button chrome so downloading stays the only loud action.
+- Repair's Scan–Review–Repair steps no longer stretch across the whole page, and the Settings Mode panel lost its box-in-a-box border.
+- The Upgrade/Downsample switcher hides when upgrades are unavailable (the nav already did), and status chips use the same capitalisation and names everywhere — History now says "Needs review" like the job page does.
 
 ## [0.10.0] - 2026-07-02
 

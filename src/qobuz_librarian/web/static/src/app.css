@@ -2651,6 +2651,11 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
   gap: 0.75rem;
 }
 .ql-activity-section-header {
+  /* The count belongs to the word, not the far edge — a chip floating at the
+     opposite side of the page read as disconnected. */
+  justify-content: flex-start;
+  align-items: center;
+  gap: 0.5rem;
   padding-inline: 0.15rem;
 }
 .ql-activity-section-header h2 {
@@ -2834,9 +2839,23 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
   font-size: 0.84rem;
 }
 .ql-history-row .ql-activity-side {
-  grid-template-columns: auto auto;
+  /* chip · time · open on one line; the old two-column grid wrapped the Open
+     link onto its own ragged row. */
+  grid-template-columns: auto auto auto;
   align-items: center;
   gap: 0.7rem;
+}
+.ql-history-row .ql-activity-time {
+  /* Relative stamps ("2 hr ago") speak the same voice as the tool pages —
+     prose, not a log line. */
+  font-family: inherit;
+  font-size: 0.8rem;
+}
+.ql-history-row .ql-row-meta {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 .ql-row-open {
   color: var(--ql-text-2);
@@ -2896,6 +2915,22 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
   .ql-activity-side {
     width: 100%;
     justify-items: start;
+  }
+  .ql-history-row .ql-activity-side {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+  }
+  .ql-history-row .ql-activity-side .ql-activity-actions {
+    width: auto;
+    margin-left: auto;
+  }
+  .ql-history-row .ql-activity-actions > form,
+  .ql-history-row .ql-activity-actions > .ql-btn {
+    flex: none;
+  }
+  .ql-history-row .ql-activity-actions .ql-btn {
+    width: auto;
   }
   .ql-history-title-line {
     flex-direction: column;
@@ -3623,6 +3658,9 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
 }
 .ql-repair-phase {
   display: flex;
+  /* Capped: stretched across the full content width the three steps read as
+     lost punctuation, not one unit. */
+  max-width: 26rem;
   align-items: center;
   gap: 0.5rem;
   margin-bottom: 0.25rem;
@@ -4964,14 +5002,14 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
 }
 
 .ql-mode-row {
+  /* A divider row, not a box — the old bordered panel nested a card inside
+     the section card. */
   display: flex;
   min-width: 0;
   flex-direction: column;
   gap: 0.875rem;
-  border: 1px solid color-mix(in oklab, var(--ql-text) 10%, transparent);
-  border-radius: var(--ql-radius-sm);
-  background-color: color-mix(in oklab, var(--ql-text) 3%, transparent);
-  padding: 0.875rem 1rem;
+  border-top: 1px solid var(--ql-line-soft);
+  padding-top: 0.875rem;
 }
 .ql-mode-state {
   margin: 0 0 0.125rem;
@@ -4984,10 +5022,6 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
     align-items: center;
     justify-content: space-between;
   }
-}
-[data-theme="night"] .ql-mode-row {
-  border-color: color-mix(in oklab, var(--ql-text) 11%, transparent);
-  background-color: color-mix(in oklab, var(--ql-text) 3.5%, transparent);
 }
 
 .ql-diagnostics-list {
@@ -5471,6 +5505,22 @@ details[open] > .ql-disclosure-summary::after {
   .ql-job-actions .ql-btn,
   .ql-job-actions form {
     width: 100%;
+  }
+}
+@media (max-width: 639.98px) {
+  /* One loud thing in the footer. The secondary actions keep their tap
+     targets but drop the button chrome, so the bar stays one button tall
+     instead of stacking two full-width slabs. */
+  .ql-review-footer-secondary-group {
+    justify-content: center;
+    gap: 1.25rem;
+  }
+  .ql-review-footer-secondary-group .ql-btn {
+    flex: none;
+    width: auto;
+    border-color: transparent;
+    background: transparent;
+    box-shadow: none;
   }
 }
 @media (min-width: 640px) {

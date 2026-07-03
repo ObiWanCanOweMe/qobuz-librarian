@@ -111,7 +111,7 @@
       <p class="ql-job-activity-line">
         <span id="job-activity" aria-live="polite">{% if s == 'scanning' %}{{ job.progress_phase or 'Scanning' }}{% elif s == 'running' %}{{ job.progress_phase or labels.job_activity(job) }}{% else %}Queued{% endif %}</span>
         <span id="scan-elapsed" class="ql-job-elapsed readout" data-start="{{ job.started_at or job.created_at }}" data-now="{{ now_ts() }}"></span>
-        {% if job.cancel_requested %}<span class="ql-status-chip is-neutral ql-inline-status">stopping</span>{% endif %}
+        {% if job.cancel_requested %}<span class="ql-status-chip is-neutral ql-inline-status">Stopping</span>{% endif %}
         <span id="sse-reconnect" class="ql-status-chip is-warning ql-inline-status hidden" role="status" aria-live="polite">connection lost, reconnecting…</span>
       </p>
       {% if not job.cancel_requested %}

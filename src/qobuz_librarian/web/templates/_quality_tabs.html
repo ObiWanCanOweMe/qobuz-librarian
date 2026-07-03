@@ -1,3 +1,7 @@
+{# Only draw the switcher when there are two tools to switch between —
+   with upgrades unavailable the nav hides Upgrade, and a tab pointing at a
+   page that bounces home would contradict it. #}
+{% if upgrade_available %}
 <nav class="ql-page-tabs ql-quality-tabs" aria-label="Quality tools">
   <a href="/upgrade"
      class="{% if active_tab == 'upgrade' %}is-active{% endif %}"
@@ -6,3 +10,4 @@
      class="{% if active_tab == 'downsample' %}is-active{% endif %}"
      {% if active_tab == 'downsample' %}aria-current="page"{% endif %}><span>Downsample</span></a>
 </nav>
+{% endif %}

@@ -3822,15 +3822,13 @@ _HISTORY_BULK_CAP = 40
 async def queue_history(request: Request, p: int = 1):
     """The History tab: every finished job, newest first, paged from jobs.db so
     the record outlives the in-memory cap (which only the Queue/SSE views use)."""
-    from datetime import datetime
-
     from qobuz_librarian.web import job_persistence
     p = max(1, p)
 
     def _stamp(rows):
         for r in rows:
             ts = r.get("finished_at") or r.get("created_at")
-            r["when"] = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else ""
+            r["when"], r["when_exact"] = _when_label(ts)
         return rows
 
     def _load_page(page):
@@ -4663,6 +4661,24 @@ def _format_age(ts: float) -> str:
         return f"{int(age / 3600)} hr ago"
     days = int(age / 86400)
     return f"{days} day{'s' if days != 1 else ''} ago"
+
+
+def _when_label(ts) -> tuple[str, str]:
+    """(label, exact) pair for a history timestamp: relative while it's fresh
+    (matching the "1 hr ago" the tool pages already speak), a short date once
+    it isn't. The exact stamp goes in a tooltip for anyone who needs the
+    minute."""
+    from datetime import datetime
+    if not ts:
+        return "", ""
+    exact = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    if time.time() - ts < 7 * 86400:
+        return _format_age(ts), exact
+    dt = datetime.fromtimestamp(ts)
+    label = f"{dt.strftime('%b')} {dt.day}"
+    if dt.year != datetime.now().year:
+        label += f", {dt.year}"
+    return label, exact
 
 
 def _last_scan_age() -> str | None:
