@@ -542,6 +542,11 @@
         if (!keys.length || bulkButton.disabled) return;
         var forms = keys.map(firstFormForKey).filter(Boolean);
         if (!forms.length) return;
+        window.qlConfirm("Download " + keys.length + " selected album(s)? They queue now and import into your library.").then(function (ok) {
+          if (ok) runBulkDownload(forms);
+        });
+      }
+      function runBulkDownload(forms) {
         var original = bulkButton.textContent;
         bulkButton.disabled = true;
         bulkButton.textContent = "Queueing...";
