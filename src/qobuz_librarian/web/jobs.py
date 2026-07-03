@@ -578,6 +578,33 @@ class JobLogHandler(logging.Handler):
 # ── Global singletons ─────────────────────────────────────────────────────────
 
 registry = JobRegistry()
+
+# Review ticks save the whole candidate list, and on a big library that list
+# runs to tens of megabytes — written per checkbox, each tap waited on a
+# multi-hundred-ms serialize+write. Coalesce instead: at most one save per job
+# per delay window. Approve, discard, and status changes still persist
+# synchronously, so at worst a crash loses the last second and a half of ticks.
+_PERSIST_DELAY = 1.5
+_persist_timers: dict[str, threading.Timer] = {}
+_persist_timers_lock = threading.Lock()
+
+
+def persist_soon(job) -> None:
+    def _flush():
+        with _persist_timers_lock:
+            _persist_timers.pop(job.id, None)
+        # A job pruned or dismissed while the timer ran must not be written
+        # back — restore would resurrect a review the user already discarded.
+        if registry.get(job.id) is not job:
+            return
+        job_persistence.persist(job)
+    with _persist_timers_lock:
+        if job.id in _persist_timers:
+            return
+        t = threading.Timer(_PERSIST_DELAY, _flush)
+        t.daemon = True
+        _persist_timers[job.id] = t
+        t.start()
 # Two worker lanes so a quick single-album download isn't stuck behind a scan
 # whose execute phase is downloading 30 albums. Each lane keeps its own work
 # queue and worker thread; the shared `staging_lock` below serialises the

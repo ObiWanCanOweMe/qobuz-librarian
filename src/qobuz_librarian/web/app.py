@@ -3363,16 +3363,13 @@ async def job_select(request: Request, job_id: str):
     job = _get_reviewable_job(job_id)
     if not job or job.execute_kind not in _SELECTABLE_KINDS:
         return JSONResponse({"error": "not found"}, status_code=404)
-    from qobuz_librarian.web import job_persistence
     form = await request.form()
     cid = (form.get("cid") or "").strip()
     on = (form.get("checked") or "").strip().lower() in ("1", "true", "on", "yes")
     if cid and job.set_selected(cid, on):
-        # persist() json.dumps the whole candidates list (multi-MB near the
-        # candidate cap) and writes SQLite under a lock — keep it off the event
-        # loop so a single checkbox tick doesn't stall every other request.
-        await asyncio.get_running_loop().run_in_executor(
-            None, job_persistence.persist, job)
+        # Coalesced save: the candidate list is multi-MB on a big library, so
+        # the tap must not wait for (or even schedule) a full serialize+write.
+        job_mgr.persist_soon(job)
         job.notify_review_changed(_review_origin(request))
     return JSONResponse(_selection_payload(job))
 
@@ -3384,7 +3381,6 @@ async def job_select_all(request: Request, job_id: str):
     job = _get_reviewable_job(job_id)
     if not job or job.execute_kind not in _SELECTABLE_KINDS:
         return JSONResponse({"error": "not found"}, status_code=404)
-    from qobuz_librarian.web import job_persistence
     form = await request.form()
     on = (form.get("on") or "").strip().lower() in ("1", "true", "on", "yes")
     scope = (form.get("scope") or "all").strip().lower()
@@ -3400,8 +3396,7 @@ async def job_select_all(request: Request, job_id: str):
             cids = [c["cid"] for c in job.candidates
                     if flows.is_gap_candidate(c) == gap_active]
     if job.set_all_selected(on, cids=cids):
-        await asyncio.get_running_loop().run_in_executor(
-            None, job_persistence.persist, job)
+        job_mgr.persist_soon(job)
         job.notify_review_changed(_review_origin(request))
     return JSONResponse(_selection_payload(job))
 
