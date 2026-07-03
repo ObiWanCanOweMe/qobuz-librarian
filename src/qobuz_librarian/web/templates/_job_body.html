@@ -41,8 +41,11 @@
   {% set s = job.status.value %}
   {% set _historical = historical|default(false) %}
   {% set _review_thing = labels.discard_review_label(job) %}
-  {% set _back_href = '/repair' if job.execute_kind == 'repair' else ('/library' if job.execute_kind in ('library', 'new_releases') else '/queue') %}
-  {% set _back_label = 'Back to repair' if job.execute_kind == 'repair' else ('Back to Library' if job.execute_kind in ('library', 'new_releases') else 'Back to queue') %}
+  {# Finished jobs are reached from History, not the queue — send people back
+     to where they actually came from. #}
+  {% set _finished = s in ('done', 'failed', 'canceled') %}
+  {% set _back_href = '/repair' if job.execute_kind == 'repair' else ('/library' if job.execute_kind in ('library', 'new_releases') else ('/queue/history' if _finished else '/queue')) %}
+  {% set _back_label = 'Back to repair' if job.execute_kind == 'repair' else ('Back to Library' if job.execute_kind in ('library', 'new_releases') else ('Back to History' if _finished else 'Back to queue')) %}
 
   {% if s == 'awaiting_review' %}
     {# The review tools row already states the live count; repeating the scan

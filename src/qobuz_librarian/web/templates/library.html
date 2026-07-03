@@ -69,7 +69,7 @@
   <section class="ql-scan-panel">
     <div class="ql-scan-panel-copy">
       <p class="ql-scan-panel-title">Scan library</p>
-      <p class="ql-scan-panel-text">Re-reads your artist folders (skipping unchanged ones) and refreshes Missing Albums, Gap Fill, Upgrade, and Downsample in one pass. Check new releases only asks Qobuz for albums newer than your last scan.</p>
+      <p class="ql-scan-panel-text">Re-reads your artist folders (skipping unchanged ones) and refreshes Missing Albums, Gap Fill, Upgrade, and Downsample in one pass.{% if last_full_scan %} Results from your last scan are reused for unchanged folders, so this is quick — a discarded review comes back the same way.{% endif %}</p>
     </div>
     <div class="ql-scan-panel-actions">
       <form action="/library" method="post" data-busy-submit>
@@ -77,17 +77,21 @@
         <input type="hidden" name="mode" value="missing_albums">
         <button type="submit" class="ql-btn ql-btn-primary w-full sm:w-auto">Scan library</button>
       </form>
-      <form action="/library" method="post" data-busy-submit>
-        <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-        <input type="hidden" name="mode" value="new_releases">
-        <button type="submit" class="ql-btn ql-btn-secondary ql-secondary-action">Check new releases</button>
-      </form>
-      <form action="/library" method="post" data-busy-submit>
-        <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-        <input type="hidden" name="mode" value="missing_albums">
-        <button type="submit" name="force_full" value="1" class="ql-btn ql-btn-ghost ql-btn-sm w-full sm:w-auto"
-                data-confirm="Re-scan every artist folder from scratch? This ignores the unchanged-folder cache, so it takes as long as a first scan. Use it after large manual changes to your files.">Force full rescan</button>
-      </form>
+      <div class="ql-scan-variants">
+        <form action="/library" method="post" data-busy-submit>
+          <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+          <input type="hidden" name="mode" value="new_releases">
+          <button type="submit" class="ql-link-action"
+                  title="Skips your folders entirely — just asks Qobuz for albums newer than your last scan.">Check new releases only</button>
+        </form>
+        <span class="ql-scan-variants-sep" aria-hidden="true">·</span>
+        <form action="/library" method="post" data-busy-submit>
+          <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+          <input type="hidden" name="mode" value="missing_albums">
+          <button type="submit" name="force_full" value="1" class="ql-link-action"
+                  data-confirm="Re-scan every artist folder from scratch? This ignores the unchanged-folder cache, so it takes as long as a first scan. Use it after large manual changes to your files.">Force full rescan</button>
+        </form>
+      </div>
     </div>
   </section>
 

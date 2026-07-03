@@ -4477,6 +4477,31 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
   position: relative;
   z-index: 1;
 }
+/* Scan variants: quiet text actions under the one real button. */
+.ql-scan-variants {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.55rem;
+  margin-top: 0.15rem;
+}
+.ql-scan-variants-sep {
+  color: var(--ql-text-3);
+}
+.ql-link-action {
+  border: 0;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+  color: var(--ql-text-2);
+  font-size: 0.8rem;
+  border-bottom: 1px dotted color-mix(in oklab, currentColor 55%, transparent);
+  transition: color 150ms ease;
+}
+.ql-link-action:hover {
+  color: var(--ql-text);
+}
+
 /* App-drawn confirm dialog — replaces the browser's native popup. */
 .ql-confirm {
   margin: auto;
