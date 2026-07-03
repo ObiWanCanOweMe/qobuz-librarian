@@ -303,6 +303,14 @@
 
   <div id="download-toast" class="ql-toast-host" aria-live="polite"></div>
 
+  <dialog id="ql-confirm" class="ql-confirm" aria-labelledby="ql-confirm-text">
+    <p id="ql-confirm-text" class="ql-confirm-text" data-confirm-text></p>
+    <div class="ql-confirm-actions">
+      <button type="button" class="ql-btn ql-btn-sm ql-btn-secondary" data-confirm-cancel>Cancel</button>
+      <button type="button" class="ql-btn ql-btn-sm ql-btn-primary" data-confirm-ok>Continue</button>
+    </div>
+  </dialog>
+
   <script nonce="{{ request.state.csp_nonce }}">
     if ('serviceWorker' in navigator) {
       // The content hash invalidates the service-worker cache.

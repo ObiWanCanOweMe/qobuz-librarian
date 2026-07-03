@@ -2583,9 +2583,12 @@ async def library_page(request: Request, page: int = 1):
         # nothing is running above.
         cp = scan_checkpoint.pending()
         ctx["library_resume"] = cp if cp is not None else None
-        if ctx["baseline_complete"]:
-            loop = asyncio.get_running_loop()
-            ctx["census"] = await loop.run_in_executor(None, _census_view)
+    # The census renders whenever the page is calm — no job, or a parked
+    # review below it — so it doesn't blink in and out with review state.
+    if ctx["baseline_complete"] and (
+            ljob is None or ljob.status == job_mgr.JobStatus.AWAITING_REVIEW):
+        loop = asyncio.get_running_loop()
+        ctx["census"] = await loop.run_in_executor(None, _census_view)
     return _tr(request, "library.html", ctx)
 
 

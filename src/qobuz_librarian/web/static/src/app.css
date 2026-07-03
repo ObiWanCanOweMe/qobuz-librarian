@@ -4437,6 +4437,33 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
   position: relative;
   z-index: 1;
 }
+/* App-drawn confirm dialog — replaces the browser's native popup. */
+.ql-confirm {
+  margin: auto;
+  width: min(26rem, calc(100vw - 2.5rem));
+  padding: 1.15rem 1.2rem 1.05rem;
+  border: 1px solid var(--ql-line-soft);
+  border-radius: 0.85rem;
+  background: color-mix(in oklab, var(--ql-bg) 96%, #fff);
+  color: var(--ql-text);
+  box-shadow: 0 18px 50px oklch(0% 0 0 / 0.45);
+}
+[data-theme="winter"] .ql-confirm {
+  background: #faf4e8;
+}
+.ql-confirm::backdrop {
+  background: oklch(0% 0 0 / 0.55);
+}
+.ql-confirm-text {
+  margin: 0 0 1.05rem;
+  font-size: 0.925rem;
+  line-height: 1.5;
+}
+.ql-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6rem;
+}
 .ql-census-rows {
   display: grid;
   gap: 0.5rem;

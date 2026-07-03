@@ -1,0 +1,31 @@
+{% if census %}
+<section class="ql-census">
+  <div class="ql-census-head">
+    <p class="ql-scan-panel-title">What's on disk</p>
+    <span class="ql-census-total">{{ census.total }}</span>
+  </div>
+  <div class="ql-census-bar" aria-hidden="true">
+    {% for seg in census.bar %}<i class="ql-census-seg-{{ seg.key }}" style="flex-basis: {{ seg.pct }}%"></i>{% endfor %}
+  </div>
+  <div class="ql-census-rows">
+    {% for row in census.rows %}
+    <div class="ql-census-row">
+      <span class="ql-census-dot ql-census-seg-{{ row.key }}" aria-hidden="true"></span>
+      <span class="ql-census-name">{{ row.label }}</span>
+      <span class="ql-census-n">{{ row.tracks }}</span>
+      <span class="ql-census-gb">{{ row.size }}</span>
+    </div>
+    {% endfor %}
+  </div>
+  {% if census.top %}
+  <hr class="ql-census-rule">
+  <p class="ql-census-subhead">Most hi-res disk</p>
+  <div class="ql-census-artists">
+    {% for a in census.top %}<span><b>{{ a.name }}</b> {{ a.size }}</span>{% endfor %}
+  </div>
+  {% endif %}
+  {% if census.reclaim %}
+  <p class="ql-census-foot">Downsampling the hi-res set to CD rate would reclaim about <b>{{ census.reclaim }}</b> &mdash; <a href="/downsample" class="ql-inline-link">review candidates</a></p>
+  {% endif %}
+</section>
+{% endif %}

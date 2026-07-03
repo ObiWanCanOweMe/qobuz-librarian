@@ -138,22 +138,51 @@
     });
   });
 
-  // Shared confirm prompt for destructive submits and links. A {count}
-  // placeholder picks up the number shown in the control's own label, so the
-  // review submit can say how many albums a tap is really about to queue.
+  // Styled confirm prompt (the app-drawn <dialog>, not the browser's popup),
+  // falling back to window.confirm where <dialog> is unsupported.
+  window.qlConfirm = function (msg) {
+    var d = document.getElementById("ql-confirm");
+    if (!d || typeof d.showModal !== "function") {
+      return Promise.resolve(window.confirm(msg));
+    }
+    return new Promise(function (resolve) {
+      d.querySelector("[data-confirm-text]").textContent = msg;
+      var choice = false;
+      d.querySelector("[data-confirm-ok]").onclick = function () { choice = true; d.close(); };
+      d.querySelector("[data-confirm-cancel]").onclick = function () { choice = false; d.close(); };
+      d.addEventListener("close", function h() {
+        d.removeEventListener("close", h);
+        resolve(choice);
+      });
+      d.showModal();
+    });
+  };
+
+  // Shared confirm for destructive submits and links. A {count} placeholder
+  // picks up the number in the control's own label, so the review submit can
+  // say how many albums a tap is really about to queue. Capture phase: the
+  // original activation is swallowed, the dialog asks, and on Continue the
+  // click is replayed with a bypass mark so forms/htmx fire exactly once.
   document.addEventListener("click", function (evt) {
     var el = evt.target.closest && evt.target.closest("[data-confirm]");
     if (!el) return;
+    if (el.dataset.confirmBypass === "1") {
+      delete el.dataset.confirmBypass;
+      return;
+    }
+    evt.preventDefault();
+    evt.stopPropagation();
     var msg = el.getAttribute("data-confirm");
     if (msg.indexOf("{count}") !== -1) {
       var m = (el.textContent || "").match(/[\d,]+/);
       msg = msg.replace("{count}", m ? m[0] : "the");
     }
-    if (!window.confirm(msg)) {
-      evt.preventDefault();
-      evt.stopPropagation();
-    }
-  });
+    window.qlConfirm(msg).then(function (ok) {
+      if (!ok) return;
+      el.dataset.confirmBypass = "1";
+      el.click();
+    });
+  }, true);
 
   // Lock-busy retry button.
   document.addEventListener("click", function (evt) {
@@ -1152,24 +1181,26 @@
         var tc = tabCounts(lastCounts);
         var rest = tc.total - tc.selected;
         if (rest <= 0) return;
-        if (!window.confirm(dismissConfirm(rest))) return;
-        var prev = dismissRest.textContent;
-        dismissRest.disabled = true;
-        dismissRest.textContent = dismissBusyLabel();
-        post("/jobs/" + id + "/dismiss-rest", "tab=" + encodeURIComponent(curTab()))
-          .then(function (r) { return r.ok ? r.json() : Promise.reject(); })
-          .then(function (c) {
-            if (c.review_done) { location.reload(); return; }
-            dismissRest.disabled = false;
-            applyCounts(c);
-            loadPage(1, curQuery());
-            if (c.hidden) showToast(dismissToast(c.hidden), "success");
-          })
-          .catch(function () {
-            dismissRest.disabled = false;
-            dismissRest.textContent = prev;
-            flashSelectError();
-          });
+        window.qlConfirm(dismissConfirm(rest)).then(function (ok) {
+          if (!ok) return;
+          var prev = dismissRest.textContent;
+          dismissRest.disabled = true;
+          dismissRest.textContent = dismissBusyLabel();
+          post("/jobs/" + id + "/dismiss-rest", "tab=" + encodeURIComponent(curTab()))
+            .then(function (r) { return r.ok ? r.json() : Promise.reject(); })
+            .then(function (c) {
+              if (c.review_done) { location.reload(); return; }
+              dismissRest.disabled = false;
+              applyCounts(c);
+              loadPage(1, curQuery());
+              if (c.hidden) showToast(dismissToast(c.hidden), "success");
+            })
+            .catch(function () {
+              dismissRest.disabled = false;
+              dismissRest.textContent = prev;
+              flashSelectError();
+            });
+        });
       });
     }
 
