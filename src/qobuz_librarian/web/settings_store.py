@@ -307,7 +307,14 @@ def load():
 
 
 def _any_active_job() -> bool:
-    """True if any job is currently scanning/running/awaiting review.
+    """True if a job is genuinely in flight (pending/scanning/running).
+
+    Parked reviews don't count: they sit for weeks by design, and deferring
+    saves under them means changes that never land while the settings page
+    shows the new values as current. The deferral only exists so a change
+    can't shift the ground under a job that's mid-run; a review approved
+    later executes with whatever the settings are at that moment, which is
+    what the person who just changed them expects.
 
     Late import so settings_store can be loaded without jobs.py being
     importable yet (eg during CLI startup that never touches the web).
@@ -316,8 +323,8 @@ def _any_active_job() -> bool:
         from qobuz_librarian.web import jobs as job_mgr
     except ImportError:
         return False
-    return bool(job_mgr.registry.pending_and_running()
-                or job_mgr.registry.awaiting_review())
+    return any(j.status != job_mgr.JobStatus.AWAITING_REVIEW
+               for j in job_mgr.registry.pending_and_running())
 
 
 def drain_pending():

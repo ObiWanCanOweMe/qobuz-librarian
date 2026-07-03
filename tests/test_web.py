@@ -698,6 +698,27 @@ def test_settings_save_defers_apply_when_job_is_active(tmp_path, monkeypatch):
     assert cfg.DOWNSAMPLE_HIRES_ENABLED is True  # idempotent
 
 
+def test_parked_review_does_not_defer_settings(tmp_path, monkeypatch):
+    """A parked review can sit for weeks — a save made next to one must apply
+    right away, not wait in the pending slot for a job that may never run."""
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.web import settings_store as ss
+
+    monkeypatch.setattr(ss, "SETTINGS_FILE", tmp_path / "s.json")
+    monkeypatch.setattr(cfg, "DOWNSAMPLE_HIRES_ENABLED", False)
+    review = _inject_job(jm.JobStatus.AWAITING_REVIEW)
+    review.execute_kind = "downsample"
+    with ss._pending_lock:
+        ss._pending_apply = None
+
+    assert ss._any_active_job() is False
+    ok, _ = ss.save({"DOWNSAMPLE_HIRES_ENABLED": True})
+    assert ok is True
+    assert cfg.DOWNSAMPLE_HIRES_ENABLED is True  # applied immediately
+    with ss._pending_lock:
+        assert ss._pending_apply is None
+
+
 def test_settings_save_only_pins_changed_fields(tmp_path, monkeypatch):
     """Saving the Settings form must not freeze untouched fields into the
     settings file — the file wins over env on load, so writing a field that
