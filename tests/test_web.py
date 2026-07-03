@@ -2617,6 +2617,25 @@ def test_settings_empty_token_warning_names_localuser_token(client, monkeypatch)
 # ── CLI/web mode hand-off ───────────────────────────────────────────────────────
 
 
+def test_parked_review_does_not_block_cli_handoff(client):
+    """The staging race the handoff guards against needs a running worker; a
+    review waiting on the user has none, and it can wait for weeks — refusing
+    on it would make terminal mode unreachable."""
+    import qobuz_librarian.web.app as app_mod
+    review = _inject_job(jm.JobStatus.AWAITING_REVIEW)
+    review.execute_kind = "downsample"
+
+    r = client.post("/settings/mode", data={"target": "cli"},
+                    follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/settings?mode=cli"
+    assert app_mod._CLI_MODE is True
+    back = client.post("/settings/mode", data={"target": "web"},
+                       follow_redirects=False)
+    assert back.status_code == 303
+    assert app_mod._CLI_MODE is False
+
+
 def test_mode_handoff_to_cli_pauses_web_downloads(client, monkeypatch):
     import qobuz_librarian.web.app as app_mod
     # No active job (the registry is a shared singleton across tests).

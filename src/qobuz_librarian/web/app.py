@@ -4244,10 +4244,15 @@ async def set_mode(request: Request, target: str = Form("")):
         # handoff is refused (503) instead of slipping past the check and racing
         # the CLI over /staging once we release the lock below.
         _CLI_MODE = True
-        if job_mgr.registry.pending_and_running():
+        # Only work in flight blocks the handoff — the race this guards
+        # against is the CLI and a running worker sharing /staging. A parked
+        # review has no worker and can sit for weeks; refusing on it would
+        # make terminal mode unreachable.
+        if any(j.status != job_mgr.JobStatus.AWAITING_REVIEW
+               for j in job_mgr.registry.pending_and_running()):
             _CLI_MODE = False  # no transfer happened; stay in web mode
             return RedirectResponse(url="/settings?error=" + urllib.parse.quote(
-                "Finish or cancel the active download before handing off to the "
+                "Finish or cancel the running job before handing off to the "
                 "terminal."), status_code=303)
         if _RUN_LOCK_HANDLE is not None:
             try:
