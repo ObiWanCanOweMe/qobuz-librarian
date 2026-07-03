@@ -3057,7 +3057,10 @@ async def job_page(request: Request, job_id: str, approved: bool = False,
     if not job:
         job = job_mgr.load_historical_job(job_id)
         if job is None:
-            return RedirectResponse(url="/queue", status_code=303)
+            return RedirectResponse(
+                url="/queue?error=" + urllib.parse.quote(
+                    "That job is no longer in the record."),
+                status_code=303)
         historical = True
     # An upgrade/downsample job page is that tool's surface, so its nav item
     # lights up (and its review dot counts as seen — the user is looking at it).
