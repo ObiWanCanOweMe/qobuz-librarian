@@ -82,6 +82,14 @@
   }
 }
 
+/* The component rules below are unlayered, so they outrank Tailwind's layered
+   utilities — including `hidden`, which anything with its own `display` was
+   silently defeating (the empty Queue badge dot). Hidden must always mean
+   gone, no matter what the element is. */
+.hidden {
+  display: none !important;
+}
+
 /* App surfaces use warm record-shelf depth without decorative blobs. */
 [data-theme="night"] body {
   background-color: var(--color-base-100);
