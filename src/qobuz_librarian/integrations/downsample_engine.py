@@ -419,12 +419,11 @@ def resample_one(rel, sr, rate, af_filter, *, base_dir=None):
         in_samples = read_total_samples(src)
         out_samples = read_total_samples(tmp)
         if not (in_samples and out_samples):
-            # A 0 = STREAMINFO 'unknown' on either side means the length can't be
-            # verified. Previously this SKIPPED the check and replaced the master
-            # anyway, so a truncated-but-decodable encode of an unknown-length
-            # source slipped through. Refuse instead — keep the original; an
-            # un-shrunk file is a far cheaper outcome than a silently-truncated
-            # master with no recovery path.
+            # A 0 = STREAMINFO 'unknown' on either side means the length can't
+            # be verified, and a truncated-but-decodable encode would slip
+            # through unnoticed. Refuse and keep the original; an un-shrunk
+            # file is a far cheaper outcome than a silently-truncated master
+            # with no recovery path.
             return (rel, sr, rate, None,
                     "couldn't verify resampled length (source/output STREAMINFO "
                     "reports unknown sample count); left the original untouched")

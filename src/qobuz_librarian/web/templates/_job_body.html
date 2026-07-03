@@ -41,11 +41,9 @@
   {% set s = job.status.value %}
   {% set _historical = historical|default(false) %}
   {% set _review_thing = labels.discard_review_label(job) %}
-  {# Finished jobs are reached from History, not the queue — send people back
-     to where they actually came from. #}
+  {# Back points at the surface that owns the job; finished jobs came from
+     History, so they go back there. #}
   {% set _finished = s in ('done', 'failed', 'canceled') %}
-  {# Back always points at the surface that owns the job; finished jobs are
-     reached from History. #}
   {% if job.execute_kind == 'repair' %}
   {% set _back_href, _back_label = '/repair', 'Back to Repair' %}
   {% elif job.execute_kind in ('library', 'new_releases') %}
