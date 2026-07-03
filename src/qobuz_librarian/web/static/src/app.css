@@ -468,18 +468,24 @@ h1, h2, h3 {
 }
 .ql-tabbar .ql-tab-count {
   position: absolute;
-  top: 0;
-  left: calc(50% + 0.4rem);
+  top: -0.2rem;
+  left: calc(50% + 0.45rem);
   min-width: 1.05rem;
   border-radius: 999px;
   background: var(--ql-gold);
   color: var(--ql-gold-ink);
   font-family: var(--ql-font-mono);
-  font-size: 0.56rem;
-  font-weight: 600;
+  font-size: 0.62rem;
+  font-weight: 700;
   line-height: 1.05rem;
   text-align: center;
   padding-inline: 0.22rem;
+  /* Ring in the bar's own color, so the pill reads as a badge sitting on the
+     icon instead of a blob merged into it. */
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--ql-bg) 97%, #000);
+}
+[data-theme="winter"] .ql-tabbar .ql-tab-count {
+  box-shadow: 0 0 0 2px #efe6d4;
 }
 .ql-tabbar .ql-tab-count.is-warning {
   background: var(--ql-warning);
@@ -4411,6 +4417,20 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
 .ql-census-seg-h96   { background: color-mix(in oklab, var(--ql-gold) 48%, transparent); }
 .ql-census-seg-h192  { background: color-mix(in oklab, var(--ql-gold) 88%, var(--ql-surface)); }
 .ql-census-seg-other { background: color-mix(in oklab, var(--ql-text-3) 35%, var(--ql-surface-2)); }
+/* The whole queue card opens its job's surface — a thumb target, not just the
+   title text. Buttons sit above the stretched link so they still win the tap. */
+.ql-activity-row--queue {
+  position: relative;
+}
+.ql-activity-row--queue .ql-row-link::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+.ql-activity-row--queue .ql-activity-actions {
+  position: relative;
+  z-index: 1;
+}
 .ql-census-rows {
   display: grid;
   gap: 0.5rem;

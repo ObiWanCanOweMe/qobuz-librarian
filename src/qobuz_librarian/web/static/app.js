@@ -570,19 +570,27 @@
     }
     document.addEventListener("htmx:beforeSwap", onSwap);
     if (reconnect) {
+      var warnDelay = null;
       src.onopen = function () {
+        if (warnDelay) { clearTimeout(warnDelay); warnDelay = null; }
         reconnect.classList.add("hidden");
       };
       src.onerror = function () {
         if (src.readyState === EventSource.CLOSED) {
+          if (warnDelay) { clearTimeout(warnDelay); warnDelay = null; }
           reconnect.textContent = "Connection lost. Reload to see the latest.";
           reconnect.classList.remove("is-warning");
           reconnect.classList.add("is-error");
           reconnect.classList.remove("hidden");
-        } else {
-          reconnect.classList.remove("is-error");
-          reconnect.classList.add("is-warning");
-          reconnect.classList.remove("hidden");
+        } else if (!warnDelay) {
+          // Phones drop the stream the moment the tab backgrounds; only warn
+          // when a reconnect still hasn't landed after a real wait.
+          warnDelay = setTimeout(function () {
+            warnDelay = null;
+            reconnect.classList.remove("is-error");
+            reconnect.classList.add("is-warning");
+            reconnect.classList.remove("hidden");
+          }, 5000);
         }
       };
     }
@@ -699,7 +707,9 @@
       clearQueuedState();
       if (logEl) { logEl.appendChild(document.createTextNode(e.data + "\n")); logEl.scrollTop = logEl.scrollHeight; }
     };
+    var reconnectDelay = null;
     src.onopen = function () {
+      if (reconnectDelay) { clearTimeout(reconnectDelay); reconnectDelay = null; }
       if (reconnect) reconnect.classList.add("hidden");
       // Reconnect replays recent lines, so reset before appending them again.
       if (opened) {
@@ -711,6 +721,7 @@
     };
     src.onerror = function () {
       if (src.readyState === EventSource.CLOSED) {
+        if (reconnectDelay) { clearTimeout(reconnectDelay); reconnectDelay = null; }
         if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
         if (reconnect) {
           reconnect.textContent = "Connection lost. Reload to see the latest.";
@@ -718,10 +729,15 @@
           reconnect.classList.add("is-error");
           reconnect.classList.remove("hidden");
         }
-      } else if (reconnect) {
-        reconnect.classList.remove("is-error");
-        reconnect.classList.add("is-warning");
-        reconnect.classList.remove("hidden");
+      } else if (reconnect && !reconnectDelay) {
+        // Backgrounding the tab on a phone kills the stream every time; hold
+        // the banner back until a reconnect has genuinely failed to land.
+        reconnectDelay = setTimeout(function () {
+          reconnectDelay = null;
+          reconnect.classList.remove("is-error");
+          reconnect.classList.add("is-warning");
+          reconnect.classList.remove("hidden");
+        }, 5000);
       }
     };
     src.addEventListener("progress", function (e) {
