@@ -21,8 +21,8 @@
   {% elif library_job %}
   {# Single surface: the scan's live progress and the Missing Albums / Gap
      Fill review render right here, same as /repair. #}
+  {% with census_folded = true %}{% include "_census.html" %}{% endwith %}
   {% with job = library_job, embedded_surface = true %}{% include "_job_body.html" %}{% endwith %}
-  {% include "_census.html" %}
 
   {% elif not library_scan_state.ready %}
   <section class="ql-work-card ql-work-card-warning">

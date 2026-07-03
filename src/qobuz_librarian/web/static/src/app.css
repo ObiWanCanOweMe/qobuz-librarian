@@ -4394,6 +4394,42 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
       color-mix(in oklab, var(--ql-surface-2) 30%, var(--ql-surface)) 0%,
       color-mix(in oklab, var(--ql-surface) 92%, var(--ql-bg)) 100%);
 }
+/* Collapsed one-liner above a parked review. */
+.ql-census-fold {
+  margin-top: 0;
+  margin-bottom: 1rem;
+  padding: 0.7rem 1rem;
+}
+.ql-census-fold[open] {
+  padding-bottom: 1.1rem;
+}
+.ql-census-fold-summary {
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+.ql-census-fold-summary::-webkit-details-marker {
+  display: none;
+}
+.ql-census-fold-summary::after {
+  content: "";
+  width: 0.42rem;
+  height: 0.42rem;
+  flex: none;
+  border-right: 1.8px solid var(--ql-text-3);
+  border-bottom: 1.8px solid var(--ql-text-3);
+  transform: rotate(45deg);
+  transition: transform 150ms ease;
+}
+.ql-census-fold[open] > .ql-census-fold-summary::after {
+  transform: rotate(225deg);
+}
+.ql-census-fold > .ql-census-fold-summary {
+  margin-bottom: 0;
+}
+.ql-census-fold[open] > .ql-census-fold-summary {
+  margin-bottom: 0.9rem;
+}
 .ql-census-head {
   display: flex;
   flex-wrap: wrap;

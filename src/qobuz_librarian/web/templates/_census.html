@@ -1,9 +1,4 @@
-{% if census %}
-<section class="ql-census">
-  <div class="ql-census-head">
-    <p class="ql-scan-panel-title">What's on disk</p>
-    <span class="ql-census-total">{{ census.total }}</span>
-  </div>
+{% macro census_body() %}
   <div class="ql-census-bar" aria-hidden="true">
     {% for seg in census.bar %}<i class="ql-census-seg-{{ seg.key }}" style="flex-basis: {{ seg.pct }}%"></i>{% endfor %}
   </div>
@@ -27,5 +22,25 @@
   {% if census.reclaim %}
   <p class="ql-census-foot">Downsampling the hi-res set to CD rate would reclaim about <b>{{ census.reclaim }}</b> &mdash; <a href="/downsample" class="ql-inline-link">review candidates</a></p>
   {% endif %}
+{% endmacro %}
+{% if census %}
+{% if census_folded %}
+{# Above the review as one collapsed line: content below the auto-loading
+   list would keep drifting out of reach as more artists stream in. #}
+<details class="ql-census ql-census-fold">
+  <summary class="ql-census-head ql-census-fold-summary">
+    <p class="ql-scan-panel-title">What's on disk</p>
+    <span class="ql-census-total">{{ census.total }}</span>
+  </summary>
+  {{ census_body() }}
+</details>
+{% else %}
+<section class="ql-census">
+  <div class="ql-census-head">
+    <p class="ql-scan-panel-title">What's on disk</p>
+    <span class="ql-census-total">{{ census.total }}</span>
+  </div>
+  {{ census_body() }}
 </section>
+{% endif %}
 {% endif %}
