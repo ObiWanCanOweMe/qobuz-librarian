@@ -88,7 +88,7 @@
             {% if not _bar_selected %} disabled{% endif %}
             {%- if job.execute_kind == 'downsample' %} data-confirm="{% if keeps_ds_originals() %}Downsample the selected albums now? Each file is rewritten in place at 44.1 / 48 kHz; the hi-res originals are kept for {{ backup_retention_days }} day{{ 's' if backup_retention_days != 1 }} and can be restored from Settings.{% else %}Downsample the selected albums now? This cannot be undone. Each file is rewritten in place at 44.1 / 48 kHz and hi-res originals are not kept.{% endif %}"
             {%- elif job.execute_kind == 'migration' %} data-confirm="{% if job.review_verb == 'Move' %}Move the selected files now? This relocates your originals instead of copying them, and removes the folders it empties.{% else %}Copy {count} selected folder(s) into the organised library? Your original files stay where they are.{% endif %}"
-            {%- elif job.execute_kind == 'repair' %} data-confirm="Repair {count} selected album(s)? Files are replaced only after each new copy verifies."
+            {%- elif job.execute_kind == 'repair' %} data-confirm="Repair {count} selected file(s)? Files are replaced only after each new copy verifies."
             {%- else %} data-confirm="Download {count} selected album(s)? They queue now and import into your library."
             {%- endif %}>{% if _bar_selected %}{{ job.review_verb }} {{ _bar_selected }} selected{% else %}{{ labels.review_empty_label(job) }}{% endif %}</button>
           {% set _result_count = review_counts.total %}
