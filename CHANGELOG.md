@@ -15,6 +15,7 @@ Fixes from the first day of running 0.10.0 against a full-size library.
 - Big-review handling: each artist row can be dismissed without expanding it, the review tools (select, expand, dismiss unselected, dismissed link) live in one row so the sticky footer holds just the download button, and "Load more artists" loads itself as you scroll.
 - Once Qobuz is connected, the Settings credential fields collapse behind "Change account or token" instead of sitting as an open form.
 - Confirmations are drawn by the app now instead of the browser's plain popup, logins survive container restarts and image updates, "What's on disk" folds to one line above a parked review instead of hiding entirely, and the Dismissed results page got a plain heading with an inline way back.
+- A finished job is saved to disk before its notification hook fires, and the hook runs in the background — a slow webhook could previously leave a completed scan looking stuck and hold up the next job in line.
 
 ## [0.10.0] - 2026-07-02
 
