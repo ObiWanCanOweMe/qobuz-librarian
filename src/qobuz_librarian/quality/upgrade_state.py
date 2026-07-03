@@ -58,7 +58,7 @@ def _candidate_spec(artist_name: str, candidate: dict):
     return {
         "title": title,
         "artist": artist_name,
-        "detail": (f"{candidate.get('existing_quality_label', '?')} -> "
+        "detail": (f"{candidate.get('existing_quality_label', '?')} → "
                    f"{candidate.get('target_quality_label', '?')}{part}"),
         "payload": {
             "album_id": album.get("id"),
