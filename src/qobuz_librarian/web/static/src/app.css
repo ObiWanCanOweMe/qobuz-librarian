@@ -5073,6 +5073,9 @@ details[open] > .ql-disclosure-summary::after {
   line-height: 1.45;
 }
 
+.ql-review-group-shell {
+  position: relative;
+}
 .ql-review-group {
   position: relative;
 }

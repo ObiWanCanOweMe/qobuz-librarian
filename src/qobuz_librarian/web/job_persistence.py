@@ -283,6 +283,9 @@ def prune_finished(keep: int) -> None:
 
 
 _TERMINAL_SQL = "status IN ('done', 'failed', 'canceled')"
+# The History view also lists parked reviews (with an Open link back to their
+# surface) — but clearing and pruning must never touch them.
+_HISTORY_SQL = "status IN ('done', 'failed', 'canceled', 'awaiting_review')"
 
 
 # History splits finished work into two layers: meaningful jobs get cards,
@@ -314,7 +317,7 @@ def history_count(bulk: Optional[bool] = None) -> int:
             return 0
         try:
             return conn.execute(
-                f"SELECT COUNT(*) FROM jobs WHERE {_TERMINAL_SQL} {clause}",
+                f"SELECT COUNT(*) FROM jobs WHERE {_HISTORY_SQL} {clause}",
                 params).fetchone()[0]
         except sqlite3.Error:
             return 0
@@ -336,7 +339,7 @@ def history_page(limit: int, offset: int,
             rows = conn.execute(
                 "SELECT id, title, artist, album_id, status, error, summary, "
                 "execute_kind, created_at, finished_at FROM jobs "
-                f"WHERE {_TERMINAL_SQL} {clause}"
+                f"WHERE {_HISTORY_SQL} {clause}"
                 "ORDER BY COALESCE(finished_at, created_at) DESC, id DESC "
                 "LIMIT ? OFFSET ?",
                 (*params, limit, offset),

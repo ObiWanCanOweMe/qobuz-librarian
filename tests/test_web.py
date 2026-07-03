@@ -1787,15 +1787,15 @@ def test_queue_job_actions_use_clear_labels(client):
         r = client.get("/queue")
 
         assert r.status_code == 200
-        assert 'id="queue-review-heading"' in r.text and "Needs review" in r.text
+        # Parked reviews live on their surfaces and in History, not the queue.
+        assert 'id="queue-review-heading"' not in r.text
+        assert "Review scan" not in r.text
+        assert "Downsample scan" not in r.text
         assert 'id="queue-active-heading"' in r.text and "Running now" in r.text
         assert 'id="queue-waiting-heading"' in r.text and "Waiting" in r.text
         assert ">Clear queue and reviews</button>" in r.text
         assert "Queued jobs are removed, reviews are discarded" in r.text
         assert "Starts automatically after the current job finishes." in r.text
-        assert "1 candidate found." in r.text
-        assert "1 album can be downsampled." in r.text
-        assert "Migration preview ready." in r.text
         assert "hi-res album to review" not in r.text
         assert "album folder to review" not in r.text
         assert "Waiting for “Running scan”" not in r.text
@@ -1804,9 +1804,7 @@ def test_queue_job_actions_use_clear_labels(client):
         assert ">Cancel</button>" in r.text
         assert 'data-confirm="Cancel this job? It will stop after the current safe step."' in r.text
         assert 'data-confirm="Remove this waiting job from the queue?"' in r.text
-        assert ">Discard</button>" in r.text
         assert "Its 1 result are" not in r.text
-        assert "No files will change. Run the scan again to see these results later." in r.text
         assert ">×</button>" not in r.text
         assert "loading loading-spinner" not in r.text
         assert "ql-btn-secondary" in r.text

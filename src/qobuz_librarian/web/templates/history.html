@@ -49,6 +49,8 @@
         <span class="ql-status-chip is-success">done</span>
       {% elif job.status == 'canceled' %}
         <span class="ql-status-chip is-neutral">cancelled</span>
+      {% elif job.status == 'awaiting_review' %}
+        <span class="ql-status-chip is-info">awaiting review</span>
       {% else %}
         <span class="ql-status-chip is-error">failed</span>
       {% endif %}
@@ -60,7 +62,7 @@
           <button type="submit" class="ql-btn ql-btn-sm ql-btn-secondary ql-secondary-action" title="Retry">Retry</button>
         </form>
         {% endif %}
-        <a href="/jobs/{{ job.id }}" class="ql-row-open">Open →</a>
+        <a href="{{ '/repair' if job.execute_kind == 'repair' else ('/library' if job.execute_kind in ('library', 'new_releases') else '/jobs/' ~ job.id) }}" class="ql-row-open">Open →</a>
       </div>
     </div>
 {%- endmacro %}

@@ -77,11 +77,6 @@
             {%- elif job.execute_kind == 'repair' %} data-confirm="Repair {count} selected album(s)? Files are replaced only after each new copy verifies."
             {%- else %} data-confirm="Download {count} selected album(s)? They queue now and import into your library."
             {%- endif %}>{% if _bar_selected %}{{ job.review_verb }} {{ _bar_selected }} selected{% else %}{{ labels.review_empty_label(job) }}{% endif %}</button>
-          {% if job.execute_kind in ('library', 'upgrade', 'new_releases', 'downsample') %}
-          {% set _dismiss_rest_label = 'Keep hi-res' if job.execute_kind == 'downsample' else 'Dismiss unselected' %}
-          <button type="button" id="review-dismiss-rest"
-                  class="ql-btn ql-btn-secondary ql-btn-sm ql-review-footer-secondary{% if _bar_selected >= _bar_total %} hidden{% endif %}">{{ _dismiss_rest_label }} ({{ _bar_total - _bar_selected }})</button>
-          {% endif %}
           {% set _result_count = review_counts.total %}
           {% if job.execute_kind == 'migration' %}
             {% set _discard_confirm = 'Discard this migration preview? No files will be moved or copied.' %}

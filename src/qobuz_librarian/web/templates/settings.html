@@ -101,6 +101,7 @@
       <span class="ql-badge ql-badge-primary">Required for search</span>
       {% endif %}
     </div>
+    {% if not auth_token_set %}
     <details class="ql-settings-details">
       <summary class="ql-disclosure-summary">How do I find my token?</summary>
       <p class="ql-settings-details-copy">
@@ -112,6 +113,12 @@
         same entry is your user ID.
       </p>
     </details>
+    {% endif %}
+    {# Once connected the whole form collapses — replacing the account or
+       token is a rare event and two open inputs read as a chore to fill. #}
+    {% if auth_token_set %}<details class="ql-settings-details">
+      <summary class="ql-disclosure-summary">Change account or token</summary>
+    {% endif %}
 
     {% if creds_from_env %}
     <div class="ql-settings-notice">
@@ -167,6 +174,7 @@
         <button type="submit" class="ql-btn ql-btn-primary w-full sm:w-auto">Save &amp; connect</button>
       </div>
     </form>
+    {% if auth_token_set %}</details>{% endif %}
   </div>
 </section>
 

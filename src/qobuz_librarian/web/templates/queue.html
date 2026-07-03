@@ -127,18 +127,9 @@
 {% set active_jobs = (pending | selectattr('status.value', 'equalto', 'running') | list) + (pending | selectattr('status.value', 'equalto', 'scanning') | list) %}
 {% set waiting_jobs = pending | selectattr('status.value', 'equalto', 'pending') | list %}
 <div class="ql-activity-stack">
-  {% if review_jobs %}
-  <section class="ql-activity-section" aria-labelledby="queue-review-heading">
-    <header class="ql-activity-section-header">
-      <h2 id="queue-review-heading">Needs review</h2>
-      <span class="ql-activity-count">{{ review_jobs | length }}</span>
-    </header>
-    <div class="ql-activity-list ql-panelize">
-      {% for job in review_jobs %}{{ queue_job_row(job) }}{% endfor %}
-    </div>
-  </section>
-  {% endif %}
-
+  {# Parked reviews don't wait here demanding attention — they live on their
+     own pages (Library, Upgrade, Downsample) behind the nav dots, and show
+     in History with an Open link. The queue is work in flight. #}
   {% if active_jobs %}
   <section class="ql-activity-section" aria-labelledby="queue-active-heading">
     <header class="ql-activity-section-header">

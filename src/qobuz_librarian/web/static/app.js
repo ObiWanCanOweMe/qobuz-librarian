@@ -1254,6 +1254,35 @@
   // Re-scan swapped content for flashes and streams.
   document.addEventListener("htmx:afterSwap", initAll);
   cleanFlashUrl();
+  // "Load more artists" clicks itself as it approaches the viewport, so a
+  // long review reads as one continuous scrolling list. Deferred to DOM-ready:
+  // this script loads in <head>, where document.body doesn't exist yet.
+  (function () {
+    if (!("IntersectionObserver" in window)) return;
+    function start() {
+      var io = new IntersectionObserver(function (entries) {
+        for (var i = 0; i < entries.length; i++) {
+          if (entries[i].isIntersecting) entries[i].target.click();
+        }
+      }, { rootMargin: "700px 0px" });
+      var seen = null;
+      function arm() {
+        var btn = document.querySelector("[data-load-more]");
+        if (btn === seen) return;
+        if (seen) io.unobserve(seen);
+        seen = btn;
+        if (btn) io.observe(btn);
+      }
+      arm();
+      new MutationObserver(arm).observe(document.body, { childList: true, subtree: true });
+    }
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", start);
+    } else {
+      start();
+    }
+  })();
+
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", initAll);
   } else {
