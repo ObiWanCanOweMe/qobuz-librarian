@@ -16,6 +16,12 @@ Fixes from the first day of running 0.10.0 against a full-size library.
 - Once Qobuz is connected, the Settings credential fields collapse behind "Change account or token" instead of sitting as an open form.
 - Confirmations are drawn by the app now instead of the browser's plain popup, logins survive container restarts and image updates, "What's on disk" folds to one line above a parked review instead of hiding entirely, and the Dismissed results page got a plain heading with an inline way back.
 - A finished job is saved to disk before its notification hook fires, and the hook runs in the background — a slow webhook could previously leave a completed scan looking stuck and hold up the next job in line.
+- Opening a page while signed out returns you to that page after login instead of dropping you on Search.
+- The Queue shows its empty state instead of a blank page when the only thing outstanding is a parked review, and its empty-state copy matches the new queue model.
+- A parked Repair review gets the same "review ready" dot in the nav that Library, Upgrade, and Downsample reviews get.
+- Downsample's "Refresh candidates" says up front when it will replace a review you already have parked, and the toolbar's "Dismissed (N)" link updates as you dismiss instead of waiting for a reload.
+- Library migration is reachable from Settings → Library paths (it previously existed only as a direct URL), approving a copy migration asks about copying rather than "downloading", and discarding an Upgrade, Downsample, or migration review returns you to its page instead of the queue.
+- The library census notes that its counts come from the last scan.
 
 ## [0.10.0] - 2026-07-02
 

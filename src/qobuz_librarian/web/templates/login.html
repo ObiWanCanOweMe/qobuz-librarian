@@ -37,6 +37,7 @@
       {% from "_secret_toggle.html" import secret_toggle %}
       <form action="/login" method="post" class="ql-auth-form">
         <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+        {% if next_path %}<input type="hidden" name="next" value="{{ next_path }}">{% endif %}
         <div class="ql-field">
           <label class="ql-field-label" for="username">Username</label>
           <input type="text" name="username" id="username" autocomplete="username"

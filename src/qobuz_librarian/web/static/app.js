@@ -925,6 +925,15 @@
         if (mc) mc.textContent = c.missing_total;
         if (gc) gc.textContent = c.gap_total;
       }
+      // Only hide/dismiss responses carry hidden_total; a plain tick doesn't
+      // change it, so its absence means "leave the link alone".
+      if (c.hidden_total !== undefined) {
+        var dl = cont.querySelector(".ql-review-dismissed-link");
+        if (dl) {
+          dl.textContent = (dl.getAttribute("data-hidden-label") || "Dismissed")
+            + " (" + c.hidden_total + ")";
+        }
+      }
       updateDismissRest();
     }
 

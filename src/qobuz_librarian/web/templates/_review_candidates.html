@@ -70,7 +70,7 @@
       {% endif %}
       {% if triage %}
       <span class="ql-review-tool-sep" aria-hidden="true"></span>
-      <a href="{{ _hidden_url }}" class="ql-inline-link ql-review-dismissed-link">{{ _hidden_label }} ({{ review_hidden_count }})</a>
+      <a href="{{ _hidden_url }}" class="ql-inline-link ql-review-dismissed-link" data-hidden-label="{{ _hidden_label }}">{{ _hidden_label }} ({{ review_hidden_count }})</a>
       {% endif %}
     </div>
   </div>

@@ -1763,9 +1763,22 @@ def test_queue_empty_state_has_clear_actions(client):
 
     assert r.status_code == 200
     assert "Queue is empty." in r.text
-    assert "Downloads, scans, and reviews appear here" in r.text
+    assert "Downloads and scans appear here" in r.text
     assert ">Search Qobuz</a>" in r.text
     assert ">View history</a>" in r.text
+
+
+def test_queue_shows_empty_state_when_only_parked_reviews_exist(client):
+    # Parked reviews render on their own surfaces, not in the queue — so a
+    # registry holding nothing but a parked review must still show the queue's
+    # empty state rather than a blank page (the stack wrapper with no sections).
+    review = _inject_job(jm.JobStatus.AWAITING_REVIEW, "Downsample scan")
+    review.execute_kind = "downsample"
+
+    r = client.get("/queue")
+
+    assert r.status_code == 200
+    assert "Queue is empty." in r.text
 
 
 def test_queue_job_actions_use_clear_labels(client):
@@ -2667,6 +2680,47 @@ def test_login_accepts_correct_password(monkeypatch, tmp_path):
         assert c.get("/", follow_redirects=False).status_code == 200
 
 
+def test_login_returns_to_the_page_that_bounced(monkeypatch, tmp_path):
+    # A deep link opened while logged out should survive the login bounce:
+    # /queue → /login?next=/queue → sign in → land on /queue, not the dashboard.
+    with _enable_auth(monkeypatch, tmp_path) as c:
+        r = c.get("/queue", follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/login?next=/queue"
+        r = c.get("/login?next=/queue")
+        assert 'name="next" value="/queue"' in r.text
+        tok = c.cookies.get("qf_csrf")
+        r = c.post("/login",
+                   data={"username": "admin", "password": "hunter2hunter",
+                         "_csrf_token": tok, "next": "/queue"},
+                   headers={"X-CSRF-Token": tok}, follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/queue"
+
+
+def test_login_next_cannot_leave_the_app(monkeypatch, tmp_path):
+    # The next field is attacker-writable (it rides links and the login form),
+    # so anything that could land off-site or loop must fall back to "/".
+    from qobuz_librarian.web import auth as web_auth
+
+    for bad in ("//evil.example", "/\\evil.example", "https://evil.example",
+                "javascript:alert(1)", "/login", "/setup", "/api/jobs",
+                "/a\r\nSet-Cookie:x=1", "queue", ""):
+        assert web_auth.safe_next_path(bad) == "", bad
+    assert web_auth.safe_next_path("/queue") == "/queue"
+    assert web_auth.safe_next_path("/jobs/abc?x=1") == "/jobs/abc?x=1"
+
+    with _enable_auth(monkeypatch, tmp_path) as c:
+        c.get("/login")
+        tok = c.cookies.get("qf_csrf")
+        r = c.post("/login",
+                   data={"username": "admin", "password": "hunter2hunter",
+                         "_csrf_token": tok, "next": "//evil.example"},
+                   headers={"X-CSRF-Token": tok}, follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/"
+
+
 def test_malformed_host_cannot_bypass_auth(monkeypatch, tmp_path):
     # CVE-2026-48710: Starlette rebuilds request.url.path from the client Host
     # header, so a host like "example.com/login?x=" can make the auth middleware
@@ -2678,7 +2732,7 @@ def test_malformed_host_cannot_bypass_auth(monkeypatch, tmp_path):
         # Page route: redirected to login, never served.
         r = c.get("/settings", headers=bad, follow_redirects=False)
         assert r.status_code == 303
-        assert r.headers["location"] == "/login"
+        assert r.headers["location"].startswith("/login")
         # JSON route: 401, not a 200 leaking state.
         r = c.get("/api/jobs", headers=bad, follow_redirects=False)
         assert r.status_code == 401

@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% set is_upgrade = scope == 'upgrade' %}
 {% set is_downsample = scope == 'downsample' %}
-{% set noun = 'upgrade' if is_upgrade else ('album' if is_downsample else 'item') %}
+{% set noun = 'upgrade' if is_upgrade else ('album' if is_downsample else 'result') %}
 {% set heading = 'Dismissed upgrades' if is_upgrade else ('Kept hi-res' if is_downsample else 'Dismissed results') %}
 {% set kept_label = 'albums kept hi-res' if is_downsample else ('dismissed upgrades' if is_upgrade else 'dismissed results') %}
 {% set restore_all_label = 'album kept hi-res' if is_downsample else noun %}

@@ -914,17 +914,24 @@ async def login_page(request: Request):
     cookie = request.cookies.get(web_auth.SESSION_COOKIE)
     if cookie and web_auth.verify_session(cookie):
         return RedirectResponse(url="/", status_code=303)
-    return templates.TemplateResponse(request=request, name="login.html",
-                                      context={"error": ""})
+    return templates.TemplateResponse(
+        request=request, name="login.html",
+        context={"error": "",
+                 "next_path": web_auth.safe_next_path(
+                     request.query_params.get("next"))})
 
 
 @app.post("/login", response_class=HTMLResponse)
 async def login_submit(request: Request, username: str = Form(""),
-                       password: str = Form("")):
+                       password: str = Form(""), next: str = Form("")):
     if web_auth.auth_disabled():
         return RedirectResponse(url="/", status_code=303)
     if not web_auth.credentials_configured():
         return RedirectResponse(url="/setup", status_code=303)
+    # Where to land after signing in — the deep link that bounced here, kept
+    # through failed attempts and re-validated so the form can't smuggle in an
+    # off-site redirect.
+    next_path = web_auth.safe_next_path(next)
     ip = (request.client.host if request.client else "") or "unknown"
     # A request already carrying a valid session is provably the logged-in user,
     # not the brute-forcer the throttle exists to stop — exempt it so a remote
@@ -934,7 +941,8 @@ async def login_submit(request: Request, username: str = Form(""),
     if not has_session and not web_auth.check_login_rate_limit(ip, username):
         return templates.TemplateResponse(
             request=request, name="login.html",
-            context={"error": "Too many failed attempts. Wait an hour and try again."},
+            context={"error": "Too many failed attempts. Wait an hour and try again.",
+                     "next_path": next_path},
             status_code=429)
     # Offload the 600k-round PBKDF2 to a thread so one login attempt can't stall
     # the single-worker event loop (health, API and SSE all freeze during a KDF
@@ -946,10 +954,11 @@ async def login_submit(request: Request, username: str = Form(""),
         web_auth.record_login_failure(ip, username)
         return templates.TemplateResponse(
             request=request, name="login.html",
-            context={"error": "Incorrect username or password."},
+            context={"error": "Incorrect username or password.",
+                     "next_path": next_path},
             status_code=401)
     web_auth.clear_login_failures(ip, username)
-    resp = RedirectResponse(url="/", status_code=303)
+    resp = RedirectResponse(url=next_path or "/", status_code=303)
     web_auth.set_session_cookie(resp, request)
     return resp
 
@@ -2768,11 +2777,18 @@ async def downsample_page(request: Request):
     from qobuz_librarian.integrations.downsample_engine import HAVE_DOWNSAMPLE
     from qobuz_librarian.library import hidden as hidden_mod
     state = _downsample_state_summary()
+    # A fresh scan supersedes the parked review (see _submit_scan_deduped), so
+    # the Refresh confirm must say so instead of quietly dropping the user's
+    # ticks.
+    review_parked = any(
+        getattr(j, "execute_kind", "") == "downsample"
+        for j in job_mgr.registry.awaiting_review())
     return _tr(request, "downsample.html", {
         "page": "downsample",
         "have_downsample": HAVE_DOWNSAMPLE,
         "creds_ok": bool(_read_creds().get("auth_token")),
         "downsample_state": state,
+        "review_parked": review_parked,
         "last_run": _tool_last_run_age("downsample"),
         "hidden_count": hidden_mod.count(hidden_mod.SCOPE_DOWNSAMPLE)})
 
@@ -3465,9 +3481,15 @@ async def job_hide(request: Request, job_id: str):
         if n:
             # Carry the fresh authoritative counts so the page updates the
             # summary/selected/reclaimable without recounting a partial DOM.
+            # hidden_total keeps the toolbar's "Dismissed (N)" link current —
+            # it's rendered once with the page and has no other refresh path.
             import json as _json
+            from qobuz_librarian.library import hidden as hidden_mod
+            counts = _selection_payload(job)
+            counts["hidden_total"] = hidden_mod.count(
+                _hide_scope(job.execute_kind))
             resp.headers["HX-Trigger"] = _json.dumps(
-                {"qlHidden": {"n": n, "counts": _selection_payload(job)}})
+                {"qlHidden": {"n": n, "counts": counts}})
         return resp
     return HTMLResponse("")
 
@@ -3517,8 +3539,10 @@ async def job_dismiss_rest(request: Request, job_id: str):
                           for a in artists))
     if hidden_count:
         job.notify_review_changed(_review_origin(request))
+    from qobuz_librarian.library import hidden as hidden_mod
     payload = _selection_payload(job)
     payload["hidden"] = hidden_count
+    payload["hidden_total"] = hidden_mod.count(scope)
     payload["review_done"] = job_mgr.finalize_review_if_empty(job)
     return JSONResponse(payload)
 
@@ -3754,13 +3778,18 @@ async def job_cancel(request: Request, job_id: str):
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, lambda: job_mgr.request_cancel(job))
     # Repair stays on its single surface either way (idle start form once the
-    # cancel lands). A queued job vanishes the instant it's cancelled, and a
-    # review discard is instant too → back to the queue; a running/scanning job
-    # stops cooperatively → keep them on the job page to watch it wind down.
+    # cancel lands). A discarded review goes home to the page that owns it —
+    # landing on an unrelated (often empty) Queue reads like something broke.
+    # A cancelled queued job vanishes instantly → the queue; a running/scanning
+    # job stops cooperatively → keep them on the job page to watch it wind down.
     if job.execute_kind == "repair":
         dest = "/repair"
     elif job.execute_kind in _LIBRARY_SURFACE_KINDS:
         dest = "/library"
+    elif was_review and job.execute_kind in ("upgrade", "downsample"):
+        dest = f"/{job.execute_kind}"
+    elif was_review and job.execute_kind == "migration":
+        dest = "/migrate"
     else:
         dest = "/queue" if (was_review or was_pending) else f"/jobs/{job_id}"
     return RedirectResponse(url=dest, status_code=303)
@@ -4536,10 +4565,11 @@ async def job_status(job_id: str):
 
 @app.get("/api/queue/count")
 async def queue_count():
-    """Live count of active jobs (pending/scanning/running/awaiting-review) so the
-    nav Queue badge stays in sync without a page reload. The badge is otherwise
-    server-rendered once per page, which left it stale (e.g. reading "1" next to
-    an empty Queue) after a job finished while you sat on another page."""
+    """Live count of in-flight jobs (pending/scanning/running — parked reviews
+    have their own dots) so the nav Queue badge stays in sync without a page
+    reload. The badge is otherwise server-rendered once per page, which left it
+    stale (e.g. reading "1" next to an empty Queue) after a job finished while
+    you sat on another page."""
     active = [j for j in job_mgr.registry.pending_and_running()
               if j.status != job_mgr.JobStatus.AWAITING_REVIEW]
     return JSONResponse({

@@ -122,14 +122,15 @@
 <div class="ql-notice ql-notice-error" data-flash><span>{{ error }} Refresh the queue or check Settings.</span></div>
 {% endif %}
 
-{% if pending %}
-{% set review_jobs = pending | selectattr('status.value', 'equalto', 'awaiting_review') | list %}
+{# Parked reviews don't wait here demanding attention — they live on their
+   own pages (Library, Upgrade, Downsample) behind the nav dots, and show
+   in History with an Open link. The queue is work in flight — so the empty
+   state is gated on in-flight jobs, not on `pending` (which still carries
+   parked reviews and would leave a blank page). #}
 {% set active_jobs = (pending | selectattr('status.value', 'equalto', 'running') | list) + (pending | selectattr('status.value', 'equalto', 'scanning') | list) %}
 {% set waiting_jobs = pending | selectattr('status.value', 'equalto', 'pending') | list %}
+{% if active_jobs or waiting_jobs %}
 <div class="ql-activity-stack">
-  {# Parked reviews don't wait here demanding attention — they live on their
-     own pages (Library, Upgrade, Downsample) behind the nav dots, and show
-     in History with an Open link. The queue is work in flight. #}
   {% if active_jobs %}
   <section class="ql-activity-section" aria-labelledby="queue-active-heading">
     <header class="ql-activity-section-header">
@@ -172,7 +173,7 @@
     </svg>
   </div>
   <p class="font-medium text-base-content/70">Queue is empty.</p>
-  <p class="text-sm mt-1 text-base-content/50">Downloads, scans, and reviews appear here while they run.</p>
+  <p class="text-sm mt-1 text-base-content/50">Downloads and scans appear here while they run. Finished work and parked reviews live in History.</p>
   <div class="ql-empty-actions">
     <a href="/" class="ql-btn ql-btn-primary w-full sm:w-auto">Search Qobuz</a>
     <a href="/queue/history" class="ql-btn ql-btn-secondary w-full sm:w-auto">View history</a>

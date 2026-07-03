@@ -11,6 +11,12 @@
   {% set active_tab = 'downsample' %}
   {% include "_quality_tabs.html" %}
 
+  {% if review_parked %}
+  {% set refresh_confirm = "Refresh local downsample candidates? This replaces the review you have parked, and anything ticked there starts unticked. You still choose what to downsample before files change." %}
+  {% else %}
+  {% set refresh_confirm = "Refresh local downsample candidates? You review and choose what to downsample before anything changes." %}
+  {% endif %}
+
   <div class="ql-work-status ql-work-status--bar ql-quality-status">
     <span class="ql-status-chip {% if downsample_state.count %}is-info{% else %}is-neutral{% endif %}">
       {% if downsample_state.count %}Review ready{% else %}No saved candidates{% endif %}
@@ -41,7 +47,7 @@
         <form action="/downsample" method="post" data-busy-submit>
           <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
           <button type="submit" class="ql-btn ql-btn-secondary ql-secondary-action w-full sm:w-auto"
-                  data-confirm="Refresh local downsample candidates? You review and choose what to downsample before anything changes.">Refresh candidates</button>
+                  data-confirm="{{ refresh_confirm }}">Refresh candidates</button>
         </form>
       </div>
     </section>
@@ -55,7 +61,7 @@
         <form action="/downsample" method="post" data-busy-submit>
           <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
           <button type="submit" class="ql-btn ql-btn-primary w-full sm:w-auto"
-                  data-confirm="Refresh local downsample candidates? You review and choose what to downsample before anything changes.">Refresh candidates</button>
+                  data-confirm="{{ refresh_confirm }}">Refresh candidates</button>
         </form>
       </div>
     </section>

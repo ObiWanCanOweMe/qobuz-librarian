@@ -5,7 +5,7 @@ import time
 
 from qobuz_librarian import config as cfg
 
-SURFACES = {"library", "upgrade", "downsample"}
+SURFACES = {"library", "upgrade", "downsample", "repair"}
 _VERSION = 1
 
 

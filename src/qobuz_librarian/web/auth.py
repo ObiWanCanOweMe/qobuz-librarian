@@ -37,6 +37,29 @@ _OPEN_PREFIXES = ("/static/",)
 _PBKDF2_ROUNDS = 600_000
 _COOKIE_MAX_AGE = 60 * 60 * 24 * 30  # 30 days, matching the CSRF cookie
 
+
+def safe_next_path(raw) -> str:
+    """A local path it's safe to send the browser back to after login, or "".
+
+    Only same-app paths pass: a leading "/" with a normal second character.
+    "//host" (protocol-relative) and "/\\host" (browsers fold backslash into
+    slash) would leave the app — an attacker could mail a login link that lands
+    on a look-alike site after a *successful* sign-in. Control characters are
+    header-injection material, and bouncing back to /login or /setup would
+    just loop.
+    """
+    p = str(raw or "").strip()
+    if not p.startswith("/") or len(p) > 512:
+        return ""
+    if p.startswith(("//", "/\\")) or "\\" in p:
+        return ""
+    if any(ord(ch) < 0x20 or ch == "\x7f" for ch in p):
+        return ""
+    bare = p.split("?", 1)[0]
+    if bare in (LOGIN_PATH, SETUP_PATH) or bare.startswith("/api/"):
+        return ""
+    return p
+
 # Credential file cache. Keyed to the file path so test fixtures that
 # redirect WEB_AUTH_FILE to a temp path don't serve stale data to the next
 # test. Invalidated explicitly in set_credentials() on any write.
@@ -500,4 +523,16 @@ class AuthMiddleware(BaseHTTPMiddleware):
                                 status_code=401)
         if request.headers.get("HX-Request") == "true":
             return Response(status_code=401, headers={"HX-Redirect": location})
+        # Remember where a plain page GET was headed so login can land there
+        # instead of dumping every deep link on the dashboard. Only full-page
+        # GETs: a replayed POST target isn't a page, and htmx partials would
+        # render bare.
+        if location == LOGIN_PATH and request.method == "GET":
+            import urllib.parse
+            target = request.scope["path"]
+            qs = request.scope.get("query_string", b"").decode("utf-8", "ignore")
+            if qs:
+                target += "?" + qs
+            if target != "/" and safe_next_path(target):
+                location = LOGIN_PATH + "?next=" + urllib.parse.quote(target)
         return RedirectResponse(url=location, status_code=303)
