@@ -84,13 +84,6 @@
           <button type="submit" class="ql-link-action"
                   title="Skips your folders entirely — just asks Qobuz for albums newer than your last scan.">Check new releases only</button>
         </form>
-        <span class="ql-scan-variants-sep" aria-hidden="true">·</span>
-        <form action="/library" method="post" data-busy-submit>
-          <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-          <input type="hidden" name="mode" value="missing_albums">
-          <button type="submit" name="force_full" value="1" class="ql-link-action"
-                  data-confirm="Re-scan every artist folder from scratch? This ignores the unchanged-folder cache, so it takes as long as a first scan. Use it after large manual changes to your files.">Force full rescan</button>
-        </form>
       </div>
     </div>
   </section>

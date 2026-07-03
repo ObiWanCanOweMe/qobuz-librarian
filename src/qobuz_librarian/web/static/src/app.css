@@ -4515,9 +4515,6 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
   gap: 0.55rem;
   margin-top: 0.15rem;
 }
-.ql-scan-variants-sep {
-  color: var(--ql-text-3);
-}
 .ql-link-action {
   border: 0;
   background: none;
