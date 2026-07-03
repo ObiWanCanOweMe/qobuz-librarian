@@ -4424,6 +4424,22 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
 .ql-census-name { color: var(--ql-text); min-width: min(14em, 60%); }
 .ql-census-n { color: var(--ql-text-2); }
 .ql-census-gb { margin-left: auto; color: var(--ql-text); }
+/* Narrow phones: the long tier names wrap unevenly in the flex row, so pin
+   every row to the same two-line shape — name first, counts beneath it. */
+@media (max-width: 479.98px) {
+  .ql-census-row {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    grid-template-areas:
+      "dot name name"
+      ". tracks size";
+    row-gap: 0.1rem;
+  }
+  .ql-census-dot { grid-area: dot; }
+  .ql-census-name { grid-area: name; min-width: 0; }
+  .ql-census-n { grid-area: tracks; }
+  .ql-census-gb { grid-area: size; justify-self: end; }
+}
 .ql-census-rule {
   border: 0;
   border-top: 1px solid var(--ql-line-soft);

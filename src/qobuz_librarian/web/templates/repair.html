@@ -4,11 +4,8 @@
 {% block content %}
 
 <div class="ql-tool-page ql-tool-page--wide">
-  <header class="ql-page-header ql-page-header--actions">
-    <div>
-      <h1>Repair</h1>
-    </div>
-    <a href="/repair/history" class="ql-btn ql-btn-secondary ql-btn-sm ql-secondary-action ql-page-action">View history</a>
+  <header class="ql-page-header">
+    <h1>Repair</h1>
   </header>
 
 {% if not qobuz_ready %}
@@ -25,6 +22,7 @@
   <span>
     {% if last_run %}Last repair scan {{ last_run }}.{% else %}No repair scan has finished yet.{% endif %}
   </span>
+  <a href="/repair/history">View history</a>
 </div>
 
 {% if repair_resume %}
