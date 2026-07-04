@@ -34,6 +34,10 @@ services:
       # putting PUID/PGID in .env. PUID=0 PGID=0 runs as root if you need it.
       PUID: "${PUID:-1000}"
       PGID: "${PGID:-1000}"
+      # Timezone for timestamps in History and the job pages ("2 hr ago"
+      # stays right either way; exact times follow this). IANA name, e.g.
+      # America/Edmonton. Empty = UTC.
+      TZ: "${TZ:-}"
 
       # ── Auth ──────────────────────────────────────────────────────────────
       # Optional: set QOBUZ_USER_AUTH_TOKEN / QOBUZ_USER_ID in .env, or use

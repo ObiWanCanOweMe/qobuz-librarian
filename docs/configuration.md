@@ -106,6 +106,10 @@ For a read-only music share, append `:ro` to the `/music` bind and set `QL_CHECK
 
 To run as root, set `PUID=0` and `PGID=0` explicitly. A non-numeric typo makes the container refuse to start rather than silently falling back to root.
 
+## Timezone
+
+Set `TZ` in `.env` (an IANA name like `America/Edmonton`) so exact timestamps in History and on job pages show your local time instead of UTC. Relative labels like "2 hr ago" are correct either way.
+
 If the bind dirs were auto-created as root on first `up`, chown them before enabling those settings:
 
 ```bash
