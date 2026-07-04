@@ -1,0 +1,16 @@
+{% if qobuz_ready and baseline_complete and library_scan_state.ready and (not library_job or library_job.status == JobStatus.AWAITING_REVIEW) %}
+{% if library_refresh_running %}
+<span class="ql-refresh-note" role="status" title="Checking your folders for music added outside the app."
+      hx-get="/library/refresh-note" hx-trigger="every 4s" hx-swap="outerHTML">Refreshing…</span>
+{% else %}
+<form action="/library" method="post" data-busy-submit>
+  <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+  <input type="hidden" name="mode" value="missing_albums">
+  <button type="submit" class="ql-header-refresh"
+          title="Scan for music added outside the app"
+          aria-label="Scan for music added outside the app">
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+  </button>
+</form>
+{% endif %}
+{% endif %}

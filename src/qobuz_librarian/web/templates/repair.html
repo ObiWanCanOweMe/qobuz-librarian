@@ -8,6 +8,8 @@
     <h1>Repair</h1>
   </header>
 
+{% if error %}<div class="ql-flash ql-flash-warning" data-flash><span>{{ error }}</span></div>{% endif %}
+
 {% if not qobuz_ready %}
 <section class="ql-work-card">
   {% with connect_embedded=True %}

@@ -6,27 +6,13 @@
 <div class="ql-tool-page ql-tool-page--wide ql-library-page">
   <header class="ql-page-header ql-page-header--split">
     <h1>Library</h1>
-    {% if qobuz_ready and baseline_complete and library_scan_state.ready and (not library_job or library_job.status == JobStatus.AWAITING_REVIEW) %}
-    {% if library_refresh_running %}
-    <span class="ql-refresh-note" role="status" title="Checking your folders for music added outside the app.">Refreshing…</span>
-    {% else %}
-    <form action="/library" method="post" data-busy-submit>
-      <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-      <input type="hidden" name="mode" value="missing_albums">
-      <button type="submit" class="ql-header-refresh"
-              title="Scan for music added outside the app"
-              aria-label="Scan for music added outside the app">
-        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
-      </button>
-    </form>
-    {% endif %}
-    {% endif %}
+    {% include "_library_refresh.html" %}
   </header>
 
   {% if error %}<div class="ql-flash ql-flash-warning" data-flash><span>{{ error }}</span></div>{% endif %}
   {% if library_notice %}<div class="ql-flash ql-flash-info" data-flash><span>{{ library_notice }}</span></div>{% endif %}
 
-  {% if not qobuz_ready %}
+  {% if not qobuz_ready and not library_job %}
   <section class="ql-work-card">
     {% with connect_embedded=True %}
       {% include "_connect_cta.html" %}
@@ -35,7 +21,16 @@
 
   {% elif library_job %}
   {# Single surface: the scan's live progress and the Missing Albums / Gap
-     Fill review render right here, same as /repair. #}
+     Fill review render right here, same as /repair. A dead token banners the
+     reconnect ABOVE the review instead of replacing it — ticking and
+     dismissing are local, only downloading needs Qobuz. #}
+  {% if not qobuz_ready %}
+  <section class="ql-work-card">
+    {% with connect_embedded=True, connect_note="Your parked review is below — you can keep ticking and dismissing; downloading waits for the connection." %}
+      {% include "_connect_cta.html" %}
+    {% endwith %}
+  </section>
+  {% endif %}
   {% with census_folded = true %}{% include "_census.html" %}{% endwith %}
   {% with job = library_job, embedded_surface = true %}{% include "_job_body.html" %}{% endwith %}
 

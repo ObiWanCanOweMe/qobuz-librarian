@@ -193,6 +193,12 @@
     }
     window.qlConfirm(msg).then(function (ok) {
       if (!ok) return;
+      if (el.tagName === "FORM") {
+        // A form's click() never submits it — fire a real submit event so
+        // htmx (or the browser) takes it from here.
+        el.requestSubmit();
+        return;
+      }
       el.dataset.confirmBypass = "1";
       el.click();
     });
@@ -1018,7 +1024,8 @@
       if (bulkBusy) return Promise.resolve();
       bulkBusy = true;
       var body = "on=" + (on ? "1" : "0") + "&scope=" + scope +
-                 "&tab=" + encodeURIComponent(curTab());
+                 "&tab=" + encodeURIComponent(curTab()) +
+                 "&q=" + encodeURIComponent(curQuery());
       if (scope === "page") {
         pageBox() && pageBox().querySelectorAll(".cb").forEach(function (cb) {
           body += "&cid=" + encodeURIComponent(cb.value);
@@ -1228,12 +1235,21 @@
         var tc = tabCounts(lastCounts);
         var rest = tc.total - tc.selected;
         if (rest <= 0) return;
-        window.qlConfirm(dismissConfirm(rest)).then(function (ok) {
+        // With a filter typed the action only touches the rows it shows, so
+        // the tab-wide number would overstate — ask without one.
+        var confirmMsg = curQuery()
+          ? (isDownsampleReview
+              ? "Keep the unselected albums matching your filter hi-res? You can downsample later."
+              : "Dismiss the unselected " + dismissItemPlural + " matching your filter? You can show them again later.")
+          : dismissConfirm(rest);
+        window.qlConfirm(confirmMsg).then(function (ok) {
           if (!ok) return;
           var prev = dismissRest.textContent;
           dismissRest.disabled = true;
           dismissRest.textContent = dismissBusyLabel();
-          post("/jobs/" + id + "/dismiss-rest", "tab=" + encodeURIComponent(curTab()))
+          post("/jobs/" + id + "/dismiss-rest",
+               "tab=" + encodeURIComponent(curTab()) +
+               "&q=" + encodeURIComponent(curQuery()))
             .then(function (r) { return r.ok ? r.json() : Promise.reject(); })
             .then(function (c) {
               if (c.review_done) { location.reload(); return; }

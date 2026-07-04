@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -1170,6 +1171,22 @@ async def _http_exception_handler(request: Request, exc: StarletteHTTPException)
                         headers=getattr(exc, "headers", None))
 
 
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(request: Request,
+                                        exc: RequestValidationError):
+    """A mangled query param (``/library?page=abc``) renders the styled error
+    page instead of dumping framework validation JSON into the browser. API
+    routes keep the JSON detail machine callers want."""
+    if not request.scope["path"].startswith("/api/"):
+        return _tr(request, "error.html", {
+            "code": 400,
+            "title": "Bad request",
+            "msg": "That address has an invalid value in it. Check the link "
+                   "and try again.",
+        }, status_code=400)
+    return JSONResponse({"detail": exc.errors()}, status_code=422)
+
+
 @app.exception_handler(Exception)
 async def _unhandled_exception_handler(request: Request, exc: Exception):
     """An uncaught route error renders the styled page for browser paths instead
@@ -1596,19 +1613,58 @@ def _fold_into_parked_library_review(job):
     from qobuz_librarian.web import flows, job_persistence, review_badges
     with job._lock:
         cands = list(job.candidates)
-    added = flows.fold_new_candidates(parked, cands)
+    with parked._lock:
+        before = {flows.fold_key(c) for c in parked.candidates}
+    folded = flows.fold_new_candidates(parked, cands)
+    if folded is None:
+        # The review was approved or discarded while the refresh ran — leave
+        # the scan's candidates alone so they park as their own review.
+        return
+    _, updated = folded
+    # Missing-album rows whose folder now exists (music added outside the app
+    # while the refresh skipped that artist) leave the review too — a disk
+    # probe, no Qobuz calls, ticks on other rows untouched.
+    flows.drop_owned_missing_candidates(parked)
+    # Count what the user's review actually gained/lost, not the fold's
+    # internals: an album the scan lists but the disk probe rejects is added
+    # then immediately dropped, and reporting that churn as "9 new finds,
+    # 9 removed" on a no-change refresh would be its own state lie.
+    with parked._lock:
+        after = {flows.fold_key(c) for c in parked.candidates}
+    added = len(after - before)
+    removed = len(before - after)
     job_persistence.persist(parked)
-    if added:
+    # Open review pages re-fetch on this nudge — without it the fold is
+    # invisible until a manual reload (and "Refreshing…" never resolves).
+    parked.notify_review_changed()
+    if added or updated:
         # Fresh reviewable results landed in the parked review — light the
         # Library dot again until the user opens it.
         review_badges.mark_ready("library")
     with job._lock:
         job.candidates = []
+    bits = []
     if added:
-        job.summary = (f"Folded {added} new find{'s' if added != 1 else ''} "
-                       "into the open Library review.")
-    else:
-        job.summary = "No new finds. The open Library review is up to date."
+        bits.append(f"Folded {added} new find{'s' if added != 1 else ''} "
+                    "into the open Library review.")
+    if updated:
+        bits.append(f"Updated {updated} where the music on disk changed.")
+    if removed:
+        bits.append(f"Removed {removed} now in your library.")
+    unchecked = getattr(job, "_unchecked_artists", 0)
+    if not bits:
+        if unchecked:
+            bits.append("No new finds from the artists that could be checked.")
+        else:
+            bits.append("No new finds. The open Library review is up to date.")
+    if unchecked:
+        bits.append(f"{unchecked} artist{'s' if unchecked != 1 else ''} "
+                    "couldn't be checked; scan again to resume from where it "
+                    "left off.")
+    if job.candidate_cap_hit or parked.candidate_cap_hit:
+        bits.append("The scan hit the result cap, so some finds may not be "
+                    "listed.")
+    job.summary = " ".join(bits)
     job.push_line(job.summary)
     job.status = job_mgr.JobStatus.DONE
 
@@ -2648,6 +2704,26 @@ async def library_page(request: Request, page: int = 1):
     return _tr(request, "library.html", ctx)
 
 
+@app.get("/library/refresh-note", response_class=HTMLResponse)
+async def library_refresh_note(request: Request):
+    """Fragment behind the header's refresh control. The "Refreshing…" note
+    polls this while a refresh runs, so it swaps back to the idle icon when
+    the scan ends instead of sitting there forever; the idle icon itself
+    never polls."""
+    from qobuz_librarian.library import new_releases
+    loop = asyncio.get_running_loop()
+    ctx = await loop.run_in_executor(None, lambda: {
+        "qobuz_ready": _qobuz_ready(),
+        "baseline_complete": new_releases.is_baseline_complete(),
+        "library_scan_state": _library_scan_state(),
+        "library_job": _library_current_job(),
+        "JobStatus": job_mgr.JobStatus,
+        "library_refresh_running": _active_scan(
+            "library", statuses=("pending", "scanning", "running")) is not None,
+    })
+    return _tr(request, "_library_refresh.html", ctx)
+
+
 @app.post("/library")
 async def library_scan(
     request: Request,
@@ -2734,6 +2810,7 @@ def _hidden_view(request, scope, *, page, restore_action, back_url):
     return _tr(request, "hidden.html", {
         "page": page, "scope": scope, "back_url": back_url,
         "restore_action": restore_action,
+        "notice": request.query_params.get("notice", ""),
         "groups": hidden_mod.hidden_by_artist(scope)})
 
 
@@ -2751,6 +2828,23 @@ async def _restore_hidden(request, scope, redirect):
         hidden_mod.restore(scope, artists)
     if fingerprints:
         hidden_mod.restore_albums(scope, fingerprints)
+    if scope == hidden_mod.SCOPE_MISSING and (artists or fingerprints):
+        # Upgrade/Downsample re-derive their reviews from saved state at read
+        # time, so restore takes effect there on its own. The Library review
+        # is a parked job — fold the restored candidates back in, or the
+        # restore looks like a no-op until some future scan.
+        from qobuz_librarian.web import flows
+        loop = asyncio.get_running_loop()
+        rejoined = await loop.run_in_executor(
+            None, lambda: flows.refold_restored_missing(artists, fingerprints))
+        if rejoined:
+            msg = (f"Restored {rejoined} — back in the Library review."
+                   if rejoined != 1 else "Restored — back in the Library review.")
+        else:
+            msg = "Restored. They return the next time the library scans."
+        return RedirectResponse(
+            url=redirect + "?notice=" + urllib.parse.quote(msg),
+            status_code=303)
     return RedirectResponse(url=redirect, status_code=303)
 
 
@@ -2907,6 +3001,7 @@ async def repair_page(request: Request, page: int = 1):
     rjob = _repair_current_job()
     ctx = {"creds_ok": creds_ok, "qobuz_ready": _qobuz_ready(),
            "page": "repair", "repair_job": rjob,
+           "error": request.query_params.get("error", ""),
            "JobStatus": job_mgr.JobStatus}
     if rjob is not None:
         ctx["queue_wait"] = _queue_wait(rjob)
@@ -3098,7 +3193,8 @@ async def migrate_scan(request: Request):
 
 @app.get("/jobs/{job_id}", response_class=HTMLResponse)
 async def job_page(request: Request, job_id: str, approved: bool = False,
-                   stale: bool = False, noselection: bool = False, page: int = 1):
+                   stale: bool = False, noselection: bool = False, page: int = 1,
+                   error: str = ""):
     job = job_mgr.registry.get(job_id)
     historical = False
     if not job:
@@ -3126,7 +3222,7 @@ async def job_page(request: Request, job_id: str, approved: bool = False,
         await loop.run_in_executor(None, lambda: job_persistence.persist(job))
     ctx = {"job": job, "page": nav_page,
            "approved": approved, "stale": stale, "noselection": noselection,
-           "historical": historical,
+           "error": error, "historical": historical,
            "queue_wait": _queue_wait(job),
            "JobStatus": job_mgr.JobStatus}
     ctx.update(_review_context(job, page))
@@ -3233,6 +3329,7 @@ def _split_off_inactive_tab(job, tab):
                         review_verb=job.review_verb,
                         status=job_mgr.JobStatus.AWAITING_REVIEW)
     other.candidates = split  # cids, seqs, and saved ticks ride along
+    other.sync_cand_seq()
     factory = _RESUME_EXECUTE.get(other.execute_kind)
     if factory is not None:
         other._execute_fn = factory(other, other.execute_args)
@@ -3250,7 +3347,10 @@ async def job_approve(request: Request, job_id: str):
         return busy
     job = job_mgr.registry.get(job_id)
     if not job:
-        return RedirectResponse(url="/queue", status_code=303)
+        return RedirectResponse(
+            url="/queue?error=" + urllib.parse.quote(
+                "That job is no longer in the record."),
+            status_code=303)
     # A parked review can outlive its feature: credentials can be pulled after
     # an upgrade review parks, and the downsample engine can vanish across a
     # restart. The tool's own routes refuse in that state, so the approve door
@@ -3271,6 +3371,18 @@ async def job_approve(request: Request, job_id: str):
         dest = "/library"
     else:
         dest = f"/jobs/{job_id}"
+    # Library, new-release, and repair downloads need Qobuz just as much as
+    # upgrades do — refuse up front rather than consuming the review with a
+    # run that dies on the first token lookup. (A token that expires mid-run
+    # is caught by the execute path, which re-parks the review.)
+    if (job.execute_kind in ("library", "new_releases", "repair")
+            and job.status == job_mgr.JobStatus.AWAITING_REVIEW
+            and not _qobuz_ready()):
+        return RedirectResponse(
+            url=dest + "?error=" + urllib.parse.quote(
+                "Reconnect Qobuz before downloading — your review is "
+                "untouched."),
+            status_code=303)
     # Guard a zero-selection approve: with nothing ticked, approving would flip
     # the job to done over an empty set and flash success while quietly
     # discarding the whole review. The submit button is disabled client-side, but
@@ -3353,6 +3465,8 @@ def _hide_scope(execute_kind):
 # albums; rendering them all is what made the review page tank, so the server
 # pages by whole artist groups (an album never splits across a page).
 REVIEW_PAGE_ARTISTS = 40
+# Whole-group candidate budget per page — see _paginate_groups.
+REVIEW_PAGE_CANDIDATES = 1500
 
 
 def _artist_sort_key(name: str) -> str:
@@ -3381,10 +3495,8 @@ def _review_artist_groups(job, query="", tab=""):
         if tab and flows.is_gap_candidate(c) != (tab == "gaps"):
             continue
         artist = c.get("artist") or ""
-        if q:
-            hay = artist + " " + (c.get("title") or "")
-            if q not in hay.lower():
-                continue
+        if q and not flows.candidate_matches_query(c, q):
+            continue
         groups.setdefault(artist, []).append(c)
     # Sort groups by music-library order, tracks by their stable seq.
     ordered = []
@@ -3396,11 +3508,28 @@ def _review_artist_groups(job, query="", tab=""):
 
 def _paginate_groups(groups, page):
     """Slice artist groups into one page. Returns (page_groups, page, n_pages).
-    ``page`` is clamped into range so a stale/empty page lands somewhere valid."""
-    n_pages = max(1, (len(groups) + REVIEW_PAGE_ARTISTS - 1) // REVIEW_PAGE_ARTISTS)
+    ``page`` is clamped into range so a stale/empty page lands somewhere valid.
+
+    Pages pack whole artist groups (so select-artist stays sane) up to
+    REVIEW_PAGE_ARTISTS groups AND ~REVIEW_PAGE_CANDIDATES rows — counting
+    artists alone let a page of prolific artists carry thousands of collapsed
+    rows into the DOM (a 40-artist page measured 758KB HTML). A single group
+    larger than the budget still gets its own page, whole."""
+    pages = []
+    cur, cur_rows = [], 0
+    for g in groups:
+        rows = len(g[1])
+        if cur and (len(cur) >= REVIEW_PAGE_ARTISTS
+                    or cur_rows + rows > REVIEW_PAGE_CANDIDATES):
+            pages.append(cur)
+            cur, cur_rows = [], 0
+        cur.append(g)
+        cur_rows += rows
+    if cur:
+        pages.append(cur)
+    n_pages = max(1, len(pages))
     page = max(1, min(int(page or 1), n_pages))
-    start = (page - 1) * REVIEW_PAGE_ARTISTS
-    return groups[start:start + REVIEW_PAGE_ARTISTS], page, n_pages
+    return (pages[page - 1] if pages else []), page, n_pages
 
 
 def _review_origin(request) -> str:
@@ -3495,16 +3624,21 @@ async def job_select_all(request: Request, job_id: str):
     on = (form.get("on") or "").strip().lower() in ("1", "true", "on", "yes")
     scope = (form.get("scope") or "all").strip().lower()
     cids = form.getlist("cid")[:100000] if scope == "page" else None
-    # Tab scoping: on a library review, select-all flips only the active tab's
-    # candidates — never the tab the user can't see.
+    # Tab and filter scoping: on a library review, select-all flips only the
+    # active tab's candidates — never the tab the user can't see. And with a
+    # filter typed, only the candidates it shows — flipping the other
+    # thousand rows invisibly would overwrite every saved tick on the tab.
     tab = (form.get("tab") or "").strip()
-    if (cids is None and job.execute_kind == "library"
-            and tab in ("missing", "gaps")):
+    q = (form.get("q") or "").strip().lower()
+    tab_scoped = (job.execute_kind == "library" and tab in ("missing", "gaps"))
+    if cids is None and (tab_scoped or q):
         from qobuz_librarian.web import flows
         gap_active = tab == "gaps"
         with job._lock:
             cids = [c["cid"] for c in job.candidates
-                    if flows.is_gap_candidate(c) == gap_active]
+                    if (not tab_scoped
+                        or flows.is_gap_candidate(c) == gap_active)
+                    and (not q or flows.candidate_matches_query(c, q))]
     if job.set_all_selected(on, cids=cids):
         job_mgr.persist_soon(job)
         job.notify_review_changed(_review_origin(request))
@@ -3601,6 +3735,9 @@ async def job_dismiss_rest(request: Request, job_id: str):
     if job.execute_kind != "library" or tab not in ("missing", "gaps"):
         tab = ""
     gap_only = (tab == "gaps") if tab else None
+    # An active filter narrows the dismissal to the rows it shows — same
+    # what-you-see-is-what-you-act-on rule as select-all.
+    q = (form.get("q") or "").strip().lower()
     # Snapshot the artists that still have an unticked album. dismiss_albums
     # re-reads each artist's saved ticks, so a tick that lands after this
     # snapshot is still honoured and its album isn't dropped.
@@ -3610,6 +3747,8 @@ async def job_dismiss_rest(request: Request, job_id: str):
             if c.get("selected"):
                 continue
             if gap_only is not None and flows.is_gap_candidate(c) != gap_only:
+                continue
+            if q and not flows.candidate_matches_query(c, q):
                 continue
             name = c.get("artist") or ""
             if name not in seen:
@@ -3622,7 +3761,7 @@ async def job_dismiss_rest(request: Request, job_id: str):
     loop = asyncio.get_running_loop()
     hidden_count = await loop.run_in_executor(
         None, lambda: sum(flows.dismiss_albums(job, a, scope=scope,
-                                               gap_only=gap_only)
+                                               gap_only=gap_only, query=q)
                           for a in artists))
     if hidden_count:
         job.notify_review_changed(_review_origin(request))
@@ -3643,8 +3782,16 @@ async def job_retry(request: Request, job_id: str):
     # well for a job evicted from the registry (restart, or 50 jobs later) as
     # for a live one — fall back to the archive instead of silently bouncing.
     job = job_mgr.registry.get(job_id) or job_mgr.load_historical_job(job_id)
-    if not job or job.status != job_mgr.JobStatus.FAILED or not job.album_id:
-        return RedirectResponse(url="/queue", status_code=303)
+    if not job:
+        return RedirectResponse(
+            url="/queue?error=" + urllib.parse.quote(
+                "That job is no longer in the record."),
+            status_code=303)
+    if job.status != job_mgr.JobStatus.FAILED or not job.album_id:
+        return RedirectResponse(
+            url="/queue?error=" + urllib.parse.quote(
+                "Nothing to retry for that job."),
+            status_code=303)
     album_id = job.album_id
     duplicate = _find_job_touching_album(album_id)
     if duplicate:
@@ -3714,7 +3861,7 @@ async def job_retry(request: Request, job_id: str):
 async def job_undo(request: Request, job_id: str):
     """Reverse a single-track download: delete the track it added, drop the beets row
     for it, undo the single mark, and remove a folder the download created if it's
-    now empty. Available while the job is still in memory."""
+    now empty. Works from the archive too — the single payload is persisted."""
     # Undo deletes files and touches the beets DB, so it needs the same run-lock
     # gate every other mutating route has — the in-process staging lock below
     # can't keep it off the library while a CLI session or another instance
@@ -3735,7 +3882,10 @@ async def job_undo(request: Request, job_id: str):
             if job:
                 return _tr(request, "_job_body.html", {"job": job})
             return HTMLResponse("", headers={"HX-Redirect": "/queue"})
-        return RedirectResponse(url="/queue", status_code=303)
+        msg = ("That job is no longer in the record." if not job
+               else "Nothing to undo for that job.")
+        return RedirectResponse(
+            url="/queue?error=" + urllib.parse.quote(msg), status_code=303)
 
     def _refresh_after_undo():
         import logging
@@ -4096,7 +4246,8 @@ def _resolve_host_path(container_path: str) -> tuple[str, bool]:
 
 def _settings_response(request, *, saved=False, queued=False, connected=False,
                        unverified=False, error="", mode="", user_id=None,
-                       auth_token_prefill="", diagnostics=None, warnings=None):
+                       auth_token_prefill="", diagnostics=None, warnings=None,
+                       quality_note=False):
     from qobuz_librarian.web import settings_store
     creds = _read_creds()
     values = settings_store.current()
@@ -4130,6 +4281,7 @@ def _settings_response(request, *, saved=False, queued=False, connected=False,
         "mode_changed": (mode or "").strip().lower(),
         "saved": saved,
         "queued": queued,
+        "quality_note": quality_note,
         "connected": connected,
         "unverified": unverified,
         "error": error,
@@ -4158,12 +4310,13 @@ def _settings_response(request, *, saved=False, queued=False, connected=False,
 async def settings_page(request: Request, saved: bool = False,
                         queued: bool = False, connected: bool = False,
                         unverified: bool = False, error: str = "",
-                        mode: str = ""):
+                        mode: str = "", quality_note: bool = False):
     loop = asyncio.get_running_loop()
     diags = await loop.run_in_executor(None, _diagnostics)
     return _settings_response(request, saved=saved, queued=queued,
                               connected=connected, unverified=unverified,
-                              error=error, mode=mode, diagnostics=diags)
+                              error=error, mode=mode, diagnostics=diags,
+                              quality_note=quality_note)
 
 
 def _streamrip_has_userid() -> bool:
@@ -4294,7 +4447,19 @@ async def save_behavior(request: Request):
     for k in settings_store.TEXT_KEYS:
         if k in form:
             values[k] = form.get(k, "")
+    quality_before = (str(getattr(cfg, "STREAMRIP_QUALITY", "")),
+                      bool(getattr(cfg, "PREFER_HIRES", False)))
     ok, warnings = settings_store.save(values)
+    # A quality-policy change leaves a parked/saved Upgrade review promising
+    # targets the settings no longer produce. No silent re-scan (that's the
+    # user's bandwidth) — say so, and let the policy-aware refresh re-derive.
+    quality_note = False
+    if quality_before != (str(getattr(cfg, "STREAMRIP_QUALITY", "")),
+                          bool(getattr(cfg, "PREFER_HIRES", False))):
+        from qobuz_librarian.quality import upgrade_state
+        loop = asyncio.get_running_loop()
+        state = await loop.run_in_executor(None, upgrade_state.load)
+        quality_note = bool((state or {}).get("candidates"))
     # Applied in-memory regardless; error only means it won't persist.
     if not ok:
         return RedirectResponse(url="/settings?error=persist", status_code=303)
@@ -4306,8 +4471,11 @@ async def save_behavior(request: Request):
         diags = await loop.run_in_executor(None, _diagnostics)
         return _settings_response(request, saved=True,
                                   queued=settings_store._any_active_job(),
-                                  warnings=warnings, diagnostics=diags)
+                                  warnings=warnings, diagnostics=diags,
+                                  quality_note=quality_note)
     suffix = "&queued=1" if settings_store._any_active_job() else ""
+    if quality_note:
+        suffix += "&quality_note=1"
     return RedirectResponse(url=f"/settings?saved=1{suffix}", status_code=303)
 
 

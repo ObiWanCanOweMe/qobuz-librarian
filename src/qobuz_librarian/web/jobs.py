@@ -195,6 +195,15 @@ class Job:
     _cand_seq: int = field(default=0, repr=False)
     # Set once a scan hits JOB_CANDIDATE_CAP and stops listing further finds.
     _candidate_cap_noted: bool = field(default=False, repr=False)
+    # Set by the execute flows the moment the first album/track lands on disk.
+    # An auth failure BEFORE this is set means nothing happened — the approve
+    # path re-parks the review instead of burying the user's picks in a failed
+    # job; after it, normal fail semantics apply (a re-park would re-download).
+    _imported_any: bool = field(default=False, repr=False)
+    # How many artists a library scan couldn't check (per-artist errors). The
+    # fold reads it so a partial refresh can't masquerade as a complete one
+    # after the fold rewrites the scan's summary.
+    _unchecked_artists: int = field(default=0, repr=False)
     # When set to (current, total, unit), push_progress reports THESE counts in
     # place of the caller's — so a multi-item execute (repairing 16 albums) keeps
     # the progress card on "album 3 / 16" even while each album's inner phases
@@ -202,6 +211,33 @@ class Job:
     # execute loop; None = normal pass-through. The phase + item still come from
     # the inner call, so the card reads e.g. "Importing… · 3/16 · <album>".
     _progress_scope: Optional[tuple] = field(default=None, repr=False)
+
+    def __post_init__(self):
+        self.sync_cand_seq()
+
+    def sync_cand_seq(self):
+        """Advance the cid counter past any candidates this job already carries.
+
+        A job rebuilt with pre-existing candidates (restart rehydration, the
+        tab-split) would otherwise mint fresh cids from c0 and collide with
+        the rows it inherited — a cid-keyed dismiss then deletes unrelated
+        candidates. Must be re-run by any code that assigns ``candidates``
+        after construction."""
+        highest = -1
+        for c in self.candidates:
+            seq = c.get("seq")
+            if seq is None:
+                # Legacy rows persisted before seq existed: recover it from
+                # the cid ("c57" → 57).
+                cid = str(c.get("cid") or "")
+                try:
+                    seq = int(cid.lstrip("c"))
+                except ValueError:
+                    continue
+            if seq > highest:
+                highest = seq
+        if highest >= self._cand_seq - 1:
+            self._cand_seq = highest + 1
 
     # ── logging / streaming ──────────────────────────────────────────────────
     def _fan_out(self, line: str):
@@ -401,8 +437,8 @@ class Job:
         if capped:  # log once, outside the lock (push_line takes it itself)
             self.push_line(
                 f"Reached the {self.CANDIDATE_CAP:,}-result cap. Further "
-                "finds aren't listed. Narrow the scan (scan by artist) to "
-                "see the rest.")
+                "finds aren't listed. Work through or dismiss some results, "
+                "then refresh to see the rest.")
         return cid
 
     @property
@@ -993,7 +1029,32 @@ def approve(job: Job, selected_ids=None) -> bool:
             j.push_line("No candidates selected. Nothing to do.")
             j.status = JobStatus.DONE
             return
-        j._execute_fn(j, chosen)
+        try:
+            j._execute_fn(j, chosen)
+        except (Exception, SystemExit) as e:
+            # Qobuz went away before ANYTHING landed: put the review back
+            # exactly as it was instead of burying the picks in a failed job
+            # — a months-old review's ticks would otherwise be gone for good.
+            # After the first import, normal fail semantics apply (a re-park
+            # would re-download what already landed).
+            from qobuz_librarian.api.auth import AuthLost, QobuzUnavailable
+            if (j._imported_any or j.cancel_requested
+                    or not isinstance(e, (AuthLost, QobuzUnavailable,
+                                          SystemExit))):
+                raise
+            with j._lock:
+                # A cancel/discard that landed while the run was dying wins —
+                # only a still-RUNNING job goes back to review.
+                if j.status != JobStatus.RUNNING or j.cancel_requested:
+                    raise
+                j.status = JobStatus.AWAITING_REVIEW
+                j.finished_at = None
+                j.error = None
+            j.push_line(
+                "Couldn't reach Qobuz, so nothing was downloaded. Your "
+                "review and picks are untouched — reconnect and try again.")
+            job_persistence.persist(j)
+            j.notify_review_changed()
 
     _scan_queue.put((job, _execute))
     return True
@@ -1101,8 +1162,17 @@ def restore_jobs(execute_registry: dict) -> None:
             # opens; the whole-library repair sweep also checkpoints but only
             # picks up when its scan is started again; every other kind restarts.
             if job.execute_kind == "library":
-                job.summary = ("Interrupted by a restart. It resumes from where "
-                               "it left off the next time you open the app.")
+                # Only a pre-baseline scan auto-resumes; after the baseline the
+                # affordance is the dashboard's manual resume notice — don't
+                # promise an auto-resume that never comes.
+                from qobuz_librarian.library import new_releases
+                if new_releases.is_baseline_complete():
+                    job.summary = ("Interrupted by a restart. Resume it from "
+                                   "the notice on the Search page.")
+                else:
+                    job.summary = ("Interrupted by a restart. It resumes from "
+                                   "where it left off the next time you open "
+                                   "the app.")
             elif job.execute_kind == "repair":
                 job.summary = ("Interrupted by a restart. Start the repair scan "
                                "again and it continues from where it left off.")

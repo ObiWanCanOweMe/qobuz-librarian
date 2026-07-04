@@ -23,8 +23,18 @@ def _empty_kind():
         "updated_at": None,
         "complete": False,
         "hidden_signature": "",
+        "quality_signature": "",
         "artists": {},
     }
+
+
+def quality_signature() -> str:
+    """The quality policy the saved candidates were computed under. When it
+    differs from the current settings, a refresh must re-derive Upgrade and
+    Downsample candidates even for unchanged folders — the cheap skip would
+    otherwise carry forward promises made under a dead policy."""
+    return (f"{getattr(cfg, 'STREAMRIP_QUALITY', '')}"
+            f"|{bool(getattr(cfg, 'PREFER_HIRES', False))}")
 
 
 def hidden_signature(store, scope: str) -> str:
@@ -65,6 +75,7 @@ def kind_state(kind: str):
         "updated_at": bucket.get("updated_at"),
         "complete": bool(bucket.get("complete")),
         "hidden_signature": str(bucket.get("hidden_signature") or ""),
+        "quality_signature": str(bucket.get("quality_signature") or ""),
         "artists": artists,
     })
     return base
@@ -107,7 +118,7 @@ def _clean_artist_state(entry):
 
 
 def save_kind(kind: str, *, artists: dict, complete: bool,
-              hidden_signature: str = ""):
+              hidden_signature: str = "", quality_sig: str = ""):
     data = load()
     kinds = data.setdefault("kinds", {})
     now = time.time()
@@ -115,6 +126,7 @@ def save_kind(kind: str, *, artists: dict, complete: bool,
         "updated_at": now,
         "complete": bool(complete),
         "hidden_signature": str(hidden_signature or ""),
+        "quality_signature": str(quality_sig or ""),
         "artists": {
             str(name): _clean_artist_state(entry)
             for name, entry in (artists or {}).items()

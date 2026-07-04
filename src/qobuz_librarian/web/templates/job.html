@@ -20,6 +20,12 @@
 </div>
 {% endif %}
 
+{% if error %}
+<div class="ql-notice ql-notice-warning ql-job-banner" data-flash>
+  <span>{{ error }}</span>
+</div>
+{% endif %}
+
 {% if noselection %}
 <div class="ql-notice ql-notice-warning ql-job-banner" data-flash>
   {% set _review_thing = labels.discard_review_label(job) %}

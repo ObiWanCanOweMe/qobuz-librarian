@@ -16,6 +16,8 @@
   <h1>{{ heading }}</h1>
 </header>
 
+{% if notice %}<div class="ql-flash ql-flash-info" data-flash><span>{{ notice }}</span></div>{% endif %}
+
 {% if groups %}
 <div class="ql-work-status">
   <span>{{ groups | length }} artist{% if groups | length != 1 %}s{% endif %} with {{ kept_label }}.</span>

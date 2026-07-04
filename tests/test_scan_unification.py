@@ -1158,6 +1158,7 @@ def test_scan_library_reuses_unchanged_artist_snapshot(tmp_path, monkeypatch):
         complete=True,
         hidden_signature=library_scan_state.hidden_signature(
             hidden, hidden_mod.SCOPE_MISSING),
+        quality_sig=library_scan_state.quality_signature(),
     )
     downsample_skip = []
     upgrade_skip = []
@@ -1317,6 +1318,7 @@ def test_scan_library_force_full_ignores_saved_artist_snapshot(
         complete=True,
         hidden_signature=library_scan_state.hidden_signature(
             hidden, hidden_mod.SCOPE_MISSING),
+        quality_sig=library_scan_state.quality_signature(),
     )
     downsample_skip = []
     upgrade_skip = []

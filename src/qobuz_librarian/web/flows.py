@@ -232,8 +232,8 @@ def _cap_note(job) -> str:
     if not job.candidate_cap_hit:
         return ""
     return (f" Showing the first {len(job.candidates):,}; the scan hit the "
-            f"{job.CANDIDATE_CAP:,} result cap. Scan a single artist, or raise "
-            "JOB_CANDIDATE_CAP, to see the rest.")
+            f"{job.CANDIDATE_CAP:,} result cap. Work through or dismiss some "
+            "results, then refresh to see the rest.")
 
 
 def _gap_candidate_spec(
@@ -259,6 +259,15 @@ def _add_gap_candidate(job, gap, artist_name, selected=False, is_new=False):
         job, _gap_candidate_spec(gap, artist_name, selected, is_new))
 
 
+def candidate_matches_query(c, q):
+    """The review filter's predicate — artist or album title contains ``q``
+    (already lowercased). Shared by the fragment render and the bulk
+    selection/dismiss endpoints so what the user sees is exactly what a bulk
+    action touches."""
+    hay = (c.get("artist") or "") + " " + (c.get("title") or "")
+    return q in hay.lower()
+
+
 def is_gap_candidate(c):
     """Whether a saved review candidate is a Gap Fill entry (missing tracks in
     an owned album) rather than a fully missing album. New scans stamp the
@@ -269,27 +278,139 @@ def is_gap_candidate(c):
     return "gap-fill:" in (c.get("detail") or "")
 
 
-def fold_new_candidates(parked, cands):
-    """Append candidates a parked review doesn't already list, keyed by Qobuz
-    album id (falling back to artist+title for keyless carry-overs). The
-    parked review's own entries — and the user's ticks on them — are never
-    touched; a refresh only ever adds. Returns how many were added."""
-    def _key(c):
-        album_id = str((c.get("payload") or {}).get("album_id") or "")
-        if album_id:
-            return album_id
-        return ((c.get("artist") or "").lower(), (c.get("title") or "").lower())
+def fold_key(c):
+    """A candidate's merge identity: Qobuz album id, falling back to
+    artist+title for keyless carry-overs. Shared by the fold and its caller's
+    before/after arithmetic so the summary counts what actually changed."""
+    album_id = str((c.get("payload") or {}).get("album_id") or "")
+    if album_id:
+        return album_id
+    return ((c.get("artist") or "").lower(), (c.get("title") or "").lower())
 
+
+def fold_new_candidates(parked, cands):
+    """Merge a refresh's finds into a parked review, keyed by Qobuz album id
+    (falling back to artist+title for keyless carry-overs).
+
+    Entries the refresh didn't touch — and the user's ticks on them — are
+    never changed. An album the refresh found in the OTHER class (a missing
+    album now partially on disk, or a gapped album deleted by hand) swaps to
+    the fresh candidate with its tick preserved; absence from the refresh is
+    NOT evidence of change (the cheap refresh skips unchanged artists), so
+    nothing is removed on that basis. Candidates the user dismissed while the
+    refresh ran are checked against a fresh hidden snapshot so the fold can't
+    resurrect them. Returns (added, updated), or None when the review stopped
+    being parked mid-refresh (approved/discarded) — the caller should leave
+    the scan's results alone so they park as their own review."""
+    from qobuz_librarian.web import jobs as job_mgr
+
+    _key = fold_key
+    # Loaded fresh, NOT the scan's own snapshot from its start — the window a
+    # refresh runs is exactly when a dismissal would be missed.
+    hidden = hidden_mod.load()
     with parked._lock:
-        seen = {_key(c) for c in parked.candidates}
-    added = 0
-    for c in cands:
-        key = _key(c)
-        if key in seen:
+        if parked.status != job_mgr.JobStatus.AWAITING_REVIEW:
+            return None
+        fresh_by_key = {}
+        for c in cands:
+            fresh_by_key.setdefault(_key(c), c)
+        updated = 0
+        swapped_ticks = {}
+        keep = []
+        for c in parked.candidates:
+            key = _key(c)
+            fresh = fresh_by_key.get(key)
+            if (fresh is not None
+                    and is_gap_candidate(fresh) != is_gap_candidate(c)):
+                # Disk reality changed class — the fresh row replaces this one
+                # below, wearing the user's tick.
+                swapped_ticks[key] = bool(c.get("selected"))
+                updated += 1
+                continue
+            keep.append(c)
+        parked.candidates = keep
+        seen = {_key(c) for c in keep}
+        added = 0
+        for c in cands:
+            key = _key(c)
+            if key in seen:
+                continue
+            if key not in swapped_ticks and hidden_mod.is_hidden(
+                    hidden_mod.SCOPE_MISSING, c.get("artist") or "",
+                    c.get("title") or "", hidden):
+                continue
+            seen.add(key)
+            # Class swaps ride past the cap: their old row was just removed,
+            # so appending the replacement is net-zero.
+            if (key not in swapped_ticks
+                    and len(parked.candidates) >= parked.CANDIDATE_CAP):
+                parked._candidate_cap_noted = True
+                continue
+            seq = parked._cand_seq
+            parked._cand_seq += 1
+            parked.candidates.append({
+                "cid": f"c{seq}", "seq": seq,
+                "kind": c.get("kind", "album"),
+                "title": c.get("title") or "?",
+                "artist": c.get("artist") or "",
+                "detail": c.get("detail") or "",
+                "payload": c.get("payload") or {},
+                "selected": swapped_ticks.get(key, bool(c.get("selected"))),
+            })
+            if key not in swapped_ticks:
+                added += 1
+    return added, updated
+
+
+def refold_restored_missing(artists, fingerprints):
+    """Return just-restored dismissals to the open Library review.
+
+    Dismissing drops rows from the parked job for good, so clearing the
+    hidden entries alone leaves Restore looking like a no-op until some
+    future scan re-carries them — and most users never scan again. Rebuild
+    the restored artists'/albums' candidate specs from the saved scan state
+    and fold them back in, unselected. Returns how many rejoined the review,
+    or None when no library review is parked (they return on the next scan)."""
+    from qobuz_librarian.library import library_scan_state
+    from qobuz_librarian.web import job_persistence
+    from qobuz_librarian.web import jobs as job_mgr
+
+    parked = None
+    for job in job_mgr.registry.awaiting_review():
+        if getattr(job, "execute_kind", "") != "library":
             continue
-        seen.add(key)
-        if _add_candidate_spec(parked, c) is not None:
-            added += 1
+        if parked is None or (job.created_at or 0) > (parked.created_at or 0):
+            parked = job
+    if parked is None:
+        return None
+    wanted_artists = {(a or "").lower() for a in artists}
+    wanted_fps = set(fingerprints)
+    specs = []
+    state = library_scan_state.kind_state("missing")
+    for name, entry in (state.get("artists") or {}).items():
+        for spec in (entry or {}).get("candidates") or []:
+            artist = spec.get("artist") or name
+            title = spec.get("title") or ""
+            if ((artist or "").lower() in wanted_artists
+                    or hidden_mod.album_fingerprint(artist, title)
+                    in wanted_fps):
+                spec = dict(spec)
+                spec["selected"] = False
+                specs.append(spec)
+    if not specs:
+        return 0
+    with parked._lock:
+        before = {fold_key(c) for c in parked.candidates}
+    if fold_new_candidates(parked, specs) is None:
+        return None
+    # Same reconciliation the refresh's fold does: saved specs whose folder
+    # turns out to exist on disk must not rejoin as "missing".
+    drop_owned_missing_candidates(parked)
+    with parked._lock:
+        added = len({fold_key(c) for c in parked.candidates} - before)
+    if added:
+        job_persistence.persist(parked)
+        parked.notify_review_changed()
     return added
 
 
@@ -425,7 +546,8 @@ def _flag_new_since_last_scan(job, mode):
     _save_scan_seen(mode, seen_now)
 
 
-def dismiss_albums(job, artist, scope=hidden_mod.SCOPE_MISSING, gap_only=None):
+def dismiss_albums(job, artist, scope=hidden_mod.SCOPE_MISSING, gap_only=None,
+                   query=""):
     """Hide ``artist``'s albums that aren't currently selected, in ``scope``.
 
     Selection is server-backed (saved as the user ticks), so "hide the rest"
@@ -437,7 +559,8 @@ def dismiss_albums(job, artist, scope=hidden_mod.SCOPE_MISSING, gap_only=None):
     ``gap_only`` narrows the hide to one side of a library review's tab split:
     True drops only Gap Fill candidates, False only fully missing albums, None
     (the default) both. The button only ever shows one tab's rows, so it must
-    not silently dismiss the other tab's.
+    not silently dismiss the other tab's. ``query`` narrows the same way for
+    an active review filter — only the rows the user can see leave.
 
     The hidden albums are recorded in the durable store so future bulk walks of
     that scope skip them, then dropped from this job's review list. Returns the
@@ -451,7 +574,8 @@ def dismiss_albums(job, artist, scope=hidden_mod.SCOPE_MISSING, gap_only=None):
     with job._lock:
         to_hide = [c for c in job.candidates
                    if c.get("artist") == artist and not c.get("selected")
-                   and (gap_only is None or is_gap_candidate(c) == gap_only)]
+                   and (gap_only is None or is_gap_candidate(c) == gap_only)
+                   and (not query or candidate_matches_query(c, query))]
         if not to_hide:
             return 0
         drop = {c["cid"] for c in to_hide}
@@ -542,12 +666,16 @@ def scan_library(job, token, partial_only=False, force_full=False):
     hidden = hidden_mod.load()
     hidden_sig = library_scan_state.hidden_signature(
         hidden, hidden_mod.SCOPE_MISSING)
+    quality_sig = library_scan_state.quality_signature()
     previous_scan = library_scan_state.kind_state(kind)
     cheap_refresh = (
         not force_full
         and not resuming
         and previous_scan.get("complete")
         and previous_scan.get("hidden_signature", "") == hidden_sig
+        # Saved candidates computed under a different quality policy must not
+        # carry forward — a settings change re-derives even unchanged folders.
+        and previous_scan.get("quality_signature", "") == quality_sig
     )
     # The two refreshes and the fingerprint pass below run before the main
     # artist loop, and on a first scan of a large library each takes real
@@ -774,6 +902,7 @@ def scan_library(job, token, partial_only=False, force_full=False):
             artists=state_artists,
             complete=library_complete,
             hidden_signature=hidden_sig,
+            quality_sig=quality_sig,
         )
         if library_complete:
             if downsample_refresh.complete:
@@ -822,6 +951,7 @@ def scan_library(job, token, partial_only=False, force_full=False):
     # total and the resume prompt that follows looks unexplained.
     unchecked = len(artists) - len(state_artists)
     if not job.cancel_requested and unchecked > 0:
+        job._unchecked_artists = unchecked
         job.summary += (f" {plural(unchecked, 'artist')} couldn't be checked; "
                         "scan again to resume from where it left off.")
     log.info(job.summary)
@@ -990,6 +1120,7 @@ def execute_albums(job, chosen, token):
             failed += 1
             continue
         if result and result.get("imported") and result.get("n_ok", 0) > 0:
+            job._imported_any = True
             _refresh_after_local_album_change(
                 full,
                 result,
@@ -1177,9 +1308,11 @@ def execute_upgrades(job, chosen, token):
             # as the original, so the backup was kept. Not a clean upgrade and
             # not a failure — count it apart so the tally stays honest.
             kept += 1
+            job._imported_any = True
         elif result and result.get("imported") and _res not in (
                 _skip | {"upgrade_aborted_backup_failed"}):
             ok += 1
+            job._imported_any = True
             verdict = result.get("quality_verdict")
             if verdict and verdict["under"] and not verdict["recovered"]:
                 from qobuz_librarian.quality.decision import mark_album_capped
@@ -1733,6 +1866,7 @@ def execute_repairs(job, chosen, token):
         # up downloaded-and-imported is a real failure.
         if result and result.get("n_ok", 0) > 0 and result.get("imported"):
             fixed += 1
+            job._imported_any = True
             _refresh_after_local_album_change(
                 None,
                 result,
