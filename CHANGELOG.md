@@ -2,10 +2,13 @@
 
 All notable changes to Qobuz Librarian are recorded here, newest first. The project follows [semantic versioning](https://semver.org/); dates are when each version was tagged during local development.
 
-## [0.10.1] - 2026-07-03
+## [0.10.1] - 2026-07-04
 
-Fixes from the first day of running 0.10.0 against a full-size library.
+Fixes and hardening from running 0.10.0 against a full-size library, plus a deep audit of the album-matching and downsample paths.
 
+- The library review no longer counts an empty folder as an album you already own. A failed download, or a folder whose tracks were deleted, used to make a genuinely-missing album quietly disappear from the review; the same empty-folder check now also gates the Search "in library" tag.
+- Downsampling a loud master no longer clips it. The resampler can momentarily overshoot full scale on hot, brickwalled sources, and the rewrite used to hard-clip those peaks into distortion. Those files — and only those — are now eased down by the small amount needed first; quieter, more dynamic albums are untouched.
+- The first time you downsample, you choose once whether to keep a restorable copy of your hi-res originals or delete them to save the space. The choice is saved in Settings and applied from then on, so you're never silently left without a backup.
 - Approving a review now asks before it queues anything, with the real count in the question — previously one tap on the review button could start every selected download unprompted. Repair reviews confirm the same way.
 - Review checkboxes respond immediately on large libraries: each tick used to serialize and write the entire candidate list (tens of megabytes at tens of thousands of candidates) before answering; saves now coalesce in the background.
 - The first library scan reports what it's doing from the start — reading albums on disk, checking upgrade quality, fingerprinting folders — instead of sitting on "waiting for output" for minutes while it worked through the pre-scan passes.
