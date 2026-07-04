@@ -761,7 +761,7 @@ def test_parked_review_does_not_defer_settings(tmp_path, monkeypatch):
 
 def test_quality_change_flags_the_stale_upgrade_review(
         client, tmp_path, monkeypatch):
-    """#44: lowering/raising the download quality leaves a saved Upgrade
+    """Lowering/raising the download quality leaves a saved Upgrade
     review promising dead targets — the save must say a refresh updates it.
     An unchanged save stays quiet."""
     from qobuz_librarian import config as cfg
@@ -2485,7 +2485,7 @@ def test_library_select_all_scoped_to_tab(client):
 
 
 def test_select_all_scoped_to_the_active_filter(client):
-    """#37: with a filter showing 3 rows, Select all must not silently flip
+    """With a filter showing 3 rows, Select all must not silently flip
     the other thousand — and Deselect must scope the same way so a filtered
     select-all can be undone filtered."""
     job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
@@ -2532,7 +2532,7 @@ def test_dismiss_rest_scoped_to_the_active_filter(client):
 
 
 def test_review_pages_split_on_a_candidate_budget():
-    """#25: pagination counts candidates, not just artists — a few prolific
+    """Pagination counts candidates, not just artists — a few prolific
     artists must not put thousands of rows in one page's DOM. Whole groups
     stay together; a single over-budget group still gets its own page."""
     from qobuz_librarian.web import app as webapp
@@ -2549,7 +2549,8 @@ def test_review_pages_split_on_a_candidate_budget():
 
 
 def test_mangled_query_param_renders_the_error_page(client):
-    """#47: /library?page=abc must answer with the styled error page, not raw
+    """A mangled page param (/library?page=abc) must answer with the styled
+    error page, not raw
     framework validation JSON; API routes keep the JSON detail."""
     r = client.get("/library?page=abc")
     assert r.status_code == 400
@@ -2560,7 +2561,7 @@ def test_mangled_query_param_renders_the_error_page(client):
 
 
 def test_filter_with_no_matches_says_so(client):
-    """#38: a filter matching nothing must render its message, not a void."""
+    """A filter matching nothing must render its message, not a void."""
     job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
     job.execute_kind = "library"
     job._execute_fn = lambda j, chosen: None
@@ -2578,7 +2579,7 @@ def test_filter_with_no_matches_says_so(client):
 
 
 def test_discard_confirm_names_the_lost_picks(client):
-    """#41: the one guarded door in front of destroying the user's ticks must
+    """The one guarded door in front of destroying the user's ticks must
     say that's the stake — not reassure about files."""
     job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
     job.execute_kind = "library"
@@ -2917,7 +2918,7 @@ def test_restart_interrupt_message_matches_the_retry_affordance(monkeypatch):
 
 
 def test_interrupted_scan_summary_matches_the_real_resume_path(monkeypatch):
-    """#24: only a pre-baseline library scan auto-resumes; post-baseline the
+    """Only a pre-baseline library scan auto-resumes; post-baseline the
     summary must point at the manual resume notice instead."""
     from qobuz_librarian.web import job_persistence
 
@@ -3547,7 +3548,7 @@ def test_fold_does_not_resurrect_albums_dismissed_during_the_refresh(
 
 
 def test_fold_skips_a_review_approved_mid_refresh(monkeypatch):
-    """#31: approve flips the review out of AWAITING_REVIEW between scan finish
+    """Approve flips the review out of AWAITING_REVIEW between scan finish
     and fold — the refresh must keep its candidates and park normally instead
     of leaking finds into the executing job."""
     from qobuz_librarian.web import app as webapp
