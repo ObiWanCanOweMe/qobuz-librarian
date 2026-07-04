@@ -2077,11 +2077,14 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
                     # the year picks the user's pressing as the row (so the rest
                     # show as "other versions") while Search stays out of
                     # upgrade decisions.
-                    from qobuz_librarian.library.catalog import _dir_year
+                    from qobuz_librarian.library.catalog import _count_audio_files_in, _dir_year
                     for res, alb in zip(results, _album_raws):
                         try:
                             folder = find_album_dir_filesystem(alb)
-                            if folder is None:
+                            # A folder with the album's name but no audio (a
+                            # failed download, deleted tracks) isn't "in library"
+                            # — the same empty-shell guard the review reconcile uses.
+                            if folder is None or not _count_audio_files_in(folder):
                                 continue
                             res["owned"] = True
                             res["disk_year"] = _dir_year(folder.name)

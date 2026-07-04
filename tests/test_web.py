@@ -624,6 +624,7 @@ def test_album_search_keeps_upgrades_out_of_search(client, monkeypatch, tmp_path
     }
     owned = tmp_path / "Das Tor (2013)"
     owned.mkdir()
+    (owned / "01 - Das Tor.flac").write_bytes(b"\x00")  # real audio => in library
 
     monkeypatch.setattr(search_mod, "search_albums", lambda *_a, **_kw: [album])
     monkeypatch.setattr(catalog_mod, "find_album_dir_filesystem", lambda _a: owned)
