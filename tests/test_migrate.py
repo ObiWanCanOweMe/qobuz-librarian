@@ -91,6 +91,41 @@ def test_in_place_mode_moves_only_after_verified_copy(tmp_path):
     assert (plan.dest_root / plan.placed[0].dest_rel).exists()
 
 
+def test_move_tree_relocates_whole_folder_atomically(tmp_path):
+    src = tmp_path / "src_album"
+    (src / "Disc 1").mkdir(parents=True)
+    (src / "01 - a.flac").write_bytes(b"AAA")
+    (src / "Disc 1" / "02 - b.flac").write_bytes(b"BBB")
+    (src / "cover.jpg").write_bytes(b"IMG")
+    dst = tmp_path / "primary" / "src_album"
+    assert m.move_tree(src, dst) is True
+    assert not src.exists()
+    assert (dst / "01 - a.flac").read_bytes() == b"AAA"
+    assert (dst / "Disc 1" / "02 - b.flac").read_bytes() == b"BBB"
+    assert (dst / "cover.jpg").read_bytes() == b"IMG"
+
+
+def test_move_tree_cross_filesystem_verifies_before_deleting_source(tmp_path, monkeypatch):
+    # Force the cross-filesystem path: os.rename raises, so the move must fall
+    # back to a per-file copy-verify-replace and only then remove each source —
+    # nothing deleted before a proven copy exists at the destination.
+    src = tmp_path / "src_album"
+    (src / "Disc 1").mkdir(parents=True)
+    (src / "01 - a.flac").write_bytes(b"A" * 1000)
+    (src / "Disc 1" / "02 - b.flac").write_bytes(b"B" * 2000)
+    dst = tmp_path / "primary" / "src_album"
+
+    def _no_rename(*a, **k):
+        raise OSError("simulated cross-device link")
+    monkeypatch.setattr(m.os, "rename", _no_rename)
+
+    assert m.move_tree(src, dst) is True
+    assert not src.exists()
+    assert (dst / "01 - a.flac").read_bytes() == b"A" * 1000
+    assert (dst / "Disc 1" / "02 - b.flac").read_bytes() == b"B" * 2000
+    assert not (dst / "01 - a.flac.partial").exists()
+
+
 def test_execute_never_overwrites_a_destination_that_appears_late(tmp_path):
     plan = _placed_plan(tmp_path)
     dst = plan.dest_root / plan.placed[0].dest_rel

@@ -1089,8 +1089,7 @@ def _merge_album_dirs(src: Path, dst: Path, _depth: int = 0) -> bool:
     showing size + quality. Recurses into directory-vs-directory collisions
     (multi-disc albums with Disc 1/, Disc 2/ subdirs). Returns True on
     completion (even if some files were skipped); False on a hard I/O failure."""
-    import shutil as _shutil
-
+    from qobuz_librarian.library.migrate import move_path
     from qobuz_librarian.ui_cli.colors import format_size
     from qobuz_librarian.ui_cli.prompts import confirm
 
@@ -1109,10 +1108,9 @@ def _merge_album_dirs(src: Path, dst: Path, _depth: int = 0) -> bool:
     for item in items:
         target = dst / item.name
         if not target.exists():
-            try:
-                _shutil.move(str(item), str(target))
-            except OSError as e:
-                log.info(fmt(C.YELLOW, f"     skipped {item.name}: {e}"))
+            if not move_path(item, target):
+                log.info(fmt(C.YELLOW,
+                    f"     skipped {item.name}: couldn't move it (left in place)"))
             continue
 
         # Directory-vs-directory collision (typically multi-disc Disc N/):
@@ -1284,8 +1282,7 @@ def prompt_and_migrate_multi_artist_folder(album, args):
     Returns the resulting album dir Path (possibly unchanged) or None when
     we can't locate the folder.
     """
-    import shutil as _shutil
-
+    from qobuz_librarian.library import migrate
     from qobuz_librarian.library.scanner import clear_scan_caches as _clear_caches
     from qobuz_librarian.library.tags import beets_sanitize, normalize
 
@@ -1342,37 +1339,19 @@ def prompt_and_migrate_multi_artist_folder(album, args):
         return cur
 
     try:
-        new_parent.mkdir(parents=True, exist_ok=True)
-        _shutil.move(str(cur), str(new_dir))
-        # shutil.move falls back to copy+rmtree across filesystem
-        # boundaries; on permission edge cases that has been observed
-        # to leave files at the source while the rename log line
-        # already fired. Sweep anything left behind into the new dir.
-        if cur.exists():
-            leftovers = [p for p in cur.rglob("*") if p.is_file()]
-            if leftovers:
-                log.info(fmt(C.YELLOW,
-                    f"  ⚠  {len(leftovers)} file(s) left at {cur} after move; "
-                    "sweeping manually."))
-                for src in leftovers:
-                    rel = src.relative_to(cur)
-                    dst = new_dir / rel
-                    # Per-file try/except: one un-movable leftover (a permission
-                    # flip, ENOSPC) must not abort the sweep and skip the DB sync
-                    # below — that would leave the album split across both folders
-                    # with the DB still pointing every moved row at the old path.
-                    try:
-                        dst.parent.mkdir(parents=True, exist_ok=True)
-                        if not dst.exists():
-                            _shutil.move(str(src), str(dst))
-                    except OSError as e:
-                        log.info(fmt(C.YELLOW,
-                            f"  ⚠  couldn't sweep {rel} into {new_dir.name}: {e}."))
-            maybe_remove_empty_dir(cur)
+        # move_path renames within one filesystem and copy-verifies each file
+        # before deleting the source across filesystems, so a MUSIC_ROOT that
+        # spans two mounts can't strand a half-moved album. A partial move
+        # leaves files at cur; the merge-aware DB sync below reconciles only the
+        # rows whose file actually moved.
+        if not migrate.move_path(cur, new_dir) and cur.exists():
+            log.info(fmt(C.YELLOW,
+                f"  ⚠  Some files couldn't be moved out of {cur}; left in "
+                "place — reconcile by hand or re-run."))
         # Sync beets DB BEFORE the cache clear so a concurrent scan can't see the
         # new layout with the DB still pointing at the old path. Use the
         # merge-aware sync (reconciles only rows whose file ACTUALLY moved), so a
-        # partial sweep that left some files at cur doesn't mis-repoint their
+        # partial move that left some files at cur doesn't mis-repoint their
         # rows to new_dir.
         _sync_beets_db_after_merge(cur, new_dir)
         log.info(fmt(C.GRAY,

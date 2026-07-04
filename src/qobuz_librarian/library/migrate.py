@@ -780,6 +780,58 @@ def _place_file(src: Path, dst: Path, *, move: bool) -> None:
             log.info(f"  ⚠  copied {src.name} but couldn't remove original: {e}")
 
 
+def move_tree(src_dir: Path, dst_dir: Path) -> bool:
+    """Relocate a whole folder to ``dst_dir`` (which must not already exist),
+    with ``_place_file``'s guarantees.
+
+    On one filesystem this is a single atomic rename. Across filesystems it
+    moves each file through ``_place_file`` — a copy that is size- and
+    content-verified before the source is removed — so an interrupt or a full
+    destination can never delete an original before a proven copy exists at the
+    destination. Returns True iff the source was fully relocated and its emptied
+    tree removed; False if anything was left behind, which the caller reconciles
+    (e.g. against the beets DB) rather than treating the move as clean.
+    """
+    src_dir, dst_dir = Path(src_dir), Path(dst_dir)
+    dst_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.rename(str(src_dir), str(dst_dir))
+        return True
+    except OSError:
+        pass                                # cross-filesystem: move file by file
+    left_behind = False
+    files = []
+    for dirpath, _dirs, names in os.walk(str(src_dir), followlinks=False):
+        files.extend(Path(dirpath) / n for n in names)
+    for f in files:
+        try:
+            _place_file(f, dst_dir / f.relative_to(src_dir), move=True)
+            if f.exists():                  # verified copy landed, source lingered
+                left_behind = True
+        except (OSError, shutil.Error):
+            left_behind = True
+    prune_empty_dirs(src_dir)
+    try:
+        src_dir.rmdir()
+    except OSError:
+        left_behind = True
+    return not left_behind
+
+
+def move_path(src: Path, dst: Path) -> bool:
+    """Relocate a file or a whole folder to ``dst`` (which must not already
+    exist): a directory goes through ``move_tree``, a file through
+    ``_place_file``. Returns True iff ``src`` was fully moved."""
+    src, dst = Path(src), Path(dst)
+    if src.is_dir() and not src.is_symlink():
+        return move_tree(src, dst)
+    try:
+        _place_file(src, dst, move=True)
+    except (OSError, shutil.Error):
+        return False
+    return not src.exists()
+
+
 def execute_plan(plan: MigrationPlan, *, in_place: bool = False,
                  cancel_check: Optional[Callable[[], bool]] = None,
                  progress: Optional[Callable] = None) -> ExecResult:
