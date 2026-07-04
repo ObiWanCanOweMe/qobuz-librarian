@@ -807,7 +807,8 @@ templates.env.globals["repo_url"] = "https://github.com/jarynclouatre/qobuz-libr
 templates.env.globals["now_ts"] = time.time
 # Callable, not a snapshot: the toggle lives in Settings and the downsample
 # warnings have to describe whichever mode is active when the page renders.
-templates.env.globals["keeps_ds_originals"] = lambda: bool(cfg.DOWNSAMPLE_KEEP_ORIGINALS)
+templates.env.globals["keeps_ds_originals"] = lambda: cfg.DOWNSAMPLE_KEEP_ORIGINALS == "keep"
+templates.env.globals["ds_originals_chosen"] = lambda: cfg.DOWNSAMPLE_KEEP_ORIGINALS in ("keep", "delete")
 templates.env.globals["backup_retention_days"] = cfg.UPGRADE_BACKUP_RETENTION_DAYS
 
 
@@ -3400,6 +3401,24 @@ async def job_approve(request: Request, job_id: str):
     if job.execute_kind != "library" or tab not in ("missing", "gaps"):
         tab = ""
     loop = asyncio.get_running_loop()
+    # First downsample while the keep-vs-delete choice is unmade: force it here,
+    # before anything is rewritten. The prompt re-posts to this route carrying
+    # keep_choice — that saves the real setting (changeable later in Settings)
+    # and the run proceeds. An env-set or already-saved choice skips straight
+    # through, so nobody who has decided is asked again.
+    if (job.execute_kind == "downsample"
+            and job.status == job_mgr.JobStatus.AWAITING_REVIEW
+            and cfg.DOWNSAMPLE_KEEP_ORIGINALS not in ("keep", "delete")):
+        choice = (form.get("keep_choice") or "").strip().lower()
+        if choice in ("keep", "delete"):
+            from qobuz_librarian.web import settings_store
+            await loop.run_in_executor(
+                None, lambda: settings_store.save(
+                    {"DOWNSAMPLE_KEEP_ORIGINALS": choice}))
+        else:
+            return _tr(request, "downsample_keep_choice.html", {
+                "job": job, "page": "downsample",
+                "backup_retention_days": cfg.UPGRADE_BACKUP_RETENTION_DAYS})
     skipped = 0
     if (job.status == job_mgr.JobStatus.AWAITING_REVIEW
             and job.execute_kind in _LIBRARY_SURFACE_KINDS):

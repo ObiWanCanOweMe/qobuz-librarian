@@ -178,9 +178,10 @@ services:
       # Downsample hi-res FLACs to 44.1/48 kHz before import to save space.
       # Leave false to keep whatever Qobuz delivers (CD quality is fine).
       DOWNSAMPLE_HIRES_ENABLED: "${DOWNSAMPLE_HIRES_ENABLED:-false}"
-      # Keep a copy of each hi-res original when the on-demand Downsample
-      # rewrites it, recoverable from Settings for UPGRADE_BACKUP_RETENTION_DAYS.
-      DOWNSAMPLE_KEEP_ORIGINALS: "${DOWNSAMPLE_KEEP_ORIGINALS:-false}"
+      # What the on-demand Downsample does with each hi-res original: keep a
+      # restorable copy (Settings, for UPGRADE_BACKUP_RETENTION_DAYS) or delete
+      # to save space. Leave unset to be asked on the first downsample.
+      DOWNSAMPLE_KEEP_ORIGINALS: "${DOWNSAMPLE_KEEP_ORIGINALS:-}"
 
       # ── Matching thresholds (advanced) ──────────────────────────────────
       # Similarity score (0–1) for fuzzy directory-name matching.

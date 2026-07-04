@@ -1785,8 +1785,10 @@ def test_downsample_saved_review_restore_updates_existing_job(
 
 def test_downsample_approve_resyncs_saved_review_before_execution(
         client, monkeypatch):
+    from qobuz_librarian import config as cfg
     from qobuz_librarian.web import jobs as job_mgr
 
+    monkeypatch.setattr(cfg, "DOWNSAMPLE_KEEP_ORIGINALS", "delete")
     monkeypatch.setattr(
         "qobuz_librarian.integrations.downsample_engine.HAVE_DOWNSAMPLE", True)
     state = {
@@ -1816,6 +1818,48 @@ def test_downsample_approve_resyncs_saved_review_before_execution(
     assert r.headers["location"] == f"/jobs/{job.id}?noselection=1"
     assert job.status == job_mgr.JobStatus.AWAITING_REVIEW
     assert job.candidates == []
+
+
+def test_first_downsample_prompts_for_keep_choice_then_saves_it(
+        client, monkeypatch, tmp_path):
+    """With keep-originals still unchosen, approving a downsample shows the
+    one-time prompt instead of rewriting anything; picking one saves it to the
+    real setting and the run proceeds, so a returning user is never asked again."""
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.web import jobs as job_mgr
+    from qobuz_librarian.web import settings_store as ss
+
+    monkeypatch.setattr(ss, "SETTINGS_FILE", tmp_path / "s.json")
+    monkeypatch.setattr(cfg, "DOWNSAMPLE_KEEP_ORIGINALS", None)
+    monkeypatch.setattr(
+        "qobuz_librarian.integrations.downsample_engine.HAVE_DOWNSAMPLE", True)
+    monkeypatch.setattr(job_mgr._scan_queue, "put", lambda item: None)
+    state = {
+        "updated_at": time.time(), "complete": True,
+        "candidates": [{
+            "title": "Album", "artist": "Portishead",
+            "detail": "24-bit / 96 kHz -> 16-bit / 48 kHz",
+            "album_dir": "/music/Portishead/Album", "est_saving": 1234,
+        }],
+    }
+    monkeypatch.setattr(
+        "qobuz_librarian.library.downsample_state.load", lambda: state)
+
+    first = client.post("/downsample/review", follow_redirects=False)
+    job = job_mgr.registry.get(first.headers["location"].removeprefix("/jobs/"))
+    client.post(f"/jobs/{job.id}/select",
+                data={"cid": job.candidates[0]["cid"], "checked": "1"})
+
+    r = client.post(f"/jobs/{job.id}/approve", follow_redirects=False)
+    assert r.status_code == 200
+    assert "Before your first downsample" in r.text
+    assert job.status == job_mgr.JobStatus.AWAITING_REVIEW
+    assert cfg.DOWNSAMPLE_KEEP_ORIGINALS is None
+
+    r2 = client.post(f"/jobs/{job.id}/approve",
+                     data={"keep_choice": "keep"}, follow_redirects=False)
+    assert r2.status_code == 303
+    assert cfg.DOWNSAMPLE_KEEP_ORIGINALS == "keep"
 
 
 def test_approve_refuses_parked_downsample_review_without_engine(

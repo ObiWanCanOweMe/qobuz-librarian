@@ -63,6 +63,21 @@ def _env_choice(key, default: str, choices) -> str:
     return default
 
 
+def _env_downsample_choice():
+    """The keep-originals choice from env (keep/delete), or None when unset.
+
+    Tri-state, not a bool: None means unchosen, so the first downsample asks.
+    keep/delete is a conscious choice — it shows selected in Settings and never
+    prompts."""
+    v = (os.environ.get("DOWNSAMPLE_KEEP_ORIGINALS") or "").strip().lower()
+    if v in ("keep", "delete"):
+        return v
+    if v:
+        _warn(f"DOWNSAMPLE_KEEP_ORIGINALS must be keep or delete; got {v!r} — "
+              "leaving it unchosen so the first downsample asks")
+    return None
+
+
 def _env_path(key, default: Path) -> Path:
     val = os.environ.get(key)
     return Path(val) if val else default
@@ -515,7 +530,7 @@ DOWNSAMPLE_HIRES_ENABLED = _env_bool("DOWNSAMPLE_HIRES_ENABLED", False)
 # that space back while they last. On, the on-demand Downsample parks each
 # hi-res original in the backup area for UPGRADE_BACKUP_RETENTION_DAYS, so
 # the rewrite can be undone from Settings until the window closes.
-DOWNSAMPLE_KEEP_ORIGINALS = _env_bool("DOWNSAMPLE_KEEP_ORIGINALS", False)
+DOWNSAMPLE_KEEP_ORIGINALS = _env_downsample_choice()
 
 # Album-version / library-structure preferences. CLI and web both read these,
 # so shared options behave the same across interfaces.

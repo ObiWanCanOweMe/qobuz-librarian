@@ -35,10 +35,6 @@ BEHAVIOR_FIELDS = [
     ("DOWNSAMPLE_HIRES_ENABLED", "Downsample new hi-res downloads",
      "Before import, reduce newly downloaded hi-res FLACs to 44.1 or 48 kHz. "
      "The hi-res files are not kept."),
-    ("DOWNSAMPLE_KEEP_ORIGINALS", "Keep originals when downsampling",
-     "Park a copy of each hi-res original before the Downsample page rewrites "
-     "it, so the rewrite can be undone from Settings until the backup "
-     "retention window ends. Uses that much extra disk while the copies last."),
     ("SUPPRESS_SINGLE_TRACK_GAPS", "Treat track downloads as singles",
      "Hide the rest of an album from gap scans after you download one track. "
      "Leave this off if a track download should not affect future album offers."),
@@ -100,6 +96,12 @@ TEXT_FIELDS = [
      "How often to auto-check for new releases on app open. Results go to the "
      "dashboard to review; nothing downloads. Off = manual only.",
      "enum", ["0", "21600", "43200", "86400", "604800"], ""),
+    ("DOWNSAMPLE_KEEP_ORIGINALS", "Keep originals when downsampling",
+     "Whether the Downsample page parks a restorable copy of each hi-res "
+     "original before rewriting it (undo from Settings until the backup "
+     "retention window ends; uses that much extra disk) or deletes it to save "
+     "space. You're asked to choose the first time you downsample.",
+     "enum", ["keep", "delete"], ""),
 ]
 TEXT_KEYS = [k for k, *_ in TEXT_FIELDS]
 
@@ -137,6 +139,10 @@ ENUM_OPTION_LABELS = {
         "43200": "Every 12 hours",
         "86400": "Daily (default)",
         "604800": "Weekly",
+    },
+    "DOWNSAMPLE_KEEP_ORIGINALS": {
+        "keep": "Keep a restorable backup",
+        "delete": "Delete to save space",
     },
 }
 

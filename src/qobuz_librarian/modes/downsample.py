@@ -41,12 +41,18 @@ def run_downsample_walk_mode(args):
         log.info(fmt(C.YELLOW, "  ⚠  No artist directories found."))
         return
 
-    log.info(fmt(C.YELLOW,
-        "  ⚠  This rewrites hi-res files in place to 44.1/48kHz. The originals "
-        "are not kept"))
-    log.info(fmt(C.YELLOW,
-        "     and there is no undo — re-downloading hi-res later would just "
-        "reverse the saving."))
+    if cfg.DOWNSAMPLE_KEEP_ORIGINALS == "keep":
+        log.info(fmt(C.YELLOW,
+            "  ⚠  This rewrites hi-res files in place to 44.1/48kHz. A "
+            "restorable copy of each original is kept for a while."))
+    elif cfg.DOWNSAMPLE_KEEP_ORIGINALS == "delete":
+        log.info(fmt(C.YELLOW,
+            "  ⚠  This rewrites hi-res files in place to 44.1/48kHz. The "
+            "originals are not kept and there is no undo."))
+    else:
+        log.info(fmt(C.YELLOW,
+            "  ⚠  This rewrites hi-res files in place to 44.1/48kHz. You'll "
+            "choose first whether to keep the hi-res originals."))
     if args.dry_run:
         log.info(fmt(C.GRAY, "  --dry-run: listing candidates only, nothing is changed."))
     log.info(fmt(C.GRAY, "  Ctrl-C to stop at any point."))
@@ -71,6 +77,26 @@ def run_downsample_walk_mode(args):
     candidates_by_artist = {}
     for candidate in refresh.candidates:
         candidates_by_artist.setdefault(candidate.artist, []).append(candidate)
+
+    # First downsample with the keep-vs-delete choice unmade: ask once — the web
+    # UI asks the same thing — and save it as the standing default (changeable
+    # later in Settings). Default keeps the originals: the safe answer, and what
+    # a piped/unattended run that can't be asked falls back to.
+    if (refresh.candidates and not args.dry_run
+            and cfg.DOWNSAMPLE_KEEP_ORIGINALS not in ("keep", "delete")):
+        from qobuz_librarian.web import settings_store
+        _flush_stdin()
+        keep = confirm(
+            "  Keep a restorable backup of the hi-res originals? "
+            "(answering No deletes them to save space)",
+            default_yes=True, auto_yes=False)
+        _choice = "keep" if keep else "delete"
+        settings_store.save({"DOWNSAMPLE_KEEP_ORIGINALS": _choice})
+        cfg.DOWNSAMPLE_KEEP_ORIGINALS = _choice
+        log.info(fmt(C.GRAY,
+            f"  Saved — originals will be {'kept' if keep else 'deleted'}; "
+            "change this any time in Settings."))
+        log.info("")
 
     # Auto-accept gate. Plain --yes deliberately does NOT cover this path — its
     # contract is that destructive prompts still ask — so the user opts in
@@ -132,7 +158,7 @@ def run_downsample_walk_mode(args):
                 artist_attempted = True
                 res = downsample_dir(c.album_dir, verbose=True,
                                      base_dir=c.album_dir, log=log.info,
-                                     keep_originals=cfg.DOWNSAMPLE_KEEP_ORIGINALS)
+                                     keep_originals=cfg.DOWNSAMPLE_KEEP_ORIGINALS == "keep")
                 if res.get("resampled"):
                     n_albums_done += 1
                     mark_local_album_capped(c.album_dir)
