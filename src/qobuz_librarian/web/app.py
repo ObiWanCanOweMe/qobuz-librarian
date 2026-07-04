@@ -1556,17 +1556,57 @@ def _start_library_scan(partial_only=False, force_full=False):
         title = "Gap Fill scan" if partial_only else "Library scan"
         job = job_mgr.Job(title=title)
         job.execute_kind = "library"
+
+        def _scan(j):
+            flows.scan_library(j, _get_token(), partial_only=partial_only,
+                               force_full=force_full)
+            _fold_into_parked_library_review(j)
+
         job_mgr.submit_scan(
             job,
-            lambda j: flows.scan_library(
-                j,
-                _get_token(),
-                partial_only=partial_only,
-                force_full=force_full,
-            ),
+            _scan,
             lambda j, chosen: flows.execute_albums(j, chosen, _get_token()),
         )
         return job
+
+
+def _fold_into_parked_library_review(job):
+    """A refresh that finishes while a Missing Albums / Gap Fill review is
+    parked folds its finds into that review instead of parking a second one —
+    the Library review is one living thing that updates in place, and a
+    refresh must never wipe the picks already made there. The scan job then
+    completes with a summary, so Queue/History records the refresh without
+    ever becoming a second review surface."""
+    if (job.status not in (job_mgr.JobStatus.SCANNING, job_mgr.JobStatus.RUNNING)
+            or job.cancel_requested):
+        return
+    parked = None
+    for other in job_mgr.registry.awaiting_review():
+        if (getattr(other, "execute_kind", "") != "library"
+                or other.id == job.id):
+            continue
+        if parked is None or (other.created_at or 0) > (parked.created_at or 0):
+            parked = other
+    if parked is None:
+        return
+    from qobuz_librarian.web import flows, job_persistence, review_badges
+    with job._lock:
+        cands = list(job.candidates)
+    added = flows.fold_new_candidates(parked, cands)
+    job_persistence.persist(parked)
+    if added:
+        # Fresh reviewable results landed in the parked review — light the
+        # Library dot again until the user opens it.
+        review_badges.mark_ready("library")
+    with job._lock:
+        job.candidates = []
+    if added:
+        job.summary = (f"Folded {added} new find{'s' if added != 1 else ''} "
+                       "into the open Library review.")
+    else:
+        job.summary = "No new finds. The open Library review is up to date."
+    job.push_line(job.summary)
+    job.status = job_mgr.JobStatus.DONE
 
 
 def _maybe_resume_library_scan():
@@ -2574,6 +2614,11 @@ async def library_page(request: Request, page: int = 1):
         "baseline_complete": new_releases.is_baseline_complete(),
         "hidden_count": hidden_mod.count(hidden_mod.SCOPE_MISSING),
         "JobStatus": job_mgr.JobStatus,
+        # Drives the header's quiet refresh: hidden while a crawl is already
+        # under way (the "Refreshing…" note takes its place over a parked
+        # review; a bare scan shows its own progress body).
+        "library_refresh_running": _active_scan(
+            "library", statuses=("pending", "scanning", "running")) is not None,
     }
     # Single-surface rule (same as /repair): a scan in flight or a parked
     # review renders inline right here, so results never hide behind the

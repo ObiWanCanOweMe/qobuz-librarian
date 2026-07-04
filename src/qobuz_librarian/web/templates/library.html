@@ -4,8 +4,23 @@
 {% block content %}
 
 <div class="ql-tool-page ql-tool-page--wide ql-library-page">
-  <header class="ql-page-header">
+  <header class="ql-page-header ql-page-header--split">
     <h1>Library</h1>
+    {% if qobuz_ready and baseline_complete and library_scan_state.ready and (not library_job or library_job.status == JobStatus.AWAITING_REVIEW) %}
+    {% if library_refresh_running %}
+    <span class="ql-refresh-note" role="status" title="Checking your folders for music added outside the app.">Refreshing…</span>
+    {% else %}
+    <form action="/library" method="post" data-busy-submit>
+      <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+      <input type="hidden" name="mode" value="missing_albums">
+      <button type="submit" class="ql-header-refresh"
+              title="Scan for music added outside the app"
+              aria-label="Scan for music added outside the app">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+      </button>
+    </form>
+    {% endif %}
+    {% endif %}
   </header>
 
   {% if error %}<div class="ql-flash ql-flash-warning" data-flash><span>{{ error }}</span></div>{% endif %}
@@ -64,29 +79,13 @@
       {{ hidden_count }} dismissed result{% if hidden_count != 1 %}s{% endif %}
     </a>
     {% endif %}
+    <form action="/library" method="post" data-busy-submit>
+      <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+      <input type="hidden" name="mode" value="new_releases">
+      <button type="submit" class="ql-link-action"
+              title="Skips your folders entirely — just asks Qobuz for albums newer than your last scan.">Check new releases</button>
+    </form>
   </div>
-
-  <section class="ql-scan-panel">
-    <div class="ql-scan-panel-copy">
-      <p class="ql-scan-panel-title">Scan library</p>
-      <p class="ql-scan-panel-text">Re-reads your artist folders (skipping unchanged ones) and refreshes Missing Albums, Gap Fill, Upgrade, and Downsample in one pass.{% if last_full_scan %} Results from your last scan are reused for unchanged folders, so this is quick — a discarded review comes back the same way.{% endif %}</p>
-    </div>
-    <div class="ql-scan-panel-actions">
-      <form action="/library" method="post" data-busy-submit>
-        <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-        <input type="hidden" name="mode" value="missing_albums">
-        <button type="submit" class="ql-btn ql-btn-primary w-full sm:w-auto">Scan library</button>
-      </form>
-      <div class="ql-scan-variants">
-        <form action="/library" method="post" data-busy-submit>
-          <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
-          <input type="hidden" name="mode" value="new_releases">
-          <button type="submit" class="ql-link-action"
-                  title="Skips your folders entirely — just asks Qobuz for albums newer than your last scan.">Check new releases only</button>
-        </form>
-      </div>
-    </div>
-  </section>
 
   {% if library_resume and library_resume.kind == 'missing' %}
   <div class="ql-tool-note ql-tool-note-info">

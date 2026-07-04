@@ -3096,3 +3096,109 @@ def test_auth_loss_fires_the_hook_once_per_transition(monkeypatch):
     app_mod._on_auth_state(True)
     app_mod._on_auth_state(False)
     assert len(calls) == 2
+
+
+def test_refresh_folds_into_parked_library_review(monkeypatch):
+    from qobuz_librarian.web import app as webapp
+
+    parked = jm.Job(title="Library scan")
+    parked.execute_kind = "library"
+    parked.add_candidate(kind="album", title="Dummy", artist="Portishead",
+                         detail="1994 · 16-bit/44.1 kHz · 11 tracks",
+                         payload={"album_id": "al1"}, selected=False)
+    parked.add_candidate(kind="album", title="Third", artist="Portishead",
+                         detail="2008 · 24-bit/44.1 kHz · 10 tracks",
+                         payload={"album_id": "al2"}, selected=False)
+    parked.set_selected(parked.candidates[0]["cid"], True)
+    parked.status = jm.JobStatus.AWAITING_REVIEW
+    jm.registry.add(parked)
+
+    scan = jm.Job(title="Library scan")
+    scan.execute_kind = "library"
+    scan.status = jm.JobStatus.SCANNING
+    scan.add_candidate(kind="album", title="Dummy", artist="Portishead",
+                       detail="1994 · 16-bit/44.1 kHz · 11 tracks",
+                       payload={"album_id": "al1"}, selected=False)
+    scan.add_candidate(kind="album", title="Roseland NYC Live",
+                       artist="Portishead",
+                       detail="1998 · 16-bit/44.1 kHz · 11 tracks",
+                       payload={"album_id": "al3"}, selected=False)
+    jm.registry.add(scan)
+    try:
+        webapp._fold_into_parked_library_review(scan)
+
+        assert scan.status == jm.JobStatus.DONE
+        assert scan.candidates == []
+        assert "Folded 1 new find" in (scan.summary or "")
+        ids = [c["payload"]["album_id"] for c in parked.candidates]
+        assert ids == ["al1", "al2", "al3"]
+        ticked = [c["payload"]["album_id"]
+                  for c in parked.candidates if c.get("selected")]
+        assert ticked == ["al1"]
+        assert parked.status == jm.JobStatus.AWAITING_REVIEW
+        library_reviews = [j for j in jm.registry.awaiting_review()
+                           if j.execute_kind == "library"]
+        assert library_reviews == [parked]
+    finally:
+        _remove_job(parked)
+        _remove_job(scan)
+
+
+def test_refresh_without_parked_review_parks_normally(monkeypatch):
+    from qobuz_librarian.web import app as webapp
+
+    scan = jm.Job(title="Library scan")
+    scan.execute_kind = "library"
+    scan.status = jm.JobStatus.SCANNING
+    scan.add_candidate(kind="album", title="Dummy", artist="Portishead",
+                       payload={"album_id": "al1"}, selected=False)
+    jm.registry.add(scan)
+    try:
+        webapp._fold_into_parked_library_review(scan)
+
+        assert scan.status == jm.JobStatus.SCANNING
+        assert len(scan.candidates) == 1
+    finally:
+        _remove_job(scan)
+
+
+def test_post_baseline_library_scan_control_recedes(client, monkeypatch):
+    from qobuz_librarian.web import app as webapp
+
+    monkeypatch.setattr(webapp, "_read_creds",
+                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
+    monkeypatch.setattr(
+        "qobuz_librarian.library.new_releases.is_baseline_complete",
+        lambda: True)
+    monkeypatch.setattr(webapp, "_TOKEN_VALID", True)
+    monkeypatch.setattr(webapp, "_library_scan_state",
+                        lambda: {"ready": True, "count": 3, "message": ""})
+    monkeypatch.setattr(webapp, "_last_scan_age", lambda: "2 days ago")
+    monkeypatch.setattr(webapp, "_census_view", lambda: None)
+
+    r = client.get("/library")
+
+    assert r.status_code == 200
+    assert 'class="ql-header-refresh"' in r.text
+    assert "Scan for music added outside the app" in r.text
+    assert ">Scan library</button>" not in r.text
+    assert ">Check new releases</button>" in r.text
+
+
+def test_pre_baseline_library_keeps_the_scan_hero(client, monkeypatch):
+    from qobuz_librarian.web import app as webapp
+
+    monkeypatch.setattr(webapp, "_read_creds",
+                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
+    monkeypatch.setattr(
+        "qobuz_librarian.library.new_releases.is_baseline_complete",
+        lambda: False)
+    monkeypatch.setattr(webapp, "_TOKEN_VALID", True)
+    monkeypatch.setattr(webapp, "_library_scan_state",
+                        lambda: {"ready": True, "count": 3, "message": ""})
+
+    r = client.get("/library")
+
+    assert r.status_code == 200
+    assert ">Scan library</button>" in r.text
+    assert 'class="ql-header-refresh"' not in r.text

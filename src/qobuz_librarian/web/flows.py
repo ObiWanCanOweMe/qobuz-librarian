@@ -269,6 +269,30 @@ def is_gap_candidate(c):
     return "gap-fill:" in (c.get("detail") or "")
 
 
+def fold_new_candidates(parked, cands):
+    """Append candidates a parked review doesn't already list, keyed by Qobuz
+    album id (falling back to artist+title for keyless carry-overs). The
+    parked review's own entries — and the user's ticks on them — are never
+    touched; a refresh only ever adds. Returns how many were added."""
+    def _key(c):
+        album_id = str((c.get("payload") or {}).get("album_id") or "")
+        if album_id:
+            return album_id
+        return ((c.get("artist") or "").lower(), (c.get("title") or "").lower())
+
+    with parked._lock:
+        seen = {_key(c) for c in parked.candidates}
+    added = 0
+    for c in cands:
+        key = _key(c)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _add_candidate_spec(parked, c) is not None:
+            added += 1
+    return added
+
+
 def prune_library_review_candidates(album):
     """A full album just landed on disk (Search download, batch download,
     upgrade replace): drop its candidates from every parked or still-scanning
