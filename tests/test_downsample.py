@@ -129,6 +129,42 @@ def test_resample_clean_hires_shrinks_and_verifies(tmp_path, _need_ffmpeg, _need
     assert subprocess.run(["flac", "-t", "-s", str(src)]).returncode == 0
 
 
+def _peak_dbfs(path: Path) -> float:
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-i", str(path),
+                        "-af", "astats", "-f", "null", "-"],
+                       capture_output=True, text=True)
+    return max(float(line.split("Peak level dB:")[1])
+               for line in r.stderr.splitlines() if "Peak level dB:" in line)
+
+
+def test_resample_pulls_a_clipping_hot_source_below_full_scale(
+        tmp_path, _need_ffmpeg, _need_flac):
+    """A hot, clipped master whose soxr reconstruction overshoots full scale
+    must not come back clipped: the resample attenuates it by just enough to
+    land at the ceiling, instead of hard-clipping the overshoot into audible
+    distortion. Without the guard the integer output pegs at 0.0 dBFS."""
+    src = tmp_path / "track.flac"
+    # Brickwalled pink noise: hot enough to clip (flat-topped, so it overshoots
+    # on reconstruction) and incompressible (so it genuinely shrinks).
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+         "-i", "anoisesrc=sample_rate=96000:duration=2:color=pink:amplitude=0.9",
+         "-af", "volume=6dB", "-sample_fmt", "s32", "-bits_per_raw_sample", "24",
+         "-c:a", "flac", str(src)],
+        check=True)
+    assert _peak_dbfs(src) > -0.1                      # source is clipped hot
+    af, _ = detect_resampler_filter()
+
+    rel, sr, rate, saved, err = resample_one("track.flac", 96000, 48000, af,
+                                             base_dir=tmp_path)
+    assert err is None
+    assert saved is not None and saved > 0
+    assert read_sample_rate(src) == 48000
+    assert read_local_bit_depth(src) == 24
+    # Below full scale => attenuated, not clipped (a clipped output pegs at 0.0).
+    assert _peak_dbfs(src) < -0.5
+
+
 def test_resample_preserves_embedded_jpeg_and_all_pictures(tmp_path, _need_ffmpeg, _need_flac):
     # Without -c:v copy the FLAC muxer transcodes embedded JPEG art to PNG
     # (inflating the file), and without -map 0 all but one PICTURE block is

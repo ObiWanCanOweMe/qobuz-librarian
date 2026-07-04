@@ -303,6 +303,40 @@ def _decode_ok(path):
     return r.returncode == 0
 
 
+# Where a would-clip file is pulled down to. A downsample never lifts the
+# ceiling: only files whose resample overshoots full scale are attenuated, and
+# only to here, so everything else stays bit-untouched.
+_TARGET_PEAK_DBFS = -1.0
+
+
+def _resampled_peak_dbfs(src, af_filter, rate):
+    """Peak level (dBFS) the resampled signal reaches, on a float render.
+
+    soxr's reconstruction can push a hot (loud) source past full scale; the
+    integer FLAC written below would hard-clip that overshoot into audible
+    distortion. Measured on the base resample filter with a float output codec —
+    before the s32 format step, which would itself clip the overshoot away and
+    hide it (volumedetect and an integer render both read 0.0 there). Returns
+    None when it can't be read, so the caller encodes without attenuation rather
+    than guess."""
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostdin", "-i", str(src),
+             "-map", "0:a", "-af", f"{af_filter},astats=metadata=1:reset=0",
+             "-ar", str(rate), "-c:a", "pcm_f32le", "-f", "null", "-"],
+            capture_output=True, timeout=600, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    peaks = []
+    for line in r.stderr.decode(errors="replace").splitlines():
+        if "Peak level dB" in line:
+            try:
+                peaks.append(float(line.split("Peak level dB:")[1]))
+            except (ValueError, IndexError):
+                continue
+    return max(peaks) if peaks else None
+
+
 # Resample output is written to a dot-prefixed temp beside the source, then
 # atomically swapped in. The dot keeps the library scanner from indexing it
 # mid-encode; the shared prefix lets a later run recognise and sweep one an
@@ -361,6 +395,17 @@ def resample_one(rel, sr, rate, af_filter, *, base_dir=None):
             return (rel, sr, rate, None,
                     "couldn't read the source bit depth; left the original untouched")
         af, sample_fmt, depth_args = _encode_opts_for_bps(bps, af_filter)
+        # Keep the resample from clipping a hot master: soxr can overshoot full
+        # scale on loud/brickwalled sources, which the integer encode would
+        # hard-clip into audible distortion. Measure the resampled peak; if it
+        # would exceed full scale, attenuate the source by just enough to land it
+        # at _TARGET_PEAK_DBFS (inaudible, and only on files that would clip —
+        # everything else stays bit-untouched). A failed measurement falls back
+        # to no attenuation, no worse than before.
+        enc_af = af
+        _peak = _resampled_peak_dbfs(src, af_filter, rate)
+        if _peak is not None and _peak > 0.0:
+            enc_af = f"volume={_TARGET_PEAK_DBFS - _peak:.3f}dB,{af}"
 
         fd, tmp_name = tempfile.mkstemp(
             dir=str(src.parent), prefix=_TMP_PREFIX, suffix=".flac")
@@ -375,7 +420,7 @@ def resample_one(rel, sr, rate, af_filter, *, base_dir=None):
                 # (front+back cover) survive — ffmpeg's default selection keeps
                 # only one video stream and would drop the rest.
                 "-map", "0",
-                "-af", af,
+                "-af", enc_af,
                 "-ar", str(rate),
                 "-sample_fmt", sample_fmt,
                 *depth_args,
