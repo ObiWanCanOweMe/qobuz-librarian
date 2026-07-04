@@ -3625,6 +3625,11 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
   font-family: var(--ql-font-mono);
   font-size: 0.71875rem;
 }
+.ql-review-badge.is-attention,
+.ql-tabbar .ql-tab-dot.is-attention {
+  background-color: var(--ql-warning);
+  box-shadow: 0 0 0.5rem color-mix(in oklab, var(--ql-warning) 65%, transparent);
+}
 .ql-page-header p {
   max-width: 42rem;
   margin: 0;

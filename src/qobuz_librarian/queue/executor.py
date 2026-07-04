@@ -51,6 +51,11 @@ from qobuz_librarian.ui_cli.colors import C, fmt, section, truncate
 from qobuz_librarian.ui_cli.logging import log, vlog
 from qobuz_librarian.ui_cli.prompts import log_fetch
 
+# Installed by the web layer (web/jobs): called when a staged download stays
+# under the quality target after the recovery attempt, so the owning job can
+# carry an attention marker. The CLI leaves it unset.
+on_quality_shortfall = None
+
 
 def _download_for_queue_item(item):
     """Download one queue item, writing n_ok/n_fail/etc back into the item.
@@ -877,6 +882,10 @@ def _execute_download_queue(queue, args, token, *, on_progress=None):
                 elif not item["quality_verdict"]["under"]:
                     log.info(fmt(C.GRAY,
                         "    Quality check: staged rip meets the selected source cap."))
+                elif on_quality_shortfall is not None:
+                    # Still under target after the retry: the import proceeds,
+                    # but the owning job must not look like a clean finish.
+                    on_quality_shortfall()
 
                 # Repair carries a callback that re-tags the staged refills
                 # with the originals' own metadata before beets files them, so

@@ -23,6 +23,9 @@
       {% else %}
         <span class="ql-status-chip is-error">Failed</span>
       {% endif %}
+      {% if job.attention %}
+        <span class="ql-status-chip is-warning" title="Finished below your target quality — open it for details.">Below target quality</span>
+      {% endif %}
       <span class="ql-activity-time tabular-nums"{% if job.when_exact %} title="{{ job.when_exact }}"{% endif %}>{{ job.when }}</span>
       <div class="ql-activity-actions">
         {% if job.status == 'failed' and job.album_id %}

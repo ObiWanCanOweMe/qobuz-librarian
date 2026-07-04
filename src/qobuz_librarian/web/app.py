@@ -1068,6 +1068,10 @@ def _tr(request, name, context, *, status_code=200):
         badges = dict(badges)
         badges["upgrade"] = False
     context.setdefault("nav_review_badges", badges)
+    # Finished jobs flagged for review (e.g. a quality shortfall) keep a
+    # warning dot on the Queue nav until each flagged job page is opened.
+    from qobuz_librarian.web import job_persistence
+    context.setdefault("history_attention", job_persistence.attention_count())
     return templates.TemplateResponse(request=request, name=name,
                                       context=context, status_code=status_code)
 
@@ -3113,6 +3117,13 @@ async def job_page(request: Request, job_id: str, approved: bool = False,
                 if job.execute_kind in ("upgrade", "downsample") else "queue")
     if nav_page == "upgrade" and not _upgrade_available():
         nav_page = "queue"
+    if job.attention:
+        # Opening the page is the acknowledgement: the History chip and the
+        # nav's warning dot stand down once the user has seen the job.
+        job.attention = ""
+        from qobuz_librarian.web import job_persistence
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: job_persistence.persist(job))
     ctx = {"job": job, "page": nav_page,
            "approved": approved, "stale": stale, "noselection": noselection,
            "historical": historical,

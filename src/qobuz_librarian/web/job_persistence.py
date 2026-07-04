@@ -102,12 +102,13 @@ CREATE TABLE IF NOT EXISTS jobs (
     execute_args  TEXT NOT NULL DEFAULT '{}',
     created_at    REAL,
     finished_at   REAL,
-    single        TEXT NOT NULL DEFAULT '{}'
+    single        TEXT NOT NULL DEFAULT '{}',
+    attention     TEXT NOT NULL DEFAULT ''
 )
 """
 
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 def init() -> None:
@@ -146,6 +147,12 @@ def init() -> None:
                 if "single" not in cols:
                     conn.execute(
                         "ALTER TABLE jobs ADD COLUMN single TEXT NOT NULL DEFAULT '{}'")
+                # v3: persist Job.attention (finished-job needs-review marker,
+                # e.g. a download that stayed under the quality target) so the
+                # History chip and nav dot survive a restart.
+                if "attention" not in cols:
+                    conn.execute(
+                        "ALTER TABLE jobs ADD COLUMN attention TEXT NOT NULL DEFAULT ''")
                 conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
             conn.commit()
         except sqlite3.Error as e:
@@ -186,8 +193,8 @@ def persist(job) -> None:
                 "INSERT OR REPLACE INTO jobs "
                 "(id, title, artist, album_id, kind, status, phase, candidates, "
                 " error, summary, review_verb, execute_kind, execute_args, "
-                " created_at, finished_at, single) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " created_at, finished_at, single, attention) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     job.id, job.title or "", job.artist or "",
                     job.album_id or "", job.kind or "download",
@@ -202,6 +209,7 @@ def persist(job) -> None:
                     job.created_at,
                     job.finished_at,
                     single_json,
+                    getattr(job, "attention", "") or "",
                 ),
             )
             conn.commit()
@@ -235,7 +243,8 @@ def load_one(job_id: str) -> Optional[dict]:
             row = conn.execute(
                 "SELECT id, title, artist, album_id, kind, status, phase, "
                 "candidates, error, summary, review_verb, execute_kind, "
-                "execute_args, created_at, finished_at, single FROM jobs WHERE id=?",
+                "execute_args, created_at, finished_at, single, attention "
+                "FROM jobs WHERE id=?",
                 (job_id,),
             ).fetchone()
         except sqlite3.Error as e:
@@ -253,6 +262,7 @@ def load_one(job_id: str) -> Optional[dict]:
             "execute_args": json.loads(row[12] or "{}"),
             "created_at": row[13], "finished_at": row[14],
             "single": json.loads(row[15] or "{}"),
+            "attention": row[16] or "",
         }
     except (ValueError, TypeError):
         return None
@@ -338,7 +348,7 @@ def history_page(limit: int, offset: int,
         try:
             rows = conn.execute(
                 "SELECT id, title, artist, album_id, status, error, summary, "
-                "execute_kind, created_at, finished_at FROM jobs "
+                "execute_kind, created_at, finished_at, attention FROM jobs "
                 f"WHERE {_HISTORY_SQL} {clause}"
                 "ORDER BY COALESCE(finished_at, created_at) DESC, id DESC "
                 "LIMIT ? OFFSET ?",
@@ -351,7 +361,7 @@ def history_page(limit: int, offset: int,
         "id": r[0], "title": r[1] or "", "artist": r[2] or "",
         "album_id": r[3] or "", "status": r[4], "error": r[5],
         "summary": r[6] or "", "execute_kind": r[7] or "",
-        "created_at": r[8], "finished_at": r[9],
+        "created_at": r[8], "finished_at": r[9], "attention": r[10] or "",
     } for r in rows]
 
 
@@ -376,6 +386,21 @@ def last_finished_at(execute_kind: str) -> Optional[float]:
         except sqlite3.Error:
             return None
     return row[0] if row and row[0] is not None else None
+
+
+def attention_count() -> int:
+    """How many finished jobs still carry an attention marker — drives the
+    warning dot on the Queue nav until each flagged job page has been opened."""
+    with _lock:
+        conn = _get_conn()
+        if conn is None:
+            return 0
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE attention != ''"
+            ).fetchone()[0]
+        except sqlite3.Error:
+            return 0
 
 
 def clear_history() -> None:
@@ -403,8 +428,8 @@ def load_all() -> list[dict]:
             rows = conn.execute(
                 "SELECT id, title, artist, album_id, kind, status, phase, "
                 "candidates, error, summary, review_verb, execute_kind, "
-                "execute_args, created_at, finished_at, single FROM jobs "
-                "ORDER BY created_at"
+                "execute_args, created_at, finished_at, single, attention "
+                "FROM jobs ORDER BY created_at"
             ).fetchall()
         except sqlite3.Error as e:
             _log.info("couldn't read jobs.db on startup (%s); starting fresh.", e)
@@ -427,6 +452,7 @@ def load_all() -> list[dict]:
                 "execute_args": json.loads(r[12] or "{}"),
                 "created_at": r[13], "finished_at": r[14],
                 "single": json.loads(r[15] or "{}"),
+                "attention": r[16] or "",
             })
         except (ValueError, TypeError) as e:
             _log.info("skipping unreadable jobs.db row %s: %s", r[0], e)

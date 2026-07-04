@@ -3202,3 +3202,43 @@ def test_pre_baseline_library_keeps_the_scan_hero(client, monkeypatch):
     assert r.status_code == 200
     assert ">Scan library</button>" in r.text
     assert 'class="ql-header-refresh"' not in r.text
+
+
+def test_quality_shortfall_marks_history_until_the_job_is_opened(
+        client, monkeypatch):
+    from qobuz_librarian.web import job_persistence
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+
+    job = jm.Job(title="Dummy", artist="Portishead", album_id="al1")
+    job.status = jm.JobStatus.DONE
+    job.attention = "quality"
+    job.finished_at = time.time()
+    job_persistence.persist(job)
+
+    r = client.get("/queue/history")
+    assert r.status_code == 200
+    assert "Below target quality" in r.text
+    assert "data-attention-badge" in r.text
+
+    r = client.get(f"/jobs/{job.id}")
+    assert r.status_code == 200
+
+    row = job_persistence.load_one(job.id)
+    assert row["attention"] == ""
+    r = client.get("/queue/history")
+    assert "Below target quality" not in r.text
+    assert "data-attention-badge" not in r.text
+
+
+def test_note_quality_shortfall_flags_the_running_job():
+    job = jm.Job(title="Dummy")
+    jm._TLS.current_job = job
+    try:
+        jm.note_quality_shortfall()
+    finally:
+        jm._TLS.current_job = None
+    assert job.attention == "quality"
+    assert jm._queue_executor.on_quality_shortfall is jm.note_quality_shortfall

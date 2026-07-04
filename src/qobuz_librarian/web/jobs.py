@@ -165,6 +165,10 @@ class Job:
     # Short, user-facing outcome shown as a callout on the finished job page —
     # e.g. why a scan found nothing — so it isn't buried in the log.
     summary: str = ""
+    # Set when a finished job needs the user's eyes — e.g. a download that
+    # stayed under the quality target after the automatic retry. History marks
+    # the row and the nav carries a warning dot until the job page is opened.
+    attention: str = ""
     # The verb the review screen's submit button uses. Most jobs download what
     # you approve; the migration job copies (or moves), so it overrides this.
     review_verb: str = "Download"
@@ -1063,6 +1067,7 @@ def restore_jobs(execute_registry: dict) -> None:
             execute_kind=row.get("execute_kind") or "",
             execute_args=row.get("execute_args") or {},
             single=row.get("single") or {},
+            attention=row.get("attention") or "",
             created_at=row.get("created_at") or time.time(),
             finished_at=row.get("finished_at"),
         )
@@ -1163,6 +1168,7 @@ def load_historical_job(job_id: str) -> Optional[Job]:
         execute_kind=row.get("execute_kind") or "",
         execute_args=row.get("execute_args") or {},
         single=row.get("single") or {},
+        attention=row.get("attention") or "",
         created_at=row.get("created_at") or time.time(),
         finished_at=row.get("finished_at"),
     )
@@ -1207,3 +1213,17 @@ def request_cancel(job: Job) -> bool:
         # skips a cancelled job when it dequeues one, so this can't double-run.
         _mark_canceled(job)
     return True
+
+
+def note_quality_shortfall():
+    """Queue-layer callback: the download being processed stayed under the
+    quality target after the automatic recovery attempt. Flag the owning web
+    job so History marks it for review (see Job.attention)."""
+    job = getattr(_TLS, "current_job", None)
+    if job is not None:
+        job.attention = "quality"
+
+
+from qobuz_librarian.queue import executor as _queue_executor  # noqa: E402
+
+_queue_executor.on_quality_shortfall = note_quality_shortfall
