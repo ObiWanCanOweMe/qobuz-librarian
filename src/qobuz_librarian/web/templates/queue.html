@@ -71,11 +71,7 @@
 
   {% if job.status.value == 'awaiting_review' %}
   {% set _thing = labels.discard_review_label(job) %}
-  {% if job.execute_kind == 'migration' %}
-  {% set _discard_confirm = 'Discard this migration preview? No files will be moved or copied.' %}
-  {% else %}
-  {% set _discard_confirm = 'Discard this ' ~ _thing ~ '? No files will change. Run the scan again to see these results later.' %}
-  {% endif %}
+  {% set _discard_confirm = labels.discard_confirm(job) | trim %}
   <div class="ql-activity-actions">
     <a href="{{ '/repair' if job.execute_kind == 'repair' else ('/library' if job.execute_kind == 'library' else '/jobs/' ~ job.id) }}" class="ql-btn ql-btn-sm ql-btn-secondary ql-secondary-action">Review</a>
     <form action="/jobs/{{ job.id }}/cancel" method="post">

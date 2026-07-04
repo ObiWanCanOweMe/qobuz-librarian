@@ -93,11 +93,7 @@
             {%- else %} data-confirm="Download {count} selected album(s)? They queue now and import into your library."
             {%- endif %}>{% if _bar_selected %}{{ job.review_verb }} {{ _bar_selected }} selected{% else %}{{ labels.review_empty_label(job) }}{% endif %}</button>
           {% set _result_count = review_counts.total %}
-          {% if job.execute_kind == 'migration' %}
-            {% set _discard_confirm = 'Discard this migration preview? No files will be moved or copied.' %}
-          {% else %}
-            {% set _discard_confirm = 'Discard this ' ~ _review_thing ~ '? No files will change. Run the scan again to see these results later.' %}
-          {% endif %}
+          {% set _discard_confirm = labels.discard_confirm(job) | trim %}
           <div class="ql-review-footer-secondary-group">
             {% if not embedded_surface|default(false) %}
             <a href="{{ _back_href }}" class="ql-btn ql-btn-secondary ql-btn-sm">{{ _back_label }}</a>

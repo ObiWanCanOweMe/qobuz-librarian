@@ -154,6 +154,14 @@
   {%- endif -%}
 {%- endmacro %}
 
+{% macro discard_confirm(job) -%}
+  {%- if job.execute_kind == 'migration' -%}
+    Discard this migration preview? No files will be moved or copied.
+  {%- else -%}
+    Discard this {{ discard_review_label(job) }}? Everything you've ticked is lost. A later scan lists these results again, unticked.
+  {%- endif -%}
+{%- endmacro %}
+
 {% macro job_activity(job) -%}
   {%- if job.status.value == 'scanning' -%}
     Scanning
