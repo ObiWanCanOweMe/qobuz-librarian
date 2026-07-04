@@ -2404,6 +2404,9 @@ def test_library_approve_skips_candidates_already_on_disk(client, monkeypatch):
         "qobuz_librarian.library.catalog.find_album_dir_filesystem",
         lambda alb: Path("/music/Portishead/Third") if alb.get("id") == "q123"
         else None)
+    # The faked folder stands in for a real one, so treat it as holding audio.
+    monkeypatch.setattr(
+        "qobuz_librarian.library.catalog._count_audio_files_in", lambda d: 1)
 
     job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
     job.execute_kind = "library"
@@ -2449,6 +2452,8 @@ def test_library_approve_when_everything_is_already_on_disk(client, monkeypatch)
     monkeypatch.setattr(
         "qobuz_librarian.library.catalog.find_album_dir_filesystem",
         lambda alb: Path("/music/Portishead/x"))
+    monkeypatch.setattr(
+        "qobuz_librarian.library.catalog._count_audio_files_in", lambda d: 1)
     job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
     job.execute_kind = "library"
     job._execute_fn = lambda j, chosen: None
@@ -2461,6 +2466,41 @@ def test_library_approve_when_everything_is_already_on_disk(client, monkeypatch)
         # Nothing left to review or download; the review completed quietly.
         assert job.candidates == []
         assert job.status != jm.JobStatus.AWAITING_REVIEW
+    finally:
+        _remove_job(job)
+
+
+def test_drop_owned_keeps_a_missing_album_whose_folder_is_an_empty_shell(
+        tmp_path, monkeypatch):
+    """A fully-missing candidate whose only on-disk match is an empty folder —
+    a failed download or deleted tracks that left the directory behind — stays
+    in the review. A name-matching shell with no audio isn't ownership, and the
+    scanner still lists that album missing; dropping it would hide a real gap."""
+    from qobuz_librarian.web import flows
+
+    shell = tmp_path / "Runnin' Wild (2019)"
+    shell.mkdir()
+    real = tmp_path / "Real Album (2010)"
+    real.mkdir()
+    (real / "01 - track.flac").write_bytes(b"\x00")
+
+    monkeypatch.setattr(
+        "qobuz_librarian.library.catalog.find_album_dir_filesystem",
+        lambda alb: shell if alb.get("id") == "empty1"
+        else real if alb.get("id") == "real1" else None)
+
+    job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
+    job.execute_kind = "library"
+    job.add_candidate(kind="album", title="Runnin' Wild", artist="Airbourne",
+                      payload={"album_id": "empty1"}, selected=True)
+    job.add_candidate(kind="album", title="Real Album", artist="Airbourne",
+                      payload={"album_id": "real1"}, selected=True)
+    try:
+        dropped = flows.drop_owned_missing_candidates(job)
+        titles = [c["title"] for c in job.candidates]
+        assert "Runnin' Wild" in titles
+        assert "Real Album" not in titles
+        assert dropped == 1
     finally:
         _remove_job(job)
 

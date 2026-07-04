@@ -453,14 +453,17 @@ def prune_library_review_candidates(album):
 
 def drop_owned_missing_candidates(job):
     """Reconcile a parked library review against the disk right before it
-    executes: a missing-album candidate whose folder now exists (grabbed from
-    Search while the review sat parked, or added by hand) is dropped instead
-    of downloaded again. Gap Fill candidates are left alone — their album
-    folder exists by definition; full-album imports already prune them via
-    prune_library_review_candidates. Returns how many of the dropped
-    candidates were selected (the number the user believes they're about to
-    download)."""
-    from qobuz_librarian.library.catalog import find_album_dir_filesystem
+    executes: a missing-album candidate whose folder now holds music (grabbed
+    from Search while the review sat parked, or added by hand) is dropped
+    instead of downloaded again. A folder that merely shares the album's name
+    but holds no audio — a failed download, deleted tracks, a leftover shell —
+    is NOT ownership: the scanner reads tracks and rightly still lists that
+    album missing, so dropping it here would silently hide a real gap. Gap Fill
+    candidates are left alone — their album folder exists by definition;
+    full-album imports already prune them via prune_library_review_candidates.
+    Returns how many of the dropped candidates were selected (the number the
+    user believes they're about to download)."""
+    from qobuz_librarian.library.catalog import _count_audio_files_in, find_album_dir_filesystem
     from qobuz_librarian.web import job_persistence
     with job._lock:
         snapshot = [(c["cid"], bool(c.get("selected")),
@@ -472,7 +475,8 @@ def drop_owned_missing_candidates(job):
     owned = {}
     for cid, selected, alb in snapshot:
         try:
-            if find_album_dir_filesystem(alb) is not None:
+            d = find_album_dir_filesystem(alb)
+            if d is not None and _count_audio_files_in(d) > 0:
                 owned[cid] = selected
         except Exception:
             continue
