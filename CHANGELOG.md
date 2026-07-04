@@ -32,6 +32,24 @@ Fixes from the first day of running 0.10.0 against a full-size library.
 - Search's download confirmation uses the app's own dialog like everywhere else instead of the browser's plain popup.
 - New-release check results live on their own review page instead of taking over the Library page — the Missing Albums / Gap Fill review stays put, and the dashboard shows a "N new releases" notice that opens the check's results.
 - Search deep links with an album or track kind run the search on load like artist links do, the "/" shortcut reaches the search box from any page, the grouped album view names both numbers when editions fold ("94 albums · 99 releases"), and the phone's More sheet closes on Escape.
+- After the baseline scan, the Library header keeps a small refresh icon for the occasional case of music added to the folders outside the app. A refresh folds anything new into the review you already have parked — your picks stay exactly as you left them — instead of stacking a second review, and the open page updates live when it finishes. "Force full rescan" moved to Settings → Library maintenance.
+- The refresh also keeps the open review honest about the disk: an album you added by hand while it sat parked becomes a Gap Fill row (keeping its tick), a folder you deleted returns to Missing Albums, rows for albums now fully in your library leave the review, results dismissed mid-refresh stay dismissed, and a refresh that couldn't check some artists says so instead of reporting "up to date".
+- A download that still lands under your quality target after the automatic retry now marks its History row "Below target quality" and puts a warning dot on the Queue nav until the job page is opened — 0.10.0 promised this flag; now it exists.
+- Retry (failed downloads) and Undo (single tracks) work from History for any archived job and survive restarts — they used to quietly vanish once a job aged out of memory.
+- Undo on a single-track download works again; the confirmation dialog was swallowing the click, so Continue did nothing.
+- Approving any review needs its feature to actually work: dead Qobuz credentials, a missing downsample engine, or upgrades turned off refuse up front with the review left untouched — and a run that can't reach Qobuz before anything downloads puts the review back exactly as it was, picks intact, instead of burying them in a failed job.
+- Reviews reopened after a container restart could hand out duplicate internal row ids, and a dismiss then silently deleted unrelated candidates — including ticked ones. Ids now stay unique across restarts and tab splits.
+- A rejected Qobuz token no longer hides a parked Library review behind the connect card: the reconnect notice sits above the review, and ticking and dismissing keep working while downloads wait for the connection.
+- Restoring dismissed results puts them straight back into the open Library review — restore used to look like a no-op until some future scan — and the page says where they went.
+- "Select all" and "Dismiss unselected" respect the review filter: with a filter showing three albums they act on those three, not the whole tab, so a filtered select-all can't silently overwrite a thousand saved ticks.
+- The "Discard review" confirmation names the real stake — every pick you've made is lost — instead of reassuring that no files change.
+- Search's bulk "Download selected" asks first with the real count, the same way a single download does.
+- The Downsample and Lyrics pages show their own scan running instead of an idle "Ready" state, repair's confirmation counts file(s) rather than album(s), the Lyrics "Change" link lands on the right Settings section, and search results remember the table/grid choice.
+- Changing the download quality in Settings flags a parked Upgrade review as stale on save, and the next refresh re-derives Upgrade and Downsample candidates under the new policy even for unchanged folders. Downloads themselves always used the new setting immediately.
+- Review pages split on a row budget as well as an artist count, so a page of prolific artists can't put thousands of collapsed rows into a phone's DOM at once.
+- Stale job links and buttons say "That job is no longer in the record" instead of bouncing silently, a mistyped address renders the app's own error page instead of raw framework JSON, and an interrupted scan's restart note points at the resume that actually exists.
+- Winter theme small text and warning chips darkened to meet the readability bar (night already passed), and the result-cap notice tells web users what to actually do instead of naming a CLI-only option.
+- The compose file passes `TZ` through (documented beside PUID/PGID) so exact timestamps in History and on job pages can show your local time; relative times were always right.
 
 ## [0.10.0] - 2026-07-02
 
