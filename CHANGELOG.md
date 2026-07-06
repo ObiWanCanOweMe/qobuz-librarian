@@ -2,6 +2,14 @@
 
 All notable changes to Qobuz Librarian are recorded here, newest first. The project follows [semantic versioning](https://semver.org/); dates are when each version was tagged during local development.
 
+## [0.10.2] - 2026-07-05
+
+Reliability and interface polish over 0.10.1.
+
+- Filing a downloaded album into its primary-artist folder now copies and verifies each file at the new location before removing the original. On a library spread across two drives, a mid-move failure could previously leave the album split between both folders; the reorganise step is now as crash-safe as the standalone library migration, and reconciles the database only for the files that actually moved.
+- Search shows placeholder rows while it fetches results, instead of a lone spinner on an empty panel, so a lookup reads as loading rather than stalled.
+- The library and tool reviews are now a light hairline list, one clean row per artist rather than a boxed panel each, which is easier to scan down a long list and on a phone and matches the search results.
+
 ## [0.10.1] - 2026-07-04
 
 Fixes and hardening from running 0.10.0 against a full-size library, plus a deep audit of the album-matching and downsample paths.
