@@ -5933,6 +5933,31 @@ details[open] > .ql-disclosure-summary::after {
 .ql-skel-row:nth-child(4) .ql-skel-title { width: 62%; }
 @media (prefers-reduced-motion: reduce) { .ql-skel::after { animation: none; } }
 
+/* Reviews read as a light hairline list, one row per artist, like search results. */
+.ql-review-group {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+[data-theme="night"] .ql-review-group {
+  border-color: transparent;
+  background-color: transparent;
+}
+.ql-review-group-shell {
+  margin: 0;
+}
+.ql-review-group-shell + .ql-review-group-shell {
+  border-top: 1px solid var(--ql-line-soft);
+}
+[data-theme="night"] .ql-review-group-shell + .ql-review-group-shell {
+  border-top-color: var(--ql-line);
+}
+.ql-review-summary {
+  padding-left: 0.35rem;
+  padding-right: 0.35rem;
+}
+
 /* Theme toggle shows the destination: a sun while dark, a moon while light. */
 [data-theme="night"] .theme-when-light { display: none; }
 [data-theme="winter"] .theme-when-dark { display: none; }
