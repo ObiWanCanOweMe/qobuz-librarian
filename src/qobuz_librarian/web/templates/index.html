@@ -186,7 +186,7 @@
       {% else %}
       <form action="/search" method="post"
             hx-post="/search" hx-target="#search-results" hx-swap="innerHTML"
-            hx-indicator="#dashboard-search-spinner"
+            hx-indicator="#dashboard-search-spinner, #search-skeleton"
             {% if auto_search %}hx-trigger="submit, load"{% endif %}
             class="ql-search-form">
         <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
@@ -225,6 +225,19 @@
       </form>
       {% endif %}
     </section>
+
+    <div id="search-skeleton" class="ql-search-skeleton htmx-indicator" aria-hidden="true">
+      {% for _ in range(4) %}
+      <div class="ql-skel-row">
+        <span class="ql-skel ql-skel-cover"></span>
+        <span class="ql-skel-lines">
+          <span class="ql-skel ql-skel-title"></span>
+          <span class="ql-skel ql-skel-meta"></span>
+        </span>
+        <span class="ql-skel ql-skel-chip"></span>
+      </div>
+      {% endfor %}
+    </div>
 
     <div id="search-results" class="ql-search-results" aria-live="polite">
       {{ initial_search_results | safe }}

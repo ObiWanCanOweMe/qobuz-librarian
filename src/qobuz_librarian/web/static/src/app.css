@@ -5886,6 +5886,53 @@ details[open] > .ql-disclosure-summary::after {
 .htmx-request .htmx-indicator,
 .htmx-request.htmx-indicator { display: inline-block; }
 
+/* Search loading placeholders, shown only while the search request is in flight. */
+.ql-search-skeleton { display: none; }
+.ql-search-skeleton.htmx-request {
+  display: block;
+  margin-top: 1.5rem;
+  border: 1px solid var(--ql-line);
+  border-radius: var(--ql-radius-lg);
+  background: var(--ql-surface);
+  box-shadow: var(--ql-shadow-soft);
+  padding: 0.35rem 1.1rem;
+}
+.ql-search-skeleton.htmx-request + .ql-search-results { display: none; }
+.ql-skel-row {
+  display: grid;
+  grid-template-columns: 46px 1fr auto;
+  gap: 0.9rem;
+  align-items: center;
+  padding: 0.8rem 0;
+  border-top: 1px solid var(--ql-line-soft);
+}
+.ql-skel-row:first-child { border-top: none; }
+.ql-skel {
+  position: relative;
+  overflow: hidden;
+  border-radius: var(--ql-radius-sm);
+  background: color-mix(in oklab, var(--ql-text) 7%, transparent);
+}
+.ql-skel::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent,
+    color-mix(in oklab, var(--ql-text) 9%, transparent), transparent);
+  animation: ql-skel-shimmer 1.4s ease-in-out infinite;
+}
+@keyframes ql-skel-shimmer { 100% { transform: translateX(100%); } }
+.ql-skel-cover { width: 46px; height: 46px; border-radius: var(--ql-radius-sm); }
+.ql-skel-lines { display: flex; flex-direction: column; gap: 0.5rem; min-width: 0; }
+.ql-skel-title { height: 0.8rem; width: 58%; }
+.ql-skel-meta { height: 0.62rem; width: 34%; }
+.ql-skel-chip { height: 1.25rem; width: 4rem; border-radius: var(--ql-radius-sm); }
+.ql-skel-row:nth-child(2) .ql-skel-title { width: 68%; }
+.ql-skel-row:nth-child(3) .ql-skel-title { width: 48%; }
+.ql-skel-row:nth-child(4) .ql-skel-title { width: 62%; }
+@media (prefers-reduced-motion: reduce) { .ql-skel::after { animation: none; } }
+
 /* Theme toggle shows the destination: a sun while dark, a moon while light. */
 [data-theme="night"] .theme-when-light { display: none; }
 [data-theme="winter"] .theme-when-dark { display: none; }
