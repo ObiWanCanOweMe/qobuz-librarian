@@ -212,11 +212,32 @@ def _local_album_cap_key(album_dir):
     return f"local:{digest}"
 
 
-def is_local_album_capped(album_dir, capped):
+def is_local_album_capped(album_dir, capped, album=None):
+    capped = capped or {}
     key = _local_album_cap_key(album_dir)
-    if not key:
-        return False
-    return key in (capped or {})
+    if key and key in capped:
+        return True
+    # Path-independent fallback: a folder move / rename / migrate / consolidate
+    # changes the path-derived key, but it's the same album the user
+    # deliberately downsampled — so match the durable local cap by Qobuz album
+    # id, then by a loose artist+title fingerprint (the same identity the
+    # dismiss store uses). Without this, any reorg re-opens the
+    # downsample→upgrade loop the cap exists to stop. Errs toward "still
+    # capped" — the safe direction (won't re-download shed hi-res).
+    if album:
+        aid = str(album.get("id") or "")
+        fp = hidden_mod.album_fingerprint(
+            (album.get("artist") or {}).get("name") or "",
+            album.get("title") or "")
+        for v in capped.values():
+            if not isinstance(v, dict) or v.get("scope") != "local_album":
+                continue
+            if aid and str(v.get("qobuz_album_id") or "") == aid:
+                return True
+            if fp and hidden_mod.album_fingerprint(
+                    v.get("artist") or "", v.get("title") or "") == fp:
+                return True
+    return False
 
 
 def mark_album_capped(album_id, qobuz_album, post_qual):
@@ -327,7 +348,7 @@ def scan_artist_for_upgrades(artist_name, artist_dir, token, args, capped=None):
             continue
 
         # Skip albums Qobuz can't actually deliver at target.
-        if capped and is_local_album_capped(album_dir, capped):
+        if capped and is_local_album_capped(album_dir, capped, qobuz_album):
             vlog(f"    {album_dir.name}: capped (locally downsampled)")
             continue
         if capped and is_album_capped(qobuz_album.get("id"), capped):
