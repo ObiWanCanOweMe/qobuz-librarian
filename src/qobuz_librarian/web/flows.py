@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from qobuz_librarian import config as cfg
-from qobuz_librarian.api.auth import AuthLost, QobuzUnavailable
+from qobuz_librarian.api.auth import AuthLost, QobuzUnavailable, load_qobuz_token
 from qobuz_librarian.api.search import get_album
 from qobuz_librarian.library import (
     downsample_state,
@@ -444,7 +444,7 @@ def refold_into_living_review(picks):
     return folded[0]
 
 
-def _park_library_failures(failed_cands, token):
+def _park_library_failures(failed_cands):
     """After a whole-review download (every candidate ticked) finishes, retire
     empties the living review — so the albums that FAILED to download would
     vanish until the next scan. Re-park them as a fresh living Library review,
@@ -459,7 +459,8 @@ def _park_library_failures(failed_cands, token):
     job = job_mgr.Job(title="Library scan", kind="scan",
                       execute_kind="library",
                       status=job_mgr.JobStatus.AWAITING_REVIEW)
-    job._execute_fn = lambda j, chosen: execute_albums(j, chosen, token)
+    job._execute_fn = lambda j, chosen: execute_albums(
+        j, chosen, load_qobuz_token()[1])
     for c in failed_cands:
         job.add_candidate(
             kind=c.get("kind", "album"),
@@ -1286,7 +1287,7 @@ def execute_albums(job, chosen, token):
     # come back to retry rather than silently vanishing until the next scan.
     if getattr(job, "_consumed_whole_review", False):
         if failed_cands:
-            _park_library_failures(failed_cands, token)
+            _park_library_failures(failed_cands)
         from qobuz_librarian.library import library_scan_state
         library_scan_state.mark_review_retired(reason="worked_through")
     elif failed_cands and is_library_run:

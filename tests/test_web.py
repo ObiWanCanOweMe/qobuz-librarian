@@ -3319,6 +3319,53 @@ def test_whole_review_download_retires_and_reparks_failures(monkeypatch, tmp_pat
             _remove_job(parked)
 
 
+def test_reparked_failures_resolve_the_token_at_approve_time(monkeypatch, tmp_path):
+    """The retry review parked for failed downloads must look the Qobuz token
+    up when it is APPROVED, not reuse the value from the run that failed —
+    otherwise a token replaced in Settings never reaches it and every retry
+    fails with the same 'update it in Settings' error until a restart."""
+    from qobuz_librarian.library import library_scan_state as lss
+    from qobuz_librarian.modes import process as process_mod
+    from qobuz_librarian.web import flows
+
+    original = lss.load()
+    running = _inject_job(jm.JobStatus.RUNNING, "Library scan")
+    running.execute_kind = "library"
+    running._consumed_whole_review = True
+    running.add_candidate(kind="album", title="Failed One", artist="Agalloch",
+                          payload={"album_id": "fail1"}, selected=True)
+    chosen = list(running.candidates)
+    monkeypatch.setattr(flows.cfg, "ARTIST_API_DELAY", 0)
+    monkeypatch.setattr(flows, "get_album", lambda aid, _t: {"id": aid})
+    monkeypatch.setattr(flows, "clear_scan_caches", lambda: None)
+    monkeypatch.setattr(flows, "_refresh_after_local_album_change",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(flows, "prune_library_review_candidates", lambda *a, **k: 0)
+    monkeypatch.setattr(process_mod, "process_album",
+                        lambda *a, **k: {"result": "error", "imported": False,
+                                         "n_ok": 0})
+    parked = None
+    try:
+        flows.execute_albums(running, chosen, "stale-tok")
+        parked = next(j for j in jm.registry.awaiting_review()
+                      if getattr(j, "execute_kind", "") == "library"
+                      and any((c.get("payload") or {}).get("album_id") == "fail1"
+                              for c in j.candidates))
+        # Token replaced in Settings after the failed run; the retry must use it.
+        monkeypatch.setattr(flows, "load_qobuz_token",
+                            lambda: ("uid", "fresh-tok"))
+        seen = {}
+        monkeypatch.setattr(flows, "execute_albums",
+                            lambda j, ch, token: seen.setdefault("token", token))
+        parked._execute_fn(parked, list(parked.candidates))
+        assert seen["token"] == "fresh-tok"
+    finally:
+        lss._write_state(original)
+        _remove_job(running)
+        if parked is not None:
+            _remove_job(parked)
+
+
 def test_partial_run_failure_folds_back_into_the_living_review(monkeypatch, tmp_path):
     """#C1: on a PARTIAL approve (only some picks ticked) a living split-off
     review still holds the unticked picks. An album that FAILS on that run must
