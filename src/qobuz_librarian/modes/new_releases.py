@@ -64,6 +64,15 @@ def run_check_new_releases_mode(args):
     state = new_releases_mod.load()
     seen = state.get("seen") or {}
     hidden = hidden_mod.load()
+    # Single-track marks only suppress artists when the setting is on — the
+    # same gate the web check applies, so the two report the same artists.
+    single_store = hidden if cfg.SUPPRESS_SINGLE_TRACK_GAPS else None
+    # A grown catalog cap means the old baseline is missing everything past
+    # the previous limit; re-baseline instead of dumping that slice as "new"
+    # (mirrors the web check's guard).
+    cur_limit = int(cfg.ARTIST_CATALOG_LIMIT)
+    prev_limit = state.get("baseline_limit")
+    rebaseline = prev_limit is None or cur_limit > int(prev_limit)
     opts = DiscoveryOpts(prefer_hires=cfg.PREFER_HIRES)
 
     section(f"New-release check — {plural(len(artists), 'artist')}")
@@ -88,8 +97,8 @@ def run_check_new_releases_mode(args):
     try:
         futures = {ex.submit(find_new_releases_for_artist, ad.name,
                              token=token, opts=opts, seen_by_id=seen,
-                             hidden=hidden, single_store=hidden,
-                             artist_dir=ad): ad
+                             hidden=hidden, single_store=single_store,
+                             artist_dir=ad, baseline_only=rebaseline): ad
                    for ad in artists}
         for fut in as_completed(futures):
             ad = futures[fut]
@@ -128,7 +137,11 @@ def run_check_new_releases_mode(args):
 
     flush_resolve_cache()
     log.info("")
-    if total_new:
+    if rebaseline and seen:
+        log.info(fmt(C.GRAY,
+            "  · Catalogue limit changed — recorded a fresh baseline; "
+            "future checks diff against it."))
+    elif total_new:
         log.info(fmt(C.BOLD + C.WHITE,
             f"  ✓  {plural(total_new, 'new release')} across "
             f"{plural(artists_with_news, 'artist')}."))
@@ -140,10 +153,17 @@ def run_check_new_releases_mode(args):
         log.info(fmt(C.GRAY, "  · Baseline recorded."))
 
     if not args.dry_run:
-        # Merge over the existing baseline so an artist that errored doesn't
-        # lose its prior 'seen' set — matches the web flow's semantics. Only
-        # claim a COMPLETE baseline when the crawl actually reached artists
-        # cleanly: marking complete after an all-skipped/errored run would seed
-        # an empty baseline and permanently defeat the library scan's seeding.
+        # UNION each reached artist's snapshot into the prior baseline rather
+        # than replacing it — an over-cap catalog comes back as a different
+        # slice each run, so a replace would let rotated-out ids re-surface as
+        # "new" (the same merge the web flow does). An artist that errored
+        # keeps its old entry. Only claim a COMPLETE baseline when the crawl
+        # actually reached artists cleanly: marking complete after an
+        # all-skipped/errored run would seed an empty baseline and permanently
+        # defeat the library scan's seeding.
+        merged = dict(seen)
+        for aid, ids in current_seen.items():
+            merged[aid] = sorted(set(merged.get(aid, [])) | set(ids))
         complete = not had_failure and bool(current_seen)
-        new_releases_mod.mark_run({**seen, **current_seen}, complete=complete)
+        new_releases_mod.mark_run(merged, complete=complete,
+                                  baseline_limit=cur_limit)
