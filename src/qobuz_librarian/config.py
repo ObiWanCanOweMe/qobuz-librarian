@@ -454,7 +454,8 @@ NEW_RELEASE_MAX_AGE_DAYS = _env("NEW_RELEASE_MAX_AGE_DAYS", 365)
 # Resume an interrupted library scan when the app is idle, driving it to
 # completion across restarts so the new-release baseline gets established
 # without the user re-triggering it. A FRESH first scan is never auto-started —
-# the dashboard offers it as a choice; Off disables the automatic resume.
+# it's offered as a choice on first run. Off disables both that first-run offer
+# and the automatic resume; the manual Resume button works regardless.
 AUTO_LIBRARY_SCAN = _env_bool("AUTO_LIBRARY_SCAN", True)
 
 # Per-request budgets for the web UI's Qobuz API calls (album/search/track

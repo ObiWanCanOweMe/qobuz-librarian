@@ -34,7 +34,7 @@ These settings apply to new jobs. A field you change on the Settings page keeps 
 | `LYRICS_FORMAT` | `embed` | `embed` (FLAC tag), `sidecar` (.lrc), or `both` |
 | `LYRICS_PROVIDERS` | `Lrclib,NetEase,Musixmatch` | Ordered comma list |
 | `ARTWORK` | `sidecar` | Cover art: `sidecar`, `embed`, or `both` |
-| `AUTO_LIBRARY_SCAN` | `true` | Offer the one-time baseline scan on the Search page on first run (`false` hides the offer entirely) |
+| `AUTO_LIBRARY_SCAN` | `true` | Offer the one-time baseline scan on the Search page on first run, and auto-resume an interrupted library scan when the app is idle (`false` turns both off; the manual Resume button still works) |
 | `NEW_RELEASE_CHECK_INTERVAL` | `86400` | How often (seconds) to auto-check for new releases; daily (also on Settings) |
 | `ARTIST_CATALOG_CACHE_TTL` | `604800` | How long (seconds) artist album-lists stay cached; 7 days |
 | `REPAIR_CACHE_ENABLED` | `true` | Cache the repair scan's Qobuz ISRC lookups (files are still decode-tested fresh every scan) |
