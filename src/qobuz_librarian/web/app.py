@@ -4153,15 +4153,30 @@ async def job_undo(request: Request, job_id: str):
         # reporting false success and burning the one-shot.
         return removed
 
-    def _reverse_under_lock():
-        # Take the lock inside the worker thread, never on the event loop —
-        # holding a threading.Lock on the loop would freeze every other request
-        # while a download worker (which may rip for minutes) holds it.
-        with job_mgr.staging_lock():
-            return _reverse()
-
+    # The removal works under the staging mutex. Acquire it non-blocking: the
+    # undo runs from a DONE job page that can't show progress, so blocking here
+    # would hang the request with no feedback for as long as a library-wide
+    # Lyrics scan or a migration holds the lock — bounce naming the holder
+    # instead, like the backup-restore route. A failed non-blocking acquire
+    # returns instantly, so the event loop is never frozen; the file work
+    # itself still runs in a worker.
+    lock = job_mgr.staging_lock()
+    if not lock.acquire(blocking=False):
+        holder = job_mgr.staging_holder()
+        msg = (f"{holder} is using the library right now — try Undo again "
+               "when it finishes." if holder else
+               "Another job is using the library right now — try Undo again "
+               "in a moment.")
+        if _is_htmx(request):
+            return HTMLResponse(
+                f'<div id="job-content">'
+                f'{_ql_notice_html("warning", html.escape(msg))}</div>')
+        return _tr(request, "lock_busy.html", {"msg": msg}, status_code=503)
     loop = asyncio.get_running_loop()
-    removed = await loop.run_in_executor(None, _reverse_under_lock)
+    try:
+        removed = await loop.run_in_executor(None, _reverse)
+    finally:
+        lock.release()
     if removed is not None:
         await loop.run_in_executor(None, _refresh_after_undo)
         job.single = {**info, "removed": True}

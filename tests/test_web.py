@@ -2272,6 +2272,49 @@ def test_undo_burns_the_one_shot_in_the_archive(client, monkeypatch, tmp_path):
     assert row["single"].get("removed") is True
 
 
+def test_undo_bounces_when_the_staging_mutex_is_held(client, monkeypatch, tmp_path):
+    """Undo behind a long staging-lock holder (library-wide Lyrics scan,
+    migration) must bounce naming the holder instead of hanging the request
+    until the holder finishes — the DONE job page can't show progress, so a
+    blocking wait is invisible. The timer below is a watchdog: without the fix
+    the request blocks on the held lock, the timer releases it, the undo runs
+    to completion and the 503 assert fails instead of the test hanging."""
+    import threading
+
+    from qobuz_librarian.web import job_persistence
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+
+    gone = tmp_path / "Portishead" / "Dummy"
+    job = jm.Job(title="Dummy", artist="Portishead")
+    job.status = jm.JobStatus.DONE
+    job.single = {"dir": str(gone), "track_id": "t1", "title": "Glory Box"}
+    job.finished_at = time.time()
+    job_persistence.persist(job)
+
+    lock = jm.staging_lock()
+    lock.acquire()
+    jm.set_staging_holder("Lyrics scan")
+    release_timer = threading.Timer(3.0, lock.release)
+    release_timer.start()
+    try:
+        r = client.post(f"/jobs/{job.id}/undo", follow_redirects=False)
+
+        assert r.status_code == 503
+        assert "Lyrics scan" in r.text
+        row = job_persistence.load_one(job.id)
+        assert not row["single"].get("removed")
+    finally:
+        jm.set_staging_holder(None)
+        release_timer.cancel()
+        try:
+            lock.release()
+        except RuntimeError:
+            pass
+
+
 def test_hidden_empty_state_points_back_to_library(client):
     r = client.get("/library/hidden")
 
