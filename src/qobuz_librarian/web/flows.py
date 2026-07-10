@@ -414,14 +414,16 @@ def refold_restored_missing(artists, fingerprints):
     return added
 
 
-def refold_cancelled_picks(unrun):
-    """Fold the picks a cancelled library download never reached back into the
-    living review, ticked — so a mid-batch cancel doesn't strand them in the
-    dead job (WebUIAudit #43). The living review is the split-off parked review
-    #48 left behind at approve; when the whole review was ticked there is none,
-    and the saved-state rebuild brings those picks back (unticked) on the next
-    /library visit instead. Returns how many rejoined, or None when there's no
-    parked review to fold into."""
+def refold_into_living_review(picks):
+    """Fold a list of library picks back into the living review, ticked — so they
+    come back on /library ready to retry instead of stranding in a dead job. Two
+    callers: the picks a cancelled download never reached (WebUIAudit #43), and
+    the albums that FAILED on a partial-approve run. The living review is the
+    split-off parked review #48 left behind at approve; when the WHOLE review was
+    ticked there is none, and those paths recover differently (a cancel lets the
+    saved-state rebuild bring the picks back unticked; a failure re-parks a fresh
+    review). Dedups by fold key, so re-adding a pick already in the review is
+    safe. Returns how many rejoined, or None when there's no review to fold into."""
     from qobuz_librarian.web import job_persistence
     from qobuz_librarian.web import jobs as job_mgr
 
@@ -433,7 +435,7 @@ def refold_cancelled_picks(unrun):
             parked = j
     if parked is None:
         return None
-    specs = [dict(c, selected=True) for c in unrun]
+    specs = [dict(c, selected=True) for c in picks]
     folded = fold_new_candidates(parked, specs)
     if folded is None:
         return None
@@ -1179,6 +1181,20 @@ def execute_albums(job, chosen, token):
     # in flight is folded back with the un-started picks.
     failed_cands = []
     cancelled_cand = None
+    # Every fold-back recovery below is for LIBRARY runs only: this function
+    # also executes new-release batches, and their albums must never enter the
+    # Library review — they live and die with their own job.
+    is_library_run = getattr(job, "execute_kind", "") == "library"
+
+    def _fold_back_unfinished():
+        # Token death / outage mid-batch: once something has imported, this
+        # job is headed for FAILED (approve's no-harm re-park only covers the
+        # nothing-landed case) — fold the picks this run didn't finish back
+        # into the living review, ticked, so they come back to retry like any
+        # other early exit. cand/processed are read at call time, inside the
+        # loop.
+        if is_library_run and job._imported_any:
+            refold_into_living_review(failed_cands + [cand] + chosen[processed:])
     for i, cand in enumerate(chosen, 1):
         if job.cancel_requested:
             break
@@ -1192,6 +1208,7 @@ def execute_albums(job, chosen, token):
         try:
             full = get_album(album_id, token)
         except (AuthLost, QobuzUnavailable):
+            _fold_back_unfinished()
             raise
         except Exception as e:
             log.info(f"  could not fetch album {album_id}: {e}")
@@ -1204,6 +1221,7 @@ def execute_albums(job, chosen, token):
                 result = process_album(full, args, allow_force=False,
                                        already_confirmed=True, token=token)
         except (AuthLost, QobuzUnavailable):
+            _fold_back_unfinished()
             raise
         except Exception as e:
             log.info(f"  failed: {e}")
@@ -1245,8 +1263,8 @@ def execute_albums(job, chosen, token):
         unrun = chosen[processed:]
         if cancelled_cand is not None:
             unrun = [cancelled_cand] + unrun
-        if unrun:
-            refold_cancelled_picks(unrun)
+        if unrun and is_library_run:
+            refold_into_living_review(unrun)
         job.summary = (f"Stopped early. {ok} downloaded, "
                        f"{len(chosen) - processed} not started.")
         log.info(job.summary)
@@ -1271,6 +1289,12 @@ def execute_albums(job, chosen, token):
             _park_library_failures(failed_cands, token)
         from qobuz_librarian.library import library_scan_state
         library_scan_state.mark_review_retired(reason="worked_through")
+    elif failed_cands and is_library_run:
+        # Partial approve: the unticked picks stayed behind as a living split-off
+        # review (#48). Fold the albums that FAILED back into it, ticked, so they
+        # come back to retry — the same recovery the whole-review path gets, not
+        # surviving only as this job's error line until a manual refresh.
+        refold_into_living_review(failed_cands)
 
 
 # ── Upgrade flow ──────────────────────────────────────────────────────────────

@@ -3174,7 +3174,7 @@ def test_cancel_folds_unrun_picks_back_into_the_review():
              "artist": "Abigail", "detail": "", "payload": {"album_id": "r2"},
              "selected": True},
         ]
-        assert flows.refold_cancelled_picks(unrun) == 2
+        assert flows.refold_into_living_review(unrun) == 2
         by_title = {c["title"]: c for c in parked.candidates}
         assert {"Unrun One", "Unrun Two"} <= set(by_title)
         # They rejoin ticked; the existing leftover is untouched.
@@ -3274,6 +3274,179 @@ def test_whole_review_download_retires_and_reparks_failures(monkeypatch, tmp_pat
         _remove_job(running)
         if parked is not None:
             _remove_job(parked)
+
+
+def test_partial_run_failure_folds_back_into_the_living_review(monkeypatch, tmp_path):
+    """#C1: on a PARTIAL approve (only some picks ticked) a living split-off
+    review still holds the unticked picks. An album that FAILS on that run must
+    fold back into it, ticked, to retry — matching the whole-review re-park —
+    instead of surviving only as the job's error line until a manual refresh."""
+    from qobuz_librarian.modes import process as process_mod
+    from qobuz_librarian.web import flows
+
+    parked = _inject_job(jm.JobStatus.AWAITING_REVIEW, "Library scan")
+    parked.execute_kind = "library"
+    parked.add_candidate(kind="album", title="Left Unticked", artist="Agalloch",
+                         payload={"album_id": "u1"}, selected=False)
+    running = _inject_job(jm.JobStatus.RUNNING, "Library scan")
+    running.execute_kind = "library"
+    running._consumed_whole_review = False   # partial approve — the remnant lives
+    running.add_candidate(kind="album", title="Downloaded OK", artist="Agalloch",
+                          payload={"album_id": "ok1"}, selected=True)
+    running.add_candidate(kind="album", title="Failed One", artist="Agalloch",
+                          payload={"album_id": "fail1"}, selected=True)
+    chosen = list(running.candidates)
+    monkeypatch.setattr(flows.cfg, "ARTIST_API_DELAY", 0)
+    monkeypatch.setattr(flows, "get_album", lambda aid, _t: {"id": aid})
+    monkeypatch.setattr(flows, "clear_scan_caches", lambda: None)
+    monkeypatch.setattr(flows, "_refresh_after_local_album_change",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(flows, "prune_library_review_candidates", lambda *a, **k: 0)
+
+    def fake_process(full, *_a, **_k):
+        if full["id"] == "fail1":
+            return {"result": "error", "imported": False, "n_ok": 0}
+        return {"imported": True, "n_ok": 1, "n_fail": 0, "result": "downloaded",
+                "dir": str(tmp_path)}
+
+    monkeypatch.setattr(process_mod, "process_album", fake_process)
+    try:
+        flows.execute_albums(running, chosen, "tok")
+        by_title = {c["title"]: c for c in parked.candidates}
+        # The failure rejoined the living review, ticked; the leftover is untouched
+        # and the successful download was NOT parked.
+        assert by_title.get("Failed One", {}).get("selected") is True
+        assert by_title["Left Unticked"]["selected"] is False
+        assert "Downloaded OK" not in by_title
+    finally:
+        _remove_job(running)
+        _remove_job(parked)
+
+
+def test_new_release_run_recoveries_never_touch_the_library_review(monkeypatch):
+    """A failed or cancelled NEW-RELEASE download run must not fold its albums
+    into the parked Library review — new-release results never enter the
+    Library tabs. Guards both fold-back call sites in execute_albums, which
+    also runs new-release batches."""
+    from qobuz_librarian.modes import process as process_mod
+    from qobuz_librarian.web import flows
+
+    parked = _inject_job(jm.JobStatus.AWAITING_REVIEW, "Library scan")
+    parked.execute_kind = "library"
+    parked.add_candidate(kind="album", title="Left Unticked", artist="Agalloch",
+                         payload={"album_id": "u1"}, selected=False)
+    monkeypatch.setattr(flows.cfg, "ARTIST_API_DELAY", 0)
+    monkeypatch.setattr(flows, "get_album", lambda aid, _t: {"id": aid})
+    monkeypatch.setattr(flows, "clear_scan_caches", lambda: None)
+    monkeypatch.setattr(flows, "_refresh_after_local_album_change",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(flows, "prune_library_review_candidates", lambda *a, **k: 0)
+    try:
+        # A run where an album fails outright.
+        failing = _inject_job(jm.JobStatus.RUNNING, "New-release check")
+        failing.execute_kind = "new_releases"
+        failing.add_candidate(kind="album", title="NR Failed", artist="Agalloch",
+                              payload={"album_id": "nr1"}, selected=True)
+        monkeypatch.setattr(process_mod, "process_album",
+                            lambda full, *_a, **_k: {"result": "error",
+                                                     "imported": False, "n_ok": 0})
+        try:
+            flows.execute_albums(failing, list(failing.candidates), "tok")
+        finally:
+            _remove_job(failing)
+
+        # A run cancelled mid-batch with a pick it never reached.
+        cancelled = _inject_job(jm.JobStatus.RUNNING, "New-release check")
+        cancelled.execute_kind = "new_releases"
+        cancelled.add_candidate(kind="album", title="NR In Flight", artist="Agalloch",
+                                payload={"album_id": "nr2"}, selected=True)
+        cancelled.add_candidate(kind="album", title="NR Unreached", artist="Agalloch",
+                                payload={"album_id": "nr3"}, selected=True)
+
+        def cancelling(full, *_a, **_k):
+            cancelled.cancel_requested = True
+            return {"result": "cancelled", "imported": False, "n_ok": 0}
+
+        monkeypatch.setattr(process_mod, "process_album", cancelling)
+        try:
+            flows.execute_albums(cancelled, list(cancelled.candidates), "tok")
+        finally:
+            _remove_job(cancelled)
+
+        assert [c["title"] for c in parked.candidates] == ["Left Unticked"]
+    finally:
+        _remove_job(parked)
+
+
+def test_auth_death_mid_batch_folds_unfinished_picks_back(monkeypatch, tmp_path):
+    """A token death / Qobuz outage AFTER the first import fails the job
+    (approve's no-harm re-park only covers the nothing-landed case), so on a
+    partial approve the picks the run never finished must fold back into the
+    living split-off review, ticked. Before anything lands the fold must NOT
+    fire — approve() restores the whole review instead, and folding here too
+    would offer the same picks twice."""
+    from qobuz_librarian.api.auth import AuthLost
+    from qobuz_librarian.modes import process as process_mod
+    from qobuz_librarian.web import flows
+
+    parked = _inject_job(jm.JobStatus.AWAITING_REVIEW, "Library scan")
+    parked.execute_kind = "library"
+    parked.add_candidate(kind="album", title="Left Unticked", artist="Agalloch",
+                         payload={"album_id": "u1"}, selected=False)
+    running = _inject_job(jm.JobStatus.RUNNING, "Library scan")
+    running.execute_kind = "library"
+    running._consumed_whole_review = False
+    for title, aid in (("Landed", "ok1"), ("Died Mid-Rip", "die1"),
+                       ("Never Started", "ns1")):
+        running.add_candidate(kind="album", title=title, artist="Agalloch",
+                              payload={"album_id": aid}, selected=True)
+    chosen = list(running.candidates)
+    monkeypatch.setattr(flows.cfg, "ARTIST_API_DELAY", 0)
+    monkeypatch.setattr(flows, "get_album", lambda aid, _t: {"id": aid})
+    monkeypatch.setattr(flows, "clear_scan_caches", lambda: None)
+    monkeypatch.setattr(flows, "_refresh_after_local_album_change",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(flows, "prune_library_review_candidates", lambda *a, **k: 0)
+
+    def fake_process(full, *_a, **_k):
+        if full["id"] == "die1":
+            raise AuthLost("token expired")
+        return {"imported": True, "n_ok": 1, "n_fail": 0, "result": "downloaded",
+                "dir": str(tmp_path)}
+
+    monkeypatch.setattr(process_mod, "process_album", fake_process)
+    try:
+        with pytest.raises(AuthLost):
+            flows.execute_albums(running, chosen, "tok")
+        by_title = {c["title"]: c for c in parked.candidates}
+        # The album that died and the one never reached rejoin ticked; what
+        # landed stays out; the untouched leftover keeps its state.
+        assert by_title.get("Died Mid-Rip", {}).get("selected") is True
+        assert by_title.get("Never Started", {}).get("selected") is True
+        assert by_title["Left Unticked"]["selected"] is False
+        assert "Landed" not in by_title
+    finally:
+        _remove_job(running)
+        _remove_job(parked)
+
+    # Nothing landed: the no-harm re-park recovers the whole job, so the fold
+    # must stay out of it.
+    parked = _inject_job(jm.JobStatus.AWAITING_REVIEW, "Library scan")
+    parked.execute_kind = "library"
+    parked.add_candidate(kind="album", title="Left Unticked", artist="Agalloch",
+                         payload={"album_id": "u1"}, selected=False)
+    running = _inject_job(jm.JobStatus.RUNNING, "Library scan")
+    running.execute_kind = "library"
+    running._consumed_whole_review = False
+    running.add_candidate(kind="album", title="Died First", artist="Agalloch",
+                          payload={"album_id": "die1"}, selected=True)
+    try:
+        with pytest.raises(AuthLost):
+            flows.execute_albums(running, list(running.candidates), "tok")
+        assert [c["title"] for c in parked.candidates] == ["Left Unticked"]
+    finally:
+        _remove_job(running)
+        _remove_job(parked)
 
 
 def test_bulk_cancel_pending_never_touches_parked_reviews():
