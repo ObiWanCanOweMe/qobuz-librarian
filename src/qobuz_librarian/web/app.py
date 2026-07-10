@@ -3544,9 +3544,18 @@ async def job_approve(request: Request, job_id: str):
         if choice in ("keep", "delete"):
             from qobuz_librarian.web import settings_store
 
-            await loop.run_in_executor(
-                None, lambda: settings_store.save(
-                    {"DOWNSAMPLE_KEEP_ORIGINALS": choice}))
+            def _save_keep_choice():
+                # Persist as the standing default AND apply in-memory now.
+                # settings_store.save() defers the apply while another job is
+                # running, but the downsample run this approve is about to
+                # launch reads the value at once and nothing else reads it —
+                # so it must not wait for the worker to idle, or the originals
+                # get deleted despite a "keep" choice. Mirrors the CLI path
+                # (modes/downsample).
+                settings_store.save({"DOWNSAMPLE_KEEP_ORIGINALS": choice})
+                cfg.DOWNSAMPLE_KEEP_ORIGINALS = choice
+
+            await loop.run_in_executor(None, _save_keep_choice)
         else:
             return _tr(request, "downsample_keep_choice.html", {
                 "job": job, "page": "downsample",

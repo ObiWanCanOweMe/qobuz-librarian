@@ -1863,6 +1863,50 @@ def test_first_downsample_prompts_for_keep_choice_then_saves_it(
     assert cfg.DOWNSAMPLE_KEEP_ORIGINALS == "keep"
 
 
+def test_first_downsample_keep_choice_applies_while_a_job_is_running(
+        client, monkeypatch, tmp_path):
+    """The keep/delete pick made at the first-downsample prompt must take
+    effect for the run it launches even when another job is already active.
+    settings_store.save() defers its in-memory apply while a job runs, so the
+    approve path applies the choice itself — otherwise the run reads the still
+    unset value and deletes the hi-res originals despite a 'keep' choice."""
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.web import jobs as job_mgr
+    from qobuz_librarian.web import settings_store as ss
+
+    monkeypatch.setattr(ss, "SETTINGS_FILE", tmp_path / "s.json")
+    monkeypatch.setattr(ss, "_pending_apply", None)
+    monkeypatch.setattr(cfg, "DOWNSAMPLE_KEEP_ORIGINALS", None)
+    monkeypatch.setattr(
+        "qobuz_librarian.integrations.downsample_engine.HAVE_DOWNSAMPLE", True)
+    monkeypatch.setattr(job_mgr._scan_queue, "put", lambda item: None)
+    # A job is running in the other lane, so save() takes its deferral branch —
+    # the exact condition that used to strand the choice at its unset default.
+    monkeypatch.setattr(ss, "_any_active_job", lambda: True)
+    state = {
+        "updated_at": time.time(), "complete": True,
+        "candidates": [{
+            "title": "Album", "artist": "Portishead",
+            "detail": "24-bit / 96 kHz -> 16-bit / 48 kHz",
+            "album_dir": "/music/Portishead/Album", "est_saving": 1234,
+        }],
+    }
+    monkeypatch.setattr(
+        "qobuz_librarian.library.downsample_state.load", lambda: state)
+
+    first = client.post("/downsample/review", follow_redirects=False)
+    job = job_mgr.registry.get(first.headers["location"].removeprefix("/jobs/"))
+    client.post(f"/jobs/{job.id}/select",
+                data={"cid": job.candidates[0]["cid"], "checked": "1"})
+
+    r = client.post(f"/jobs/{job.id}/approve",
+                    data={"keep_choice": "keep"}, follow_redirects=False)
+    assert r.status_code == 303
+    # Applied in-memory immediately despite the deferral: the launched run
+    # reads "keep" and parks a restorable backup rather than deleting.
+    assert cfg.DOWNSAMPLE_KEEP_ORIGINALS == "keep"
+
+
 def test_approve_refuses_parked_downsample_review_without_engine(
         client, monkeypatch):
     from qobuz_librarian.web import jobs as job_mgr
