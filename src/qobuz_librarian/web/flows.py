@@ -2230,14 +2230,21 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
     # with a concurrent download lane importing into the same <artist>/<album>
     # path — the exact race the "staging_lock serializes everything that touches
     # the tree" model is meant to prevent.
-    from qobuz_librarian.web.jobs import staging_lock
+    from qobuz_librarian.web.jobs import set_staging_holder, staging_lock
+    # A cross-filesystem move can run for hours; name the holder so a download
+    # that blocks on the staging mutex shows what it's waiting behind instead of
+    # sitting on RUNNING with no reason (the same treatment the lyrics scan gets).
     with staging_lock():
-        result = engine.execute_plan(
-            plan, in_place=in_place,
-            cancel_check=lambda: job.cancel_requested,
-            progress=job.push_progress)
-        # In-place leaves the emptied source folders behind; clear the husk.
-        pruned = engine.prune_empty_dirs(src) if (in_place and src) else 0
+        set_staging_holder("Library migration")
+        try:
+            result = engine.execute_plan(
+                plan, in_place=in_place,
+                cancel_check=lambda: job.cancel_requested,
+                progress=job.push_progress)
+            # In-place leaves the emptied source folders behind; clear the husk.
+            pruned = engine.prune_empty_dirs(src) if (in_place and src) else 0
+        finally:
+            set_staging_holder(None)
     # Leave the preview manifest (the full plan, including what was left behind)
     # alone; record what this run actually did in a sibling results file.
     try:

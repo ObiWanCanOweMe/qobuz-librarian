@@ -2319,10 +2319,12 @@ def _make_download_run(album, token, *, treat_as_new=False):
         from qobuz_librarian.modes.process import process_album
         from qobuz_librarian.ui_cli.errors import plural
         from qobuz_librarian.web.flows import (
+            _note_staging_wait,
             _refresh_after_local_album_change,
             build_args,
         )
         args = build_args()
+        _note_staging_wait(j, "Downloading", 0, 1)
         with job_mgr.staging_lock():
             r = process_album(album, args, allow_force=False,
                               already_confirmed=True, token=token,
@@ -2383,6 +2385,7 @@ def _make_single_track_run(album, track, token):
         from qobuz_librarian.queue.executor import _execute_download_queue
         from qobuz_librarian.ui_cli.errors import plural
         from qobuz_librarian.web.flows import (
+            _note_staging_wait,
             _refresh_after_local_album_change,
             build_args,
         )
@@ -2406,6 +2409,7 @@ def _make_single_track_run(album, track, token):
             upgrade_only=False, auto_upgrade=False,
             force_track_by_track=True,
         )
+        _note_staging_wait(j, "Downloading", 0, 1)
         with job_mgr.staging_lock():
             _execute_download_queue([qi], args, token)
         if not (qi.get("n_ok", 0) > 0 and qi.get("imported", False)
