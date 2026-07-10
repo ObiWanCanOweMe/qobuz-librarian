@@ -73,11 +73,11 @@
       </svg>
       <span class="min-w-0 flex-1 text-sm">
         {% if setup_scanning %}
-        <strong>Library scan running.</strong> Refreshing missing albums, Gap Fill candidates, upgrades, and downsample candidates.
+        <strong>Library scan running.</strong> Building the Missing Albums, Gap Fill, Upgrade, and Downsample reviews.
         {% elif not library_scan_state.ready %}
         <strong>Music library unavailable.</strong> {{ library_scan_state.message }}
         {% else %}
-        <strong>Library scan needed.</strong> Scan once to refresh missing albums, Gap Fill candidates, upgrades, and downsample candidates.
+        <strong>Scan your library.</strong> Builds the Missing Albums, Gap Fill, Upgrade, and Downsample reviews.
         {% endif %}
       </span>
       {% if setup_scanning %}

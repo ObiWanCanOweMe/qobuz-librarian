@@ -64,9 +64,14 @@
       {% if job.execute_kind in ('library', 'upgrade', 'new_releases', 'downsample') %}
       <span class="ql-review-tool-sep" aria-hidden="true"></span>
       {# Lives up here with the other whole-list tools: the sticky footer keeps
-         a single job — the download button. #}
+         a single job — the download button. Scope the count to the active tab
+         on a tabbed library review (the JS re-scopes it after a tab switch;
+         this keeps the FIRST render honest too — the action is already
+         tab-scoped server-side). #}
+      {% set _rest_total = review_tab_counts.missing if review_tab == 'missing' else review_tab_counts.gaps if review_tab == 'gaps' else review_counts.total %}
+      {% set _rest_selected = review_tab_counts.missing_selected if review_tab == 'missing' else review_tab_counts.gaps_selected if review_tab == 'gaps' else review_counts.selected %}
       <button type="button" id="review-dismiss-rest"
-              class="ql-review-tool{% if review_counts.selected >= review_counts.total %} hidden{% endif %}">{{ 'Keep hi-res' if job.execute_kind == 'downsample' else 'Dismiss unselected' }} ({{ review_counts.total - review_counts.selected }})</button>
+              class="ql-review-tool{% if _rest_selected >= _rest_total %} hidden{% endif %}">{{ 'Keep hi-res' if job.execute_kind == 'downsample' else 'Dismiss unselected' }} ({{ _rest_total - _rest_selected }})</button>
       {% endif %}
       {% if triage %}
       <span class="ql-review-tool-sep" aria-hidden="true"></span>
