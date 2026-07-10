@@ -3603,7 +3603,13 @@ async def job_approve(request: Request, job_id: str):
         # their own recovery (Upgrade/Downsample rebuild from saved state).
         if (job.execute_kind == "library"
                 and job.status == job_mgr.JobStatus.AWAITING_REVIEW):
-            _split_off_unapproved(job, tab)
+            remnant = _split_off_unapproved(job, tab)
+            # Whole review ticked → nothing was left to re-park. Remember it so
+            # the run, on success, retires the worked-through review instead of
+            # letting the saved-state rebuild resurrect the just-downloaded
+            # albums as "missing" on the next /library visit. Any that FAIL are
+            # re-parked to retry (flows.execute_albums).
+            job._consumed_whole_review = remnant is None
         return job_mgr.approve(job, None)
 
     approved = await loop.run_in_executor(None, _split_and_approve)

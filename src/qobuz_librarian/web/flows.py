@@ -442,6 +442,39 @@ def refold_cancelled_picks(unrun):
     return folded[0]
 
 
+def _park_library_failures(failed_cands, token):
+    """After a whole-review download (every candidate ticked) finishes, retire
+    empties the living review — so the albums that FAILED to download would
+    vanish until the next scan. Re-park them as a fresh living Library review,
+    ticked, so they come back on /library ready to retry (mirrors the split-off
+    review #48 leaves on a partial approve). Persisted so a restart keeps them
+    even though the retired baseline no longer rebuilds. Returns the parked job,
+    or None when nothing failed."""
+    from qobuz_librarian.web import job_persistence
+    from qobuz_librarian.web import jobs as job_mgr
+    if not failed_cands:
+        return None
+    job = job_mgr.Job(title="Library scan", kind="scan",
+                      execute_kind="library",
+                      status=job_mgr.JobStatus.AWAITING_REVIEW)
+    job._execute_fn = lambda j, chosen: execute_albums(j, chosen, token)
+    for c in failed_cands:
+        job.add_candidate(
+            kind=c.get("kind", "album"),
+            title=c.get("title") or "?",
+            artist=c.get("artist") or "",
+            detail=c.get("detail") or "",
+            payload=c.get("payload") or {},
+            selected=True,
+        )
+    n = len(job.candidates)
+    job.summary = (f"{n:,} album{'s' if n != 1 else ''} didn't download last "
+                   "time. Ticked and ready to retry.")
+    job_mgr.registry.add(job)
+    job_persistence.persist(job)
+    return job
+
+
 def prune_library_review_candidates(album):
     """A full album just landed on disk (Search download, batch download,
     upgrade replace): drop its candidates from every parked or still-scanning
@@ -1141,6 +1174,11 @@ def execute_albums(job, chosen, token):
     partial = 0
     failed = 0
     processed = 0
+    # Picks that didn't land (never fetched, errored, or came back empty). On a
+    # whole-review download these are re-parked to retry; on a cancel the album
+    # in flight is folded back with the un-started picks.
+    failed_cands = []
+    cancelled_cand = None
     for i, cand in enumerate(chosen, 1):
         if job.cancel_requested:
             break
@@ -1158,6 +1196,7 @@ def execute_albums(job, chosen, token):
         except Exception as e:
             log.info(f"  could not fetch album {album_id}: {e}")
             failed += 1
+            failed_cands.append(cand)
             continue
         _note_staging_wait(job, "Downloading albums", i, len(chosen))
         try:
@@ -1169,7 +1208,12 @@ def execute_albums(job, chosen, token):
         except Exception as e:
             log.info(f"  failed: {e}")
             failed += 1
+            failed_cands.append(cand)
             continue
+        if result and result.get("result") == "cancelled":
+            # Cancelled mid-download: processed already points past this album,
+            # so the cancel fold-back below would drop its pick — remember it.
+            cancelled_cand = cand
         if result and result.get("imported") and result.get("n_ok", 0) > 0:
             job._imported_any = True
             _refresh_after_local_album_change(
@@ -1189,13 +1233,18 @@ def execute_albums(job, chosen, token):
                 ok += 1
         elif not (result and result.get("result") in _benign):
             failed += 1
+            failed_cands.append(cand)
         time.sleep(cfg.ARTIST_API_DELAY)
     job._progress_scope = None
     if job.cancel_requested:
         # #43: the picks this run never started aren't lost — fold them back
         # into the living review, ticked, so a cancel mid-batch doesn't strand
-        # them in this dead job.
+        # them in this dead job. The album that was mid-download when the cancel
+        # landed sits just before `processed`, so it's outside chosen[processed:]
+        # — fold it in too, or its pick vanishes silently.
         unrun = chosen[processed:]
+        if cancelled_cand is not None:
+            unrun = [cancelled_cand] + unrun
         if unrun:
             refold_cancelled_picks(unrun)
         job.summary = (f"Stopped early. {ok} downloaded, "
@@ -1212,6 +1261,16 @@ def execute_albums(job, chosen, token):
                  f"(some tracks failed); see the log.")
     if failed:
         job.error = f"{failed} of {plural(len(chosen), 'album')} didn't finish; see the log."
+    # #1: a whole-review download (every candidate ticked, nothing re-parked at
+    # approve) consumed the entire living review. Retire it so the saved-state
+    # rebuild doesn't resurrect the albums we just downloaded as "missing" on
+    # the next /library visit. Albums that FAILED are re-parked, ticked, so they
+    # come back to retry rather than silently vanishing until the next scan.
+    if getattr(job, "_consumed_whole_review", False):
+        if failed_cands:
+            _park_library_failures(failed_cands, token)
+        from qobuz_librarian.library import library_scan_state
+        library_scan_state.mark_review_retired(reason="worked_through")
 
 
 # ── Upgrade flow ──────────────────────────────────────────────────────────────

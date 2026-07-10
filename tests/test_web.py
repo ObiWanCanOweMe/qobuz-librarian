@@ -3185,6 +3185,97 @@ def test_cancel_folds_unrun_picks_back_into_the_review():
         _remove_job(parked)
 
 
+def test_cancel_mid_download_folds_the_in_flight_pick_too(monkeypatch):
+    """#4: a cancel that lands while an album is downloading must not lose that
+    album's pick. `processed` already points past the in-flight album, so the
+    un-started fold-back (chosen[processed:]) skips it — it has to be folded in
+    on its own or the pick vanishes silently."""
+    from qobuz_librarian.modes import process as process_mod
+    from qobuz_librarian.web import flows
+
+    parked = _inject_job(jm.JobStatus.AWAITING_REVIEW, "Library scan")
+    parked.execute_kind = "library"
+    running = _inject_job(jm.JobStatus.RUNNING, "Library scan")
+    running.execute_kind = "library"
+    running.add_candidate(kind="album", title="In Flight", artist="Abigail",
+                          payload={"album_id": "r1"}, selected=True)
+    running.add_candidate(kind="album", title="Never Started", artist="Abigail",
+                          payload={"album_id": "r2"}, selected=True)
+    chosen = list(running.candidates)
+    monkeypatch.setattr(flows.cfg, "ARTIST_API_DELAY", 0)
+    monkeypatch.setattr(flows, "get_album", lambda aid, _t: {"id": aid})
+    monkeypatch.setattr(flows, "clear_scan_caches", lambda: None)
+
+    def fake_process(_full, *_a, **_k):
+        # The first (and only reached) album is mid-download when the cancel lands.
+        running.cancel_requested = True
+        return {"result": "cancelled"}
+
+    monkeypatch.setattr(process_mod, "process_album", fake_process)
+    try:
+        flows.execute_albums(running, chosen, "tok")
+        by_title = {c["title"]: c for c in parked.candidates}
+        # Both the in-flight album AND the never-started one rejoin, ticked.
+        assert by_title.get("In Flight", {}).get("selected") is True
+        assert by_title.get("Never Started", {}).get("selected") is True
+    finally:
+        _remove_job(parked)
+        _remove_job(running)
+
+
+def test_whole_review_download_retires_and_reparks_failures(monkeypatch, tmp_path):
+    """#1: downloading an ENTIRE library review (every candidate ticked, nothing
+    re-parked at approve) must retire the worked-through review so the saved-state
+    rebuild doesn't resurrect the just-downloaded albums as 'missing'. Albums that
+    FAILED are re-parked, ticked, to retry — not silently dropped."""
+    from qobuz_librarian.library import library_scan_state as lss
+    from qobuz_librarian.modes import process as process_mod
+    from qobuz_librarian.web import flows
+
+    original = lss.load()
+    running = _inject_job(jm.JobStatus.RUNNING, "Library scan")
+    running.execute_kind = "library"
+    running._consumed_whole_review = True   # set by _split_and_approve at approve
+    running.add_candidate(kind="album", title="Downloaded OK", artist="Agalloch",
+                          payload={"album_id": "ok1"}, selected=True)
+    running.add_candidate(kind="album", title="Failed One", artist="Agalloch",
+                          payload={"album_id": "fail1"}, selected=True)
+    chosen = list(running.candidates)
+    monkeypatch.setattr(flows.cfg, "ARTIST_API_DELAY", 0)
+    monkeypatch.setattr(flows, "get_album", lambda aid, _t: {"id": aid})
+    monkeypatch.setattr(flows, "clear_scan_caches", lambda: None)
+    monkeypatch.setattr(flows, "_refresh_after_local_album_change",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(flows, "prune_library_review_candidates", lambda *a, **k: 0)
+
+    def fake_process(full, *_a, **_k):
+        if full["id"] == "fail1":
+            return {"result": "error", "imported": False, "n_ok": 0}
+        return {"imported": True, "n_ok": 1, "n_fail": 0, "result": "downloaded",
+                "dir": str(tmp_path)}
+
+    monkeypatch.setattr(process_mod, "process_album", fake_process)
+    parked = None
+    try:
+        flows.execute_albums(running, chosen, "tok")
+        # The worked-through review is retired → the rebuild won't resurrect it.
+        assert lss.load().get("review_retired_reason") == "worked_through"
+        # The failure is re-parked, ticked; the successful download is NOT.
+        reviews = [j for j in jm.registry.awaiting_review()
+                   if getattr(j, "execute_kind", "") == "library"
+                   and any((c.get("payload") or {}).get("album_id") == "fail1"
+                           for c in j.candidates)]
+        assert len(reviews) == 1
+        parked = reviews[0]
+        assert {c["title"]: c["selected"] for c in parked.candidates} == {
+            "Failed One": True}
+    finally:
+        lss._write_state(original)
+        _remove_job(running)
+        if parked is not None:
+            _remove_job(parked)
+
+
 def test_bulk_cancel_pending_never_touches_parked_reviews():
     """Guard for the 2026-07-02 dead-end: /queue/cancel-pending once swept
     parked AWAITING_REVIEW reviews (the operator's baseline library / upgrade /
