@@ -1078,6 +1078,18 @@ def scan_new_releases(job, token):
 
 # ── Execute ───────────────────────────────────────────────────────────────────
 
+def _note_staging_wait(job, phase, current, total):
+    """If a long staging-lock holder (a library-wide Lyrics scan) owns the mutex
+    right now, show that this job is waiting behind it. Without this the album
+    sits on RUNNING with no visible reason until the holder releases the lock;
+    the note is replaced by real progress the moment the lock is acquired."""
+    from qobuz_librarian.web.jobs import staging_holder
+    holder = staging_holder()
+    if holder:
+        job.push_progress(phase, current, total,
+                          f"waiting for {holder} to finish…", unit="album")
+
+
 def execute_albums(job, chosen, token):
     """Download each selected album via the normal process_album path."""
     from qobuz_librarian.modes.process import process_album
@@ -1113,6 +1125,7 @@ def execute_albums(job, chosen, token):
             log.info(f"  could not fetch album {album_id}: {e}")
             failed += 1
             continue
+        _note_staging_wait(job, "Downloading albums", i, len(chosen))
         try:
             with staging_lock():
                 result = process_album(full, args, allow_force=False,
@@ -1295,6 +1308,7 @@ def execute_upgrades(job, chosen, token):
             log.info(f"  album {album_id} is no longer on Qobuz; skipping.")
             failed += 1
             continue
+        _note_staging_wait(job, "Upgrading albums", i, len(chosen))
         try:
             with staging_lock():
                 result = process_album(album, args, allow_force=False,
@@ -1487,6 +1501,7 @@ def execute_downsamples(job, chosen, token=None, args=None):
                 review_badges.set_ready(
                     "downsample", _surface_has_candidates("downsample"))
             continue
+        _note_staging_wait(job, "Downsampling albums", i, len(chosen))
         try:
             with staging_lock():
                 res = downsample_dir(album_dir, verbose=True,
@@ -1851,6 +1866,7 @@ def execute_repairs(job, chosen, token):
         job.push_progress("Repairing damaged albums", i, len(chosen),
                           f"{p['artist_name']} — {cand['title']}", unit="album")
         log.info(f"[{i}/{len(chosen)}] {p['artist_name']} — {cand['title']}")
+        _note_staging_wait(job, "Repairing damaged albums", i, len(chosen))
         try:
             if cand.get("kind") == "redownload":
                 # _redownload_damaged_album takes the staging lock itself.
@@ -1930,16 +1946,20 @@ def run_lyric_retry(job):
     # Hold the staging lock: fetch_for_paths rewrites library FLACs in place, so
     # it must not run concurrently with the scan-lane downsample/repair/upgrade
     # work that mutates the same files (the documented file-mutation mutex).
-    from qobuz_librarian.web.jobs import staging_lock
+    from qobuz_librarian.web.jobs import set_staging_holder, staging_lock
     try:
         with staging_lock():
-            lyric_fetch.fetch_for_paths(
-                existing, log=log,
-                providers=cfg.LYRICS_PROVIDERS or None,
-                lyrics_format=cfg.LYRICS_FORMAT,
-                state_path=cfg.LYRIC_FETCH_STATE_FILE,
-                should_stop=lambda: job.cancel_requested,
-            )
+            set_staging_holder("Lyrics retry")
+            try:
+                lyric_fetch.fetch_for_paths(
+                    existing, log=log,
+                    providers=cfg.LYRICS_PROVIDERS or None,
+                    lyrics_format=cfg.LYRICS_FORMAT,
+                    state_path=cfg.LYRIC_FETCH_STATE_FILE,
+                    should_stop=lambda: job.cancel_requested,
+                )
+            finally:
+                set_staging_holder(None)
     except Exception as e:
         job.error = f"Lyric retry failed: {e}; manifest preserved."
         job.summary = "Lyric retry failed. Manifest preserved, will retry next time."
@@ -1975,10 +1995,14 @@ def run_library_lyrics(job, *, rescan=False, synced_only=False):
         log.info("Re-checking every track (ignoring saved state).")
     # Hold the staging lock: the engine rewrites library FLACs in place, which
     # must not race the scan-lane downsample/repair/upgrade work on the same tree.
-    from qobuz_librarian.web.jobs import staging_lock
+    from qobuz_librarian.web.jobs import set_staging_holder, staging_lock
     with staging_lock():
-        res = engine(rescan=rescan, synced_only=synced_only,
-                     should_stop=lambda: job.cancel_requested, log=log)
+        set_staging_holder("Lyrics scan")
+        try:
+            res = engine(rescan=rescan, synced_only=synced_only,
+                         should_stop=lambda: job.cancel_requested, log=log)
+        finally:
+            set_staging_holder(None)
 
     total = res.get("total", 0)
     if not total:

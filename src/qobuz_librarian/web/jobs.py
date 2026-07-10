@@ -675,6 +675,26 @@ def staging_lock():
     return _staging_lock
 
 
+# Human label for a long staging-lock hold — a library-wide Lyrics scan holds
+# the mutex for its whole (possibly hours-long) run, not per album. Set while
+# it owns the lock so a job blocked on it can tell the user what it's waiting
+# behind instead of sitting on RUNNING with no reason. Per-album holders leave
+# it None; they clear in well under a second.
+_staging_holder: Optional[str] = None
+_staging_holder_lock = threading.Lock()
+
+
+def set_staging_holder(label: Optional[str]) -> None:
+    global _staging_holder
+    with _staging_holder_lock:
+        _staging_holder = label or None
+
+
+def staging_holder() -> Optional[str]:
+    with _staging_holder_lock:
+        return _staging_holder
+
+
 def _friendly_job_error(exc, fallback: str) -> str:
     """Map common worker failures to a short user-facing summary.
 
