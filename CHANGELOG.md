@@ -2,6 +2,22 @@
 
 All notable changes to Qobuz Librarian are recorded here, newest first. The project follows [semantic versioning](https://semver.org/); dates are when each version was tagged during local development.
 
+## [0.10.3] - 2026-07-10
+
+Hardening from repeated independent audits of the whole app — mostly review-lifecycle fixes, plus clearer waiting states.
+
+- Downloading everything in the Library review no longer resurrects the same albums as "missing" on the next visit: a fully worked-through review retires, and anything that failed to download comes back ticked and ready to retry instead of vanishing until the next scan.
+- Failed downloads from a partial approve also fold back into the open review, ticked, rather than surviving only as an error line in a finished job.
+- The Library review survives restarts and discarded jobs: it rebuilds from the last scan's saved state, so the page can't end up saying the baseline is ready while showing nothing. A worked-through or discarded review now gets a proper finished page with the tabs still visible, a link to dismissed albums, and a "Bring all back" action.
+- New-release batches can no longer leak their albums into the Library review's fold-back paths — their results live and die with their own job.
+- The first downsample's keep-or-delete-originals answer now takes effect for the run that asked it. It previously could sit deferred behind the running job, and a "keep" choice risked being applied too late.
+- The downsample cap now follows the album itself (by release identity, not folder path), so moving or renaming a downsampled album no longer re-opens it as an upgrade candidate — which would have re-downloaded hi-res you deliberately shed.
+- Retrying a parked download review after fixing your Qobuz token in Settings now works without restarting the container; the retry no longer holds onto the dead token it was parked with.
+- Undo on a single-track download no longer hangs while a long job (a lyrics scan, a migration) is using the library — it tells you what's busy and to try again after.
+- A download waiting behind a library-wide lyrics scan or a migration now says what it's waiting for instead of sitting on "Running" with no explanation.
+- The terminal's `--check-new-releases` now applies the same guards as the web check: the catalogue-limit re-baseline, the singles-suppression setting, and the baseline merge behave identically in both.
+- Small fixes: the History tab heading, scan progress copy, and the dismissed-count on tab-scoped reviews read correctly; `AUTO_LIBRARY_SCAN` documentation now describes both things it controls.
+
 ## [0.10.2] - 2026-07-05
 
 Reliability and interface polish over 0.10.1.
