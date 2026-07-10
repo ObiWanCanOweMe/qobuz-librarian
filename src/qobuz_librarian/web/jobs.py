@@ -997,6 +997,11 @@ def finalize_review_if_empty(job: Job) -> bool:
         else:
             job.summary = "All albums reviewed. Dismissed items can be restored later."
     job_persistence.persist(job)
+    if job.execute_kind == "library":
+        # Worked through to empty — retire the baseline's review so the
+        # saved-state reconstruction doesn't rebuild it from stale scan state.
+        from qobuz_librarian.library import library_scan_state
+        library_scan_state.mark_review_retired(reason="worked_through")
     return True
 
 
@@ -1093,6 +1098,13 @@ def cancel_review(job: Job) -> bool:
         job.status = JobStatus.CANCELED
         job.finished_at = time.time()
     job_persistence.persist(job)
+    if job.execute_kind == "library":
+        # Discarded — retire the baseline's review so the saved-state
+        # reconstruction doesn't immediately rebuild what the user threw away.
+        # (A re-scan that supersedes a stale review advances the scan's
+        # updated_at past this, so its fresh review still shows.)
+        from qobuz_librarian.library import library_scan_state
+        library_scan_state.mark_review_retired(reason="discarded")
     job.end_stream()
     return True
 

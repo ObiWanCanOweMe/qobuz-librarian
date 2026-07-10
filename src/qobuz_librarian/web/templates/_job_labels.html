@@ -157,6 +157,8 @@
 {% macro discard_confirm(job) -%}
   {%- if job.execute_kind == 'migration' -%}
     Discard this migration preview? No files will be moved or copied.
+  {%- elif job.execute_kind == 'library' -%}
+    Discard this library review? Your ticks are cleared, but you can bring the whole review back from the Library page.
   {%- else -%}
     Discard this {{ discard_review_label(job) }}? Everything you've ticked is lost. A later scan lists these results again, unticked.
   {%- endif -%}

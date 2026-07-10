@@ -69,11 +69,6 @@
   <div class="ql-scan-status">
     <span class="ql-status-chip is-success">Baseline ready</span>
     <span class="ql-scan-status-meta">{% if last_full_scan %}Last full scan {{ last_full_scan }}{% else %}A full baseline has finished{% endif %}</span>
-    {% if hidden_count %}
-    <a href="/library/hidden" class="ql-inline-link ql-scan-status-link">
-      {{ hidden_count }} dismissed result{% if hidden_count != 1 %}s{% endif %}
-    </a>
-    {% endif %}
     <form action="/library" method="post" data-busy-submit>
       <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
       <input type="hidden" name="mode" value="new_releases">
@@ -88,6 +83,38 @@
     <p>{{ library_resume.done }} artist{{ 's' if library_resume.done != 1 }} already checked. Scan library continues from there.</p>
   </div>
   {% endif %}
+
+  {# Tabs are the Library IA — they stay visible with zero counts once the
+     review is worked through, so the page is never a bare "Baseline ready". #}
+  <nav class="ql-page-tabs ql-review-tabs" aria-label="Result type">
+    <button type="button" class="is-active" aria-current="true">Missing Albums <span class="ql-tab-count">0</span></button>
+    <button type="button">Gap Fill <span class="ql-tab-count">0</span></button>
+  </nav>
+
+  <section class="ql-scan-hero">
+    <svg class="ql-scan-hero-mark" viewBox="0 0 96 96" fill="none" aria-hidden="true">
+      <circle cx="48" cy="48" r="29" stroke="currentColor" stroke-opacity="0.5" stroke-width="2"/>
+      <path d="M35 49l9.5 9.5L62 39.5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    {% if library_review_retired_reason == 'discarded' %}
+    <p class="ql-scan-hero-title">Review discarded</p>
+    <p class="ql-scan-hero-text">You discarded this review. New music you add in the app is tracked automatically &mdash; you won&rsquo;t need to scan again unless you add albums outside it.</p>
+    {% else %}
+    <p class="ql-scan-hero-title">Review complete</p>
+    <p class="ql-scan-hero-text">Everything from your last scan has been reviewed. New music you add in the app is tracked automatically &mdash; you won&rsquo;t need to scan again unless you add albums outside it.</p>
+    {% endif %}
+    {% if hidden_count or library_review_retired_reason == 'discarded' %}
+    <div class="flex flex-wrap items-center justify-center gap-3 mt-4">
+      {% if hidden_count %}
+      <a href="/library/hidden" class="ql-btn ql-btn-secondary">View dismissed ({{ hidden_count }})</a>
+      {% endif %}
+      <form action="/library/bring-back-all" method="post" data-busy-submit style="margin-top:0">
+        <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+        <button type="submit" class="ql-btn ql-btn-ghost">Bring all back</button>
+      </form>
+    </div>
+    {% endif %}
+  </section>
 
   {% include "_census.html" %}
   {% endif %}

@@ -446,6 +446,75 @@ def _review_job_from_downsample_state(state):
         return job
 
 
+def _review_job_from_library_state():
+    """Rebuild the parked Library review from the saved baseline scan when no
+    live job holds the /library surface — so a review lost to a swept cancel, a
+    discarded scan job, or a corrupt persisted row on restart comes back
+    instead of stranding the user on 'Baseline ready' with no tabs. Mirrors the
+    Upgrade/Downsample saved-state reconstruction; the live job stays primary
+    (callers only reach here when _library_current_job() is None).
+
+    Returns the job, or None when there's nothing un-consumed to show — the
+    review was retired (worked through or discarded; see
+    library_scan_state.mark_review_retired) with no newer scan since, or every
+    saved candidate is now dismissed. Candidates already on disk are left in;
+    the approve path's drop_owned_missing_candidates skips them at download."""
+    from qobuz_librarian.library import hidden as hidden_mod
+    from qobuz_librarian.library import library_scan_state
+    from qobuz_librarian.web import flows
+
+    mstate = library_scan_state.kind_state("missing")
+    if not mstate.get("complete"):
+        return None
+    full = library_scan_state.load()
+    # Compare the retire marker against the MISSING kind's OWN last-save time,
+    # not the global stamp: save_kind() bumps the global updated_at for every
+    # kind it writes (a gap-fill / partial scan included), so a global compare
+    # let any unrelated save resurrect a review the user discarded. Only a
+    # fresh missing scan (newer mstate updated_at) should bring one back.
+    missing_updated = float(mstate.get("updated_at") or 0.0)
+    retired_at = float(full.get("review_retired_at") or 0.0)
+    if retired_at and retired_at >= missing_updated:
+        return None
+    hidden = hidden_mod.load()
+    specs = []
+    for name, entry in (mstate.get("artists") or {}).items():
+        for spec in (entry or {}).get("candidates") or []:
+            artist = spec.get("artist") or name
+            title = spec.get("title") or ""
+            if hidden_mod.is_hidden(
+                    hidden_mod.SCOPE_MISSING, artist, title, hidden):
+                continue
+            specs.append(spec)
+    if not specs:
+        return None
+    with _SAVED_REVIEW_LOCK:
+        existing = _library_current_job()  # re-check under the lock
+        if existing is not None:
+            return existing
+        job = job_mgr.Job(title="Library scan")
+        job.kind = "scan"
+        job.execute_kind = "library"
+        job._execute_fn = lambda j, chosen: flows.execute_albums(
+            j, chosen, _get_token())
+        for spec in specs:
+            job.add_candidate(
+                kind=spec.get("kind", "album"),
+                title=spec.get("title") or "?",
+                artist=spec.get("artist") or "",
+                detail=spec.get("detail") or "",
+                payload=spec.get("payload") or {},
+                selected=False,
+            )
+        job.status = job_mgr.JobStatus.AWAITING_REVIEW
+        n = len(job.candidates)
+        job.summary = (
+            f"{n:,} to review across Missing Albums and Gap Fill, "
+            "from your last library scan.")
+        job_mgr.registry.add(job)
+        return job
+
+
 # Names the persisted ``execute_kind`` strings so jobs survive a restart
 # even though their original execute closure is gone. Each factory is
 # called lazily, when the user actually approves the reloaded job, so
@@ -2677,6 +2746,10 @@ async def library_page(request: Request, page: int = 1):
         "last_full_scan": _last_scan_age(),
         "baseline_complete": new_releases.is_baseline_complete(),
         "hidden_count": hidden_mod.count(hidden_mod.SCOPE_MISSING),
+        # Why a finished review retired ("discarded" / "worked_through" / ""),
+        # so the finished-state card reads right. Filled in below only when the
+        # page is actually calm post-baseline with no live review.
+        "library_review_retired_reason": "",
         "JobStatus": job_mgr.JobStatus,
         # Drives the header's quiet refresh: hidden while a crawl is already
         # under way (the "Refreshing…" note takes its place over a parked
@@ -2688,6 +2761,13 @@ async def library_page(request: Request, page: int = 1):
     # review renders inline right here, so results never hide behind the
     # launcher and never live under the Queue nav.
     ljob = _library_current_job()
+    if ljob is None and ctx["baseline_complete"]:
+        # No live job holds the surface, but the baseline is complete — rebuild
+        # the parked review from saved scan state so post-baseline ALWAYS shows
+        # the Missing Albums / Gap Fill tabs, never "Baseline ready" with none.
+        # Off the loop: a large library builds thousands of candidate dicts.
+        loop = asyncio.get_running_loop()
+        ljob = await loop.run_in_executor(None, _review_job_from_library_state)
     ctx["library_job"] = ljob
     ctx["census"] = None
     if ljob is not None:
@@ -2699,6 +2779,13 @@ async def library_page(request: Request, page: int = 1):
         # nothing is running above.
         cp = scan_checkpoint.pending()
         ctx["library_resume"] = cp if cp is not None else None
+        # Finished-state copy: the "Review complete" vs "Review discarded" card
+        # keys off why the review retired. Only read post-baseline with no live
+        # review — the one place the finished state renders.
+        if ctx["baseline_complete"]:
+            from qobuz_librarian.library import library_scan_state
+            ctx["library_review_retired_reason"] = (
+                library_scan_state.load().get("review_retired_reason") or "")
     # The census renders whenever the page is calm — no job, or a parked
     # review below it — so it doesn't blink in and out with review state.
     if ctx["baseline_complete"] and (
@@ -2837,11 +2924,20 @@ async def _restore_hidden(request, scope, redirect):
         # time, so restore takes effect there on its own. The Library review
         # is a parked job — fold the restored candidates back in, or the
         # restore looks like a no-op until some future scan.
+        from qobuz_librarian.library import library_scan_state
         from qobuz_librarian.web import flows
         loop = asyncio.get_running_loop()
         rejoined = await loop.run_in_executor(
             None, lambda: flows.refold_restored_missing(artists, fingerprints))
-        if rejoined:
+        if rejoined is None:
+            # No live parked review to fold into. If one was retired, lift it so
+            # the restored items rebuild a usable review on the next /library
+            # load; otherwise they return on the next scan.
+            lifted = await loop.run_in_executor(
+                None, library_scan_state.clear_review_retired)
+            msg = ("Restored — back in the Library review." if lifted
+                   else "Restored. They return the next time the library scans.")
+        elif rejoined:
             msg = (f"Restored {rejoined} — back in the Library review."
                    if rejoined != 1 else "Restored — back in the Library review.")
         else:
@@ -2863,6 +2959,32 @@ async def library_hidden(request: Request):
 async def library_hidden_restore(request: Request):
     from qobuz_librarian.library import hidden as hidden_mod
     return await _restore_hidden(request, hidden_mod.SCOPE_MISSING, "/library/hidden")
+
+
+@app.post("/library/bring-back-all")
+async def library_bring_back_all(request: Request):
+    """Finished-state 'Bring all back': un-hide every dismissed missing/gap
+    album and lift a retired review, so the whole set returns. The /library
+    reload rebuilds the review from saved state (albums since downloaded are
+    dropped as owned), which is why nothing needs folding here — the finished
+    state is only reachable with no live review parked."""
+    busy = _lock_busy_response(request)
+    if busy is not None:
+        return busy
+    from qobuz_librarian.library import hidden as hidden_mod
+    from qobuz_librarian.library import library_scan_state
+    loop = asyncio.get_running_loop()
+
+    def _bring_back():
+        restored = hidden_mod.restore_all(hidden_mod.SCOPE_MISSING)
+        lifted = library_scan_state.clear_review_retired()
+        return restored or lifted
+
+    changed = await loop.run_in_executor(None, _bring_back)
+    msg = ("Brought your dismissed results back to the Library review."
+           if changed else "Nothing to bring back.")
+    return RedirectResponse(
+        url="/library?notice=" + urllib.parse.quote(msg), status_code=303)
 
 
 @app.get("/upgrade", response_class=HTMLResponse)
@@ -3313,17 +3435,23 @@ async def job_review_page(request: Request, job_id: str, page: int = 1,
     return _tr(request, "_review_page.html", ctx)
 
 
-def _split_off_inactive_tab(job, tab):
-    """Before a tab-scoped approve: move the tab the user ISN'T looking at into
-    its own parked review job, so downloading one tab never consumes the other
-    tab's un-reviewed candidates or their saved ticks. Returns the parked job,
-    or None when the inactive tab is empty (nothing to protect)."""
+def _split_off_unapproved(job, tab):
+    """Before approving a library review: move every candidate that ISN'T being
+    downloaded right now into its own parked review, so a partial download
+    consumes ONLY the ticked picks. Everything else stays in the living review —
+    the unticked candidates, plus (on a tab-scoped approve) the whole tab the
+    user isn't looking at, ticks and all. Without this the active tab's
+    unticked candidates rode into the DONE job and vanished, so ticking 10 of a
+    52k review and downloading wiped the other ~51,990. Returns the parked job,
+    or None when nothing is left to park (every candidate is being downloaded)."""
     from qobuz_librarian.web import flows, job_persistence
+    tab_scoped = tab in ("missing", "gaps")
     gap_active = tab == "gaps"
     with job._lock:
         keep, split = [], []
         for c in job.candidates:
-            (keep if flows.is_gap_candidate(c) == gap_active else split).append(c)
+            in_scope = (not tab_scoped) or (flows.is_gap_candidate(c) == gap_active)
+            (keep if (in_scope and c.get("selected")) else split).append(c)
         if not split:
             return None
         job.candidates = keep
@@ -3415,6 +3543,7 @@ async def job_approve(request: Request, job_id: str):
         choice = (form.get("keep_choice") or "").strip().lower()
         if choice in ("keep", "delete"):
             from qobuz_librarian.web import settings_store
+
             await loop.run_in_executor(
                 None, lambda: settings_store.save(
                     {"DOWNSAMPLE_KEEP_ORIGINALS": choice}))
@@ -3457,8 +3586,15 @@ async def job_approve(request: Request, job_id: str):
     # (freezing every SSE stream / other request) for a large parked review —
     # the same reason /select was offloaded.
     def _split_and_approve():
-        if tab and job.status == job_mgr.JobStatus.AWAITING_REVIEW:
-            _split_off_inactive_tab(job, tab)
+        # A library download consumes only the ticked picks: park everything
+        # else (unticked, plus the inactive tab on a tab-scoped approve) as its
+        # own living review first, so the download can't eat un-reviewed
+        # candidates. tab="" (older page / direct POST) still splits by
+        # selection, so the whole-review path is protected too. Other kinds keep
+        # their own recovery (Upgrade/Downsample rebuild from saved state).
+        if (job.execute_kind == "library"
+                and job.status == job_mgr.JobStatus.AWAITING_REVIEW):
+            _split_off_unapproved(job, tab)
         return job_mgr.approve(job, None)
 
     approved = await loop.run_in_executor(None, _split_and_approve)
@@ -3568,8 +3704,11 @@ def _review_origin(request) -> str:
 
 def _get_reviewable_job(job_id):
     """A job from the live registry, or rehydrated from disk if it has been
-    evicted — so a restored/archived awaiting-review job's selection and pager
-    keep working, not just the page render. Returns None if it's nowhere."""
+    evicted — so a restored awaiting-review job's selection and pager work, and
+    an evicted (terminal) job's review page still renders and pages. Ticks only
+    persist for a job still in the registry; persist_soon no-ops on a rehydrated
+    copy, but an evicted job is terminal and its review is read-only, so there's
+    nothing to save. Returns None if it's nowhere."""
     job = job_mgr.registry.get(job_id)
     if job is None:
         job = job_mgr.load_historical_job(job_id)

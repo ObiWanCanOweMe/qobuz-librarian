@@ -1963,7 +1963,7 @@ def test_dashboard_first_run_offers_baseline_scan_with_skip(client, monkeypatch)
 
     assert r.status_code == 200
     assert "Scan library" in r.text
-    assert "Scan once to refresh missing albums, Gap Fill candidates, upgrades, and downsample candidates." in r.text
+    assert "Builds the Missing Albums, Gap Fill, Upgrade, and Downsample reviews." in r.text
     assert 'action="/library/skip-setup"' in r.text and "Not now" in r.text
     # It's an offer, not an auto-started scan.
     assert "Your baseline scan is running" not in r.text
@@ -2664,8 +2664,9 @@ def test_filter_with_no_matches_says_so(client):
 
 
 def test_discard_confirm_names_the_lost_picks(client):
-    """The one guarded door in front of destroying the user's ticks must
-    say that's the stake — not reassure about files."""
+    """The one guarded door in front of clearing the user's ticks must name the
+    stake — not reassure about files. For a library review it also names the
+    real recovery path (Bring all back), which the finished Library page adds."""
     job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
     job.execute_kind = "library"
     job._execute_fn = lambda j, chosen: None
@@ -2673,8 +2674,8 @@ def test_discard_confirm_names_the_lost_picks(client):
                       payload={})
     try:
         r = client.get(f"/jobs/{job.id}")
-        assert ("Everything you&#39;ve ticked is lost" in r.text
-                or "Everything you've ticked is lost" in r.text)
+        assert "Your ticks are cleared" in r.text
+        assert "bring the whole review back" in r.text
         assert "Run the scan again to see these results later" not in r.text
     finally:
         _remove_job(job)
@@ -2959,8 +2960,9 @@ def test_tab_split_review_never_mints_colliding_cids():
     job.status = jm.JobStatus.AWAITING_REVIEW
     job.add_candidate("album", "Missing", "X", payload={})
     job.add_candidate("gap", "Gappy", "Y", payload={"gap_fill": True})
+    other = None
     try:
-        other = webapp._split_off_inactive_tab(job, "missing")
+        other = webapp._split_off_unapproved(job, "missing")
         assert other is not None
         other.add_candidate("gap", "New find", "Z", payload={"gap_fill": True})
         cids = [c["cid"] for c in other.candidates]
@@ -2969,6 +2971,199 @@ def test_tab_split_review_never_mints_colliding_cids():
         _remove_job(job)
         if other is not None:
             _remove_job(other)
+
+
+def test_library_download_parks_unselected_and_keeps_only_picks():
+    """F6/#48: approving a library review must download ONLY the ticked picks
+    and re-park everything else (unticked, plus the inactive tab) as a living
+    review — never let the download consume un-reviewed candidates."""
+    from qobuz_librarian.web import app as webapp
+
+    job = jm.Job(title="Library scan")
+    job.kind = "scan"
+    job.execute_kind = "library"
+    job.status = jm.JobStatus.AWAITING_REVIEW
+    job.add_candidate("album", "Picked", "X", payload={}, selected=True)
+    job.add_candidate("album", "Unpicked", "X", payload={}, selected=False)
+    job.add_candidate("gap", "OtherTab", "Y", payload={"gap_fill": True})
+    other = None
+    try:
+        # Missing tab active: only the ticked "Picked" downloads; the unticked
+        # missing album AND the whole Gap Fill tab stay parked.
+        other = webapp._split_off_unapproved(job, "missing")
+        assert other is not None
+        kept = {c["title"] for c in job.candidates}
+        parked = {c["title"] for c in other.candidates}
+        assert kept == {"Picked"}
+        assert parked == {"Unpicked", "OtherTab"}
+        assert other.status == jm.JobStatus.AWAITING_REVIEW
+        assert other.execute_kind == "library"
+    finally:
+        _remove_job(job)
+        if other is not None:
+            _remove_job(other)
+
+
+def test_library_review_rebuilds_from_saved_state_when_no_live_job():
+    """F1: with the baseline complete but no live library job (swept cancel,
+    discarded scan job, corrupt restart row), the Missing Albums / Gap Fill
+    review must rebuild from saved scan state — never 'Baseline ready' + no
+    tabs. Retiring the review (discard / worked-through) blocks the rebuild."""
+    from qobuz_librarian.library import library_scan_state
+    from qobuz_librarian.web import app as webapp
+
+    library_scan_state.save_kind("missing", artists={
+        "Agalloch": {"fingerprint": "fp", "artist_id": "a1", "catalog_ids": [],
+                     "candidates": [
+            {"kind": "album", "title": "The Mantle", "artist": "Agalloch",
+             "detail": "2002 · fully missing", "payload": {"album_id": "m1"}},
+            {"kind": "album", "title": "Ashes", "artist": "Agalloch",
+             "detail": "gap-fill: 2 missing",
+             "payload": {"album_id": "m2", "gap_fill": 2}},
+        ]},
+    }, complete=True)
+    job = None
+    try:
+        job = webapp._review_job_from_library_state()
+        assert job is not None
+        assert job.execute_kind == "library"
+        assert job.status == jm.JobStatus.AWAITING_REVIEW
+        assert {c["title"] for c in job.candidates} == {"The Mantle", "Ashes"}
+        assert all(not c["selected"] for c in job.candidates)
+        # Retire it (as a discard / empty would) → no rebuild from stale state.
+        _remove_job(job)
+        job = None
+        library_scan_state.mark_review_retired(now=time.time() + 60)
+        assert webapp._review_job_from_library_state() is None
+    finally:
+        library_scan_state.mark_review_retired(now=0)
+        library_scan_state.save_kind("missing", artists={}, complete=False)
+        if job is not None:
+            _remove_job(job)
+
+
+def test_partial_scan_does_not_resurrect_a_retired_library_review():
+    """#1: save_kind() bumps the GLOBAL updated_at for every kind it writes, so
+    a gap-fill / partial scan after a discard must not un-block the retired
+    Library review. The block keys off the missing kind's OWN stamp — a partial
+    save leaves that untouched, so the discarded review stays gone."""
+    from qobuz_librarian.library import library_scan_state as lss
+    from qobuz_librarian.web import app as webapp
+
+    original = lss.load()
+    try:
+        # missing scanned at t0, review discarded at t1 > t0, then a later
+        # gap-fill scan bumps the GLOBAL stamp to t2 > t1 (missing stays t0).
+        lss._write_state({
+            "version": lss.STATE_VERSION,
+            "updated_at": 3000.0,            # bumped by the gap-fill save
+            "review_retired_at": 2000.0,     # discard, after the missing scan
+            "kinds": {
+                "missing": {
+                    "updated_at": 1000.0,    # missing kind's own stamp
+                    "complete": True,
+                    "hidden_signature": "", "quality_signature": "",
+                    "artists": {"Agalloch": {
+                        "fingerprint": "fp", "artist_id": "a1",
+                        "catalog_ids": [], "candidates": [
+                            {"kind": "album", "title": "The Mantle",
+                             "artist": "Agalloch", "detail": "2002",
+                             "payload": {"album_id": "m1"}}]}},
+                },
+                "gaps": {"updated_at": 3000.0, "complete": True,
+                         "hidden_signature": "", "quality_signature": "",
+                         "artists": {}},
+            },
+        })
+        # Candidates are present, so a rebuild WOULD produce a job — proving the
+        # None is the retirement block holding, not an empty candidate list.
+        assert webapp._review_job_from_library_state() is None
+    finally:
+        lss._write_state(original)
+
+
+def test_bring_back_lifts_a_retired_library_review():
+    """#3 finished-state recovery: clear_review_retired lifts a discarded /
+    worked-through retirement so the saved-state review rebuilds — the backend
+    behind the Library page's 'Bring all back' and restore-from-finished."""
+    from qobuz_librarian.library import library_scan_state as lss
+    from qobuz_librarian.web import app as webapp
+
+    original = lss.load()
+    try:
+        lss.save_kind("missing", artists={
+            "Agalloch": {"fingerprint": "fp", "artist_id": "a1", "catalog_ids": [],
+                         "candidates": [
+                {"kind": "album", "title": "The Mantle", "artist": "Agalloch",
+                 "detail": "2002", "payload": {"album_id": "m1"}}]},
+        }, complete=True)
+        lss.mark_review_retired(now=time.time() + 60, reason="discarded")
+        assert webapp._review_job_from_library_state() is None
+
+        assert lss.clear_review_retired() is True
+        job = webapp._review_job_from_library_state()
+        assert job is not None
+        assert {c["title"] for c in job.candidates} == {"The Mantle"}
+        _remove_job(job)
+        # Idempotent — nothing left to lift once it's cleared.
+        assert lss.clear_review_retired() is False
+    finally:
+        lss._write_state(original)
+
+
+def test_cancel_folds_unrun_picks_back_into_the_review():
+    """#43: a library download cancelled mid-batch folds the picks it never
+    started back into the living review, ticked, instead of stranding them in
+    the dead job. The living review is the one #48 split off at approve."""
+    from qobuz_librarian.web import flows
+
+    parked = _inject_job(jm.JobStatus.AWAITING_REVIEW, "Library scan")
+    parked.execute_kind = "library"
+    parked.add_candidate(kind="album", title="Left Unticked", artist="Agalloch",
+                         payload={"album_id": "u1"}, selected=False)
+    try:
+        unrun = [
+            {"cid": "c9", "seq": 9, "kind": "album", "title": "Unrun One",
+             "artist": "Abigail", "detail": "", "payload": {"album_id": "r1"},
+             "selected": True},
+            {"cid": "c10", "seq": 10, "kind": "album", "title": "Unrun Two",
+             "artist": "Abigail", "detail": "", "payload": {"album_id": "r2"},
+             "selected": True},
+        ]
+        assert flows.refold_cancelled_picks(unrun) == 2
+        by_title = {c["title"]: c for c in parked.candidates}
+        assert {"Unrun One", "Unrun Two"} <= set(by_title)
+        # They rejoin ticked; the existing leftover is untouched.
+        assert by_title["Unrun One"]["selected"] is True
+        assert by_title["Unrun Two"]["selected"] is True
+        assert by_title["Left Unticked"]["selected"] is False
+    finally:
+        _remove_job(parked)
+
+
+def test_bulk_cancel_pending_never_touches_parked_reviews():
+    """Guard for the 2026-07-02 dead-end: /queue/cancel-pending once swept
+    parked AWAITING_REVIEW reviews (the operator's baseline library / upgrade /
+    downsample reviews) along with real queued jobs. The exemption must never
+    regress — a bulk clear can't take something the user can't see on the queue."""
+    from qobuz_librarian.web import app as webapp
+
+    review = jm.Job(title="Library scan")
+    review.execute_kind = "library"
+    review.status = jm.JobStatus.AWAITING_REVIEW
+    review.add_candidate("album", "Keep me", "X", payload={})
+    queued = jm.Job(title="Album", artist="A", album_id="q1")
+    queued.status = jm.JobStatus.PENDING
+    jm.registry.add(review)
+    jm.registry.add(queued)
+    try:
+        asyncio.run(webapp.queue_cancel_pending())
+        assert review.status == jm.JobStatus.AWAITING_REVIEW
+        assert len(review.candidates) == 1
+        assert queued.cancel_requested is True
+    finally:
+        _remove_job(review)
+        _remove_job(queued)
 
 
 def test_restart_interrupt_message_matches_the_retry_affordance(monkeypatch):

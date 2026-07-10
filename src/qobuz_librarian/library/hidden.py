@@ -229,6 +229,19 @@ def restore(scope, artists):
     return len(drop)
 
 
+def restore_all(scope):
+    """Un-hide every album dismissed in a scope at once (the Library page's
+    'Bring all back'). Returns the count removed."""
+    with _store_lock():
+        store = load()
+        bucket = store.get(scope) or {}
+        n = len(bucket)
+        if n:
+            store[scope] = {}
+            save(store)
+    return n
+
+
 def restore_albums(scope, fingerprints):
     """Un-hide specific albums by fingerprint — the same key is_hidden looks up.
 

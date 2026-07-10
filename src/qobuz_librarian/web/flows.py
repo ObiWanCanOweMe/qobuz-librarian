@@ -414,6 +414,34 @@ def refold_restored_missing(artists, fingerprints):
     return added
 
 
+def refold_cancelled_picks(unrun):
+    """Fold the picks a cancelled library download never reached back into the
+    living review, ticked — so a mid-batch cancel doesn't strand them in the
+    dead job (WebUIAudit #43). The living review is the split-off parked review
+    #48 left behind at approve; when the whole review was ticked there is none,
+    and the saved-state rebuild brings those picks back (unticked) on the next
+    /library visit instead. Returns how many rejoined, or None when there's no
+    parked review to fold into."""
+    from qobuz_librarian.web import job_persistence
+    from qobuz_librarian.web import jobs as job_mgr
+
+    parked = None
+    for j in job_mgr.registry.awaiting_review():
+        if getattr(j, "execute_kind", "") != "library":
+            continue
+        if parked is None or (j.created_at or 0) > (parked.created_at or 0):
+            parked = j
+    if parked is None:
+        return None
+    specs = [dict(c, selected=True) for c in unrun]
+    folded = fold_new_candidates(parked, specs)
+    if folded is None:
+        return None
+    job_persistence.persist(parked)
+    parked.notify_review_changed()
+    return folded[0]
+
+
 def prune_library_review_candidates(album):
     """A full album just landed on disk (Search download, batch download,
     upgrade replace): drop its candidates from every parked or still-scanning
@@ -908,7 +936,13 @@ def scan_library(job, token, partial_only=False, force_full=False):
             hidden_signature=hidden_sig,
             quality_sig=quality_sig,
         )
-        if library_complete:
+        # Publish Upgrade/Downsample from their OWN completeness, gated only on
+        # a complete catalog crawl — NOT on library_complete. library_complete
+        # additionally requires the missing/gap candidate list to have escaped
+        # the 100k cap; coupling the two here meant a huge missing-albums list
+        # silently suppressed the (independently-computed, complete) Upgrade and
+        # Downsample reviews.
+        if catalog_complete:
             if downsample_refresh.complete:
                 downsample_state.save(
                     downsample_refresh,
@@ -1158,6 +1192,12 @@ def execute_albums(job, chosen, token):
         time.sleep(cfg.ARTIST_API_DELAY)
     job._progress_scope = None
     if job.cancel_requested:
+        # #43: the picks this run never started aren't lost — fold them back
+        # into the living review, ticked, so a cancel mid-batch doesn't strand
+        # them in this dead job.
+        unrun = chosen[processed:]
+        if unrun:
+            refold_cancelled_picks(unrun)
         job.summary = (f"Stopped early. {ok} downloaded, "
                        f"{len(chosen) - processed} not started.")
         log.info(job.summary)

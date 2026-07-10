@@ -3,17 +3,34 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 import time
 
 from qobuz_librarian import config as cfg
 
 STATE_VERSION = 1
 
+# save_kind and mark_review_retired both read-modify-write the shared file;
+# serialise them so a scan's periodic save and a review retire (discard /
+# worked-through) can't clobber each other's field. Readers need no lock —
+# _write_state swaps the file in atomically.
+_lock = threading.Lock()
+
 
 def _empty_state():
     return {
         "version": STATE_VERSION,
         "updated_at": None,
+        # When the parked Library review derived from this snapshot was retired
+        # (discarded, or worked through to empty). The saved-state review
+        # reconstruction (web app) only rebuilds a review when a scan is newer
+        # than this — so a review the user deliberately finished doesn't
+        # resurrect, while a later scan's fresh review does.
+        "review_retired_at": 0.0,
+        # Why the review retired: "discarded" (thrown away in one action) or
+        # "worked_through" (dismissed/downloaded down to empty). The Library
+        # page shows different copy for each; "" when no review has retired.
+        "review_retired_reason": "",
         "kinds": {},
     }
 
@@ -59,6 +76,8 @@ def load():
     kinds = data.get("kinds") if isinstance(data.get("kinds"), dict) else {}
     base.update({
         "updated_at": data.get("updated_at"),
+        "review_retired_at": float(data.get("review_retired_at") or 0.0),
+        "review_retired_reason": str(data.get("review_retired_reason") or ""),
         "kinds": kinds,
     })
     return base
@@ -119,19 +138,51 @@ def _clean_artist_state(entry):
 
 def save_kind(kind: str, *, artists: dict, complete: bool,
               hidden_signature: str = "", quality_sig: str = ""):
-    data = load()
-    kinds = data.setdefault("kinds", {})
-    now = time.time()
-    kinds[kind] = {
-        "updated_at": now,
-        "complete": bool(complete),
-        "hidden_signature": str(hidden_signature or ""),
-        "quality_signature": str(quality_sig or ""),
-        "artists": {
-            str(name): _clean_artist_state(entry)
-            for name, entry in (artists or {}).items()
-        },
-    }
-    data["updated_at"] = now
-    data["version"] = STATE_VERSION
-    _write_state(data)
+    with _lock:
+        data = load()
+        kinds = data.setdefault("kinds", {})
+        now = time.time()
+        kinds[kind] = {
+            "updated_at": now,
+            "complete": bool(complete),
+            "hidden_signature": str(hidden_signature or ""),
+            "quality_signature": str(quality_sig or ""),
+            "artists": {
+                str(name): _clean_artist_state(entry)
+                for name, entry in (artists or {}).items()
+            },
+        }
+        data["updated_at"] = now
+        data["version"] = STATE_VERSION
+        _write_state(data)
+
+
+def mark_review_retired(now=None, reason: str = "") -> None:
+    """Record that the parked Library review from the current snapshot was
+    retired — ``reason`` is "discarded" (thrown away) or "worked_through"
+    (dismissed/downloaded to empty), driving the Library page's copy. The
+    saved-state review reconstruction won't rebuild a review from a snapshot
+    whose missing kind was last saved at or before this, so a finished review
+    doesn't come back; a fresh missing scan clears the block by construction."""
+    with _lock:
+        data = load()
+        data["review_retired_at"] = float(time.time() if now is None else now)
+        if reason:
+            data["review_retired_reason"] = reason
+        data["version"] = STATE_VERSION
+        _write_state(data)
+
+
+def clear_review_retired() -> bool:
+    """Lift a review retirement so the saved-state review rebuilds again — used
+    when the user brings dismissed results back from the finished Library page.
+    Returns True if a retirement was actually cleared (there was one to lift)."""
+    with _lock:
+        data = load()
+        if not float(data.get("review_retired_at") or 0.0):
+            return False
+        data["review_retired_at"] = 0.0
+        data["review_retired_reason"] = ""
+        data["version"] = STATE_VERSION
+        _write_state(data)
+        return True
