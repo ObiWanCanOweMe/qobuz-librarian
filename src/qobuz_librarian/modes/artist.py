@@ -465,7 +465,8 @@ def run_artist_gap_fill(artist_name, artist_dir, args, token, *,
     elif queue and pending_stop is None:
         # The executor deletes each item's chosen siblings itself once the fill
         # lands cleanly, so there's nothing to clean up here.
-        queue_results, drained = _execute_download_queue(queue, args, token)
+        queue_results, drained = _execute_download_queue(queue, args, token,
+                                                         refresh_review=True)
         results.extend(queue_results)
         if not drained:
             log.info(fmt(C.YELLOW,

@@ -635,7 +635,56 @@ def _sleep_unless_cancelled(seconds, cancel_check, step=0.5):
         time.sleep(min(step, remaining))
 
 
-def _execute_download_queue(queue, args, token, *, on_progress=None):
+def _refresh_review_state_after_downloads(results, token, args):
+    """Keep the saved Upgrade/Downsample review state fresh after a CLI download
+    batch. The WebUI reads that saved state, and WEBUI_SCAN_CONTRACT requires CLI
+    file changes to update it too — the web download path does the same via
+    flows._refresh_after_local_album_change. One re-scan per changed artist;
+    best-effort, so a refresh hiccup never fails a download that already landed."""
+    from pathlib import Path
+
+    changed = []
+    seen = set()
+    for r in results:
+        if not (r.get("imported") and r.get("n_ok", 0) > 0 and r.get("dir")):
+            continue
+        artist_dir = Path(r["dir"]).parent
+        if str(artist_dir) not in seen:
+            seen.add(str(artist_dir))
+            changed.append(artist_dir)
+    if not changed:
+        return
+    try:
+        from qobuz_librarian.library import downsample_state
+        from qobuz_librarian.library import hidden as hidden_mod
+        from qobuz_librarian.quality import upgrade_state
+        from qobuz_librarian.quality.decision import load_capped
+        from qobuz_librarian.web import review_badges
+    except Exception as e:
+        vlog(f"post-download review-state refresh unavailable: {e}")
+        return
+    hidden = hidden_mod.load()
+    capped = load_capped()
+    for artist_dir in changed:
+        try:
+            upgrade_state.update_artist(artist_dir, token=token, args=args,
+                                        capped=capped, hidden=hidden)
+            downsample_state.update_artist(artist_dir, hidden=hidden)
+        except Exception as e:
+            vlog(f"post-download review-state refresh failed for {artist_dir}: {e}")
+    try:
+        review_badges.set_ready(
+            "upgrade",
+            upgrade_state.has_visible_candidates(upgrade_state.load(), hidden))
+        review_badges.set_ready(
+            "downsample",
+            downsample_state.has_visible_candidates(downsample_state.load(), hidden))
+    except Exception as e:
+        vlog(f"post-download review-badge refresh failed: {e}")
+
+
+def _execute_download_queue(queue, args, token, *, on_progress=None,
+                            refresh_review=False):
     """Flush a batch of pre-confirmed download decisions, one album at a time.
 
     Each item runs through its own pipeline — download → downsample → lyrics →
@@ -1056,4 +1105,11 @@ def _execute_download_queue(queue, args, token, *, on_progress=None):
     # were short-circuited (and so still need a retry).
     if interrupted:
         raise KeyboardInterrupt
+    # Only the CLI batch callers (walk / artist / album / queue resume) refresh
+    # the saved review state — they change library files and nothing else keeps
+    # that state fresh. The web single-track and CLI repair callers must NOT:
+    # the web path already refreshes right after, under the same staging lock,
+    # and repair calls this per album in a loop (one artist re-scan per album).
+    if refresh_review:
+        _refresh_review_state_after_downloads(results, token, args)
     return results, not queue

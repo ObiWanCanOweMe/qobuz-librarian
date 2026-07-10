@@ -256,7 +256,8 @@ def run_album_walk_mode(args, token):
         log.info(fmt(C.CYAN,
             f"\n  ⟳  Flushing queue ({len(shared_queue)} album(s))…"))
         results, drained = _execute_download_queue(
-            shared_queue, args, token, on_progress=_save_now)
+            shared_queue, args, token, on_progress=_save_now,
+            refresh_review=True)
         if args.dry_run:
             return
         n_albums_filled += sum(1 for r in results
@@ -449,7 +450,8 @@ def run_walk_queued_mode(args, token):
         log.info(fmt(C.CYAN,
             f"\n  ⟳  Flushing queue ({len(shared_queue)} album(s))…"))
         results, drained = _execute_download_queue(
-            shared_queue, args, token, on_progress=_save_now)
+            shared_queue, args, token, on_progress=_save_now,
+            refresh_review=True)
         if not args.dry_run:
             if drained:
                 clear_pending_queue()

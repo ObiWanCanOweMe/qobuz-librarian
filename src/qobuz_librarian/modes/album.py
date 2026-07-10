@@ -191,7 +191,8 @@ def run_album_mode(args, token, *, query_args=None, loop=False):
         # and leaves the unfinished ones for a retry, so DON'T clear it — what
         # remains is exactly the work to re-offer. len() after the call is the
         # count still outstanding.
-        _, drained = _execute_download_queue(album_queue, args, token)
+        _, drained = _execute_download_queue(album_queue, args, token,
+                                             refresh_review=True)
         if not args.dry_run and not drained:
             log.info(fmt(C.YELLOW,
                 f"  ⚠  {len(album_queue)} album(s) couldn't be downloaded — "

@@ -172,7 +172,8 @@ def offer_resume_pending_queue(args, token):
                     save_pending_queue(items, mode=mode)
 
                 _, drained = _execute_download_queue(
-                    items, args, token, on_progress=_save_progress)
+                    items, args, token, on_progress=_save_progress,
+                    refresh_review=True)
                 if getattr(args, "dry_run", False):
                     pass  # preview only; leave the pending file untouched
                 elif drained:
