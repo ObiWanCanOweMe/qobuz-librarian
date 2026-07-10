@@ -6,9 +6,9 @@ the credential the way the streamrip token is persisted — an atomic 0600
 file in DATA_DIR.
 
 The session cookie carries a random per-login token, not a credential-derived
-secret. Tokens live in memory and are revoked on logout, on a password reset,
-and on restart — a restart logs every browser out, which is acceptable for a
-self-hosted app.
+secret. Token digests are persisted to disk (an atomic 0600 file in DATA_DIR)
+with an expiry and reloaded on restart, so a restart does not sign browsers
+out; a session ends on logout, on a password change, and when it expires.
 """
 import hashlib
 import json

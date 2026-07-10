@@ -451,9 +451,10 @@ NEW_RELEASE_CHECK_INTERVAL = _env("NEW_RELEASE_CHECK_INTERVAL", 86400)
 # surfaces old albums you don't own; this only narrows the new-release check.
 NEW_RELEASE_MAX_AGE_DAYS = _env("NEW_RELEASE_MAX_AGE_DAYS", 365)
 
-# Auto-start a library scan on first run — and resume an interrupted one — so the
-# new-release baseline gets established without the user remembering to scan. Off
-# disables only the automatic start; a manual library scan still seeds it.
+# Resume an interrupted library scan when the app is idle, driving it to
+# completion across restarts so the new-release baseline gets established
+# without the user re-triggering it. A FRESH first scan is never auto-started —
+# the dashboard offers it as a choice; Off disables the automatic resume.
 AUTO_LIBRARY_SCAN = _env_bool("AUTO_LIBRARY_SCAN", True)
 
 # Per-request budgets for the web UI's Qobuz API calls (album/search/track

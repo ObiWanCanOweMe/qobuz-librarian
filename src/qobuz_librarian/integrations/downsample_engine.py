@@ -52,6 +52,10 @@ def _fsync_quiet(path):
 HAVE_DOWNSAMPLE = (shutil.which("ffmpeg") is not None
                    and shutil.which("flac") is not None)
 
+# The container's music mount, used only as a fallback: every caller passes an
+# explicit base_dir (the album/staging dir), so this is never the live root. It
+# does NOT track cfg.MUSIC_ROOT (which defaults to ~/Music off-container), so a
+# bare-metal caller must pass base_dir rather than rely on this default.
 MUSIC_ROOT       = Path(os.environ.get("MUSIC_ROOT", "/music"))
 # 1024 is enough to clear large ID3v2 preambles on the rare track that has one.
 PROBE_BYTES      = 1024
