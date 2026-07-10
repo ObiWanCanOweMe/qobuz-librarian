@@ -3404,6 +3404,18 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
   color: var(--ql-gold);
   background-color: color-mix(in oklab, var(--ql-gold) 12%, transparent);
 }
+.ql-review-tabs-static button {
+  cursor: default;
+  color: var(--ql-text-2);
+}
+.ql-review-tabs-static button:hover,
+.ql-review-tabs-static button.is-active,
+.ql-review-tabs-static button.is-active:hover {
+  color: var(--ql-text);
+}
+.ql-review-tabs-static button:not(.is-active):hover {
+  color: var(--ql-text-2);
+}
 .ql-review-filter-row {
   margin-bottom: 0.75rem;
 }
