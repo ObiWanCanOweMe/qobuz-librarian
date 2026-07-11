@@ -133,3 +133,51 @@ def test_dir_caches_survive_a_concurrent_clear(monkeypatch, tmp_path):
     monkeypatch.setattr(scanner, "_ARTIST_SUBDIRS_CACHE", _LyingCache())
     assert scanner._has_audio_anywhere(artist) is False    # no KeyError
     assert [d.name for d in scanner._list_artist_subdirs_cached(artist)] == ["Album"]
+
+
+def test_transient_read_error_is_a_walk_error_not_untagged(monkeypatch, tmp_path):
+    """A file mutagen can't READ (EIO/EACCES) is not a file with no tags: the
+    filename fallback would blank its ISRC and quality — undercounting the
+    censuses that gate backup deletion — and a cached negative would keep the
+    identity blanked on every later scan until the file changes."""
+    from qobuz_librarian.library import flac_cache, scanner
+
+    album = tmp_path / "Album"
+    album.mkdir()
+    f = album / "01 - Song.flac"
+    f.write_bytes(b"x")
+
+    calls = {"n": 0}
+
+    class Boom:
+        def __call__(self, path, easy=True):
+            calls["n"] += 1
+            raise OSError(5, "EIO")
+
+    monkeypatch.setattr(scanner, "HAVE_MUTAGEN", True)
+    monkeypatch.setattr(scanner, "mutagen",
+                        type("M", (), {"File": staticmethod(Boom())}))
+    errs = []
+    tracks = scanner.read_album_dir(album, walk_errors=errs)
+    assert tracks == []          # dropped, not filename-fallback'd
+    assert errs                  # and the walk reports it
+
+    # Nothing was negative-cached: once the file reads again, its tags return.
+    assert flac_cache.get(f) is None
+
+    class Tags(dict):
+        pass
+
+    def good(path, easy=True):
+        info = type("I", (), {"bits_per_sample": 16, "sample_rate": 44100,
+                              "channels": 2, "length": 60.0})()
+        obj = type("F", (), {})()
+        obj.tags = {"title": ["Song"], "isrc": ["USAAA0000001"]}
+        obj.info = info
+        return obj
+
+    monkeypatch.setattr(scanner, "mutagen", type("M", (), {"File": staticmethod(good)}))
+    errs2 = []
+    tracks2 = scanner.read_album_dir(album, walk_errors=errs2)
+    assert not errs2
+    assert [t["isrc"] for t in tracks2] == ["USAAA0000001"]

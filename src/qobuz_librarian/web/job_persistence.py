@@ -334,13 +334,20 @@ def history_count(bulk: Optional[bool] = None) -> int:
 
 
 def history_page(limit: int, offset: int,
-                 bulk: Optional[bool] = None) -> list[dict]:
+                 bulk: Optional[bool] = None,
+                 status: Optional[str] = None) -> list[dict]:
     """A page of finished jobs, newest first — the browsable record behind the
     History view. Lighter than ``load_all`` (no candidates/args): just what a
     history row shows, plus the id to open the full job. The ``id`` tiebreaker
     keeps paging stable when finish times collide. ``bulk`` narrows to the
-    card layer (True), the downloads table (False), or everything (None)."""
+    card layer (True), the downloads table (False), or everything (None).
+    ``status`` narrows in SQL — a caller filtering the returned page itself
+    would silently lose older matching rows whenever the newest ``limit``
+    rows are mostly other statuses."""
     clause, params = _kind_clause(bulk)
+    if status:
+        clause += "AND status = ? "
+        params = (*params, status)
     with _lock:
         conn = _get_conn()
         if conn is None:

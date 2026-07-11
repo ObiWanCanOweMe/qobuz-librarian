@@ -241,12 +241,15 @@
       <span>Settings</span>
     </a>
     <details class="ql-mobile-drawer ql-tab-more">
-      <summary class="ql-tab {% if page in ('upgrade', 'downsample', 'repair', 'lyrics') %}is-active{% endif %} list-none" role="button" aria-label="More" aria-haspopup="menu">
+      {# Disclosure button for a navigation drawer, NOT aria-haspopup="menu":
+         the sheet holds ordinary links, and announcing a menu promises
+         menuitem roles + arrow-key behavior it doesn't have. #}
+      <summary class="ql-tab {% if page in ('upgrade', 'downsample', 'repair', 'lyrics') %}is-active{% endif %} list-none" role="button" aria-label="More" aria-controls="mobile-menu" aria-expanded="false">
         <svg class="ql-nav-icon-stroke" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/></svg>
         <span>More</span>
         {% if nav_review_badges.get('upgrade') or nav_review_badges.get('downsample') or nav_review_badges.get('repair') %}<span class="ql-tab-dot" aria-hidden="true"></span>{% endif %}
       </summary>
-      <div id="mobile-menu" class="ql-sheet" role="menu" aria-label="More destinations">
+      <div id="mobile-menu" class="ql-sheet">
         <div class="ql-sheet-head">
           <span>More</span>
           <button type="button" class="ql-icon-button" data-close-mobile-menu aria-label="Close">

@@ -46,12 +46,20 @@ def _empty_kind():
 
 
 def quality_signature() -> str:
-    """The quality policy the saved candidates were computed under. When it
-    differs from the current settings, a refresh must re-derive Upgrade and
-    Downsample candidates even for unchanged folders — the cheap skip would
-    otherwise carry forward promises made under a dead policy."""
+    """Every setting the saved candidates were computed under. When it differs
+    from the current settings, a refresh must re-derive candidates even for
+    unchanged folders — the cheap skip would otherwise carry forward promises
+    made under a dead policy. Not just the quality pair: single-track-gap
+    suppression, the catalogue limit, the missing-album track minimum, and
+    live-album exclusion all change WHICH candidates a scan yields, so leaving
+    any of them out keeps stale gap/missing lists after Settings says the
+    policy changed."""
     return (f"{getattr(cfg, 'STREAMRIP_QUALITY', '')}"
-            f"|{bool(getattr(cfg, 'PREFER_HIRES', False))}")
+            f"|{bool(getattr(cfg, 'PREFER_HIRES', False))}"
+            f"|{bool(getattr(cfg, 'SUPPRESS_SINGLE_TRACK_GAPS', False))}"
+            f"|{getattr(cfg, 'ARTIST_CATALOG_LIMIT', '')}"
+            f"|{getattr(cfg, 'MISSING_ALBUMS_MIN_TRACKS', '')}"
+            f"|{bool(getattr(cfg, 'EXCLUDE_LIVE_ALBUMS', False))}")
 
 
 def hidden_signature(store, scope: str) -> str:

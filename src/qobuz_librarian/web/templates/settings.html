@@ -207,6 +207,26 @@
         <code>docker compose exec qobuz-librarian qobuz-librarian</code>
       </div>
     </details>
+    {% if lock_unenforceable %}
+    <div class="ql-mode-row">
+      <div class="min-w-0">
+        {% if lock_override %}
+        <p class="ql-mode-state">Running without the safety lock</p>
+        <p class="ql-mode-help">The data folder can't hold the single-writer lock. You chose to proceed anyway; this lasts until the next restart. Don't run a second copy (CLI or another container) against this library.</p>
+        {% else %}
+        <p class="ql-mode-state">Safety lock unavailable — downloads paused</p>
+        <p class="ql-mode-help">The data folder can't hold the single-writer lock (read-only, or a mount without file locking), so two runs could write the library at once unnoticed. If nothing else runs Qobuz Librarian against this library, you can proceed without it until the next restart.</p>
+        {% endif %}
+      </div>
+      {% if not lock_override %}
+      <form action="/settings/mode" method="post" class="w-full sm:ml-auto sm:w-auto">
+        <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+        <input type="hidden" name="target" value="nolock">
+        <button type="submit" class="ql-btn ql-btn-secondary ql-secondary-action w-full sm:w-auto">Proceed without the lock</button>
+      </form>
+      {% endif %}
+    </div>
+    {% endif %}
     {% if cli_mode %}
     <div class="ql-mode-row">
       <div class="min-w-0">

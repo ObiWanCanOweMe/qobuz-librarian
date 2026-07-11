@@ -1,4 +1,5 @@
 """Tests for queue/builder.py and queue/persistence.py."""
+import errno
 import json
 from argparse import Namespace
 from datetime import datetime, timezone
@@ -217,7 +218,7 @@ def test_executor_self_heal_retry_no_files_keeps_first_download_state(
     monkeypatch.setattr(executor, "staging_preflight", lambda _a: None)
     monkeypatch.setattr(executor, "snapshot_staging", lambda: set())
     monkeypatch.setattr(executor, "is_cancel_requested", lambda: False)
-    monkeypatch.setattr(executor, "_reimport_parked_albums", lambda: False)
+    monkeypatch.setattr(executor, "_reimport_parked_albums", lambda: (False, []))
     monkeypatch.setattr(executor, "_run_pre_import_hooks_for_dirs",
                         lambda _d, _a: ([], 0))
     monkeypatch.setattr(executor, "track_signatures_for_album_dirs",
@@ -501,7 +502,7 @@ def test_reimport_parked_albums_clears_moved_and_keeps_skipped(monkeypatch, tmp_
         return "ok"  # exit 0 either way — the disk, not this, decides cleanup
     monkeypatch.setattr(executor, "beets_import_albums", fake_import)
 
-    assert executor._reimport_parked_albums() is True
+    assert executor._reimport_parked_albums()[0] is True
     assert not good.exists()           # audio moved out → parking dir cleared
     assert skipped.exists()            # files remain → kept parked, not deleted
     assert skipped_flac.exists()       # the only copy of the skipped track survives
@@ -531,7 +532,7 @@ def test_reimport_parked_albums_preserves_non_audio_companions(monkeypatch, tmp_
         return "ok"
     monkeypatch.setattr(executor, "beets_import_albums", fake_import)
 
-    assert executor._reimport_parked_albums() is True
+    assert executor._reimport_parked_albums()[0] is True
     assert not parked.exists()                       # husk cleared
     rescued = data / "import_leftovers" / "20260101_000000-grp" / "Some Album" / "booklet.pdf"
     assert rescued.exists()                          # booklet rescued, not deleted
@@ -551,7 +552,7 @@ def test_queue_runs_post_download_truncation_recheck_on_success(monkeypatch, tmp
 
     rechecked = []
     monkeypatch.setattr(executor, "staging_preflight", lambda args: None)
-    monkeypatch.setattr(executor, "_reimport_parked_albums", lambda: False)
+    monkeypatch.setattr(executor, "_reimport_parked_albums", lambda: (False, []))
     monkeypatch.setattr(executor, "snapshot_staging", lambda: set())
     monkeypatch.setattr(executor, "is_cancel_requested", lambda: False)
     monkeypatch.setattr(executor, "_download_for_queue_item",
@@ -596,3 +597,216 @@ def test_cooldown_sleep_wakes_on_cancel():
     start = _t.monotonic()
     assert executor._sleep_unless_cancelled(0.1, lambda: False, step=0.02) is False
     assert _t.monotonic() - start >= 0.1
+
+
+def test_executor_gap_fill_backup_survives_partial_beets_move(monkeypatch, tmp_path):
+    """A clean download whose beets import moved only PART of the album into
+    the library must not delete the gap-fill backup: the present tracks it
+    holds aren't provably back until the folder holds the whole album
+    (mirrors the expected-count gate in process.py)."""
+    from qobuz_librarian.library import backup as bkmod
+    from qobuz_librarian.queue import executor
+
+    album_dir = tmp_path / "music" / "Artist" / "Album"
+    album_dir.mkdir(parents=True)
+    monkeypatch.setattr("qobuz_librarian.config.UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    owned = album_dir / "01 - owned.flac"
+    owned.write_bytes(b"the-owned-original")
+    gfb = bkmod.backup_gap_fill_files([str(owned)], album_dir)
+    assert gfb is not None and not owned.exists()
+    # beets exited 0 and moved one fresh track in, leaving the rest in staging
+    # — the album is 2 tracks on Qobuz but only 1 landed.
+    (album_dir / "02 - fresh.flac").write_bytes(b"\x00" * 1000)
+
+    monkeypatch.setattr(executor, "find_album_dir_filesystem", lambda _a: album_dir)
+    monkeypatch.setattr(executor, "cleanup_duplicate_art", lambda _d: 0)
+
+    item = {
+        "album": {"id": "A", "artist": {"name": "Artist"},
+                  "tracks": {"items": [{"id": 1}, {"id": 2}]}},
+        "album_dir": album_dir,
+        "backup_path": None,
+        "gap_fill_backup_path": gfb,
+        "siblings_to_delete": [],
+        "n_ok": 2, "n_fail": 0, "n_lossy": 0,
+        "auto_upgrade": False,
+    }
+    args = Namespace(migrate_multi_artist=False, no_import=False, consolidate=False)
+    executor._resolve_queue_item(item, args, imported_globally=True)
+
+    assert gfb.exists()
+    assert (gfb / "01 - owned.flac").read_bytes() == b"the-owned-original"
+
+
+def test_executor_gap_fill_backup_kept_when_extras_satisfy_the_count(monkeypatch, tmp_path):
+    """The resolved folder holds ENOUGH audio files, but an expected track is
+    still absent — extras make up the number. A raw file count reads that as
+    whole and deletes the gap-fill backup, the moved-aside track's only copy;
+    the gate has to match every expected track one-to-one."""
+    from qobuz_librarian.library import backup as bkmod
+    from qobuz_librarian.queue import executor
+
+    album_dir = tmp_path / "music" / "Artist" / "Album"
+    album_dir.mkdir(parents=True)
+    monkeypatch.setattr("qobuz_librarian.config.UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    owned = album_dir / "01 - Alpha.flac"
+    owned.write_bytes(b"the-owned-original")
+    gfb = bkmod.backup_gap_fill_files([str(owned)], album_dir)
+    assert gfb is not None and not owned.exists()
+    # Two audio files land — the expected count (2) is satisfied — but the
+    # moved-aside "Alpha" never came back; a bonus file makes up the number.
+    (album_dir / "02 - Beta.flac").write_bytes(b"\x00" * 1000)
+    (album_dir / "09 - Bonus.flac").write_bytes(b"\x00" * 1000)
+
+    monkeypatch.setattr(executor, "find_album_dir_filesystem", lambda _a: album_dir)
+    monkeypatch.setattr(executor, "cleanup_duplicate_art", lambda _d: 0)
+
+    item = {
+        "album": {"id": "A", "artist": {"name": "Artist"},
+                  "tracks": {"items": [{"id": 1, "title": "Alpha"},
+                                       {"id": 2, "title": "Beta"}]}},
+        "album_dir": album_dir,
+        "backup_path": None,
+        "gap_fill_backup_path": gfb,
+        "siblings_to_delete": [],
+        "n_ok": 2, "n_fail": 0, "n_lossy": 0,
+        "auto_upgrade": False,
+    }
+    args = Namespace(migrate_multi_artist=False, no_import=False, consolidate=False)
+    executor._resolve_queue_item(item, args, imported_globally=True)
+
+    assert gfb.exists()
+    assert (gfb / "01 - Alpha.flac").read_bytes() == b"the-owned-original"
+
+
+def test_reimport_keeps_husk_when_companion_move_fails(monkeypatch, tmp_path):
+    """beets moved a parked album's audio out, but its booklet can't be moved
+    to the leftovers dir — the husk (and the group) must survive, because the
+    recursive delete would take down exactly the file the move failed on."""
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.queue import executor
+
+    staging = tmp_path / "staging"
+    retry = staging / cfg.BEETS_RETRY_DIR / "Group"
+    husk = retry / "Album"
+    husk.mkdir(parents=True)
+    booklet = husk / "booklet.pdf"
+    booklet.write_bytes(b"the-only-booklet")
+    monkeypatch.setattr(cfg, "STAGING_DIR", staging)
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path / "data")
+
+    monkeypatch.setattr(executor, "_import_album_with_retry", lambda dirs: True)
+    monkeypatch.setattr(executor, "track_signatures_for_album_dirs", lambda _d: [])
+    monkeypatch.setattr(executor, "find_album_dir_by_track_signatures", lambda _s: None)
+
+    def _refused(*_a, **_k):
+        raise OSError(errno.EACCES, "Permission denied")
+    monkeypatch.setattr(executor.shutil, "move", _refused)
+
+    executor._reimport_parked_albums()
+
+    assert booklet.exists()
+    assert booklet.read_bytes() == b"the-only-booklet"
+
+
+def test_executor_upgrade_backup_kept_when_companion_carry_fails(monkeypatch, tmp_path):
+    """A verified upgrade whose booklet/scan copy-out fails must keep the
+    backup — deleting it would take the only copy of the companions with it."""
+    from qobuz_librarian.queue import executor
+
+    album_dir = tmp_path / "music" / "Artist" / "Album"
+    album_dir.mkdir(parents=True)
+    (album_dir / "01 - new.flac").write_bytes(b"\x00" * 1000)
+    bp = tmp_path / "backups" / "Artist - Album.upgrade"
+    bp.mkdir(parents=True)
+    (bp / "01 - old.flac").write_bytes(b"old-audio")
+    (bp / "booklet.pdf").write_bytes(b"the-only-booklet")
+
+    monkeypatch.setattr("qobuz_librarian.config.UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    monkeypatch.setattr(executor, "find_album_dir_filesystem", lambda _a: album_dir)
+    monkeypatch.setattr(executor, "cleanup_duplicate_art", lambda _d: 0)
+    monkeypatch.setattr("qobuz_librarian.modes.process._upgrade_replacement_verified",
+                        lambda *_a, **_k: True)
+    monkeypatch.setattr("qobuz_librarian.modes.process.find_album_dir_filesystem",
+                        lambda _a: album_dir)
+
+    def _no_space(*_a, **_k):
+        raise OSError(errno.ENOSPC, "No space left on device")
+    monkeypatch.setattr("shutil.copy2", _no_space)
+
+    item = {
+        "album": {"id": "A", "artist": {"name": "Artist"}, "tracks": {"items": []}},
+        "album_dir": album_dir,
+        "backup_path": bp,
+        "gap_fill_backup_path": None,
+        "siblings_to_delete": [],
+        "n_ok": 1, "n_fail": 0, "n_lossy": 0,
+        "auto_upgrade": True,
+    }
+    args = Namespace(migrate_multi_artist=False, no_import=False, consolidate=False)
+    executor._resolve_queue_item(item, args, imported_globally=True)
+
+    assert bp.exists()
+    assert (bp / "booklet.pdf").read_bytes() == b"the-only-booklet"
+
+
+def test_parked_cleanup_distrusts_a_partial_walk(monkeypatch, tmp_path):
+    """An unreadable subtree can hide audio or the only companion; the husk
+    delete that follows these answers must treat "couldn't see everything" as
+    "something may remain"."""
+    from qobuz_librarian.queue import executor
+
+    d = tmp_path / "parked"
+    d.mkdir()
+
+    def partial(root, errors=None):
+        if errors is not None:
+            errors.append(OSError("subdir: EIO"))
+        return iter(())
+
+    monkeypatch.setattr(executor, "iter_tree_no_symlinks", partial)
+    assert executor._dir_has_audio(d) is True
+    assert executor._parked_companions(d) is None
+
+
+def test_executor_keeps_siblings_unless_the_filled_folder_is_whole(monkeypatch, tmp_path):
+    """The user picked a canonical folder from a duplicate group; the others
+    are deleted only "on successful fill". beets reports success when it moved
+    ANY audio, so a partial import with clean download flags must not delete a
+    sibling — it may hold the only copy of what's missing."""
+    from qobuz_librarian.queue import executor
+
+    album_dir = tmp_path / "music" / "Artist" / "Album"
+    album_dir.mkdir(parents=True)
+    sibling = tmp_path / "music" / "Artist" / "Album (Deluxe)"
+    sibling.mkdir(parents=True)
+    (sibling / "02 - Beta.flac").write_bytes(b"the-only-copy")
+    # Only one of the two expected tracks actually landed in the folder.
+    (album_dir / "01 - Alpha.flac").write_bytes(b"\x00" * 1000)
+
+    monkeypatch.setattr(executor, "find_album_dir_filesystem", lambda _a: album_dir)
+    monkeypatch.setattr(executor, "cleanup_duplicate_art", lambda _d: 0)
+
+    def item():
+        return {
+            "album": {"id": "A", "artist": {"name": "Artist"},
+                      "tracks": {"items": [{"id": 1, "title": "Alpha"},
+                                           {"id": 2, "title": "Beta"}]}},
+            "album_dir": album_dir,
+            "backup_path": None,
+            "gap_fill_backup_path": None,
+            "siblings_to_delete": [sibling],
+            "n_ok": 2, "n_fail": 0, "n_lossy": 0,
+            "auto_upgrade": False,
+        }
+
+    args = Namespace(migrate_multi_artist=False, no_import=False, consolidate=False)
+    executor._resolve_queue_item(item(), args, imported_globally=True)
+    assert sibling.exists()
+    assert (sibling / "02 - Beta.flac").read_bytes() == b"the-only-copy"
+
+    # Once the folder verifiably holds every expected track, the promised
+    # deletion goes through.
+    (album_dir / "02 - Beta.flac").write_bytes(b"\x00" * 1000)
+    executor._resolve_queue_item(item(), args, imported_globally=True)
+    assert not sibling.exists()

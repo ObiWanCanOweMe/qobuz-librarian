@@ -142,6 +142,42 @@ def test_full_album_backs_up_present_tracks_before_rip(monkeypatch, tmp_path):
     assert any(f.read_bytes() == b"the-owned-original" for f in bp.rglob("*"))
 
 
+def test_same_title_twin_failure_stays_failed(monkeypatch, tmp_path):
+    """Two requested tracks share a bare title; one rips clean, one fails.
+    The landed file accounts for the SUCCESS — it must not also clear the
+    twin's failure (or suppress its retry), because that false all-clean
+    reaches the executor and authorizes sibling/backup deletion while a
+    track is genuinely missing."""
+    tracks = [{"id": 1, "title": "Song", "track_number": 1},
+              {"id": 2, "title": "Song", "track_number": 2}]
+    landed = tmp_path / "01 - Song.flac"
+    retried = []
+
+    def rip(url, **_k):
+        if "track/1" in url:
+            landed.write_bytes(b"x")
+            return (0, "")
+        retried.append(url)
+        return (1, "boom")
+
+    _patch(monkeypatch, rip=rip,
+           added=lambda s: [p for p in (landed,) if p.exists() and p not in s],
+           cleanup=lambda f: (list(f), [], []))
+    monkeypatch.setattr(dl, "snapshot_staging",
+                        lambda: {p for p in (landed,) if p.exists()})
+
+    r = dl.run_album_download(album=_album(tracks), missing=tracks, present=[],
+                              album_dir=None, snapshot=set(),
+                              force_track_by_track=True)
+
+    # The failed twin was retried (not skipped because its sibling's file
+    # exists), and its failure survives the on-disk reconcile.
+    assert len(retried) == 2            # the first attempt plus one hard retry
+    assert r["n_ok"] == 1
+    assert r["n_fail"] == 1
+    assert r["failed_tracks"] == ["Song"]
+
+
 def test_snapshot_staging_skips_the_beets_retry_tree(monkeypatch, tmp_path):
     """The retry-park tree (.beets_retry/) can hold hundreds of files from a
     long-running session, so snapshot_staging + files_added_since must skip it
@@ -167,3 +203,23 @@ def test_snapshot_staging_skips_the_beets_retry_tree(monkeypatch, tmp_path):
     (staging / ".beets_retry" / "ParkedArt" / "ParkedAlbum" / "2.flac").write_bytes(b"y")
     added = {str(p.relative_to(staging)) for p in rip.files_added_since(snap)}
     assert added == {"Artist/Album/2.flac"}
+
+
+def test_recovered_twin_clears_one_reject_not_both(tmp_path):
+    """Two same-titled twins were rejected; the retry recovered ONE file. A
+    set-membership drop would clear both twins off that one recovery, so the
+    other vanishes from the retry and failure accounting and the run reads
+    clean while a track never landed."""
+    from collections import Counter
+
+    from qobuz_librarian.download import (
+        _drop_recovered_rejects,
+        match_key_from_stem,
+    )
+
+    twin_a = tmp_path / "03 - Song.flac"
+    twin_b = tmp_path / "03 - Song (1).flac"
+    recovered = Counter({match_key_from_stem(twin_a): 1})
+
+    remains = _drop_recovered_rejects([twin_a, twin_b], recovered)
+    assert len(remains) == 1

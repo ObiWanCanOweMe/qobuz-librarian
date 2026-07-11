@@ -206,7 +206,7 @@ def parse_args():
                    help="Run artist mode on NAME (skips interactive menu)")
     p.add_argument("--upgrade-walk", action="store_true",
                    help="Review saved Library upgrade candidates. Per-artist "
-                        "confirm (enter=yes), auto-advance.")
+                        "confirm (enter=skip), auto-advance.")
     p.add_argument("--downsample-walk", action="store_true",
                    help="Scan the library for hi-res files and downsample them "
                         "to CD rate in place (per-artist confirm; --dry-run lists "

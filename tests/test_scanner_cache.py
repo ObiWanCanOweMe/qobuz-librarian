@@ -27,3 +27,31 @@ def test_census_buckets_tiers_and_reclaims_only_true_hires(tmp_path, monkeypatch
     assert c["reclaim_bytes"] == 500 + 1500      # only rates above their target
     assert c["top_hires_artists"][0] == ("B", 2500)
     flac_cache._reset_for_tests()
+
+
+def test_walk_error_does_not_cache_dir_as_audioless(tmp_path, monkeypatch):
+    # A transient scandir failure is consumed by os.walk's error callback, so
+    # the shortened walk finds nothing — that must not be cached as "contains
+    # no audio" or the artist vanishes from the whole scan.
+    from qobuz_librarian.library import scanner
+
+    scanner._HAS_AUDIO_CACHE.clear()
+    (tmp_path / "Album").mkdir()
+    (tmp_path / "Album" / "01.flac").write_bytes(b"x")
+
+    calls = {"n": 0}
+    real_walk = scanner.os.walk
+
+    def flaky_walk(root, followlinks=False, onerror=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            if onerror is not None:
+                onerror(OSError("transient EIO"))
+            return iter(())
+        return real_walk(root, followlinks=followlinks, onerror=onerror)
+
+    monkeypatch.setattr(scanner.os, "walk", flaky_walk)
+    # The degraded walk answers False for this call but must not poison the cache.
+    assert scanner._has_audio_anywhere(tmp_path) is False
+    # The next walk succeeds and must see the audio again.
+    assert scanner._has_audio_anywhere(tmp_path) is True

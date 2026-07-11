@@ -2238,7 +2238,7 @@ def test_retry_rebuilds_archived_failed_download(client, monkeypatch):
                                  "artist": {"name": "Portishead"},
                                  "tracks": {"items": []}})
     monkeypatch.setattr(webapp, "_make_download_run",
-                        lambda album, token: lambda j: None)
+                        lambda album, token, treat_as_new=False: lambda j: None)
 
     r = client.post(f"/jobs/{archived.id}/retry", follow_redirects=False)
 
@@ -2247,6 +2247,47 @@ def test_retry_rebuilds_archived_failed_download(client, monkeypatch):
     assert new_id and new_id != archived.id
     new_job = jm.registry.get(new_id)
     assert new_job is not None and new_job.album_id == "al1"
+    _remove_job(new_job)
+
+
+def test_retry_keeps_the_new_edition_override(client, monkeypatch):
+    # "Download this edition anyway" lives on the job (execute_args), not just
+    # in the run closure — a retried edition download that lost the flag would
+    # hit the owned-album skip and quietly do nothing.
+    from qobuz_librarian.web import app as webapp
+    from qobuz_librarian.web import job_persistence
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+
+    archived = jm.Job(title="Dummy", artist="Portishead", album_id="al1")
+    archived.execute_args = {"new_edition": True}
+    archived.status = jm.JobStatus.FAILED
+    archived.finished_at = time.time() - 10
+    job_persistence.persist(archived)
+
+    monkeypatch.setattr(webapp, "_get_token", lambda: "tok")
+    monkeypatch.setattr(
+        "qobuz_librarian.api.search.get_album",
+        lambda album_id, token: {"title": "Dummy",
+                                 "artist": {"name": "Portishead"},
+                                 "tracks": {"items": []}})
+    seen = {}
+
+    def fake_run(album, token, *, treat_as_new=False):
+        seen["treat_as_new"] = treat_as_new
+        return lambda j: None
+    monkeypatch.setattr(webapp, "_make_download_run", fake_run)
+
+    r = client.post(f"/jobs/{archived.id}/retry", follow_redirects=False)
+
+    assert r.status_code == 303
+    assert seen.get("treat_as_new") is True
+    new_id = r.headers["location"].removeprefix("/jobs/")
+    new_job = jm.registry.get(new_id)
+    assert new_job is not None
+    assert (new_job.execute_args or {}).get("new_edition") is True
     _remove_job(new_job)
 
 
@@ -4379,3 +4420,215 @@ def test_note_quality_shortfall_flags_the_running_job():
         jm._TLS.current_job = None
     assert job.attention == "quality"
     assert jm._queue_executor.on_quality_shortfall is jm.note_quality_shortfall
+
+
+def test_new_release_approve_parks_the_unticked_remnant(client, monkeypatch):
+    """A new release stays in the New Releases review until it's downloaded or
+    dismissed: approving 1 of 2 must park the other as its own new-release
+    review, not consume it (the persistent baseline already recorded it, so
+    nothing else would ever offer it again)."""
+    from qobuz_librarian.web import app as webapp
+
+    monkeypatch.setattr(webapp, "_qobuz_ready", lambda: True)
+    job = jm.Job(title="New-release check")
+    job.execute_kind = "new_releases"
+    job.status = jm.JobStatus.AWAITING_REVIEW
+    job.add_candidate("album", "Wanted", "X", payload={"album_id": "a1"},
+                      selected=True)
+    job.add_candidate("album", "Later", "X", payload={"album_id": "a2"},
+                      selected=False)
+    job._execute_fn = lambda j, chosen: None
+    jm.registry.add(job)
+    remnant = None
+    try:
+        r = client.post(f"/jobs/{job.id}/approve", data={"tab": ""},
+                        follow_redirects=False)
+        assert r.status_code == 303
+        assert {c["title"] for c in job.candidates} == {"Wanted"}
+        remnant = next(
+            (j for j in jm.registry.awaiting_review()
+             if j.id != job.id and j.execute_kind == "new_releases"), None)
+        assert remnant is not None
+        assert {c["title"] for c in remnant.candidates} == {"Later"}
+    finally:
+        _remove_job(job)
+        if remnant is not None:
+            _remove_job(remnant)
+
+
+def test_failed_new_release_pick_returns_to_a_new_release_review():
+    """A failed new-release download wasn't downloaded — it folds back into
+    the parked New Releases review (or re-parks a fresh one), ticked, instead
+    of being consumed with the dead job. It must never land in a Library
+    review."""
+    from qobuz_librarian.web import flows
+
+    parked = jm.Job(title="New-release check")
+    parked.execute_kind = "new_releases"
+    parked.status = jm.JobStatus.AWAITING_REVIEW
+    parked.add_candidate("album", "Untouched", "X",
+                         payload={"album_id": "a1"}, selected=False)
+    jm.registry.add(parked)
+    library = jm.Job(title="Library scan")
+    library.kind = "scan"
+    library.execute_kind = "library"
+    library.status = jm.JobStatus.AWAITING_REVIEW
+    library.add_candidate("album", "LibThing", "Y", payload={"album_id": "L1"})
+    jm.registry.add(library)
+    try:
+        flows._return_new_release_picks(
+            [{"kind": "album", "title": "Failed NR", "artist": "X",
+              "detail": "", "payload": {"album_id": "a2"}}])
+        titles = {c["title"] for c in parked.candidates}
+        assert titles == {"Untouched", "Failed NR"}
+        failed = next(c for c in parked.candidates if c["title"] == "Failed NR")
+        assert failed["selected"] is True
+        assert {c["title"] for c in library.candidates} == {"LibThing"}
+    finally:
+        _remove_job(parked)
+        _remove_job(library)
+
+
+def test_partial_import_folds_an_instant_gap_fill_candidate():
+    """An album that lands with some tracks failed becomes a Gap Fill
+    candidate in the living Library review immediately — unticked, honest
+    detail — instead of waiting for the next manual refresh."""
+    from qobuz_librarian.web import flows
+
+    parked = jm.Job(title="Library scan")
+    parked.kind = "scan"
+    parked.execute_kind = "library"
+    parked.status = jm.JobStatus.AWAITING_REVIEW
+    parked.add_candidate("album", "Existing", "Y", payload={"album_id": "L1"})
+    jm.registry.add(parked)
+    try:
+        flows._fold_partial_gap_fill(
+            {"id": "a9", "title": "Short Album", "tracks_count": 10},
+            "Artist", 3)
+        gap = next(c for c in parked.candidates
+                   if c["title"] == "Short Album")
+        assert gap["selected"] is False
+        assert (gap.get("payload") or {}).get("gap_fill") == 3
+        assert "gap-fill: 3 missing of 10" in (gap.get("detail") or "")
+    finally:
+        _remove_job(parked)
+
+
+def test_partial_new_release_download_returns_to_the_nr_review(monkeypatch):
+    """A New Releases download that lands only partly isn't downloaded — the
+    release goes back to the New Releases review (ticked, like a failure), and
+    its remainder must NOT leak into the Library review as Gap Fill."""
+    from qobuz_librarian.modes import process as process_mod
+    from qobuz_librarian.web import flows
+
+    parked_nr = _inject_job(jm.JobStatus.AWAITING_REVIEW, "New-release check")
+    parked_nr.execute_kind = "new_releases"
+    parked_lib = _inject_job(jm.JobStatus.AWAITING_REVIEW, "Library scan")
+    parked_lib.execute_kind = "library"
+    running = _inject_job(jm.JobStatus.RUNNING, "New-release check")
+    running.execute_kind = "new_releases"
+    running.add_candidate(kind="album", title="Fresh Drop", artist="Abigail",
+                          payload={"album_id": "nr1"}, selected=True)
+    chosen = list(running.candidates)
+    monkeypatch.setattr(flows.cfg, "ARTIST_API_DELAY", 0)
+    monkeypatch.setattr(flows, "get_album",
+                        lambda aid, _t: {"id": aid, "title": "Fresh Drop",
+                                         "tracks_count": 10})
+    monkeypatch.setattr(flows, "clear_scan_caches", lambda: None)
+    monkeypatch.setattr(flows, "_refresh_after_local_album_change",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(process_mod, "process_album",
+                        lambda *_a, **_k: {"imported": True, "n_ok": 7,
+                                           "n_fail": 3, "result": "downloaded"})
+    try:
+        flows.execute_albums(running, chosen, "tok")
+        titles = {c["title"] for c in parked_nr.candidates}
+        assert "Fresh Drop" in titles
+        back = next(c for c in parked_nr.candidates if c["title"] == "Fresh Drop")
+        assert back["selected"] is True
+        assert parked_lib.candidates == []
+    finally:
+        _remove_job(parked_nr)
+        _remove_job(parked_lib)
+        _remove_job(running)
+
+
+def test_dismiss_honours_a_tick_saved_during_the_store_write(monkeypatch):
+    """dismiss_albums writes the durable store outside the job lock; a tick
+    landing in that window was promised "keep the ticked ones". The row must
+    survive AND its just-written dismissal must be taken back out of the
+    store."""
+    from qobuz_librarian.library import hidden as hidden_mod
+    from qobuz_librarian.web import flows
+
+    job = _inject_job(jm.JobStatus.AWAITING_REVIEW, "Library scan")
+    job.execute_kind = "library"
+    job.add_candidate(kind="album", title="Kept", artist="Abigail",
+                      payload={"album_id": "k1", "year": 2020}, selected=False)
+    cand = job.candidates[0]
+    restored = []
+
+    def hide_and_race(scope, specs):
+        # The user's tick lands while the store write is in flight.
+        cand["selected"] = True
+        return len(list(specs))
+
+    monkeypatch.setattr(hidden_mod, "hide", hide_and_race)
+    monkeypatch.setattr(hidden_mod, "restore_albums",
+                        lambda scope, fps: restored.extend(fps))
+    try:
+        n = flows.dismiss_albums(job, "Abigail")
+        assert n == 0
+        assert [c["title"] for c in job.candidates] == ["Kept"]
+        assert job.candidates[0]["selected"] is True
+        assert restored == [hidden_mod.album_fingerprint("Abigail", "Kept")]
+    finally:
+        _remove_job(job)
+
+
+def test_new_edition_download_folds_onto_an_identical_running_job():
+    """"Get this edition too" deliberately skips the owned-album fold, but two
+    identical new-edition submits are the same tap twice — the second folds
+    onto the in-flight job instead of queueing a concurrent duplicate."""
+    from qobuz_librarian.web import app as web_app
+
+    running = _inject_job(jm.JobStatus.RUNNING, "Album — edition")
+    running.album_id = "ALB9"
+    running.execute_args = {"new_edition": True}
+    other = _inject_job(jm.JobStatus.RUNNING, "Other — edition")
+    other.album_id = "OTHER"
+    other.execute_args = {"new_edition": True}
+    try:
+        assert web_app._duplicate_download_job("ALB9", "", True) is running
+        assert web_app._duplicate_download_job("UNSEEN", "", True) is None
+    finally:
+        _remove_job(running)
+        _remove_job(other)
+
+
+def test_approve_rechecks_the_write_pause_after_awaits(client, monkeypatch):
+    """set_mode('cli') can land between approve's opening gate and the enqueue
+    (form parsing and disk probes await in between); the not-yet-approved
+    review is invisible to the handoff's active-job check, so only a recheck
+    right before consuming the review can see the pause."""
+    from qobuz_librarian.web import app as webapp
+    from qobuz_librarian.web import jobs as job_mgr
+
+    job = job_mgr.Job(title="Library migration")
+    job.execute_kind = "migration"
+    job.status = job_mgr.JobStatus.AWAITING_REVIEW
+    job._execute_fn = lambda j, chosen: None
+    job.add_candidate("album", "A", "Artist", payload={"id": 1})
+    job.candidates[0]["selected"] = True
+    job_mgr.registry.add(job)
+
+    # Simulate losing the race: the opening gate already passed, then the
+    # CLI handoff flipped the mode before the enqueue.
+    monkeypatch.setattr(webapp, "_lock_busy_response", lambda req: None)
+    monkeypatch.setattr(webapp, "_CLI_MODE", True)
+
+    r = client.post(f"/jobs/{job.id}/approve", follow_redirects=False)
+
+    assert r.status_code in (200, 303, 503)
+    assert job.status == job_mgr.JobStatus.AWAITING_REVIEW
+    assert any(c.get("selected") for c in job.candidates)

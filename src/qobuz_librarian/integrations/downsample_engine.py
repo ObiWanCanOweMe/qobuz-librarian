@@ -500,10 +500,25 @@ def resample_one(rel, sr, rate, af_filter, *, base_dir=None):
             os.chmod(str(tmp), src_mode)
         except OSError:
             pass
-        _fsync_quiet(tmp)
+        # The swap overwrites the only lossless master, so a flush that
+        # genuinely fails (ENOSPC/EIO — not a mount that can't fsync) must
+        # refuse the replace: the encode may exist only in the page cache.
+        from qobuz_librarian.library.backup import _fsync
+        if not _fsync(tmp):
+            return (rel, sr, rate, None,
+                    "resampled copy couldn't be flushed to disk; "
+                    "left the original untouched")
         os.replace(str(tmp), str(src))
         tmp = None
-        _fsync_quiet(src.parent)
+        # The encode itself was flushed above, so rename atomicity leaves a
+        # valid file either way — but a directory flush that genuinely fails
+        # means the swap may quietly revert on a crash while the run reports
+        # it done. Nothing here can be undone; say so instead of staying quiet.
+        from qobuz_librarian.library.backup import _fsync
+        if not _fsync(src.parent):
+            return (rel, sr, rate, in_size - out_size,
+                    "resampled, but the folder couldn't be flushed to disk — "
+                    "the swap may not survive a power loss; check the drive")
         return (rel, sr, rate, in_size - out_size, None)
     except subprocess.TimeoutExpired:
         return (rel, sr, rate, None,
@@ -544,7 +559,7 @@ def sweep_stale_encodes(directory):
 
 
 def downsample_dir(directory, *, verbose=True, base_dir=None, log=print,
-                   keep_originals=False):
+                   keep_originals=False, cancel_check=None):
     """Resample any high-sample-rate FLACs inside `directory` (recursive).
 
     Probes each file's sample rate, resamples the ones above CD rate, and
@@ -556,6 +571,12 @@ def downsample_dir(directory, *, verbose=True, base_dir=None, log=print,
     before its rewrite, so the run can be undone until the retention sweep. A
     file whose copy can't be made is left untouched (counted as an error) —
     the mode's promise is that nothing is rewritten without its safety copy.
+
+    cancel_check: optional callable polled as each encode finishes. Once it
+    returns True, not-yet-started encodes are discarded and the run returns
+    after the in-flight ones complete — each finished encode's swap is atomic,
+    so stopping between tracks is always safe, and a Stop pressed mid-album
+    no longer waits for every remaining track.
 
     Returns dict: {"resampled": int, "errors": int, "saved_bytes": int}.
     Never raises; on bad input returns zero counts.
@@ -589,6 +610,14 @@ def downsample_dir(directory, *, verbose=True, base_dir=None, log=print,
     if verbose:
         log(f"  ⇳ downsample: {len(candidates)} file(s) in {directory.name}")
 
+    # A Stop can land while this album waits its turn for the staging lock;
+    # the poll below only runs as encodes finish, so without an entry check
+    # the album would start rewriting the moment the lock arrives. Nothing
+    # has been touched yet — report a clean cancel before even stashing.
+    if cancel_check is not None and cancel_check():
+        return {"resampled": 0, "errors": 0, "saved_bytes": 0,
+                "cancelled": True}
+
     n_uncopied = 0
     if keep_originals:
         from qobuz_librarian.library.backup import stash_downsample_originals
@@ -609,25 +638,69 @@ def downsample_dir(directory, *, verbose=True, base_dir=None, log=print,
     saved_total = 0
     errors = 0
     resampled = 0
+    flush_warnings = 0
+
+    cancelled = False
+    tallied = set()
+
+    def _tally(fut):
+        nonlocal errors, resampled, saved_total, flush_warnings
+        tallied.add(fut)
+        rel, _sr, _rate, saved, err = fut.result()
+        if err is not None and saved is not None:
+            # The rewrite finished — only the directory flush failed, so the
+            # file on disk IS the resampled copy. Counting it as untouched
+            # would leave the album unmarked as capped and the tally claiming
+            # nothing changed while the lossless master is already gone.
+            resampled += 1
+            saved_total += saved
+            flush_warnings += 1
+            if verbose:
+                log(f"  ⚠ {Path(rel).name}: {err}")
+        elif err is not None:
+            errors += 1
+            if verbose:
+                log(f"  ✗ {Path(rel).name}: {err}")
+        else:
+            resampled += 1
+            saved_total += saved
 
     with ThreadPoolExecutor(max_workers=RESAMPLE_WORKERS) as ex:
         futs = {ex.submit(resample_one, rel, sr, rate, af_filter, base_dir=_bd): rel
                 for rel, sr, rate in candidates}
         try:
             for fut in as_completed(futs):
-                rel, sr, rate, saved, err = fut.result()
-                if err is not None:
-                    errors += 1
+                _tally(fut)
+                if (cancel_check is not None and not cancelled
+                        and cancel_check()):
+                    # Must BREAK here, not keep iterating: futures cancelled
+                    # by shutdown(cancel_futures=True) never notify
+                    # as_completed's waiters (no worker ever dequeues them),
+                    # so the iterator would wait on them forever. The context
+                    # exit below waits out the in-flight encodes; they're
+                    # tallied after the block so the counts reflect disk state.
+                    cancelled = True
+                    ex.shutdown(wait=False, cancel_futures=True)
                     if verbose:
-                        log(f"  ✗ {Path(rel).name}: {err}")
-                else:
-                    resampled += 1
-                    saved_total += saved
+                        log("  ⏹ downsample: stop requested — finishing the "
+                            "in-flight track(s), discarding the rest")
+                    break
         except KeyboardInterrupt:
             # Stop promptly: discard not-yet-started encodes instead of letting
             # the context manager block on shutdown(wait=True) for the whole queue.
             ex.shutdown(wait=False, cancel_futures=True)
             raise
+    if cancelled:
+        for fut in futs:
+            if fut not in tallied and fut.done() and not fut.cancelled():
+                _tally(fut)
+        if all(f.done() and not f.cancelled() for f in futs):
+            # The stop arrived after the final track had already finished —
+            # every candidate was processed and tallied, nothing was cut
+            # short. Reporting "cancelled" here would leave the album
+            # uncounted and uncapped, so a fully-downsampled album would be
+            # offered all over again.
+            cancelled = False
 
     if verbose and resampled:
         log(f"  ✓ downsample: {resampled} resampled, "
@@ -635,4 +708,6 @@ def downsample_dir(directory, *, verbose=True, base_dir=None, log=print,
 
     return {"resampled": resampled,
             "errors": errors + n_uncopied,
-            "saved_bytes": saved_total}
+            "saved_bytes": saved_total,
+            "flush_warnings": flush_warnings,
+            "cancelled": cancelled}

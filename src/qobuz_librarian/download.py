@@ -11,6 +11,7 @@ the caller's finally/except when a rip raises AuthLost or hits a full disk.
 import re
 import shutil
 import time
+from collections import Counter
 
 from qobuz_librarian import config as cfg
 from qobuz_librarian.api.auth import (
@@ -53,6 +54,34 @@ def match_key_from_stem(p):
 
 def _bare_title(title):
     return normalize(strip_edition_suffix(title or ""))
+
+
+def _title_surplus(kept, attempted_titles, failed_titles):
+    """Clean files on disk per bare title beyond what that title's successful
+    rips already account for. Only this surplus may vouch for a failed track:
+    with two requested tracks both titled "Song", the one file the successful
+    rip landed must not double as proof that the failed twin arrived too."""
+    disk = Counter(match_key_from_stem(p) for p in kept)
+    ok = Counter(attempted_titles) - Counter(failed_titles)
+    return {ttl: disk.get(ttl, 0) - ok.get(ttl, 0)
+            for ttl in set(disk) | set(ok)}
+
+
+def _drop_recovered_rejects(bucket, recovered_ctr):
+    """Remove rejected files a retry recovered — one per recovered file, not
+    per title. A set-membership drop would clear BOTH same-title twins off one
+    recovery, so the other twin disappears from the retry and failure
+    accounting and the run reads clean while a track never landed. Mutates
+    ``recovered_ctr`` so a recovery consumed against lossy can't also clear a
+    broken twin."""
+    remains = []
+    for d in bucket:
+        k = match_key_from_stem(d)
+        if recovered_ctr.get(k, 0) > 0:
+            recovered_ctr[k] -= 1
+        else:
+            remains.append(d)
+    return remains
 
 
 def run_album_download(*, album, missing, present, album_dir, snapshot,
@@ -98,6 +127,13 @@ def run_album_download(*, album, missing, present, album_dir, snapshot,
     t_start = time.time()
     n_fail = 0
     failed_tracks = []
+    # Per-track bookkeeping kept as objects and counts, not just titles: two
+    # requested tracks can share one bare title (same-titled remixes, a track
+    # on two discs), and on-disk stems only give the title back — so every
+    # "did it land" comparison below has to work in multiplicities, or one
+    # twin's file vouches for the other twin's failure.
+    failed_track_objs = []
+    attempted_titles = []
     full_album_rc = None
     rate_limited = False
 
@@ -188,6 +224,7 @@ def run_album_download(*, album, missing, present, album_dir, snapshot,
             log.info(fmt(C.BLUE, f"\n  [{i}/{len(missing)}]") +
                      f"  {fmt(C.WHITE, truncate(tnum_prefix + ttl, 60))}")
             report_progress("Downloading", i, len(missing), ttl)
+            attempted_titles.append(_bare_title(t.get("title")))
             rc, out = rip_url(f"https://play.qobuz.com/track/{tid}",
                               timeout=cfg.RIP_TIMEOUT, quality=quality)
             if detect_auth_lost(out):
@@ -207,6 +244,7 @@ def run_album_download(*, album, missing, present, album_dir, snapshot,
                 # display-augmented "Title (Version)" would never match and a
                 # track that actually landed could never be un-failed.
                 failed_tracks.append(t.get("title") or "?")
+                failed_track_objs.append(t)
                 if "KeyError: 'body'" in out:
                     log.info(fmt(C.RED,
                         "    ✗ streamrip KeyError on track endpoint "
@@ -238,9 +276,16 @@ def run_album_download(*, album, missing, present, album_dir, snapshot,
     # Skipped once a cancel is in flight so we don't fire rips the user stopped.
     discarded = lossy + broken
     if discarded and missing and not is_cancel_requested():
-        discarded_norms = {match_key_from_stem(d) for d in discarded}
-        retry_targets = [t for t in missing
-                         if _bare_title(t.get("title")) in discarded_norms]
+        # Cap retries per bare title at the number of files actually discarded
+        # with that title: same-titled twins would otherwise BOTH re-download
+        # when only one landed lossy, duplicating the clean one in staging.
+        discarded_ctr = Counter(match_key_from_stem(d) for d in discarded)
+        retry_targets = []
+        for t in missing:
+            ttl = _bare_title(t.get("title"))
+            if discarded_ctr.get(ttl, 0) > 0:
+                discarded_ctr[ttl] -= 1
+                retry_targets.append(t)
         if retry_targets:
             log.info(fmt(C.GRAY,
                 f"  ↻  Retrying {len(retry_targets)} lossy/incomplete "
@@ -263,9 +308,10 @@ def run_album_download(*, album, missing, present, album_dir, snapshot,
             if retry_kept:
                 # Recovered tracks move to ok; drop them from whichever reject
                 # bucket they were in so the summary doesn't re-list them.
-                recovered = {match_key_from_stem(p) for p in retry_kept}
-                lossy = [d for d in lossy if match_key_from_stem(d) not in recovered]
-                broken = [d for d in broken if match_key_from_stem(d) not in recovered]
+                recovered_ctr = Counter(match_key_from_stem(p)
+                                        for p in retry_kept)
+                lossy = _drop_recovered_rejects(lossy, recovered_ctr)
+                broken = _drop_recovered_rejects(broken, recovered_ctr)
                 kept = kept + retry_kept
                 n_ok = len(kept)
                 log.info(fmt(C.GREEN,
@@ -279,12 +325,19 @@ def run_album_download(*, album, missing, present, album_dir, snapshot,
     # reconcile below un-fails anything this lands. Skipped on a cancel, and only
     # for tracks that still have no clean file on disk.
     if failed_tracks and missing and not is_cancel_requested():
-        kept_norms = {match_key_from_stem(p) for p in kept}
-        failed_norms = {_bare_title(ft) for ft in failed_tracks}
-        hard_targets = [t for t in missing
-                        if t.get("id")
-                        and _bare_title(t.get("title")) in failed_norms
-                        and _bare_title(t.get("title")) not in kept_norms]
+        # Retry the exact tracks that failed, skipping one per surplus file —
+        # a set-membership check let one twin's landed file suppress the other
+        # twin's retry (and retried every twin when only one had failed).
+        surplus = _title_surplus(kept, attempted_titles,
+                                 [_bare_title(ft) for ft in failed_tracks])
+        hard_targets = []
+        for t in failed_track_objs:
+            ttl = _bare_title(t.get("title"))
+            if surplus.get(ttl, 0) > 0:
+                surplus[ttl] -= 1
+                continue
+            if t.get("id"):
+                hard_targets.append(t)
         if hard_targets:
             log.info(fmt(C.GRAY,
                 f"  ↻  Retrying {len(hard_targets)} failed download(s) once "
@@ -320,14 +373,27 @@ def run_album_download(*, album, missing, present, album_dir, snapshot,
     # yet land FLACs (post-processing crash), or exit 0 yet silently drop a
     # track. Without this the summary and activity log mis-report failures.
     if not download_full_album and failed_tracks and kept:
-        surviving = {match_key_from_stem(p) for p in kept}
-        recovered = [t for t in failed_tracks if _bare_title(t) in surviving]
-        if recovered:
-            failed_tracks = [t for t in failed_tracks
-                             if _bare_title(t) not in surviving]
-            n_fail = max(0, n_fail - len(recovered))
+        # Un-fail at most as many same-titled failures as there are surplus
+        # files (files beyond what that title's successes account for). A bare
+        # set test let one landed "Song" clear BOTH twins' failures, turning a
+        # real failure into strict success — which downstream authorizes
+        # sibling/backup deletion while a track is still missing.
+        surplus = _title_surplus(kept, attempted_titles,
+                                 [_bare_title(ft) for ft in failed_tracks])
+        still_failed = []
+        n_recovered = 0
+        for ft in failed_tracks:
+            ttl = _bare_title(ft)
+            if surplus.get(ttl, 0) > 0:
+                surplus[ttl] -= 1
+                n_recovered += 1
+            else:
+                still_failed.append(ft)
+        if n_recovered:
+            failed_tracks = still_failed
+            n_fail = max(0, n_fail - n_recovered)
             log.info(fmt(C.GRAY,
-                f"  · {len(recovered)} track(s) landed despite a streamrip "
+                f"  · {n_recovered} track(s) landed despite a streamrip "
                 f"post-processing error — counting as success."))
 
     if download_full_album and full_album_rc is not None:

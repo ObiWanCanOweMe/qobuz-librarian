@@ -1006,8 +1006,49 @@ def staging_preflight(args):
             if isinstance(_le, KeyboardInterrupt):
                 sys.exit(EXIT_GENERAL)
             log.info(fmt(C.YELLOW, f"  ⚠  lyric hook failed during preflight: {_le}."))
+        # Tag signatures taken before the import: the hook above only EMBEDS
+        # lyrics — sidecar/both modes finish in the post-import pass, same as
+        # a queue flush, and the landed folders are only findable this way.
+        from qobuz_librarian.library.catalog import (
+            find_album_dir_by_track_signatures,
+            track_signatures_for_album_dirs,
+        )
+        # Snapshot each directory that DIRECTLY holds audio, not the top-level
+        # staging children: those are Artist dirs, and an artist with two
+        # staged albums would get one combined signature set — the resolver
+        # then returns a single landed album and the other album never gets
+        # its post-import sidecars.
+        _pre_dirs = []
+        _seen_dirs = set()
+        for _f in cfg.STAGING_DIR.rglob("*"):
+            if (_f.is_file() and _f.suffix.lower() in cfg.AUDIO_EXTS
+                    and not _under_retry_dir(_f)
+                    and _f.parent not in _seen_dirs):
+                _seen_dirs.add(_f.parent)
+                _pre_dirs.append(_f.parent)
+        _sigs_by_dir = {d: track_signatures_for_album_dirs([d])
+                        for d in _pre_dirs}
         if not beets_import_paths():
             die(fmt(C.RED, "  beets import failed; aborting."), EXIT_GENERAL)
+        _landed = []
+        for _d, _sigs in _sigs_by_dir.items():
+            if _d.exists() and _count_audio_under([_d]):
+                continue
+            try:
+                _found = find_album_dir_by_track_signatures(_sigs)
+            except Exception:
+                _found = None
+            if _found is not None and _found not in _landed:
+                _landed.append(_found)
+        if _landed:
+            try:
+                from qobuz_librarian.integrations.lyrics import (
+                    write_post_import_sidecars,
+                )
+                write_post_import_sidecars(_landed)
+            except Exception as _se:
+                log.info(fmt(C.YELLOW,
+                    f"  ⚠  lyric sidecar pass failed during preflight: {_se}."))
         leftover = [f for f in cfg.STAGING_DIR.rglob("*")
                     if f.is_file() and not _under_retry_dir(f)]
         if leftover:

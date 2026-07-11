@@ -7,7 +7,12 @@ from pathlib import Path
 from qobuz_librarian import config as cfg
 from qobuz_librarian.api.auth import AuthLost, QobuzError, QobuzUnavailable
 from qobuz_librarian.api.search import get_album
-from qobuz_librarian.library.backup import backup_gap_fill_files, restore_gap_fill_backup
+from qobuz_librarian.library.backup import (
+    backup_gap_fill_files,
+    pin_unverified_upgrade_backup,
+    restore_gap_fill_backup,
+    warn_pin_failed,
+)
 from qobuz_librarian.library.catalog import (
     _norm_isrc,
     _paths_equal,
@@ -78,25 +83,35 @@ def _restore_flac_metadata(path, snap):
     # Only swap embedded art when the original actually had some. A truncated
     # original downloaded without art (or with less) must not strip the
     # freshly-downloaded refill's Qobuz cover — that would downgrade the result.
+    pics_ok = True
     if snap["pictures"]:
         f.clear_pictures()
         for pic in snap["pictures"]:
             try:
                 f.add_picture(pic)
             except Exception:
-                pass
+                # Keep going — losing one malformed picture mustn't abort the
+                # tag carry — but report the restore incomplete so the backup
+                # (which still holds the original art) isn't deleted on it.
+                pics_ok = False
     try:
         f.save()
     except Exception:
         return False
-    return True
+    return pics_ok
 
 
 def _backup_source_by_isrc(verified_truncated, album_dir, backup_path):
-    """Map each truncated track's ISRC to where its original now lives in the
+    """Map each truncated track's ISRC to where its originals now live in the
     backup dir, so the refill can inherit the original's tags + embedded art by
     reading from disk at retag time. backup_gap_fill_files preserves each file's
     path relative to album_dir, so the backup copy is at the same relative spot.
+
+    One LIST of paths per ISRC, not one path: two originals can share an ISRC
+    (the same recording on two discs, a Track/Track.1 pair) with distinct
+    disc/track tags and art — collapsing them would stamp one twin's metadata
+    onto both refills. Paths are kept sorted so the retag pairs them with the
+    staged refills deterministically.
 
     Keeping only paths (not the decoded art) means a fully-truncated hi-res
     album's covers aren't all held in memory across the whole re-download."""
@@ -112,7 +127,9 @@ def _backup_source_by_isrc(verified_truncated, album_dir, backup_path):
             rel = Path(Path(src).name)
         cand = backup_path / rel
         if cand.exists():
-            out[isrc] = cand
+            out.setdefault(isrc, []).append(cand)
+    for paths in out.values():
+        paths.sort()
     return out
 
 
@@ -125,23 +142,56 @@ def _retag_refills_in_staging(staged_dirs, source_by_isrc):
     compilation, contradicting the folder it lives in.
 
     The originals' metadata is read from their backup copies on disk here,
-    one at a time, rather than held in memory from before the download."""
-    if _FLAC is None or not source_by_isrc:
-        return
+    one at a time, rather than held in memory from before the download.
+    Same-ISRC twins pair off in sorted order on both sides — each refill
+    consumes one distinct original, so two twins never share one twin's
+    disc/track tags — and an original left unconsumed (its refill never
+    surfaced in staging) counts as failed so its backup is kept.
+
+    Returns the ISRCs whose carry failed (snapshot unreadable, write failed,
+    or a picture dropped) so the caller keeps the originals' backup — it still
+    holds the only copy of those tags + art. With mutagen missing no carry is
+    possible at all, so every source ISRC counts as failed."""
+    if _FLAC is None:
+        return set(source_by_isrc)
+    if not source_by_isrc:
+        return set()
+    failed = set()
+    remaining = {isrc: list(paths) for isrc, paths in source_by_isrc.items()}
     for d in staged_dirs:
         for fp in sorted(Path(d).rglob("*.flac")):
             try:
                 isrc = _norm_isrc((_FLAC(fp).get("isrc") or [""])[0])
             except Exception:
                 continue
-            src = source_by_isrc.get(isrc)
-            if src is None:
+            srcs = remaining.get(isrc)
+            if not srcs:
                 continue
+            src = srcs.pop(0)
             snap = _snapshot_flac_metadata(src)
             if snap and _restore_flac_metadata(fp, snap):
                 log.info(fmt(C.GRAY,
                     f"  ⤷  Kept original tags on refilled "
                     f"{truncate(fp.name, 40)}"))
+            else:
+                failed.add(isrc)
+    failed.update(isrc for isrc, srcs in remaining.items() if srcs)
+    return failed
+
+
+def _make_retag_callback(retag_sources, retag_failed):
+    """The pre-import retag hook the executor calls on the staged refills.
+
+    An exception inside the carry surfaces in the executor's catch-and-log,
+    but the carry state is then unknown — so every source is recorded as
+    failed BEFORE the attempt and only the confirmed non-failures are cleared
+    after. Without that, the backup resolution would read the empty set as
+    "all tags carried" and delete the only copy of the originals' metadata."""
+    def _retag_callback(staged_dirs):
+        retag_failed.update(retag_sources)
+        done = _retag_refills_in_staging(staged_dirs, retag_sources)
+        retag_failed.intersection_update(done)
+    return _retag_callback
 
 
 def _resolve_parent_album(album_dir, artist_name, verified_truncated,
@@ -261,32 +311,40 @@ def _relocate_refilled_into_album_dir(album_dir, landed_dir, wanted_isrcs,
     return moved
 
 
-def _refills_present_in(album_dir, wanted_counts):
-    """True once at least as many files carry each wanted ISRC as were backed up.
+def _refills_present_in(album_dir, wanted_counts, baseline_counts):
+    """True once each wanted ISRC has its refills back ON TOP of the files
+    that already carried it.
 
     ``wanted_counts`` is a Counter of ISRC → how many truncated originals with
-    that ISRC went to backup. A plain set membership test would pass when only
-    ONE of two same-ISRC originals came back (e.g. a Track.flac + Track.1.flac
-    pair, or the same recording on two discs), letting the backup holding both
-    be deleted and silently losing the second file — so compare counts, not
-    just presence."""
+    that ISRC went to backup; ``baseline_counts`` is the ISRC census of what
+    remained on disk after that move (None = the baseline couldn't be read —
+    unverifiable, so never True). A plain set membership test would pass when
+    only ONE of two same-ISRC originals came back, and a bare count would let
+    a healthy pre-existing file sharing the ISRC vouch for a refill that never
+    returned — either way the backup holding the second file gets deleted. So
+    require baseline + wanted of each ISRC, counted."""
     if not wanted_counts:
         return True
+    if baseline_counts is None:
+        return False
     present = Counter(_norm_isrc(et.get("isrc")) for et in read_album_dir(album_dir))
-    return all(present.get(isrc, 0) >= n for isrc, n in wanted_counts.items())
+    return all(present.get(isrc, 0) >= baseline_counts.get(isrc, 0) + n
+               for isrc, n in wanted_counts.items())
 
 
-def _refills_intact(album_dir, wanted_isrcs, token):
+def _refills_intact(album_dir, wanted_counts, token, baseline_counts):
     """True only when none of the refilled ISRCs is still flagged truncated by
     a fresh duration scan. A presence check can't tell a complete refill from a
     short-but-decodable one — the exact failure repair exists to fix — so the
     rebuilt folder is re-verified against the same gate before the originals'
-    backup is trusted as redundant. Caller guarantees wanted_isrcs is non-empty;
-    AuthLost / QobuzUnavailable propagate so a transient outage can't read as
-    "still truncated"."""
+    backup is trusted as redundant. Caller guarantees wanted_counts is
+    non-empty; AuthLost / QobuzUnavailable propagate so a transient outage
+    can't read as "still truncated"."""
+    if baseline_counts is None:
+        return False
     try:
         scan = scan_dir_for_isrc_repairs(
-            album_dir, token, deep=True, only_isrcs=wanted_isrcs)
+            album_dir, token, deep=True, only_isrcs=set(wanted_counts))
     except (AuthLost, QobuzUnavailable):
         raise
     except Exception:
@@ -298,9 +356,15 @@ def _refills_intact(album_dir, wanted_isrcs, token):
     # isrc_no_match, NOT verified_truncated, so it would read as intact and the
     # only good-enough original's backup would be deleted while the refill is
     # still short. An unverified ISRC now keeps the backup (caller's "couldn't
-    # verify → keep" branch).
-    verified_ok = {_norm_isrc(i) for i in scan.get("verified_ok_isrcs", ())}
-    return wanted_isrcs.issubset(verified_ok)
+    # verify → keep" branch). Compared as a multiset ON TOP of the baseline,
+    # like the presence gate: the scan verifies every file carrying the ISRC,
+    # so a healthy pre-existing twin also lands in verified_ok — it must not
+    # vouch for a refill that's absent or still short.
+    verified_ok = Counter()
+    for isrc, n in dict(scan.get("verified_ok_isrcs") or {}).items():
+        verified_ok[_norm_isrc(isrc)] += n
+    return all(verified_ok.get(isrc, 0) >= baseline_counts.get(isrc, 0) + n
+               for isrc, n in wanted_counts.items())
 
 
 def _prompt_library_album_for_repair(args, token):
@@ -469,6 +533,21 @@ def repair_album_dir(album_dir, verified_truncated, artist_name, args, token):
             f"  ⟳  Moved {len(verified_truncated)} broken file(s) "
             f"to backup: {backup_path.name}"))
 
+        # Baseline: ISRC counts of what remains on disk now that the truncated
+        # originals are in the backup. The presence/intact gates below compare
+        # against baseline + wanted, so a healthy PRE-EXISTING file sharing a
+        # refill's ISRC can't vouch for a refill that never came back. A
+        # degraded read (walk error) would understate the baseline and loosen
+        # the gates — None marks it unverifiable, and the gates then keep the
+        # backup rather than trust the count.
+        _bl_errs = []
+        baseline_counts = Counter(
+            _norm_isrc(et.get("isrc"))
+            for et in read_album_dir(album_dir, walk_errors=_bl_errs))
+        baseline_counts.pop("", None)
+        if _bl_errs:
+            baseline_counts = None
+
         # Carry the truncated originals' own tags + art onto the refills before
         # beets files them. The audio is fetched by track ID (the right
         # recording), but Qobuz returns its compilation/single album for that
@@ -478,10 +557,10 @@ def repair_album_dir(album_dir, verified_truncated, artist_name, args, token):
         # time, so nothing is held in memory across the download.
         retag_sources = _backup_source_by_isrc(
             verified_truncated, album_dir, backup_path)
+        retag_failed = set()
         if retag_sources:
-            qi["pre_import_retag"] = (
-                lambda staged_dirs: _retag_refills_in_staging(
-                    staged_dirs, retag_sources))
+            qi["pre_import_retag"] = _make_retag_callback(
+                retag_sources, retag_failed)
 
         try:
             _execute_download_queue([qi], args, token)
@@ -540,10 +619,12 @@ def repair_album_dir(album_dir, verified_truncated, artist_name, args, token):
         # additionally requires they're verifiably NOT still truncated — a
         # presence check alone would let a short re-rip pass, and "no ISRC to
         # verify by" is unproven, not proven.
-        back_in_place = download_clean and _refills_present_in(album_dir, wanted_counts)
+        back_in_place = download_clean and _refills_present_in(
+            album_dir, wanted_counts, baseline_counts)
         if back_in_place and bool(wanted_isrcs):
             try:
-                repaired = _refills_intact(album_dir, wanted_isrcs, token)
+                repaired = _refills_intact(album_dir, wanted_counts, token,
+                                           baseline_counts)
             except (AuthLost, QobuzUnavailable):
                 # _refills_intact verifies via Qobuz, so a token loss / outage
                 # here aborts before the backup-resolution block below — leaving
@@ -563,7 +644,24 @@ def repair_album_dir(album_dir, verified_truncated, artist_name, args, token):
 
         # ── Backup resolution ────────────────────────────────────────────
         if backup_path and backup_path.exists():
-            if repaired:
+            if repaired and retag_failed:
+                # The audio is verifiably fixed, but the originals' tags/art
+                # couldn't be carried onto some refills — the backup holds the
+                # only copy of that metadata, so keep it. Pin it too: the age
+                # sweep proves redundancy by same-path same-or-larger bytes,
+                # which the (usually larger) refill satisfies — without the pin
+                # the only copy of those tags would be reaped on schedule.
+                if not pin_unverified_upgrade_backup(
+                        backup_path,
+                        "repair kept — original tags/art not carried onto the "
+                        "refill; this backup holds their only copy"):
+                    warn_pin_failed(backup_path)
+                log.info(fmt(C.YELLOW,
+                    f"  ⚠  Repaired, but the original tags/art couldn't be "
+                    f"carried onto {len(retag_failed)} refilled track(s) — "
+                    f"keeping the backup; it still holds them.\n"
+                    f"     Backup: {backup_path}"))
+            elif repaired:
                 try:
                     shutil.rmtree(backup_path)
                 except OSError:

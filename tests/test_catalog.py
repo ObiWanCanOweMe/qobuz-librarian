@@ -234,3 +234,77 @@ def test_find_expanded_edition_prefers_quality_when_extras_tied(tmp_path):
                side_effect=lambda aid, tok: hires if aid == "hires" else redbook):
         results = find_expanded_edition(orig, tmp_path, existing, "tok", SimpleNamespace())
     assert [r[0]["id"] for r in results] == ["hires", "redbook"]
+
+
+def test_folder_holds_all_tracks_matches_identity_not_count(tmp_path):
+    # Gates gap-fill backup deletion: an extra or duplicate file reaches the
+    # expected COUNT while an expected track is absent, and the backup being
+    # deleted holds that track's only copy. Identity has to match one-to-one.
+    from qobuz_librarian.library.catalog import folder_holds_all_tracks
+
+    expected = [{"id": 1, "title": "Alpha"}, {"id": 2, "title": "Beta"}]
+    folder = tmp_path / "Album"
+    folder.mkdir()
+    # Two audio files — the count is satisfied — but Beta is absent.
+    (folder / "01 - Alpha.flac").write_bytes(b"x")
+    (folder / "09 - Bonus.flac").write_bytes(b"x")
+    assert folder_holds_all_tracks(folder, expected) is False
+
+    (folder / "02 - Beta.flac").write_bytes(b"x")
+    assert folder_holds_all_tracks(folder, expected) is True
+
+    # Unverifiable inputs keep the backup: no expected list, missing folder.
+    assert folder_holds_all_tracks(folder, []) is False
+    assert folder_holds_all_tracks(tmp_path / "gone", expected) is False
+
+
+def test_title_fallback_cannot_hand_an_isrc_twin_to_another_track():
+    # Expected: two same-titled tracks with DIFFERENT ISRCs. On disk: two
+    # files both tagged as the FIRST recording. The ISRC layer claims one;
+    # the title fallback must not hand the second file (a twin of A) to B —
+    # that reads the folder as whole while B never landed, and the deletion
+    # gates built on this matcher would discard the backup holding B.
+    qobuz = [
+        {"title": "Song", "media_number": 1, "isrc": "USAAA0000001"},
+        {"title": "Song", "media_number": 1, "isrc": "USBBB0000002"},
+    ]
+    on_disk = [
+        {"title": "Song", "discnumber": 1, "isrc": "USAAA0000001"},
+        {"title": "Song", "discnumber": 1, "isrc": "USAAA0000001"},
+    ]
+    missing, present = compute_missing(qobuz, on_disk)
+    assert [t["isrc"] for t in missing] == ["USBBB0000002"]
+    assert len(present) == 1
+
+    # A file whose ISRC matches nothing on the expected side (a different
+    # edition's rip) still pairs by title — that's not a twin conflict, and
+    # blocking it would invent gaps for every remaster.
+    other_edition = [{"title": "Song", "discnumber": 1, "isrc": "GBZZZ9999999"}]
+    missing, _ = compute_missing([qobuz[0]], other_edition)
+    assert not missing
+
+
+def test_folder_completeness_requires_a_full_tree_walk(monkeypatch, tmp_path):
+    # folder_holds_all_tracks gates gap-fill backup deletion: a walk that
+    # couldn't cover the whole folder lists only the readable part, and pairing
+    # against that can prove "complete" while the right file sits in the
+    # unreadable subtree.
+    from qobuz_librarian.library import catalog as cat
+
+    folder = tmp_path / "Album"
+    folder.mkdir()
+    (folder / "01 - Song.flac").write_bytes(b"x")
+    qobuz = [{"title": "Song", "media_number": 1, "isrc": ""}]
+    tracks = [{"title": "Song", "discnumber": 1, "isrc": ""}]
+
+    def degraded(f, walk_errors=None):
+        if walk_errors is not None:
+            walk_errors.append(f"{f}/Disc 2: EIO")
+        return list(tracks)
+
+    monkeypatch.setattr(cat, "read_album_dir", degraded)
+    assert cat.folder_holds_all_tracks(folder, qobuz) is False
+
+    monkeypatch.setattr(cat, "read_album_dir",
+                        lambda f, walk_errors=None: list(tracks))
+    assert cat.folder_holds_all_tracks(folder, qobuz) is True

@@ -50,6 +50,13 @@ _LOCK_BUSY_PID = None
 # lock unexpectedly): in CLI mode the web holds no lock on purpose and pauses
 # its own download/scan endpoints so the two can't race over /staging.
 _CLI_MODE = False
+# run_lock.acquire() returned None: the data dir can't ENFORCE the
+# single-writer lock (unwritable path, or a mount without file locking).
+# Silently running would leave the corruption guard quietly off, so
+# destructive routes refuse until the user explicitly accepts the risk via
+# Settings → Mode; the override lasts until restart.
+_LOCK_UNENFORCEABLE = False
+_LOCK_OVERRIDE = False
 # Tri-state result of the startup token probe. None until the probe runs
 # (or if the network glitched); True if Qobuz accepted the saved token;
 # False if Qobuz returned AuthLost. The dashboard banner only fires on the
@@ -79,6 +86,13 @@ def _lock_busy_response(request):
                f"{', '.join(_UNWRITABLE_VOLUMES)}. On a NAS, set "
                "PUID/PGID to the share owner and confirm the host "
                "directories exist. Downloads can't run until fixed.")
+    elif _LOCK_UNENFORCEABLE and not _LOCK_OVERRIDE:
+        msg = ("The data folder can't hold the single-writer safety lock "
+               "(read-only, or a mount without file locking), so a second "
+               "run writing the library at the same time would go unnoticed. "
+               "Downloads and scans are paused. If nothing else runs Qobuz "
+               "Librarian against this library, you can proceed anyway from "
+               "Settings → Mode.")
     else:
         return None
     if _is_htmx(request):
@@ -86,6 +100,17 @@ def _lock_busy_response(request):
             _ql_notice_html("error", html.escape(msg)),
             status_code=200)
     return _tr(request, "lock_busy.html", {"msg": msg}, status_code=503)
+
+
+def _web_writes_paused() -> bool:
+    """True when destructive web work must not run — the same conditions
+    _lock_busy_response answers 503 for, as one predicate for the AUTOMATIC
+    triggers (dashboard new-release check, library-scan resume) that have no
+    request to bounce. Any trigger checking only part of this list quietly
+    re-opens the hole the pause exists to close."""
+    return (_CLI_MODE or _LOCK_BUSY_PID is not None
+            or bool(_UNWRITABLE_VOLUMES)
+            or (_LOCK_UNENFORCEABLE and not _LOCK_OVERRIDE))
 
 
 # Populated at startup. Empty list means OK; non-empty means destructive
@@ -535,7 +560,7 @@ async def _lifespan(_app: FastAPI):
     import logging
     import os
     import shutil
-    global _RUN_LOCK_HANDLE, _LOCK_BUSY_PID, _CLI_MODE
+    global _RUN_LOCK_HANDLE, _LOCK_BUSY_PID, _CLI_MODE, _LOCK_UNENFORCEABLE
     _log = logging.getLogger("qobuz_librarian")
     from qobuz_librarian.ui_cli.logging import attach_file_handler
     attach_file_handler(cfg.APP_LOG_FILE, cfg.LOG_LEVEL)
@@ -596,6 +621,16 @@ async def _lifespan(_app: FastAPI):
         try:
             _RUN_LOCK_HANDLE = run_lock.acquire()
             _LOCK_BUSY_PID = None
+            if _RUN_LOCK_HANDLE is None:
+                # None isn't success: the lock can't be ENFORCED here, and
+                # storing it as acquired would leave the corruption guard
+                # silently off. Pause destructive routes until the user
+                # explicitly accepts the risk (Settings → Mode).
+                _LOCK_UNENFORCEABLE = True
+                _log.error(
+                    "STARTUP: the data dir can't hold the single-writer lock; "
+                    "download/scan endpoints paused until the user enables "
+                    "the no-lock override on Settings → Mode.")
         except run_lock.LockBusy as busy:
             _LOCK_BUSY_PID = busy.pid
             _log.error(
@@ -606,7 +641,7 @@ async def _lifespan(_app: FastAPI):
             )
 
     async def _retry_lock():
-        global _RUN_LOCK_HANDLE, _LOCK_BUSY_PID
+        global _RUN_LOCK_HANDLE, _LOCK_BUSY_PID, _LOCK_UNENFORCEABLE
         while _LOCK_BUSY_PID is not None:
             await asyncio.sleep(30)
             # The lock state can change during the sleep: set_mode('cli') hands
@@ -618,7 +653,18 @@ async def _lifespan(_app: FastAPI):
             try:
                 _RUN_LOCK_HANDLE = run_lock.acquire()
                 _LOCK_BUSY_PID = None
-                _log.info("Lock acquired; web write endpoints now active.")
+                if _RUN_LOCK_HANDLE is None:
+                    _LOCK_UNENFORCEABLE = True
+                    _log.error(
+                        "Run-lock became unenforceable; download/scan "
+                        "endpoints paused until the no-lock override is "
+                        "enabled on Settings → Mode.")
+                else:
+                    # A real handle means the guard is ON — clear any stale
+                    # unenforceable flag from an earlier attempt, or writes
+                    # stay falsely blocked until restart.
+                    _LOCK_UNENFORCEABLE = False
+                    _log.info("Lock acquired; web write endpoints now active.")
                 return
             except run_lock.LockBusy as busy:
                 _LOCK_BUSY_PID = busy.pid
@@ -1117,6 +1163,8 @@ def _tr(request, name, context, *, status_code=200):
             any(j.status.value in ('running', 'scanning') for j in in_flight),
         )
     context.setdefault("cli_mode", _CLI_MODE)
+    context.setdefault("lock_unenforceable", _LOCK_UNENFORCEABLE)
+    context.setdefault("lock_override", _LOCK_OVERRIDE)
     # Error/utility renders (e.g. the 404 page) don't name a nav section; an
     # explicit empty page just leaves every nav link inactive instead of
     # relying on Jinja's undefined-is-falsey behaviour.
@@ -1322,6 +1370,14 @@ def _duplicate_download_job(album_id: str, track_id: str = "",
     (or a scan candidate the user is about to review), but not onto a one-track
     download from the same album."""
     if as_new_edition:
+        # "Get this edition too" is a deliberate extra copy of an owned album,
+        # so it skips folding onto scans and normal downloads — but two
+        # identical new-edition submits are the same tap twice, not two
+        # deliberate editions. Fold onto an in-flight one.
+        for j in job_mgr.registry.pending_and_running():
+            if (j.album_id == album_id
+                    and (getattr(j, "execute_args", None) or {}).get("new_edition")):
+                return j
         return None
     if track_id:
         for j in job_mgr.registry.pending_and_running():
@@ -1373,10 +1429,11 @@ def _start_new_release_check():
     dashboard trigger."""
     with _auto_check_lock:
         # The run-lock may have been handed to the terminal mid-submit (this can
-        # run in an executor for POST /library). Re-check under the lock so a
-        # scan can't start right after set_mode('cli') released the lock and then
-        # race the CLI over /staging.
-        if _CLI_MODE:
+        # run in an executor for POST /library). Re-check the whole pause
+        # predicate under the lock so a scan can't start right after
+        # set_mode('cli') released the lock — or while the lock is
+        # unenforceable and the user hasn't opted in.
+        if _web_writes_paused():
             return None
         existing = _existing_new_release_check()
         if existing is not None:
@@ -1408,8 +1465,7 @@ def _maybe_auto_check_new_releases():
     known-bad, the CLI holds the lock, another job is actively working, a
     new-release list is already awaiting review, or the interval hasn't elapsed.
     """
-    if (cfg.NEW_RELEASE_CHECK_INTERVAL <= 0 or _CLI_MODE
-            or _LOCK_BUSY_PID is not None or _UNWRITABLE_VOLUMES):
+    if cfg.NEW_RELEASE_CHECK_INTERVAL <= 0 or _web_writes_paused():
         return
     # Don't bother (or thrash) when there's no token, or one we already know
     # Qobuz is rejecting — it would just fail on the first call every load.
@@ -1571,8 +1627,12 @@ def _submit_scan_deduped(job, scan_fn, execute_fn, *kinds, statuses=("pending", 
     Checking _active_scan and submitting in one locked step closes the window
     where two near-simultaneous POSTs (a double-click, or the auto-trigger
     landing with a manual click) both pass the check and stack duplicate scans.
-    Returns the job to redirect to — the new one, or the in-flight duplicate."""
+    Returns the job to redirect to — the new one, or the in-flight duplicate —
+    or None when web writes were paused between the route's opening gate and
+    here (a set_mode CLI handoff landing mid-request; see job_approve)."""
     with _auto_check_lock:
+        if _web_writes_paused():
+            return None
         target = _scan_target(job)
         existing = _active_scan(*kinds, statuses=statuses, target=target)
         if existing is not None:
@@ -1637,8 +1697,9 @@ def _start_library_scan(partial_only=False, force_full=False):
     instead of stacking a second one (the manual button and the auto trigger can
     both land here at once)."""
     with _auto_check_lock:
-        # Re-check the CLI handoff under the lock (see _start_new_release_check).
-        if _CLI_MODE:
+        # Re-check the pause predicate under the lock (see
+        # _start_new_release_check).
+        if _web_writes_paused():
             return None
         existing = _active_library_scan()
         if existing is not None:
@@ -1748,8 +1809,7 @@ def _maybe_resume_library_scan():
     network-heavy job unprompted. Once they start one and it gets interrupted, it
     leaves a checkpoint and resumes from here. Off entirely via AUTO_LIBRARY_SCAN.
     """
-    if (not cfg.AUTO_LIBRARY_SCAN or _CLI_MODE or _LOCK_BUSY_PID is not None
-            or _UNWRITABLE_VOLUMES):
+    if not cfg.AUTO_LIBRARY_SCAN or _web_writes_paused():
         return
     if _TOKEN_VALID is False or not _read_creds().get("auth_token"):
         return
@@ -2362,8 +2422,19 @@ def _make_download_run(album, token, *, treat_as_new=False):
             )
             # A parked library review may still offer this album — drop it
             # there so the stale review can't download it a second time.
-            from qobuz_librarian.web.flows import prune_library_review_candidates
+            from qobuz_librarian.web.flows import (
+                _fold_partial_gap_fill,
+                prune_library_review_candidates,
+            )
             prune_library_review_candidates(album)
+            if r.get("n_fail", 0) > 0:
+                # Partial landing: the album is on disk with gaps. Same rule
+                # as the batch executor — surface the remainder as Gap Fill
+                # NOW (after the prune, which would otherwise drop the fresh
+                # candidate as a same-id stale one), not on the next refresh.
+                _fold_partial_gap_fill(
+                    album, (album.get("artist") or {}).get("name") or "",
+                    r.get("n_fail", 0))
             from qobuz_librarian.library import hidden as hidden_mod
             hidden_mod.unmark_single(
                 (album.get("artist") or {}).get("name") or "?",
@@ -2428,9 +2499,18 @@ def _make_single_track_run(album, track, token):
         # rest of the album if it remains incomplete.
         marked = bool(cfg.SUPPRESS_SINGLE_TRACK_GAPS and len(missing) > 1)
         if marked:
-            hidden_mod.mark_single(artist, title, album_year(album), album.get("id"))
-            j.summary = (f"Got “{t_title}”, filed under {artist} / {title}. "
-                         "The rest of the album stays out of scans.")
+            try:
+                hidden_mod.mark_single(artist, title, album_year(album),
+                                       album.get("id"))
+                j.summary = (f"Got “{t_title}”, filed under {artist} / {title}. "
+                             "The rest of the album stays out of scans.")
+            except OSError as e:
+                # The track landed fine — don't fail the job, but don't claim
+                # the exclusion stuck either.
+                marked = False
+                j.summary = (f"Got “{t_title}”, filed under {artist} / {title}.")
+                j.error = (f"{e} The rest of the album may still show "
+                           "in scans.")
         elif len(missing) > 1:
             hidden_mod.unmark_single(artist, title)
             j.summary = (f"Got “{t_title}”, filed under {artist} / {title}. "
@@ -2599,6 +2679,11 @@ async def queue_download(request: Request, album_id: str = Form(""),
             # tells the UI to hide Cancel on this job — a one-track download is done
             # before you could catch it.
             job.single = {"album_id": album_id, "track_id": str(track_id)}
+        if download_as_new_edition:
+            # Retry rebuilds the run from the persisted job, so the edition
+            # override has to live on the job — closure-only, a retried "get
+            # this edition too" would fall back to the owned-album skip.
+            job.execute_args = {"new_edition": True}
 
         # Re-check under the lock right before submitting: closes the race with
         # a concurrent /download for the same album across the get_album await.
@@ -2919,10 +3004,17 @@ async def _restore_hidden(request, scope, redirect):
     form = await request.form()
     artists = form.getlist("artist")[:10000]
     fingerprints = form.getlist("fingerprint")[:10000]
-    if artists:
-        hidden_mod.restore(scope, artists)
-    if fingerprints:
-        hidden_mod.restore_albums(scope, fingerprints)
+    try:
+        if artists:
+            hidden_mod.restore(scope, artists)
+        if fingerprints:
+            hidden_mod.restore_albums(scope, fingerprints)
+    except OSError as e:
+        # Store write failed — nothing was restored; say so instead of
+        # rendering the rows gone until the next reload.
+        return RedirectResponse(
+            url=redirect + "?notice=" + urllib.parse.quote(str(e)),
+            status_code=303)
     if scope == hidden_mod.SCOPE_MISSING and (artists or fingerprints):
         # Upgrade/Downsample re-derive their reviews from saved state at read
         # time, so restore takes effect there on its own. The Library review
@@ -2984,7 +3076,12 @@ async def library_bring_back_all(request: Request):
         lifted = library_scan_state.clear_review_retired()
         return restored or lifted
 
-    changed = await loop.run_in_executor(None, _bring_back)
+    try:
+        changed = await loop.run_in_executor(None, _bring_back)
+    except OSError as e:
+        return RedirectResponse(
+            url="/library?notice=" + urllib.parse.quote(str(e)),
+            status_code=303)
     msg = ("Brought your dismissed results back to the Library review."
            if changed else "Nothing to bring back.")
     return RedirectResponse(
@@ -3115,6 +3212,9 @@ async def downsample_scan(request: Request):
         lambda j, chosen: flows.execute_downsamples(
             j, chosen, token=_get_optional_token()),
         "downsample")
+    if job is None:
+        return _lock_busy_response(request) or RedirectResponse(
+            url="/downsample", status_code=303)
     return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
 
 
@@ -3165,6 +3265,9 @@ async def repair_scan(request: Request):
         lambda j: flows.scan_repairs(j, _get_token()),
         lambda j, chosen: flows.execute_repairs(j, chosen, _get_token()),
         "repair")
+    if job is None:
+        return _lock_busy_response(request) or RedirectResponse(
+            url="/repair", status_code=303)
     # Land back on /repair so the sweep is watched live right here — its card
     # streams each flagged album inline (and explains the wait if it's queued
     # behind another scan). When the scan finishes, the card's SSE done-handler
@@ -3221,6 +3324,13 @@ async def lyrics_scan(request: Request):
     form = await request.form()
     rescan = bool(form.get("rescan"))
     synced_only = bool(form.get("synced_only"))
+    # Re-check after the form await: set_mode can flip to CLI mode inside that
+    # yield, and everything from here to submit runs without yielding, so this
+    # read-and-submit is atomic against the on-loop mode flip (same pattern as
+    # queue_download).
+    busy = _lock_busy_response(request)
+    if busy is not None:
+        return busy
     existing = _active_scan("lyrics", statuses=("pending", "running"))
     if existing is not None:
         return RedirectResponse(url=f"/jobs/{existing.id}", status_code=303)
@@ -3319,6 +3429,9 @@ async def migrate_scan(request: Request):
                                                   in_place=in_place, src=src,
                                                   allow_low_space=allow_low_space),
         "migration")
+    if job is None:
+        return _lock_busy_response(request) or RedirectResponse(
+            url="/migrate", status_code=303)
     return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
 
 @app.get("/jobs/{job_id}", response_class=HTMLResponse)
@@ -3440,9 +3553,10 @@ async def job_review_page(request: Request, job_id: str, page: int = 1,
 
 
 def _split_off_unapproved(job, tab):
-    """Before approving a library review: move every candidate that ISN'T being
-    downloaded right now into its own parked review, so a partial download
-    consumes ONLY the ticked picks. Everything else stays in the living review —
+    """Before approving a library or new-release review: move every candidate
+    that ISN'T being downloaded right now into its own parked review, so a
+    partial download consumes ONLY the ticked picks. Everything else stays in
+    the living review —
     the unticked candidates, plus (on a tab-scoped approve) the whole tab the
     user isn't looking at, ticks and all. Without this the active tab's
     unticked candidates rode into the DONE job and vanished, so ticking 10 of a
@@ -3599,24 +3713,47 @@ async def job_approve(request: Request, job_id: str):
     # (freezing every SSE stream / other request) for a large parked review —
     # the same reason /select was offloaded.
     def _split_and_approve():
-        # A library download consumes only the ticked picks: park everything
-        # else (unticked, plus the inactive tab on a tab-scoped approve) as its
-        # own living review first, so the download can't eat un-reviewed
-        # candidates. tab="" (older page / direct POST) still splits by
-        # selection, so the whole-review path is protected too. Other kinds keep
-        # their own recovery (Upgrade/Downsample rebuild from saved state).
-        if (job.execute_kind == "library"
-                and job.status == job_mgr.JobStatus.AWAITING_REVIEW):
-            remnant = _split_off_unapproved(job, tab)
-            # Whole review ticked → nothing was left to re-park. Remember it so
-            # the run, on success, retires the worked-through review instead of
-            # letting the saved-state rebuild resurrect the just-downloaded
-            # albums as "missing" on the next /library visit. Any that FAIL are
-            # re-parked to retry (flows.execute_albums).
-            job._consumed_whole_review = remnant is None
-        return job_mgr.approve(job, None)
+        # Atomic recheck right before anything is consumed: the route's opening
+        # gate ran before several awaits (form parsing, disk probes), and
+        # set_mode('cli') can hand the run lock to the terminal inside that
+        # window — this not-yet-approved review is invisible to its active-job
+        # check, so approving after the handoff would start destructive work
+        # with the single-writer guard off. Under _auto_check_lock (which the
+        # handoff also takes) this either sees the pause and bounces with the
+        # review untouched, or flips the job active first so the handoff
+        # refuses.
+        with _auto_check_lock:
+            if _web_writes_paused():
+                return "paused"
+            # A library or new-release download consumes only the ticked picks:
+            # park everything else (unticked, plus the inactive tab on a
+            # tab-scoped approve) as its own living review first, so the download
+            # can't eat un-reviewed candidates. For new releases this is also the
+            # standing rule that a release stays in the New Releases review until
+            # it's downloaded or dismissed — approving one of ten must not consume
+            # the other nine. tab="" (older page / direct POST) still splits by
+            # selection, so the whole-review path is protected too. Other kinds
+            # keep their own recovery (Upgrade/Downsample rebuild from saved
+            # state).
+            if (job.execute_kind in ("library", "new_releases")
+                    and job.status == job_mgr.JobStatus.AWAITING_REVIEW):
+                remnant = _split_off_unapproved(job, tab)
+                # Whole review ticked → nothing was left to re-park. Remember it so
+                # the run, on success, retires the worked-through review instead of
+                # letting the saved-state rebuild resurrect the just-downloaded
+                # albums as "missing" on the next /library visit. Any that FAIL are
+                # re-parked to retry (flows.execute_albums). Library-only: new
+                # releases have no saved-state rebuild to retire.
+                if job.execute_kind == "library":
+                    job._consumed_whole_review = remnant is None
+            return job_mgr.approve(job, None)
 
     approved = await loop.run_in_executor(None, _split_and_approve)
+    if approved == "paused":
+        busy = _lock_busy_response(request)
+        if busy is not None:
+            return busy
+        return RedirectResponse(url=dest, status_code=303)
     flag = "approved=1" if approved else "stale=1"
     return RedirectResponse(url=f"{dest}?{flag}{_skip_q}", status_code=303)
 
@@ -3857,8 +3994,14 @@ async def job_hide(request: Request, job_id: str):
         # Selection is server-backed, so hide keeps this artist's ticked albums
         # and drops the rest — no form keep-set, which under pagination would
         # only carry the visible page and clobber other pages' selections.
-        n = flows.dismiss_albums(job, artist, scope=_hide_scope(job.execute_kind),
-                                 gap_only=gap_only)
+        try:
+            n = flows.dismiss_albums(job, artist,
+                                     scope=_hide_scope(job.execute_kind),
+                                     gap_only=gap_only)
+        except OSError as e:
+            # Nothing changed server-side; the non-2xx keeps htmx from
+            # swapping the rows away and the error toast reads this body.
+            return HTMLResponse(str(e), status_code=500)
         if n:
             # Keep other open tabs in sync; the originator already gets the
             # swapped group + fresh counts from this response.
@@ -3939,10 +4082,26 @@ async def job_dismiss_rest(request: Request, job_id: str):
     # plus a persist), which would block the event loop and stall every SSE
     # stream for a large scan.
     loop = asyncio.get_running_loop()
-    hidden_count = await loop.run_in_executor(
-        None, lambda: sum(flows.dismiss_albums(job, a, scope=scope,
-                                               gap_only=gap_only, query=q)
-                          for a in artists))
+    done = {"n": 0}
+
+    def _dismiss_all():
+        for a in artists:
+            done["n"] += flows.dismiss_albums(job, a, scope=scope,
+                                              gap_only=gap_only, query=q)
+
+    try:
+        await loop.run_in_executor(None, _dismiss_all)
+        hidden_count = done["n"]
+    except OSError as e:
+        # Mid-batch store failure: the artists already hidden stay hidden,
+        # the rest are untouched — report the failure instead of a count.
+        # The page and every other tab are now stale by however many artists
+        # DID go through, so fan the change out with no origin: even the
+        # requesting tab must reload to show what actually happened.
+        if done["n"]:
+            job.notify_review_changed()
+        return JSONResponse({"error": str(e), "hidden": done["n"]},
+                            status_code=500)
     if hidden_count:
         job.notify_review_changed(_review_origin(request))
     from qobuz_librarian.library import hidden as hidden_mod
@@ -4026,7 +4185,14 @@ async def job_retry(request: Request, job_id: str):
                         "That track is no longer on Qobuz. Nothing to retry."),
                     status_code=303)
             else:
-                job_mgr.submit(new_job, _make_download_run(album, token))
+                # Carry the "get this edition too" override across the retry —
+                # without it the rebuilt run sees the album as already owned
+                # and skips the download the user explicitly asked for.
+                as_new = bool((job.execute_args or {}).get("new_edition"))
+                if as_new:
+                    new_job.execute_args = {"new_edition": True}
+                job_mgr.submit(new_job, _make_download_run(album, token,
+                                                           treat_as_new=as_new))
         return RedirectResponse(url=f"/jobs/{new_job.id}", status_code=303)
     except (SystemExit, NoCredsError):
         return RedirectResponse(url="/settings?error=creds", status_code=303)
@@ -4681,37 +4847,76 @@ async def set_mode(request: Request, target: str = Form("")):
     Switching to CLI is refused while a download/scan is active — releasing the
     lock under a running job would let the CLI race the worker over /staging.
     """
-    global _RUN_LOCK_HANDLE, _LOCK_BUSY_PID, _CLI_MODE, _creds_cache
+    global _RUN_LOCK_HANDLE, _LOCK_BUSY_PID, _CLI_MODE, _creds_cache, \
+        _LOCK_UNENFORCEABLE, _LOCK_OVERRIDE
     from qobuz_librarian import run_lock
     want = (target or "").strip().lower()
     if want == "cli":
         # Flip to CLI mode first so a /download or scan POST landing during the
         # handoff is refused (503) instead of slipping past the check and racing
-        # the CLI over /staging once we release the lock below.
+        # the CLI over /staging once we release the lock below. The flip happens
+        # here on the event loop (atomic against /download's on-loop
+        # recheck-and-submit), while the active-job check and the release run
+        # under _auto_check_lock in a worker — the same lock the scan starters
+        # and review approval hold across THEIR recheck-and-enqueue, so the
+        # handoff either sees their job and refuses, or pauses them first.
         _CLI_MODE = True
-        # Only work in flight blocks the handoff — the race this guards
-        # against is the CLI and a running worker sharing /staging. A parked
-        # review has no worker and can sit for weeks; refusing on it would
-        # make terminal mode unreachable.
-        if any(j.status != job_mgr.JobStatus.AWAITING_REVIEW
-               for j in job_mgr.registry.pending_and_running()):
-            _CLI_MODE = False  # no transfer happened; stay in web mode
+
+        def _handoff():
+            global _RUN_LOCK_HANDLE, _LOCK_BUSY_PID, _CLI_MODE
+            with _auto_check_lock:
+                # Only work in flight blocks the handoff — the race this guards
+                # against is the CLI and a running worker sharing /staging. A
+                # parked review has no worker and can sit for weeks; refusing on
+                # it would make terminal mode unreachable.
+                if any(j.status != job_mgr.JobStatus.AWAITING_REVIEW
+                       for j in job_mgr.registry.pending_and_running()):
+                    _CLI_MODE = False  # no transfer happened; stay in web mode
+                    return False
+                if _RUN_LOCK_HANDLE is not None:
+                    try:
+                        _RUN_LOCK_HANDLE.close()  # closing releases the flock
+                    except OSError:
+                        pass
+                    _RUN_LOCK_HANDLE = None
+                _LOCK_BUSY_PID = None
+                return True
+
+        loop = asyncio.get_running_loop()
+        if not await loop.run_in_executor(None, _handoff):
             return RedirectResponse(url="/settings?error=" + urllib.parse.quote(
                 "Finish or cancel the running job before handing off to the "
                 "terminal."), status_code=303)
-        if _RUN_LOCK_HANDLE is not None:
-            try:
-                _RUN_LOCK_HANDLE.close()  # closing the handle releases the flock
-            except OSError:
-                pass
-            _RUN_LOCK_HANDLE = None
-        _LOCK_BUSY_PID = None
         return RedirectResponse(url="/settings?mode=cli", status_code=303)
+    if want == "nolock":
+        # The user's explicit "proceed without the safety lock" consent —
+        # only meaningful while the lock is unenforceable, and it lasts until
+        # restart so a permanent footgun can't be flipped on by accident and
+        # forgotten. The Settings card that posts this spells out the risk.
+        if _LOCK_UNENFORCEABLE:
+            _LOCK_OVERRIDE = True
+            import logging
+            logging.getLogger("qobuz_librarian").warning(
+                "no-lock override enabled by the user; the single-writer "
+                "guard is OFF until restart — nothing prevents a concurrent "
+                "run from writing staging at the same time.")
+        return RedirectResponse(url="/settings", status_code=303)
     if want == "web":
         try:
             _RUN_LOCK_HANDLE = run_lock.acquire()
             _CLI_MODE = False
             _LOCK_BUSY_PID = None
+            if _RUN_LOCK_HANDLE is None:
+                # Can't enforce the lock — same stance as startup: pause
+                # destructive routes until the user opts in to running
+                # without the guard.
+                _LOCK_UNENFORCEABLE = True
+            else:
+                # The lock took hold this time (the data dir became writable,
+                # a different mount, …) — the guard is ON, so a stale
+                # unenforceable flag from startup must not keep blocking
+                # writes until restart.
+                _LOCK_UNENFORCEABLE = False
             # The CLI may have changed the saved token while it held the lock;
             # drop the cached creds so the banner reflects what's on disk now.
             _creds_cache = None
@@ -5073,9 +5278,10 @@ async def jobs_list(status: str = "", limit: int = 50):
     # the archive rows we add are strictly older and stay correctly ordered.
     if want_terminal and len(matching) < cap:
         from qobuz_librarian.web import job_persistence
-        for row in job_persistence.history_page(cap, 0):
-            if wanted and row["status"] != wanted:
-                continue
+        # Filter in SQL: fetching the newest `cap` rows and filtering here
+        # would return too few (or none) whenever those rows are mostly other
+        # statuses, even though older matching history exists.
+        for row in job_persistence.history_page(cap, 0, status=wanted):
             if row["id"] in seen:
                 continue
             matching.append({

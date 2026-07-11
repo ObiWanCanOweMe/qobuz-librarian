@@ -89,13 +89,22 @@ def run_downsample_walk_mode(args):
         keep = confirm(
             "  Keep a restorable backup of the hi-res originals? "
             "(answering No deletes them to save space)",
-            default_yes=True, auto_yes=False)
-        _choice = "keep" if keep else "delete"
-        settings_store.save({"DOWNSAMPLE_KEEP_ORIGINALS": _choice})
-        cfg.DOWNSAMPLE_KEEP_ORIGINALS = _choice
-        log.info(fmt(C.GRAY,
-            f"  Saved — originals will be {'kept' if keep else 'deleted'}; "
-            "change this any time in Settings."))
+            default_yes=True, auto_yes=False, on_eof=None, strict=True)
+        if keep is None:
+            # Closed stdin never answered. Don't turn that into a saved
+            # standing preference — least of all the destructive one; run
+            # with the safe answer and leave the question open.
+            cfg.DOWNSAMPLE_KEEP_ORIGINALS = "keep"
+            log.info(fmt(C.GRAY,
+                "  No input available — keeping originals for this run; "
+                "set the preference in Settings."))
+        else:
+            _choice = "keep" if keep else "delete"
+            settings_store.save({"DOWNSAMPLE_KEEP_ORIGINALS": _choice})
+            cfg.DOWNSAMPLE_KEEP_ORIGINALS = _choice
+            log.info(fmt(C.GRAY,
+                f"  Saved — originals will be {'kept' if keep else 'deleted'}; "
+                "change this any time in Settings."))
         log.info("")
 
     # Auto-accept gate. Plain --yes deliberately does NOT cover this path — its
@@ -118,6 +127,7 @@ def run_downsample_walk_mode(args):
     n_albums_done = 0
     total_saved = 0
     total_errors = 0
+    total_flush_warns = 0
 
     try:
         for artist_dir in all_artists:
@@ -164,6 +174,7 @@ def run_downsample_walk_mode(args):
                     mark_local_album_capped(c.album_dir)
                 total_saved += res.get("saved_bytes", 0)
                 total_errors += res.get("errors", 0)
+                total_flush_warns += res.get("flush_warnings", 0)
             if artist_attempted:
                 downsample_state.update_artist(artist_dir, hidden=hidden)
                 saved_state = downsample_state.load()
@@ -185,3 +196,8 @@ def run_downsample_walk_mode(args):
         log.info(fmt(C.YELLOW,
             f"     {plural(total_errors, 'file')} could not be downsampled "
             "(left unchanged)."))
+    if total_flush_warns:
+        log.info(fmt(C.YELLOW,
+            f"     {plural(total_flush_warns, 'file')} resampled but couldn't "
+            f"be flushed to disk — the swap may not survive a power loss; "
+            f"check the drive."))

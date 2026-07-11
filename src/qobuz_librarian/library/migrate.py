@@ -761,17 +761,18 @@ def _place_file(src: Path, dst: Path, *, move: bool) -> None:
         raise
 
     if move:
-        # Make the destination durable before deleting the source: a crash in the
-        # gap between os.replace and unlink could otherwise leave neither a
-        # durable dst nor the source. Best-effort (fsync may be unsupported).
-        try:
-            dfd = os.open(str(dst.parent), os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
-        except OSError:
-            pass
+        # Make the destination durable before deleting the source: the copied
+        # BYTES need their own flush (a directory fsync only pins the entry,
+        # not the data, which may still sit in the page cache), and a flush
+        # that genuinely fails (ENOSPC/EIO — not a mount that can't fsync)
+        # means the destination may not survive a crash. Keep the source then:
+        # the caller sees it lingering and treats the move as not clean,
+        # instead of this being the moment the only durable copy disappears.
+        from qobuz_librarian.library.backup import _fsync
+        if not (_fsync(dst) and _fsync(dst.parent)):
+            log.info(f"  ⚠  copied {src.name} but couldn't flush the copy to "
+                     f"disk — keeping the original at {src}")
+            return
         try:
             src.unlink()
         except OSError as e:

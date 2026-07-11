@@ -552,14 +552,6 @@ h1, h2, h3 {
   flex-direction: column;
   gap: 0.125rem;
 }
-@media (max-width: 1023.98px) {
-  .ql-review-footer {
-    bottom: calc(3.6rem + env(safe-area-inset-bottom));
-  }
-  .ql-toast-host {
-    bottom: calc(4.4rem + env(safe-area-inset-bottom));
-  }
-}
 .ql-footer {
   display: none;
 }
@@ -5974,7 +5966,9 @@ details[open] > .ql-disclosure-summary::after {
 [data-theme="night"] .theme-when-light { display: none; }
 [data-theme="winter"] .theme-when-dark { display: none; }
 
-/* Coordinate with app.js when htmx removes an artist group. */
+/* Coordinate with app.js when htmx removes an artist group. The hide swap
+   targets the shell wrapping the details, so that's where htmx puts the class. */
+.ql-review-group-shell.htmx-swapping,
 details[data-artist].htmx-swapping {
   opacity: 0;
   transition: opacity 200ms ease;
@@ -5989,5 +5983,19 @@ details[data-artist].htmx-swapping {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
+  }
+}
+
+/* Phone: the fixed bottom nav owns the bottom edge, so the sticky review
+   footer and toasts sit above it. This lives at the END of the file on
+   purpose — the base rules (`.ql-review-footer { bottom: 0 }`,
+   `.ql-toast-host { bottom: 1rem }`) have equal specificity, and anywhere
+   earlier they win the cascade and the nav covers the review actions. */
+@media (max-width: 1023.98px) {
+  .ql-review-footer {
+    bottom: calc(3.6rem + env(safe-area-inset-bottom));
+  }
+  .ql-toast-host {
+    bottom: calc(4.4rem + env(safe-area-inset-bottom));
   }
 }

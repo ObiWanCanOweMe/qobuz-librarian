@@ -26,13 +26,17 @@ from qobuz_librarian.library.tags import normalize
 from qobuz_librarian.ui_cli.logging import vlog
 
 
-def iter_tree_no_symlinks(root: Path):
+def iter_tree_no_symlinks(root: Path, errors=None):
     """Yield every entry under root, never descending into symlinked dirs.
 
     A symlink loop inside MUSIC_ROOT must not send a walk into unbounded
     recursion, and content linked in from outside an album shouldn't be
     scanned as if it lived there. Symlinked subdirs are yielded as leaves so
     the caller still sees them; they're just never followed.
+
+    Pass ``errors`` (a list) to learn whether any subtree couldn't be read —
+    the walk continues past it, so the listing is incomplete and conclusions
+    like "contains no audio" must not be drawn (or cached) from it.
     """
     def _onerror(err):
         # os.walk swallows scandir failures by default — a permission-denied or
@@ -40,6 +44,8 @@ def iter_tree_no_symlinks(root: Path):
         # with no signal at all. Surface it (verbose) so vanished files are at
         # least diagnosable.
         vlog(f"scan: couldn't read {getattr(err, 'filename', root)}: {err}")
+        if errors is not None:
+            errors.append(err)
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False,
                                                 onerror=_onerror):
         dp = Path(dirpath)
@@ -100,6 +106,13 @@ def read_audio_meta(path: Path):
     sig = flac_cache.signature(path)
     try:
         f = mutagen.File(str(path), easy=True)
+    except OSError:
+        # A read failure (EACCES/EIO/ESTALE) is not proof the file is untagged.
+        # Caching a negative here would blank its identity (ISRC, quality) for
+        # every scan until the file changes, and falling back to the filename
+        # would silently undercount the ISRC censuses that gate backup
+        # deletion. Let it propagate so the caller records a walk error.
+        raise
     except Exception:
         flac_cache.put(path, _NEG_META, sig=sig)
         return None
@@ -145,7 +158,7 @@ def read_audio_meta(path: Path):
 
 
 # ── Album directory scan ──────────────────────────────────────────────────────
-def read_album_dir(album_dir: Path):
+def read_album_dir(album_dir: Path, walk_errors=None):
     """Scan album_dir for audio files; return list of track-metadata dicts.
 
     Tags are read with mutagen for every format (flac, mp3, m4a, …); a file
@@ -153,6 +166,11 @@ def read_album_dir(album_dir: Path):
     filename, so even untagged bonus tracks appear in find_extras_in_existing
     and aren't silently destroyed by upgrade-replace.
     Multi-disc subdirectories (CD1/, CD2/) are walked; symlinks never followed.
+
+    Pass ``walk_errors`` (a list) to learn whether any entry or subtree
+    couldn't be read — the returned list is then possibly INCOMPLETE, and a
+    caller about to delete something based on these counts must treat that as
+    unverifiable rather than as a smaller album.
     """
     if not album_dir.exists():
         return []
@@ -160,7 +178,7 @@ def read_album_dir(album_dir: Path):
     audio_files = []
     _exts = set(config.AUDIO_EXTS)
     try:
-        for f in iter_tree_no_symlinks(album_dir):
+        for f in iter_tree_no_symlinks(album_dir, errors=walk_errors):
             # is_file() re-raises EACCES/EIO/ESTALE (only ENOENT-class errors are
             # swallowed by pathlib). Catch per entry so one unreadable file drops
             # only itself, not every track after it — a truncated album list
@@ -169,15 +187,29 @@ def read_album_dir(album_dir: Path):
                 if f.suffix.lower() in _exts and f.is_file():
                     audio_files.append(f)
             except OSError as e:
+                if walk_errors is not None:
+                    walk_errors.append(f"{f}: {e}")
                 vlog(f"skipping unreadable entry {f} in {album_dir}: {e}")
     except OSError as e:
+        if walk_errors is not None:
+            walk_errors.append(f"{album_dir}: {e}")
         vlog(f"walk failed in {album_dir}: {e}")
     audio_files.sort()
     vlog(f"found {len(audio_files)} audio file(s) in {album_dir}")
 
     tracks = []
     for f in audio_files:
-        tags = read_audio_meta(f)
+        try:
+            tags = read_audio_meta(f)
+        except OSError as e:
+            # The file is listed but can't be read: drop it AND mark the walk
+            # degraded. The filename fallback below is for files that parse as
+            # untagged, not for read failures — those must not enter counts
+            # with a blanked ISRC/quality.
+            if walk_errors is not None:
+                walk_errors.append(f"{f}: {e}")
+            vlog(f"couldn't read tags for {f} in {album_dir}: {e}")
+            continue
         if tags is None:
             stem = f.stem
             # Strip a leading track-number token in any common form — "NN - ",
@@ -242,8 +274,9 @@ def _has_audio_anywhere(d: Path) -> bool:
     if cached is not None:
         return cached
     exts = set(config.AUDIO_EXTS)
+    walk_errors = []
     try:
-        for f in iter_tree_no_symlinks(d):
+        for f in iter_tree_no_symlinks(d, errors=walk_errors):
             if f.is_file() and f.suffix.lower() in exts:
                 _HAS_AUDIO_CACHE[key] = True
                 return True
@@ -253,6 +286,11 @@ def _has_audio_anywhere(d: Path) -> bool:
         # from the whole scan until clear_scan_caches() runs. Answer
         # conservatively for this call, but don't poison the cache: let the
         # next call re-check.
+        return False
+    if walk_errors:
+        # os.walk consumed a scandir failure via the error callback and walked
+        # on without that subtree — the audio may live exactly there. Same
+        # stance as the OSError above: unproven, so don't cache the False.
         return False
     _HAS_AUDIO_CACHE[key] = False
     return False

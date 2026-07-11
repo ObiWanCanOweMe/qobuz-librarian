@@ -17,18 +17,23 @@ cd "$(dirname "$0")/.."
 
 streamrip_ref=$(grep -oE 'streamrip @ git\+https://[^"]+' Dockerfile | head -1)
 beets_pin=$(grep -oE 'beets==[0-9.]+' Dockerfile | head -1)
-if [ -z "$streamrip_ref" ] || [ -z "$beets_pin" ]; then
-    echo "couldn't read the streamrip/beets pins from Dockerfile" >&2
+# Resolve inside the same base image the runtime uses — read it from the
+# Dockerfile like the pins above. A hard-coded python tag drifts: a lock
+# resolved on 3.12 can pick version-conditional deps and wheels the shipped
+# 3.14 interpreter never saw.
+base_image=$(grep -oE '^FROM python:[^ ]+' Dockerfile | head -1 | cut -d' ' -f2)
+if [ -z "$streamrip_ref" ] || [ -z "$beets_pin" ] || [ -z "$base_image" ]; then
+    echo "couldn't read the streamrip/beets/python pins from Dockerfile" >&2
     exit 1
 fi
 
-echo "==> Resolving image deps (streamrip ${streamrip_ref##*@}, ${beets_pin})"
+echo "==> Resolving image deps (${base_image}, streamrip ${streamrip_ref##*@}, ${beets_pin})"
 # streamrip and beets are installed --no-deps in the image because they cap a
 # few helpers (Pillow, aiofiles, tomlkit) far below what the librarian runs and
 # verifies. Here they install with deps so the resolver picks a complete,
 # self-consistent set; the freeze is what the image then pins to.
 frozen=$(docker run --rm -i -v "$PWD/requirements.txt:/tmp/requirements.txt:ro" \
-    python:3.12-slim bash -s <<EOF
+    "$base_image" bash -s <<EOF
 set -e
 apt-get update -qq && apt-get install -y -qq git build-essential >/dev/null 2>&1
 pip install --no-cache-dir -q -r /tmp/requirements.txt >/dev/null

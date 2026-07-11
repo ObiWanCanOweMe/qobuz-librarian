@@ -30,6 +30,7 @@ from qobuz_librarian.library.backup import (
     pin_unverified_upgrade_backup,
     restore_gap_fill_backup,
     restore_upgrade_backup,
+    warn_pin_failed,
 )
 from qobuz_librarian.library.catalog import (
     _count_audio_files_in,
@@ -37,10 +38,11 @@ from qobuz_librarian.library.catalog import (
     cleanup_duplicate_art,
     find_album_dir_by_track_signatures,
     find_album_dir_filesystem,
+    folder_holds_all_tracks,
     prompt_and_migrate_multi_artist_folder,
     track_signatures_for_album_dirs,
 )
-from qobuz_librarian.library.scanner import clear_scan_caches
+from qobuz_librarian.library.scanner import clear_scan_caches, iter_tree_no_symlinks
 from qobuz_librarian.quality.decision import mark_local_album_capped
 from qobuz_librarian.quality.verify import (
     redownload_with_staged_fallback,
@@ -207,30 +209,46 @@ def _move_to_beets_retry(album_dirs, label):
 
 
 def _dir_has_audio(d):
-    """True if any audio file remains under d — i.e. beets didn't move it out."""
+    """True if any audio file remains under d — i.e. beets didn't move it out.
+    Walked with an error channel, not rglob: rglob swallows a subtree listing
+    failure, and audio sitting exactly there would read as "none left" to the
+    husk delete that follows."""
+    walk_errors = []
     try:
-        return any(f.is_file() and f.suffix.lower() in cfg.AUDIO_EXTS
-                   for f in d.rglob("*"))
+        for f in iter_tree_no_symlinks(d, errors=walk_errors):
+            if f.is_file() and f.suffix.lower() in cfg.AUDIO_EXTS:
+                return True
     except OSError:
         return True  # can't tell → assume tracks remain, never delete blindly
+    return bool(walk_errors)
 
 
 def _parked_companions(d):
     """Non-audio companion files under a parked album dir worth keeping after
     beets has moved the audio out — booklets, scans, .cue/.log, hand-placed
     cover art. Skips hidden/bookkeeping dotfiles and streamrip's `__artwork`
-    cover orphans (swept separately), which aren't user content."""
+    cover orphans (swept separately), which aren't user content.
+
+    Returns None when the dir can't be listed or the walk couldn't cover the
+    whole tree — "couldn't read" must not read as "nothing to keep" to a
+    caller about to delete the tree."""
     out = []
+    walk_errors = []
     try:
-        for f in d.rglob("*"):
-            if (not f.is_file()
-                    or f.suffix.lower() in cfg.AUDIO_EXTS
-                    or f.name.startswith(".")
-                    or "__artwork" in f.parts):
-                continue
+        for f in iter_tree_no_symlinks(d, errors=walk_errors):
+            try:
+                if (not f.is_file()
+                        or f.suffix.lower() in cfg.AUDIO_EXTS
+                        or f.name.startswith(".")
+                        or "__artwork" in f.parts):
+                    continue
+            except OSError:
+                return None
             out.append(f)
     except OSError:
-        return []
+        return None
+    if walk_errors:
+        return None
     return out
 
 
@@ -240,12 +258,20 @@ def _preserve_parked_companions(group, d):
     take booklets/scans/.cue/.log down with the staging folder. They land under
     DATA_DIR/import_leftovers/<group>/<album>/ — outside the retry tree (so they
     aren't rescanned every flush) and on the persistent volume — and the move is
-    logged so the user can rescue them."""
+    logged so the user can rescue them.
+
+    Returns True when the husk is safe to delete: every companion made it out
+    (or there were none). A failed move — or a dir that couldn't even be
+    listed — returns False, because the recursive delete that follows would
+    take down precisely the file the move failed to preserve."""
     companions = _parked_companions(d)
+    if companions is None:
+        return False
     if not companions:
-        return
+        return True
     dest = cfg.DATA_DIR / "import_leftovers" / group.name / d.name
     moved = 0
+    failed = 0
     for f in companions:
         out = dest / f.relative_to(d)
         try:
@@ -253,12 +279,13 @@ def _preserve_parked_companions(group, d):
             shutil.move(str(f), str(out))
             moved += 1
         except OSError:
-            pass
+            failed += 1
     if moved:
         log.info(fmt(C.YELLOW,
             f"  📎  Kept {moved} non-audio file(s) from "
             f"{truncate(d.name, 40)} at {dest} — beets imported the audio but "
             f"left these behind."))
+    return failed == 0
 
 
 def _reimport_parked_albums():
@@ -267,13 +294,16 @@ def _reimport_parked_albums():
     cause — a DB lock, an idle-timeout, a momentarily-busy disk — so retrying
     the import (never the download; the files are already on disk) at the start
     of the next flush clears the backlog without re-fetching anything. Groups
-    that still fail stay parked for the run after. Returns True if anything
-    imported, so the caller knows to run the duplicate-album fold."""
+    that still fail stay parked for the run after. Returns (anything_imported,
+    landed_library_dirs): the flag drives the duplicate-album fold, and the
+    resolved dirs feed the post-import lyric finaliser — a parked reimport
+    that skipped it kept its embedded lyrics and never got its .lrc sidecar."""
     retry_root = cfg.STAGING_DIR / cfg.BEETS_RETRY_DIR
     if not retry_root.is_dir():
-        return False
+        return False, []
     groups = sorted(d for d in retry_root.iterdir() if d.is_dir())
     any_ok = False
+    landed_dirs = []
     for group in groups:
         album_dirs = sorted(d for d in group.iterdir() if d.is_dir())
         if not album_dirs:
@@ -284,6 +314,10 @@ def _reimport_parked_albums():
             continue
         log.info(fmt(C.GRAY,
             f"  ↻  Re-importing parked album(s): {truncate(group.name, 50)}"))
+        # Tag signatures survive beets moving/renaming the files, so the
+        # landed folder is findable after the import for the lyric finaliser.
+        sigs_by_dir = {d: track_signatures_for_album_dirs([d])
+                       for d in album_dirs}
         _import_album_with_retry(album_dirs)
         # Trust the disk, not the return value. The import-success check counts
         # audio before/after, but it can't see inside the retry tree — so a
@@ -293,6 +327,7 @@ def _reimport_parked_albums():
         # actually left keeps the skipped ones parked instead of deleting the
         # only copy.
         kept = []
+        husks_kept = 0
         for d in album_dirs:
             if _dir_has_audio(d):
                 kept.append(d)
@@ -301,18 +336,33 @@ def _reimport_parked_albums():
                 # beets moved the audio into the library; rescue any non-audio
                 # companions it left behind before removing the husk, so the
                 # booklet/scans/cue aren't silently deleted with the staging dir.
-                _preserve_parked_companions(group, d)
-                shutil.rmtree(d, ignore_errors=True)
+                # A failed rescue keeps the husk — deleting it would take down
+                # exactly the companion the move failed to preserve.
+                if _preserve_parked_companions(group, d):
+                    shutil.rmtree(d, ignore_errors=True)
+                else:
+                    husks_kept += 1
+                    log.info(fmt(C.YELLOW,
+                        f"  ⚠  Couldn't move {truncate(d.name, 40)}'s non-audio "
+                        f"files out — keeping the folder at {d} so they aren't "
+                        f"lost; move them out by hand."))
+                try:
+                    landed = find_album_dir_by_track_signatures(sigs_by_dir.get(d))
+                except Exception as _e_sig:
+                    landed = None
+                    vlog(f"parked reimport: couldn't locate landed dir: {_e_sig}")
+                if landed is not None:
+                    landed_dirs.append(landed)
         if kept:
             log.info(fmt(C.YELLOW,
                 f"  ⏭  {len(kept)} parked album(s) in {truncate(group.name, 50)} "
                 f"still hold tracks — left for a later run."))
-        else:
+        elif not husks_kept:
             # Every album in the group moved out, so the group holds no tracks —
             # clear it (and any stray non-audio leftover) rather than leaving an
             # empty husk to be rescanned each flush.
             shutil.rmtree(group, ignore_errors=True)
-    return any_ok
+    return any_ok, landed_dirs
 
 
 _RETRYABLE_STOP_RESULTS = {
@@ -412,8 +462,18 @@ def _resolve_queue_item(item, args, imported_globally):
             vlog(f"split-folder merge raised: {_e_sf}")
         # Sibling deletion requires n_fail == 0 AND n_lossy == 0 — a partial
         # download must not wipe the sibling that may hold the missing tracks.
-        if item.get("n_fail", 0) == 0 and item.get("n_lossy", 0) == 0:
-            for sib_dir in item.get("siblings_to_delete", []):
+        # And the clean-run flags alone aren't proof the album LANDED whole:
+        # beets reports success when it moved any audio (leftovers allowed),
+        # so "imported + folder has audio" can be one track in place while a
+        # sibling marked for deletion holds the only copy of the rest. Clear
+        # the same one-to-one bar the gap-fill backup gate uses; unverifiable
+        # keeps the siblings.
+        _sibs = item.get("siblings_to_delete", [])
+        _sibs_whole = bool(_sibs) and folder_holds_all_tracks(
+            post_dir, (item["album"].get("tracks") or {}).get("items") or [])
+        if (item.get("n_fail", 0) == 0 and item.get("n_lossy", 0) == 0
+                and _sibs_whole):
+            for sib_dir in _sibs:
                 if not sib_dir.exists():
                     continue
                 # Never rmtree the folder beets just imported into: the
@@ -438,9 +498,14 @@ def _resolve_queue_item(item, args, imported_globally):
                 except OSError as _e_sib:
                     log.info(fmt(C.YELLOW,
                         f"  ⚠  Couldn't remove {sib_dir.name}: {_e_sib}"))
-        elif item.get("siblings_to_delete"):
+        elif _sibs and item.get("n_fail", 0) == 0 and item.get("n_lossy", 0) == 0:
+            log.info(fmt(C.YELLOW,
+                f"  ⚠  Keeping {len(_sibs)} sibling folder(s) — the filled "
+                f"folder couldn't be verified as holding every track, and a "
+                f"sibling may hold the only copy of what's missing."))
+        elif _sibs:
             log.info(fmt(C.GRAY,
-                f"  · Keeping {len(item['siblings_to_delete'])} sibling(s) "
+                f"  · Keeping {len(_sibs)} sibling(s) "
                 f"— partial result (n_fail={item.get('n_fail', 0)}, "
                 f"n_lossy={item.get('n_lossy', 0)})"))
 
@@ -468,14 +533,26 @@ def _resolve_queue_item(item, args, imported_globally):
                 # them, so they'd be lost with the backup. Mirrors the single-
                 # album CLI path in modes/process.py; the bulk artist/upgrade
                 # walks and the web Upgrade action run through this executor.
-                _carry_non_audio_from_backup(item["album"], album_dir, bp)
-                try:
-                    shutil.rmtree(bp)
-                except OSError as e:
+                # A failed carry keeps the backup: it holds the only copies.
+                if _carry_non_audio_from_backup(item["album"], album_dir, bp):
+                    try:
+                        shutil.rmtree(bp)
+                    except OSError as e:
+                        log.info(fmt(C.YELLOW,
+                            f"  ⚠  Couldn't remove backup for {truncate(album_dir.name, 40)}: {e}"))
+                else:
+                    if not pin_unverified_upgrade_backup(bp):
+                        warn_pin_failed(bp)
                     log.info(fmt(C.YELLOW,
-                        f"  ⚠  Couldn't remove backup for {truncate(album_dir.name, 40)}: {e}"))
+                        f"  ⚠  {truncate(album_dir.name, 40)}: upgraded, but "
+                        f"the booklet/artwork companions couldn't be copied "
+                        f"out of the backup — keeping it."))
+                    log.info(fmt(C.GRAY,
+                        f"     Backup at {bp}; copy the non-audio files out "
+                        f"yourself, then delete it."))
             else:
-                pin_unverified_upgrade_backup(bp)
+                if not pin_unverified_upgrade_backup(bp):
+                    warn_pin_failed(bp)
                 log.info(fmt(C.YELLOW,
                     f"  ⚠  {truncate(album_dir.name, 40)}: upgrade couldn't be "
                     f"verified as complete — keeping your original."))
@@ -518,23 +595,35 @@ def _resolve_queue_item(item, args, imported_globally):
         # independent of whether we then *located* the filled folder, which
         # matters: a clean import beets filed where the matcher can't find it
         # must NOT be treated as a failure and restored over itself.
-        if _item_strict_success and album_has_content:
+        # NOT just "the folder has any audio": beets returns success when it
+        # moved anything, and it can leave tracks in staging on the success
+        # path — so a partial move would pass a >0 check while the present
+        # tracks' only copy is this backup. And not a raw file count either:
+        # extras, duplicate files, or pre-existing tracks reach the expected
+        # number while an expected track is absent. Require every expected
+        # track to match one-to-one, like process.py's gate.
+        _filled_whole = (album_has_content
+                         and folder_holds_all_tracks(
+                             post_dir,
+                             (item["album"].get("tracks") or {}).get("items") or []))
+        if _item_strict_success and _filled_whole:
             try:
                 shutil.rmtree(gfb)
             except OSError as e:
                 log.info(fmt(C.YELLOW,
                     f"  ⚠  Gap-fill complete but couldn't remove backup: {e}"))
         elif _item_strict_success:
-            # Imported cleanly, but beets filed the album where the matcher
-            # couldn't find it (renamed past the fuzzy gate, or under an
-            # unexpected albumartist), so post_dir fell back to the now-empty
-            # album_dir. Restoring the backed-up tracks here would strand them
-            # beside the fresh import and destroy the only backup — keep it and
-            # let the user reconcile, exactly as the upgrade branch above does.
+            # Imported cleanly, but either beets filed the album where the
+            # matcher couldn't find it (renamed past the fuzzy gate, or under
+            # an unexpected albumartist) or the located folder is short of the
+            # full track count. Restoring the backed-up tracks here would
+            # strand them beside the fresh import and destroy the only backup
+            # — keep it and let the user reconcile, exactly as the upgrade
+            # branch above does.
             log.info(fmt(C.YELLOW,
                 f"  ⚠  {truncate(album_dir.name, 40)}: filled, but the new "
-                f"folder couldn't be located — keeping the backed-up tracks "
-                f"rather than restoring them as a duplicate."))
+                f"folder couldn't be confirmed whole — keeping the backed-up "
+                f"tracks rather than restoring them as a duplicate."))
             log.info(fmt(C.GRAY,
                 f"     Backup at {gfb}; remove it once you've confirmed the "
                 f"fill landed."))
@@ -731,7 +820,7 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
     io_error = False
     auth_lost_exc = None
     queue_transient_lyric_sigs = []
-    any_imported = _reimport_parked_albums()
+    any_imported, _parked_post_dirs = _reimport_parked_albums()
     results = []
 
     def _persist():
@@ -1082,9 +1171,9 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
     # The lyric hook always embeds and relies on this post-import pass to emit
     # the sidecars; gating it on transient sigs broke LYRICS_FORMAT=sidecar/both
     # on the normal happy path. No-op when LYRICS_FORMAT is embed.
-    if any_imported and _post_dirs:
+    if any_imported and (_post_dirs or _parked_post_dirs):
         try:
-            write_post_import_sidecars(_post_dirs)
+            write_post_import_sidecars(_post_dirs + _parked_post_dirs)
         except Exception as _e_sc:
             vlog(f"post-import sidecar write raised: {_e_sc}")
 

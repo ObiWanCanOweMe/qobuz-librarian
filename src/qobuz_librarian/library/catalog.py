@@ -534,26 +534,49 @@ def _keys_match(a, b, layer):
     ))
 
 
-def _pair_tracks(claim_keys, slot_keys):
+def _pair_indices(claim_keys, slot_keys):
     """One-to-one match claim_keys against slot_keys, strongest layer first.
 
-    Returns a bool list over claim_keys marking which claimed a slot. Each slot
-    is consumed once, so a repeated title (a reprise, a hidden track, two
-    same-named versions) leaves the surplus unclaimed rather than letting them
-    all match a single file — the multiplicity that keeps a real gap, or a bonus
-    track before an upgrade wipe, from being silently hidden.
+    Returns a list over claim_keys of the slot index each claimed (None =
+    unclaimed). Each slot is consumed once, so a repeated title (a reprise, a
+    hidden track, two same-named versions) leaves the surplus unclaimed rather
+    than letting them all match a single file — the multiplicity that keeps a
+    real gap, or a bonus track before an upgrade wipe, from being silently
+    hidden.
+
+    A key whose ISRC also appears on the OTHER side is identity-locked: it can
+    only pair at the ISRC layer. Without that, a title match can hand track A's
+    second copy to track B ("Song (A twin), Song (B)" expected against two
+    files both tagged as the A recording reads complete), and the deletion
+    gates built on this matcher would discard a backup holding the only real B.
+    Tracks whose ISRC exists on neither the other side nor at all (different
+    edition, untagged rip) still pair by title as before.
     """
+    claim_isrcs = {k["isrc"] for k in claim_keys if k["isrc"]}
+    slot_isrcs = {k["isrc"] for k in slot_keys if k["isrc"]}
     used = [False] * len(slot_keys)
-    claimed = [False] * len(claim_keys)
+    claimed = [None] * len(claim_keys)
     for layer in _MATCH_LAYERS:
         for ci, ck in enumerate(claim_keys):
-            if claimed[ci]:
+            if claimed[ci] is not None:
+                continue
+            if layer != "isrc" and ck["isrc"] and ck["isrc"] in slot_isrcs:
                 continue
             for si, sk in enumerate(slot_keys):
-                if not used[si] and _keys_match(ck, sk, layer):
-                    used[si] = claimed[ci] = True
-                    break
+                if used[si] or not _keys_match(ck, sk, layer):
+                    continue
+                if layer != "isrc" and sk["isrc"] and sk["isrc"] in claim_isrcs:
+                    continue
+                used[si] = True
+                claimed[ci] = si
+                break
     return claimed
+
+
+def _pair_tracks(claim_keys, slot_keys):
+    """Bool list over claim_keys marking which claimed a slot (see
+    _pair_indices for the matching rules)."""
+    return [si is not None for si in _pair_indices(claim_keys, slot_keys)]
 
 
 def _disc_count(tracks, field):
@@ -598,6 +621,50 @@ def compute_missing(qobuz_tracks, existing_tracks):
     missing = [qt for i, qt in enumerate(qobuz_tracks) if not claimed[i]]
     present = [qt for i, qt in enumerate(qobuz_tracks) if claimed[i]]
     return missing, present
+
+
+def folder_holds_all_tracks(folder, qobuz_tracks):
+    """True only when every expected Qobuz track one-to-one matches an audio
+    file under ``folder`` — the same matcher the scan uses, so a duplicate
+    title needs two files and an extra can't stand in for an expected track.
+
+    This gates gap-fill backup deletion: a raw file count can be satisfied by
+    extras, duplicate files, or pre-existing tracks while an expected track is
+    absent, and the backup being deleted holds the only copy of the tracks
+    moved aside. No expected list, an unreadable folder, or a walk that
+    couldn't cover the whole tree reads as False — unverifiable means keep
+    the backup."""
+    if not qobuz_tracks or folder is None or not folder.exists():
+        return False
+    walk_errors = []
+    tracks = read_album_dir(folder, walk_errors=walk_errors)
+    if not tracks or walk_errors:
+        # A degraded walk lists only the readable part of the folder, but the
+        # decision below is about ALL of it: pairing against a partial listing
+        # can prove "complete" with the wrong file while the right one sits in
+        # the unreadable subtree.
+        return False
+    still_missing, _ = compute_missing(qobuz_tracks, tracks)
+    return not still_missing
+
+
+def pair_existing_tracks(a_tracks, b_tracks):
+    """One-to-one pair two ON-DISK track lists with the scan's matcher.
+
+    Returns (pairs, unpaired_a): ``pairs`` as (a_track, b_track) tuples,
+    ``unpaired_a`` the a-side tracks that claimed nothing. Used to compare a
+    rebuilt album against its backup track-by-track (quality, length): rank
+    ordering can hide a swap where one track was upgraded and another
+    downgraded, so the comparison has to follow identity, not position."""
+    disc_scoped = (_disc_count(a_tracks, "discnumber") > 1
+                   and _disc_count(b_tracks, "discnumber") > 1)
+    indices = _pair_indices(_existing_keys(a_tracks, disc_scoped),
+                            _existing_keys(b_tracks, disc_scoped))
+    pairs = [(a_tracks[ai], b_tracks[si])
+             for ai, si in enumerate(indices) if si is not None]
+    unpaired = [a_tracks[ai]
+                for ai, si in enumerate(indices) if si is None]
+    return pairs, unpaired
 
 
 def find_extras_in_existing(qobuz_tracks, existing_tracks):

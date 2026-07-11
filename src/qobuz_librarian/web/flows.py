@@ -414,28 +414,31 @@ def refold_restored_missing(artists, fingerprints):
     return added
 
 
-def refold_into_living_review(picks):
-    """Fold a list of library picks back into the living review, ticked — so they
-    come back on /library ready to retry instead of stranding in a dead job. Two
-    callers: the picks a cancelled download never reached (WebUIAudit #43), and
-    the albums that FAILED on a partial-approve run. The living review is the
-    split-off parked review #48 left behind at approve; when the WHOLE review was
-    ticked there is none, and those paths recover differently (a cancel lets the
-    saved-state rebuild bring the picks back unticked; a failure re-parks a fresh
-    review). Dedups by fold key, so re-adding a pick already in the review is
-    safe. Returns how many rejoined, or None when there's no review to fold into."""
+def refold_into_living_review(picks, execute_kind="library", ticked=True):
+    """Fold a list of picks back into the newest parked review of
+    ``execute_kind``, ticked by default — so they come back ready to retry
+    instead of stranding in a dead job. Callers: the picks a cancelled
+    download never reached (WebUIAudit #43), the albums that FAILED on a
+    partial-approve run, and (unticked) the instant Gap Fill candidate a
+    partial import leaves behind. The living review is the split-off parked
+    review #48 left behind at approve; when the WHOLE review was ticked there
+    is none, and those paths recover differently (a cancel lets the
+    saved-state rebuild bring the picks back unticked; a failure re-parks a
+    fresh review). Dedups by fold key, so re-adding a pick already in the
+    review is safe. Returns how many rejoined, or None when there's no review
+    to fold into."""
     from qobuz_librarian.web import job_persistence
     from qobuz_librarian.web import jobs as job_mgr
 
     parked = None
     for j in job_mgr.registry.awaiting_review():
-        if getattr(j, "execute_kind", "") != "library":
+        if getattr(j, "execute_kind", "") != execute_kind:
             continue
         if parked is None or (j.created_at or 0) > (parked.created_at or 0):
             parked = j
     if parked is None:
         return None
-    specs = [dict(c, selected=True) for c in picks]
+    specs = [dict(c, selected=True) if ticked else dict(c) for c in picks]
     folded = fold_new_candidates(parked, specs)
     if folded is None:
         return None
@@ -444,21 +447,28 @@ def refold_into_living_review(picks):
     return folded[0]
 
 
-def _park_library_failures(failed_cands):
+def _park_library_failures(failed_cands, execute_kind="library",
+                           ticked=True, summary=None):
     """After a whole-review download (every candidate ticked) finishes, retire
     empties the living review — so the albums that FAILED to download would
-    vanish until the next scan. Re-park them as a fresh living Library review,
-    ticked, so they come back on /library ready to retry (mirrors the split-off
-    review #48 leaves on a partial approve). Persisted so a restart keeps them
-    even though the retired baseline no longer rebuilds. Returns the parked job,
-    or None when nothing failed."""
+    vanish until the next scan. Re-park them as a fresh living review of
+    ``execute_kind``, ticked, so they come back ready to retry (mirrors the
+    split-off review #48 leaves on a partial approve). Persisted so a restart
+    keeps them even though the retired baseline no longer rebuilds. Also the
+    park half of the unticked instant Gap Fill fold, via ``ticked``/
+    ``summary``. Returns the parked job, or None when nothing failed."""
     from qobuz_librarian.web import job_persistence
     from qobuz_librarian.web import jobs as job_mgr
     if not failed_cands:
         return None
-    job = job_mgr.Job(title="Library scan", kind="scan",
-                      execute_kind="library",
-                      status=job_mgr.JobStatus.AWAITING_REVIEW)
+    if execute_kind == "new_releases":
+        job = job_mgr.Job(title="New-release check",
+                          execute_kind="new_releases",
+                          status=job_mgr.JobStatus.AWAITING_REVIEW)
+    else:
+        job = job_mgr.Job(title="Library scan", kind="scan",
+                          execute_kind="library",
+                          status=job_mgr.JobStatus.AWAITING_REVIEW)
     job._execute_fn = lambda j, chosen: execute_albums(
         j, chosen, load_qobuz_token()[1])
     for c in failed_cands:
@@ -468,14 +478,51 @@ def _park_library_failures(failed_cands):
             artist=c.get("artist") or "",
             detail=c.get("detail") or "",
             payload=c.get("payload") or {},
-            selected=True,
+            selected=True if ticked else bool(c.get("selected")),
         )
     n = len(job.candidates)
-    job.summary = (f"{n:,} album{'s' if n != 1 else ''} didn't download last "
-                   "time. Ticked and ready to retry.")
+    if summary is not None:
+        job.summary = summary
+    elif execute_kind == "new_releases":
+        job.summary = (f"{n:,} new release{'s' if n != 1 else ''} didn't "
+                       "download last time. Ticked and ready to retry.")
+    else:
+        job.summary = (f"{n:,} album{'s' if n != 1 else ''} didn't download "
+                       "last time. Ticked and ready to retry.")
     job_mgr.registry.add(job)
     job_persistence.persist(job)
     return job
+
+
+def _return_new_release_picks(picks):
+    """A new release stays in the New Releases review until it's downloaded or
+    dismissed — so picks that failed, were cancelled, or never ran fold back
+    into the parked new-release review, ticked; with none parked (the whole
+    review was ticked at approve) they re-park as a fresh one. The persistent
+    baseline consumed these ids at check time, so without this they'd never
+    be offered as new again."""
+    if not picks:
+        return
+    if refold_into_living_review(picks, execute_kind="new_releases") is None:
+        _park_library_failures(picks, execute_kind="new_releases")
+
+
+def _fold_partial_gap_fill(full_album, artist_name, n_missing):
+    """A partial download (some tracks failed) leaves the album on disk with
+    gaps. Fold it into the living Library review as an unticked Gap Fill
+    candidate right away — the app tracks its own downloads, so the gap must
+    not wait for the next manual refresh to become visible. With no library
+    review parked, a fresh one is parked so /library shows it. Runs after
+    prune_library_review_candidates, which just dropped the album's stale
+    Missing candidates — this replaces them with the honest remainder."""
+    spec = _album_candidate_spec(
+        {**full_album, "_partial_missing_count": n_missing},
+        artist_name, selected=False)
+    if refold_into_living_review([spec], ticked=False) is None:
+        _park_library_failures(
+            [spec], ticked=False,
+            summary="1 album downloaded only partly — the missing tracks "
+                    "are ready as Gap Fill.")
 
 
 def prune_library_review_candidates(album):
@@ -646,17 +693,36 @@ def dismiss_albums(job, artist, scope=hidden_mod.SCOPE_MISSING, gap_only=None,
                    and (not query or candidate_matches_query(c, query))]
         if not to_hide:
             return 0
-        drop = {c["cid"] for c in to_hide}
-        # Only this artist's unselected candidates leave; every other
-        # candidate (and its saved selection) is preserved untouched.
-        job.candidates = [c for c in job.candidates if c["cid"] not in drop]
         specs = [(c.get("artist"), c.get("title"),
                   (c.get("payload") or {}).get("year")) for c in to_hide]
-    # File write + persist outside the lock — neither needs it, and hide does
-    # disk I/O that shouldn't stall the scan thread's next add_candidate.
+    # Record the dismissals durably FIRST, outside the lock (disk I/O mustn't
+    # stall the scan thread's next add_candidate). If the store write fails it
+    # raises here with the review untouched — the rows must not vanish now
+    # only to resurface after a restart.
     hidden_mod.hide(scope, specs)
+    drop = {c["cid"] for c in to_hide}
+    with job._lock:
+        # Re-read the ticks under the lock: a selection saved while the store
+        # write above ran was promised "keep the ticked ones", so it wins —
+        # dropping the stale snapshot's ids wholesale would dismiss an album
+        # the user just ticked.
+        ticked_meanwhile = [c for c in job.candidates
+                            if c["cid"] in drop and c.get("selected")]
+        keep = {c["cid"] for c in ticked_meanwhile}
+        # Only this artist's unselected candidates leave; every other
+        # candidate (and its saved selection) is preserved untouched.
+        job.candidates = [c for c in job.candidates
+                          if c["cid"] not in drop or c["cid"] in keep]
+    if ticked_meanwhile:
+        # Their dismissals were already written durably — take them back out,
+        # or the next bulk walk skips albums that are visibly ticked here. A
+        # failed un-hide raises like a failed hide: the store is then wrong
+        # and the user must see that, not a success count.
+        fps = [hidden_mod.album_fingerprint(c.get("artist"), c.get("title"))
+               for c in ticked_meanwhile]
+        hidden_mod.restore_albums(scope, [fp for fp in fps if fp])
     job_persistence.persist(job)
-    return len(to_hide)
+    return len(to_hide) - len(ticked_meanwhile)
 
 
 # ── Scans ─────────────────────────────────────────────────────────────────────
@@ -1182,10 +1248,13 @@ def execute_albums(job, chosen, token):
     # in flight is folded back with the un-started picks.
     failed_cands = []
     cancelled_cand = None
-    # Every fold-back recovery below is for LIBRARY runs only: this function
-    # also executes new-release batches, and their albums must never enter the
-    # Library review — they live and die with their own job.
+    # Fold-back recovery is kind-scoped: this function executes both library
+    # and new-release batches, and their picks must never cross into each
+    # other's review — a library pick returns to the Library review, a
+    # new-release pick to the New Releases review (it stays there until
+    # downloaded or dismissed).
     is_library_run = getattr(job, "execute_kind", "") == "library"
+    is_nr_run = getattr(job, "execute_kind", "") == "new_releases"
 
     def _fold_back_unfinished():
         # Token death / outage mid-batch: once something has imported, this
@@ -1194,8 +1263,13 @@ def execute_albums(job, chosen, token):
         # into the living review, ticked, so they come back to retry like any
         # other early exit. cand/processed are read at call time, inside the
         # loop.
-        if is_library_run and job._imported_any:
-            refold_into_living_review(failed_cands + [cand] + chosen[processed:])
+        if not job._imported_any:
+            return
+        leftovers = failed_cands + [cand] + chosen[processed:]
+        if is_library_run:
+            refold_into_living_review(leftovers)
+        elif is_nr_run:
+            _return_new_release_picks(leftovers)
     for i, cand in enumerate(chosen, 1):
         if job.cancel_requested:
             break
@@ -1245,9 +1319,22 @@ def execute_albums(job, chosen, token):
             # offering it is stale.
             prune_library_review_candidates(full)
             # A partial (some tracks landed, some failed) isn't a full download —
-            # count it apart so the summary doesn't claim it finished.
+            # count it apart so the summary doesn't claim it finished, and
+            # surface the remainder NOW (after the prune, which would otherwise
+            # drop the fresh candidate as a same-id stale one) instead of
+            # leaving it invisible until the next manual refresh. WHERE it
+            # surfaces follows the run: a library run folds it into the living
+            # review as Gap Fill; a new-release run returns the release to the
+            # New Releases review — a release stays there until it's fully
+            # downloaded or dismissed, and its remainder must not leak into
+            # the Library review.
             if result.get("n_fail", 0) > 0:
                 partial += 1
+                if is_nr_run:
+                    _return_new_release_picks([cand])
+                elif is_library_run:
+                    _fold_partial_gap_fill(full, cand.get("artist") or "",
+                                           result.get("n_fail", 0))
             else:
                 ok += 1
         elif not (result and result.get("result") in _benign):
@@ -1266,6 +1353,8 @@ def execute_albums(job, chosen, token):
             unrun = [cancelled_cand] + unrun
         if unrun and is_library_run:
             refold_into_living_review(unrun)
+        elif unrun and is_nr_run:
+            _return_new_release_picks(unrun)
         job.summary = (f"Stopped early. {ok} downloaded, "
                        f"{len(chosen) - processed} not started.")
         log.info(job.summary)
@@ -1296,6 +1385,11 @@ def execute_albums(job, chosen, token):
         # come back to retry — the same recovery the whole-review path gets, not
         # surviving only as this job's error line until a manual refresh.
         refold_into_living_review(failed_cands)
+    elif failed_cands and is_nr_run:
+        # A new release that failed to download wasn't downloaded — it goes
+        # back to the New Releases review rather than being consumed (the
+        # baseline already recorded it, so nothing else would re-offer it).
+        _return_new_release_picks(failed_cands)
 
 
 # ── Upgrade flow ──────────────────────────────────────────────────────────────
@@ -1598,6 +1692,7 @@ def execute_downsamples(job, chosen, token=None, args=None):
     shrunk = 0
     total_saved = 0
     total_errors = 0
+    total_flush_warns = 0
     skipped = 0
     processed = 0
     for i, cand in enumerate(chosen, 1):
@@ -1630,12 +1725,16 @@ def execute_downsamples(job, chosen, token=None, args=None):
             with staging_lock():
                 res = downsample_dir(album_dir, verbose=True,
                                      base_dir=album_dir, log=log.info,
-                                     keep_originals=cfg.DOWNSAMPLE_KEEP_ORIGINALS == "keep")
+                                     keep_originals=cfg.DOWNSAMPLE_KEEP_ORIGINALS == "keep",
+                                     cancel_check=lambda: job.cancel_requested)
         except Exception as e:
             log.info(f"  failed: {e}")
             total_errors += 1
             continue
-        if res.get("resampled"):
+        if res.get("resampled") and not res.get("cancelled"):
+            # A Stop mid-album leaves the rest of its tracks hi-res: don't
+            # count it done or mark it capped — the state refresh below
+            # re-lists the remainder so the run can be finished later.
             shrunk += 1
             mark_local_album_capped(album_dir)
             if token:
@@ -1648,6 +1747,7 @@ def execute_downsamples(job, chosen, token=None, args=None):
         _refresh_downsample_artist_state(album_dir.parent)
         total_saved += res.get("saved_bytes", 0)
         total_errors += res.get("errors", 0)
+        total_flush_warns += res.get("flush_warnings", 0)
     job._progress_scope = None
     if job.cancel_requested:
         job.summary = (f"Stopped early. Downsampled {plural(shrunk, 'album')} "
@@ -1664,6 +1764,13 @@ def execute_downsamples(job, chosen, token=None, args=None):
     if total_errors:
         job.error = (f"{plural(total_errors, 'file')} couldn't be downsampled "
                      "(left unchanged); see the log.")
+    if total_flush_warns:
+        # These files WERE rewritten — only the folder flush failed afterwards,
+        # so the swap may not survive a power loss. Saying "left unchanged"
+        # about them would be false: the lossless master is already gone.
+        note = (f"{plural(total_flush_warns, 'file')} resampled but couldn't "
+                f"be flushed to disk — check the drive; see the log.")
+        job.error = f"{job.error} {note}" if job.error else note
 
 
 # ── Repair flow ───────────────────────────────────────────────────────────────
@@ -1957,7 +2064,10 @@ def _redownload_damaged_album(payload, token):
             # Imported, but a decode pass alone doesn't prove the re-rip kept
             # every track — a truncated or short result could be WORSE than the
             # damaged original it replaced. Keep the only copy that may hold
-            # more rather than deleting it on the old decode-only gate.
+            # more rather than deleting it on the old decode-only gate. Flag
+            # the result so the summary doesn't count it repaired: what's in
+            # the library is an unverified, possibly incomplete replacement.
+            result["repair_unverified"] = True
             log.info("  Re-download landed but couldn't be verified as complete "
                      f"as the original; keeping your backup at {backup}.")
         else:
@@ -2007,8 +2117,15 @@ def execute_repairs(job, chosen, token):
             failed += 1
             continue
         # Each chosen album was flagged as damaged, so anything that didn't end
-        # up downloaded-and-imported is a real failure.
-        if result and result.get("n_ok", 0) > 0 and result.get("imported"):
+        # up downloaded-and-imported is a real failure. "Repaired" also has to
+        # mean it: a partial re-download (n_fail > 0) or a replacement that
+        # failed the completeness check landed SOMETHING in the library, but
+        # counting it fixed would render a clean "Repaired n/n" over an album
+        # that's still wrong — those count failed, and their kept backup is
+        # named in the log.
+        if (result and result.get("n_ok", 0) > 0 and result.get("imported")
+                and result.get("n_fail", 0) == 0
+                and not result.get("repair_unverified")):
             fixed += 1
             job._imported_any = True
             _refresh_after_local_album_change(

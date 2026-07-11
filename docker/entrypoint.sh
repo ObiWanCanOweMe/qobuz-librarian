@@ -111,6 +111,21 @@ case "${PUID}${PGID}" in
         exit 1
         ;;
     *)
+        # Canonicalize to plain decimal first: the root checks below compare
+        # strings, and PUID=00 is still uid 0 — with extra digits it would
+        # slip past "= 0" and run as root while reading as non-root. (Not
+        # $((...)): a leading zero makes sh parse 08/09 as bad octal.)
+        PUID="$(printf '%s' "$PUID" | sed 's/^0*\([0-9]\)/\1/')"
+        PGID="$(printf '%s' "$PGID" | sed 's/^0*\([0-9]\)/\1/')"
+        # Root must be the explicit, deliberate pair 0:0. A mixed pair like
+        # 0:1000 still runs UID 0 (full root), and 1000:0 grants the root
+        # group — both look like a normal PUID/PGID setup while quietly
+        # keeping root privileges, so refuse them outright.
+        if { [ "$PUID" = "0" ] && [ "$PGID" != "0" ]; } || \
+           { [ "$PGID" = "0" ] && [ "$PUID" != "0" ]; }; then
+            echo "[fatal] PUID=${PUID} PGID=${PGID} mixes root with a non-root id. Use a fully non-root pair, or PUID=0 PGID=0 to run as root deliberately." >&2
+            exit 1
+        fi
         APP_USER="${PUID}:${PGID}"
         # /music is the user's library — possibly a huge NAS mount — so it's
         # never recursively chowned; its permissions are theirs to manage (the

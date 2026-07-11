@@ -549,3 +549,133 @@ def test_retention_sweep_reaps_an_expired_undo_copy_by_age_alone(tmp_path, monke
     bk._only_copy_cache = None
     assert all(p != fresh for p, _ in bk.find_only_copy_backups())
     assert [p for p, _ in bk.list_undo_copies()] == [fresh]
+
+
+def test_cross_fs_backup_refuses_when_flush_fails(tmp_path, monkeypatch):
+    """A copy whose fsync genuinely fails may exist only in the page cache;
+    reporting it as a valid backup and removing the original risks losing the
+    only durable copy. Refuse and keep the original instead."""
+    from qobuz_librarian.library import backup as bkmod
+
+    album_dir = tmp_path / "music" / "Artist" / "Album"
+    album_dir.mkdir(parents=True)
+    (album_dir / "01.flac").write_bytes(b"audio-bytes")
+    monkeypatch.setattr("qobuz_librarian.config.UPGRADE_BACKUP_DIR",
+                        tmp_path / "backups")
+    monkeypatch.setattr(bkmod, "_same_filesystem", lambda a, b: False)
+    monkeypatch.setattr(bkmod, "_fsync", lambda _p: False)
+
+    assert backup_album_dir(album_dir) is None
+    assert (album_dir / "01.flac").read_bytes() == b"audio-bytes"
+
+
+def test_stash_refuses_copies_that_cannot_be_flushed(monkeypatch, tmp_path):
+    # The master these copies protect is rewritten in place right after —
+    # a verified-but-unflushed copy can vanish in a delayed writeback failure
+    # AFTER the rewrite destroyed the original. No durable copy, no rewrite.
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.library import backup as bkmod
+
+    album = tmp_path / "Album"
+    album.mkdir()
+    f = album / "01 - Track.flac"
+    f.write_bytes(b"hi-res-master")
+    monkeypatch.setattr(cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    monkeypatch.setattr(bkmod, "_fsync", lambda _p: False)
+
+    bp, copied = bkmod.stash_downsample_originals([f], album)
+    assert bp is None and copied == set()
+    assert f.read_bytes() == b"hi-res-master"
+
+
+def test_gap_fill_restore_keeps_backup_when_the_dir_flush_fails(monkeypatch, tmp_path):
+    # os.replace put the file in place, but the directory entry couldn't be
+    # flushed — the restored file may not survive a crash, so the backup copy
+    # (the only other copy) must not be deleted on top of it.
+    from pathlib import Path
+
+    from qobuz_librarian.library import backup as bkmod
+
+    album = tmp_path / "Album"
+    album.mkdir()
+    bk = tmp_path / "bk"
+    bk.mkdir()
+    (bk / "01 - Track.flac").write_bytes(b"the-only-copy")
+    monkeypatch.setattr(bkmod, "_fsync",
+                        lambda p: not Path(p).is_dir())
+
+    n = bkmod.restore_gap_fill_backup(bk, album, keep_larger_dst=False)
+    assert n == 0
+    assert bk.exists()
+    assert (bk / "01 - Track.flac").read_bytes() == b"the-only-copy"
+    assert (bk / bkmod._PARTIAL_RESTORE_SENTINEL).is_file()
+
+
+def test_keep_larger_dst_branch_flushes_before_dropping_the_backup_copy(tmp_path, monkeypatch):
+    """The kept refill was just renamed into place by the import; deleting the
+    backup copy (the only other copy) before the refill is durable loses the
+    track to a crash. A genuine flush failure keeps the backup copy."""
+    import qobuz_librarian.library.backup as bk
+
+    backup = tmp_path / "backup"
+    backup.mkdir()
+    (backup / "01.flac").write_bytes(b"short-original")
+    album = tmp_path / "Album"
+    album.mkdir()
+    (album / "01.flac").write_bytes(b"the-much-larger-refill")
+    monkeypatch.setattr(bk, "flac_audio_ok", lambda p: True)
+
+    monkeypatch.setattr(bk, "_fsync", lambda p: False)
+    assert bk.restore_gap_fill_backup(backup, album, keep_larger_dst=True) == 0
+    assert (backup / "01.flac").read_bytes() == b"short-original"
+    assert (backup / bk._PARTIAL_RESTORE_SENTINEL).is_file() or backup.exists()
+
+    monkeypatch.setattr(bk, "_fsync", lambda p: True)
+    assert bk.restore_gap_fill_backup(backup, album, keep_larger_dst=True) == 1
+    assert not backup.exists()
+    assert (album / "01.flac").read_bytes() == b"the-much-larger-refill"
+
+
+def test_restore_refuses_a_silently_partial_backup_walk(tmp_path, monkeypatch):
+    """The end-of-restore rmtree deletes the whole backup dir once every
+    VISITED file restored — so a walk that couldn't cover the tree must abort
+    the restore, or the files it never visited go down with the dir."""
+    import qobuz_librarian.library.backup as bk
+
+    backup = tmp_path / "backup"
+    backup.mkdir()
+    (backup / "01.flac").write_bytes(b"the-only-copy")
+    album = tmp_path / "Album"
+
+    monkeypatch.setattr(bk, "_list_tree", lambda root: None)
+    assert bk.restore_gap_fill_backup(backup, album, keep_larger_dst=False) == 0
+    assert (backup / "01.flac").read_bytes() == b"the-only-copy"
+
+
+def test_pin_reports_an_unwritable_marker(tmp_path, monkeypatch):
+    """For a same-path same-or-larger refill, the pin marker is the ONLY thing
+    keeping the age sweep off a sole-copy backup. A swallowed write failure
+    leaves it unprotected with no sign anything is wrong."""
+    import qobuz_librarian.library.backup as bk
+
+    bp = tmp_path / "bkp"
+    bp.mkdir()
+    assert bk.pin_unverified_upgrade_backup(bp) is True
+    assert (bp / bk._UNVERIFIED_UPGRADE_SENTINEL).is_file()
+
+    (bp / bk._UNVERIFIED_UPGRADE_SENTINEL).unlink()
+    ro = tmp_path / "gone"          # never created: the write must fail
+    assert bk.pin_unverified_upgrade_backup(ro) is False
+
+
+def test_reap_never_trusts_a_partial_backup_listing(tmp_path, monkeypatch):
+    """Redundancy is proved per track; a listing that silently misses a
+    subtree proves only the visible part, and reaping on it deletes the files
+    it never saw."""
+    import qobuz_librarian.library.backup as bk
+
+    bp = tmp_path / "bkp"
+    bp.mkdir()
+    (bp / "01.flac").write_bytes(b"x")
+    monkeypatch.setattr(bk, "_list_tree", lambda root: None)
+    assert bk._backup_safe_to_reap(bp) is False

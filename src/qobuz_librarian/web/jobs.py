@@ -789,6 +789,7 @@ def _run_post_job_hook(payload: dict) -> None:
     can't kill the worker."""
     import json
     import os
+    import signal
     import subprocess
 
     from qobuz_librarian.ui_cli.logging import vlog
@@ -802,6 +803,9 @@ def _run_post_job_hook(payload: dict) -> None:
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            # Own process group, so the timeout can kill a hook's whole
+            # pipeline — killing just the shell leaves its children running.
+            start_new_session=True,
         )
     except OSError as e:
         vlog(f"post-job hook failed: {e}")
@@ -812,7 +816,10 @@ def _run_post_job_hook(payload: dict) -> None:
     except subprocess.TimeoutExpired:
         # communicate() doesn't kill or reap on timeout — without this the shell
         # child and its open stdin pipe linger as a zombie under PID 1.
-        proc.kill()
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            proc.kill()
         proc.communicate()
         vlog("post-job hook timed out")
 

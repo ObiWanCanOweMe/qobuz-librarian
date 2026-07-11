@@ -258,3 +258,120 @@ def test_target_rate_family_table():
     assert target_rate(176400) == 44100
     assert target_rate(44100) is None                  # already CD rate
     assert target_rate(48000) is None
+
+
+def test_resample_keeps_original_when_flush_fails(tmp_path, monkeypatch,
+                                                  _need_ffmpeg, _need_flac):
+    # A flush that genuinely fails means the encode may exist only in the page
+    # cache; swapping it over the only lossless master risks a half-written
+    # file after a crash. Refuse the swap — same stance as the decode guard.
+    src = tmp_path / "track.flac"
+    _hires_flac(src, 2.0)
+    before = src.read_bytes()
+    monkeypatch.setattr("qobuz_librarian.library.backup._fsync", lambda _p: False)
+    af, _ = detect_resampler_filter()
+
+    rel, sr, rate, saved, err = resample_one("track.flac", 96000, 48000, af,
+                                             base_dir=tmp_path)
+    assert saved is None and err is not None
+    assert src.read_bytes() == before
+    assert not list(tmp_path.glob(".compress-*.flac"))
+
+
+def test_downsample_dir_stops_between_tracks_on_cancel(tmp_path, monkeypatch):
+    # Stop must not wait for every remaining encode of the album: once the
+    # cancel check trips, queued encodes are discarded and only the in-flight
+    # one finishes (its swap is atomic), so a Stop mid-album lands in seconds,
+    # not after the whole track list.
+    import time as _time
+
+    calls = []
+
+    def fake_resample(rel, sr, rate, af, base_dir=None):
+        calls.append(rel)
+        _time.sleep(0.2)
+        return (rel, sr, rate, 10, None)
+
+    monkeypatch.setattr(de, "RESAMPLE_WORKERS", 1)
+    monkeypatch.setattr(de, "resample_one", fake_resample)
+    monkeypatch.setattr(de, "read_sample_rate", lambda p: 96000)
+    monkeypatch.setattr(de, "detect_resampler_filter", lambda: ("soxr", "x"))
+    for n in range(4):
+        (tmp_path / f"{n}.flac").write_bytes(b"x")
+
+    # Trips only once the first encode has finished — an always-True check
+    # would now be caught by the entry gate before any encode starts.
+    res = de.downsample_dir(tmp_path, verbose=False, base_dir=tmp_path,
+                            cancel_check=lambda: len(calls) > 0)
+
+    assert res["cancelled"] is True
+    assert res["resampled"] <= 2 and len(calls) <= 2   # rest were discarded
+
+
+def test_downsample_dir_cancel_before_start_touches_nothing(tmp_path, monkeypatch):
+    # A Stop can land while the album waits for the staging lock; the album
+    # must not begin rewriting the moment the lock arrives.
+    calls = []
+
+    def fake_resample(rel, sr, rate, af, base_dir=None):
+        calls.append(rel)
+        return (rel, sr, rate, 10, None)
+
+    monkeypatch.setattr(de, "RESAMPLE_WORKERS", 1)
+    monkeypatch.setattr(de, "resample_one", fake_resample)
+    monkeypatch.setattr(de, "read_sample_rate", lambda p: 96000)
+    monkeypatch.setattr(de, "detect_resampler_filter", lambda: ("soxr", "x"))
+    (tmp_path / "0.flac").write_bytes(b"x")
+
+    res = de.downsample_dir(tmp_path, verbose=False, base_dir=tmp_path,
+                            cancel_check=lambda: True)
+
+    assert res["cancelled"] is True
+    assert calls == [] and res["resampled"] == 0
+
+
+def test_downsample_dir_cancel_after_the_last_track_counts_complete(tmp_path, monkeypatch):
+    # The stop arrived after the only track had already finished: every
+    # candidate was processed, so the album must count as done (and get
+    # capped) instead of being offered all over again as "cancelled".
+    calls = []
+
+    def fake_resample(rel, sr, rate, af, base_dir=None):
+        calls.append(rel)
+        return (rel, sr, rate, 10, None)
+
+    monkeypatch.setattr(de, "RESAMPLE_WORKERS", 1)
+    monkeypatch.setattr(de, "resample_one", fake_resample)
+    monkeypatch.setattr(de, "read_sample_rate", lambda p: 96000)
+    monkeypatch.setattr(de, "detect_resampler_filter", lambda: ("soxr", "x"))
+    (tmp_path / "0.flac").write_bytes(b"x")
+
+    res = de.downsample_dir(tmp_path, verbose=False, base_dir=tmp_path,
+                            cancel_check=lambda: len(calls) > 0)
+
+    assert calls == ["0.flac"]
+    assert res["resampled"] == 1
+    assert res["cancelled"] is False
+
+
+def test_flush_failed_rewrite_counts_as_resampled_with_a_warning(tmp_path, monkeypatch):
+    # The rewrite finished and only the directory flush failed: the file on
+    # disk IS the resampled copy. Tallying it as an untouched error leaves the
+    # album unmarked as capped and the summary claiming nothing changed while
+    # the lossless master is already gone.
+    def fake_resample(rel, sr, rate, af, base_dir=None):
+        return (rel, sr, rate, 10,
+                "resampled, but the folder couldn't be flushed to disk")
+
+    monkeypatch.setattr(de, "RESAMPLE_WORKERS", 1)
+    monkeypatch.setattr(de, "resample_one", fake_resample)
+    monkeypatch.setattr(de, "read_sample_rate", lambda p: 96000)
+    monkeypatch.setattr(de, "detect_resampler_filter", lambda: ("soxr", "x"))
+    (tmp_path / "0.flac").write_bytes(b"x")
+
+    res = de.downsample_dir(tmp_path, verbose=False, base_dir=tmp_path)
+
+    assert res["resampled"] == 1
+    assert res["errors"] == 0
+    assert res["flush_warnings"] == 1
+    assert res["saved_bytes"] == 10

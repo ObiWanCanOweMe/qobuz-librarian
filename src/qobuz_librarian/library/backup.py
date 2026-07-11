@@ -11,8 +11,32 @@ from pathlib import Path
 
 from qobuz_librarian import config as cfg
 from qobuz_librarian.integrations.rip import flac_audio_ok
+from qobuz_librarian.library.scanner import iter_tree_no_symlinks
 from qobuz_librarian.ui_cli.colors import C, fmt
 from qobuz_librarian.ui_cli.logging import log, vlog
+
+
+def _list_tree(root: Path):
+    """Every entry under ``root``, or None when the walk couldn't cover the
+    whole tree. rglob swallows subtree listing failures, so a partial walk can
+    pass for a complete one — every caller here draws a keep-or-delete
+    conclusion from the listing, and "couldn't see it" must never count as
+    "isn't there"."""
+    if not root.exists():
+        # A tree that isn't there holds nothing to lose — distinct from one
+        # that exists but can't be read (os.walk reports the latter as an
+        # error, and "couldn't see it" must not read as "empty").
+        return []
+    entries = []
+    errors = []
+    try:
+        for f in iter_tree_no_symlinks(root, errors=errors):
+            entries.append(f)
+    except OSError:
+        return None
+    if errors:
+        return None
+    return entries
 
 
 def _backup_dir_name(album_dir: Path, *, kind: str = "") -> str:
@@ -54,11 +78,14 @@ def _same_filesystem(a: Path, b: Path) -> bool:
 
 
 def _tree_stats(d: Path):
-    """(file_count, total_bytes) for tree d, or None on stat error."""
+    """(file_count, total_bytes) for tree d, or None on any stat/walk error."""
     n_files = 0
     n_bytes = 0
+    entries = _list_tree(d)
+    if entries is None:
+        return None
     try:
-        for f in d.rglob("*"):
+        for f in entries:
             if f.is_file():
                 n_files += 1
                 try:
@@ -107,16 +134,23 @@ def _fsync(path: Path) -> bool:
         return e.errno in _FSYNC_UNSUPPORTED
 
 
-def _fsync_tree(root: Path) -> None:
+def _fsync_tree(root: Path) -> bool:
     """fsync every file and directory under ``root`` (and root itself) so a
-    verified copytree is durable before the source it mirrors is removed."""
+    verified copytree is durable before the source it mirrors is removed.
+    Returns False when any flush genuinely failed (see _fsync) — the copy may
+    exist only in the page cache, so a caller about to delete the source must
+    keep it instead."""
+    entries = _list_tree(root)
+    if entries is None:
+        return False
+    ok = True
     try:
-        for f in root.rglob("*"):
+        for f in entries:
             if not f.is_symlink():
-                _fsync(f)
+                ok = _fsync(f) and ok
     except OSError:
-        pass
-    _fsync(root)
+        ok = False
+    return _fsync(root) and ok
 
 
 def _tree_digest(d: Path):
@@ -131,9 +165,12 @@ def _tree_digest(d: Path):
     the tree isn't copied as bytes, so it can't be content-verified — refuse the
     whole backup rather than record it by target string alone."""
     out = {}
+    entries = _list_tree(d)
+    if entries is None:
+        return None
     try:
         base = d.resolve()
-        for f in d.rglob("*"):
+        for f in entries:
             rel = str(f.relative_to(d))
             if f.is_symlink():
                 target = os.readlink(str(f))
@@ -237,10 +274,13 @@ def _backup_safe_to_reap(bp: Path) -> bool:
     # couldn't be verified complete — never reap either.
     if (bp / _PARTIAL_RESTORE_SENTINEL).is_file() or (bp / _UNVERIFIED_UPGRADE_SENTINEL).is_file():
         return False
-    try:
-        tracks = [f for f in bp.rglob("*") if f.is_file() and f.name not in _SIDECARS]
-    except OSError:
+    entries = _list_tree(bp)
+    if entries is None:
         return False                       # can't read the backup → can't prove redundant
+    try:
+        tracks = [f for f in entries if f.is_file() and f.name not in _SIDECARS]
+    except OSError:
+        return False
     if not tracks:
         return True                        # holds no tracks → nothing to lose → reap the husk
     origin = _read_backup_origin(bp)
@@ -256,17 +296,37 @@ def _backup_safe_to_reap(bp: Path) -> bool:
     return True
 
 
-def pin_unverified_upgrade_backup(bp: Path) -> None:
-    """Mark an upgrade backup as the only fully-verified copy so the age sweep
-    leaves it alone. Best-effort: content-presence reaping already keeps a backup
-    whose tracks aren't all proven back at the origin, but a same-count larger
-    hi-res re-rip can defeat the byte check, so this is the explicit signal."""
+def pin_unverified_upgrade_backup(bp: Path, note: str | None = None) -> bool:
+    """Mark a backup as never-reap: it holds something the age sweep's
+    redundancy proof can't see. Content-presence reaping already keeps a
+    backup whose tracks aren't all proven back at the origin, but a same-path,
+    same-or-larger file at the origin defeats the byte check — a hi-res re-rip
+    after an unverified upgrade, or a repair refill whose original tags/art
+    survive only in the backup. For exactly those, this marker is the ONLY
+    protection, so a failed or unflushed write returns False and the caller
+    must warn the user the backup is unprotected — swallowing it (ENOSPC is
+    likeliest right after a download) leaves the sole copy one age sweep from
+    deletion with no sign anything is wrong. ``note`` names the reason when
+    the default upgrade wording doesn't fit."""
     try:
-        (bp / _UNVERIFIED_UPGRADE_SENTINEL).write_text(
-            "upgrade kept — replacement not verified complete; the only full copy",
+        marker = bp / _UNVERIFIED_UPGRADE_SENTINEL
+        marker.write_text(
+            note or "upgrade kept — replacement not verified complete; "
+                    "the only full copy",
             encoding="utf-8")
+        return _fsync(marker) and _fsync(bp)
     except OSError:
-        pass
+        return False
+
+
+def warn_pin_failed(bp: Path) -> None:
+    """One shared warning for a failed pin: every caller just decided the
+    backup holds a sole copy, so the message has to say the auto-clean
+    protection did NOT take."""
+    log.info(fmt(C.RED,
+        f"  ✗  Couldn't write the keep marker on this backup — the "
+        f"scheduled auto-clean may treat it as redundant and remove it.\n"
+        f"     Copy what you need out of {bp} now."))
 
 
 # Memoize the orphan walk: every settings load/submit and the dashboard call
@@ -416,9 +476,22 @@ def backup_album_dir(album_dir: Path):
             return None
         # Force the copy to stable storage before the original is removed below,
         # then commit atomically (same-fs rename within UPGRADE_BACKUP_DIR).
-        _fsync_tree(bp_partial)
+        # A flush that genuinely fails means the verified bytes may exist only
+        # in the page cache — refuse rather than let the original be deleted
+        # on the strength of an unflushed copy.
+        if not _fsync_tree(bp_partial):
+            log.info(fmt(C.RED,
+                "  ✗  Backup copied but couldn't be flushed to disk; "
+                "keeping the original in place."))
+            shutil.rmtree(str(bp_partial), ignore_errors=True)
+            return None
         os.rename(str(bp_partial), str(bp))
-        _fsync(bp.parent)
+        if not _fsync(bp.parent):
+            log.info(fmt(C.RED,
+                "  ✗  Backup couldn't be committed to disk; "
+                "keeping the original in place."))
+            shutil.rmtree(str(bp), ignore_errors=True)
+            return None
     except KeyboardInterrupt:
         log.info(fmt(C.YELLOW,
             f"\n  ⚠  Backup interrupted mid-copy. Original at {album_dir} "
@@ -523,8 +596,10 @@ def backup_gap_fill_files(file_paths, album_dir: Path):
                     except OSError:
                         pass
                     raise OSError("copy content mismatch (verification failed)")
-                _fsync(dst)
-                _fsync(dst.parent)
+                # The source is unlinked next, so an unflushed copy is not a
+                # backup — treat a genuine flush failure like a bad copy.
+                if not (_fsync(dst) and _fsync(dst.parent)):
+                    raise OSError("copy couldn't be flushed to disk")
                 src.unlink()
         except (OSError, shutil.Error) as e:
             log.info(fmt(C.YELLOW,
@@ -538,9 +613,11 @@ def backup_gap_fill_files(file_paths, album_dir: Path):
                 pass
     # If no files actually landed (every move failed, only empty per-disc dirs
     # were created), drop the dir and return None — otherwise the caller reads a
-    # non-empty path as "backup succeeded" when it holds no tracks.
+    # non-empty path as "backup succeeded" when it holds no tracks. A walk that
+    # couldn't cover the tree proves nothing empty — keep the dir.
+    entries = _list_tree(bp)
     try:
-        if not any(p.is_file() for p in bp.rglob("*")):
+        if entries is not None and not any(p.is_file() for p in entries):
             shutil.rmtree(bp, ignore_errors=True)
             return None
     except OSError:
@@ -556,11 +633,14 @@ def backup_gap_fill_files(file_paths, album_dir: Path):
         restore_gap_fill_backup(bp, album_dir, keep_larger_dst=False)
 
         def _still_has_tracks():
+            entries = _list_tree(bp)
+            if entries is None:
+                return True  # can't tell → assume tracks remain, don't lose them
             try:
                 return any(p.is_file() and p.name != _ORIGIN_SIDECAR
-                           for p in bp.rglob("*"))
+                           for p in entries)
             except OSError:
-                return True  # can't tell → assume tracks remain, don't lose them
+                return True
         if _still_has_tracks():
             # Restore couldn't put every original back, so bp is the only copy
             # of what's left. Hand it back so the caller records it and recovery
@@ -630,6 +710,14 @@ def stash_downsample_originals(files, album_dir):
             if _file_digest(dst) != digest:
                 dst.unlink(missing_ok=True)
                 raise OSError("copy content mismatch (verification failed)")
+            # The master this copy protects is about to be REWRITTEN in place —
+            # a verified-but-unflushed copy can vanish in a delayed writeback
+            # failure or power loss, after the rewrite already destroyed the
+            # original. A flush that genuinely fails downgrades the file to
+            # "skipped", same as a failed copy.
+            if not _fsync(dst):
+                dst.unlink(missing_ok=True)
+                raise OSError("copy couldn't be flushed to disk")
             copied.add(src)
         except (OSError, shutil.Error) as e:
             log.info(fmt(C.YELLOW,
@@ -640,6 +728,15 @@ def stash_downsample_originals(files, album_dir):
             except OSError:
                 pass
     if not copied:
+        shutil.rmtree(bp, ignore_errors=True)
+        return None, set()
+    # Pin the copies' directory entries down too, or the flushed files can be
+    # unreachable after a crash. A genuine failure here means none of the
+    # copies is provably durable — leave every original untouched.
+    if not _fsync_tree(bp):
+        log.info(fmt(C.RED,
+            "  ✗  Couldn't flush the keep-originals copies to disk; "
+            "leaving the originals untouched."))
         shutil.rmtree(bp, ignore_errors=True)
         return None, set()
     if not _write_backup_origin(bp, album_dir):
@@ -694,7 +791,18 @@ def restore_gap_fill_backup(backup_path: Path, album_dir: Path,
         return 0
     n_restored = 0
     n_failed = 0
-    for f in backup_path.rglob("*"):
+    # The end-of-loop rmtree deletes the whole backup dir when every visited
+    # file restored — so the visit list must provably be ALL of it. A silently
+    # partial walk (rglob swallows subtree errors) would delete the files it
+    # never visited.
+    entries = _list_tree(backup_path)
+    if entries is None:
+        log.info(fmt(C.RED + C.BOLD,
+            f"  ✗  Couldn't fully read the backup to restore it. Originals "
+            f"are PRESERVED at:\n     {backup_path}\n"
+            f"     Fix the folder (permissions/mount) and restore by hand."))
+        return 0
+    for f in entries:
         if not f.is_file() or f.name in _SIDECARS:
             continue
         rel = f.relative_to(backup_path)
@@ -719,6 +827,17 @@ def restore_gap_fill_backup(backup_path: Path, album_dir: Path,
                 log.info(fmt(C.GRAY,
                     f"  · Keeping the file already at {dst.name} "
                     f"(>= the backed-up copy) rather than restoring over it."))
+                # The kept refill was typically just renamed into place by the
+                # import — force its bytes and directory entry down before the
+                # backup copy (the only other copy) is deleted, exactly like
+                # the copy/replace branch below. A genuine flush failure keeps
+                # the backup copy and reports the track as not restored.
+                if not (_fsync(dst) and _fsync(dst.parent)):
+                    n_failed += 1
+                    log.info(fmt(C.YELLOW,
+                        f"  ⚠  Kept {dst.name}, but it couldn't be flushed to "
+                        f"disk — keeping the backup copy as well."))
+                    continue
                 try:
                     f.unlink()
                 except OSError:
@@ -765,7 +884,17 @@ def restore_gap_fill_backup(backup_path: Path, album_dir: Path,
                     f"flushed to disk — kept the backup copy."))
                 continue
             os.replace(str(tmp), str(dst))
-            _fsync(dst.parent)
+            # The rename's directory entry has to reach disk before the backup
+            # copy — the only other copy — is deleted. A genuine flush failure
+            # means the restored file may not survive a crash, so keep the
+            # backup copy and report the track as not restored; the
+            # end-of-function partial-restore path then preserves the dir.
+            if not _fsync(dst.parent):
+                n_failed += 1
+                log.info(fmt(C.YELLOW,
+                    f"  ⚠  Restored {f.name}, but its directory entry couldn't "
+                    f"be flushed to disk — keeping the backup copy."))
+                continue
             # Destination is verifiably in place — the backup copy is now
             # redundant. A failure to unlink it here is non-fatal: the
             # end-of-function rmtree clears the whole backup dir.
@@ -953,11 +1082,27 @@ def restore_upgrade_backup(backup_path: Path, original_path: Path) -> bool:
                     f"{backup_path}.\n     Manual restore: mv {backup_path!s} "
                     f"{original_path!s}"))
                 return False
-            # Durable before the backup (the only copy) is removed below.
-            _fsync_tree(restoring)
+            # Durable before the backup (the only copy) is removed below. An
+            # unflushed restore may exist only in the page cache — keep the
+            # backup rather than delete the only durable copy on its strength.
+            if not _fsync_tree(restoring):
+                shutil.rmtree(str(restoring), ignore_errors=True)
+                log.info(fmt(C.RED,
+                    f"  ✗  Restore copy couldn't be flushed to disk; backup "
+                    f"kept at {backup_path}.\n     Manual restore: "
+                    f"mv {backup_path!s} {original_path!s}"))
+                return False
             os.rename(str(restoring), str(original_path))
-            _fsync(original_path.parent)
-            shutil.rmtree(str(backup_path), ignore_errors=True)
+            if _fsync(original_path.parent):
+                shutil.rmtree(str(backup_path), ignore_errors=True)
+            else:
+                # The rename itself may not be durable yet — the restored files
+                # are in place, but keep the backup and let the retention
+                # sweep's redundancy proof clear it later.
+                log.info(fmt(C.YELLOW,
+                    f"  ⚠  Restored, but the folder entry couldn't be flushed "
+                    f"to disk — keeping the backup at {backup_path} as a "
+                    f"safety net."))
         try:
             for sidecar in _SIDECARS:
                 (original_path / sidecar).unlink(missing_ok=True)

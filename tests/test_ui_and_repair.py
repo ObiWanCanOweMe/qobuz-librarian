@@ -143,12 +143,12 @@ def test_refills_present_in_counts_duplicate_isrcs(tmp_path, monkeypatch):
     # Only one file with the ISRC is back → not yet present.
     monkeypatch.setattr(repair, "read_album_dir",
                         lambda d: [{"isrc": "GBCFB1300101"}])
-    assert repair._refills_present_in(tmp_path, wanted) is False
+    assert repair._refills_present_in(tmp_path, wanted, Counter()) is False
 
     # Both back → present.
     monkeypatch.setattr(repair, "read_album_dir",
                         lambda d: [{"isrc": "GBCFB1300101"}, {"isrc": "gbcfb1300101"}])
-    assert repair._refills_present_in(tmp_path, wanted) is True
+    assert repair._refills_present_in(tmp_path, wanted, Counter()) is True
 
 
 def test_refills_intact_requires_every_wanted_isrc_to_reverify(tmp_path, monkeypatch):
@@ -159,49 +159,78 @@ def test_refills_intact_requires_every_wanted_isrc_to_reverify(tmp_path, monkeyp
     # so it would read as intact and the only good copy's backup would be deleted
     # while the refill is still short. Verified ISRCs come back in Qobuz's own
     # casing, so the gate normalizes them first.
+    from collections import Counter
+
     from qobuz_librarian.modes import repair
-    wanted = {"GBCFB1300101", "USRC11700001"}
+    wanted = Counter({"GBCFB1300101": 1, "USRC11700001": 1})
 
     monkeypatch.setattr(repair, "scan_dir_for_isrc_repairs",
-                        lambda *a, **k: {"verified_ok_isrcs": ["gbcfb1300101", "USRC1-17-00001"]})
-    assert repair._refills_intact(tmp_path, wanted, "tok") is True
+                        lambda *a, **k: {"verified_ok_isrcs":
+                                         Counter({"gbcfb1300101": 1, "USRC1-17-00001": 1})})
+    assert repair._refills_intact(tmp_path, wanted, "tok", Counter()) is True
 
     # One ISRC didn't re-verify → keep the backup.
     monkeypatch.setattr(repair, "scan_dir_for_isrc_repairs",
-                        lambda *a, **k: {"verified_ok_isrcs": ["GBCFB1300101"]})
-    assert repair._refills_intact(tmp_path, wanted, "tok") is False
+                        lambda *a, **k: {"verified_ok_isrcs": Counter({"GBCFB1300101": 1})})
+    assert repair._refills_intact(tmp_path, wanted, "tok", Counter()) is False
+
+
+def test_refills_intact_counts_duplicate_isrcs_as_a_multiset(tmp_path, monkeypatch):
+    # Two truncated files can share one ISRC (a .1.flac collision pair, or the
+    # same recording on two discs). The presence gate already counts the
+    # multiset; the intact gate must too — one verified-good twin must not
+    # vouch for the other, still-truncated file and let the backup holding
+    # both originals be deleted.
+    from collections import Counter
+
+    from qobuz_librarian.modes import repair
+    wanted = Counter({"GBCFB1300101": 2})
+
+    monkeypatch.setattr(repair, "scan_dir_for_isrc_repairs",
+                        lambda *a, **k: {"verified_ok_isrcs": Counter({"gbcfb1300101": 1})})
+    assert repair._refills_intact(tmp_path, wanted, "tok", Counter()) is False
+
+    monkeypatch.setattr(repair, "scan_dir_for_isrc_repairs",
+                        lambda *a, **k: {"verified_ok_isrcs": Counter({"gbcfb1300101": 2})})
+    assert repair._refills_intact(tmp_path, wanted, "tok", Counter()) is True
 
 
 def test_refills_intact_propagates_qobuz_outage(tmp_path, monkeypatch):
     # A token loss or Qobuz outage during re-verification must propagate, not
     # collapse to "still truncated" — an outage is not a verdict on the refill.
+    from collections import Counter
+
     from qobuz_librarian.modes import repair
-    wanted = {"GBCFB1300101"}
+
+    wanted = Counter({"GBCFB1300101": 1})
 
     def raise_authlost(*a, **k):
         raise repair.AuthLost("token lost")
     monkeypatch.setattr(repair, "scan_dir_for_isrc_repairs", raise_authlost)
     with pytest.raises(repair.AuthLost):
-        repair._refills_intact(tmp_path, wanted, "tok")
+        repair._refills_intact(tmp_path, wanted, "tok", Counter())
 
     def raise_unavailable(*a, **k):
         raise repair.QobuzUnavailable("upstream down")
     monkeypatch.setattr(repair, "scan_dir_for_isrc_repairs", raise_unavailable)
     with pytest.raises(repair.QobuzUnavailable):
-        repair._refills_intact(tmp_path, wanted, "tok")
+        repair._refills_intact(tmp_path, wanted, "tok", Counter())
 
 
 def test_refills_intact_keeps_backup_on_an_unexpected_rescan_error(tmp_path, monkeypatch):
     # Any non-outage failure of the re-scan stays conservative: return False so
     # the caller keeps the backup rather than delete originals on an error we
     # can't interpret.
+    from collections import Counter
+
     from qobuz_librarian.modes import repair
-    wanted = {"GBCFB1300101"}
+
+    wanted = Counter({"GBCFB1300101": 1})
 
     def boom(*a, **k):
         raise ValueError("malformed scan result")
     monkeypatch.setattr(repair, "scan_dir_for_isrc_repairs", boom)
-    assert repair._refills_intact(tmp_path, wanted, "tok") is False
+    assert repair._refills_intact(tmp_path, wanted, "tok", Counter()) is False
 
 
 def test_repair_leaves_a_preexisting_track_sharing_the_recording_alone(tmp_path, monkeypatch):
@@ -293,8 +322,8 @@ def _call_repair_album_dir(tmp_path, monkeypatch, *, n_ok, n_fail, imported,
     # The dummy file isn't a real FLAC, so drive the post-refill verification
     # gate directly: `present` = the refilled tracks returned to album_dir,
     # `intact` = the re-scan found them no longer truncated.
-    monkeypatch.setattr(repair_mod, "_refills_present_in", lambda d, w: present)
-    monkeypatch.setattr(repair_mod, "_refills_intact", lambda d, w, t: intact)
+    monkeypatch.setattr(repair_mod, "_refills_present_in", lambda d, w, b: present)
+    monkeypatch.setattr(repair_mod, "_refills_intact", lambda d, w, t, b: intact)
 
     vt = [{"path": str(track), "title": "Track 01", "isrc": "USRC11111111",
            "qobuz_track": {"id": 1, "title": "Track 01", "album": {"id": "ALB1"}},
@@ -420,3 +449,196 @@ def test_scan_report_classifies_repair_outcomes(tmp_path, monkeypatch):
     # User declines the prompt → "skipped".
     assert _call_scan_report(tmp_path / "skip", monkeypatch,
                              yes=False, input_return="n") == "skipped"
+
+
+def test_execute_repairs_does_not_count_an_unverified_redownload_as_repaired(monkeypatch):
+    # A whole-album re-download that imported but failed the completeness check
+    # keeps the backup and must not render "Repaired 1/1" — the active copy is
+    # an unverified, possibly incomplete replacement.
+    from qobuz_librarian.web import flows
+
+    class _Job:
+        cancel_requested = False
+        _progress_scope = None
+        _imported_any = False
+        summary = ""
+        error = ""
+
+        def push_progress(self, *a, **k):
+            pass
+
+    monkeypatch.setattr(flows, "clear_scan_caches", lambda: None)
+    monkeypatch.setattr(flows, "build_args", lambda: Namespace())
+    monkeypatch.setattr(flows, "_note_staging_wait", lambda *a, **k: None)
+    monkeypatch.setattr(flows, "_redownload_damaged_album",
+                        lambda p, t: {"imported": True, "n_ok": 8,
+                                      "n_fail": 0, "repair_unverified": True})
+    monkeypatch.setattr(flows.time, "sleep", lambda _s: None)
+
+    job = _Job()
+    chosen = [{"kind": "redownload", "title": "Album",
+               "payload": {"artist_name": "Artist", "album_dir": "/x"}}]
+    flows.execute_repairs(job, chosen, "tok")
+
+    assert "Repaired 0/1" in job.summary
+    assert job.error
+
+
+def test_refill_gates_require_refills_on_top_of_the_baseline(tmp_path, monkeypatch):
+    # A healthy PRE-EXISTING file sharing the wanted ISRC (a twin on another
+    # disc that was never truncated) must not vouch for a refill that never
+    # came back — both gates count against the post-backup baseline, and an
+    # unreadable baseline (None) is unverifiable, never a pass.
+    from collections import Counter
+
+    from qobuz_librarian.modes import repair
+    wanted = Counter({"USRC11111111": 1})
+    baseline = Counter({"USRC11111111": 1})
+
+    # Only the healthy twin is on disk; the refill is absent.
+    monkeypatch.setattr(repair, "read_album_dir",
+                        lambda d: [{"isrc": "USRC11111111"}])
+    assert repair._refills_present_in(tmp_path, wanted, baseline) is False
+    monkeypatch.setattr(repair, "scan_dir_for_isrc_repairs",
+                        lambda *a, **k: {"verified_ok_isrcs":
+                                         Counter({"USRC11111111": 1})})
+    assert repair._refills_intact(tmp_path, wanted, "tok", baseline) is False
+
+    # Twin plus the returned refill: both gates clear.
+    monkeypatch.setattr(repair, "read_album_dir",
+                        lambda d: [{"isrc": "USRC11111111"},
+                                   {"isrc": "USRC11111111"}])
+    assert repair._refills_present_in(tmp_path, wanted, baseline) is True
+    monkeypatch.setattr(repair, "scan_dir_for_isrc_repairs",
+                        lambda *a, **k: {"verified_ok_isrcs":
+                                         Counter({"USRC11111111": 2})})
+    assert repair._refills_intact(tmp_path, wanted, "tok", baseline) is True
+
+    assert repair._refills_present_in(tmp_path, wanted, None) is False
+    assert repair._refills_intact(tmp_path, wanted, "tok", None) is False
+
+
+def test_backup_sources_keep_both_same_isrc_originals(tmp_path):
+    # Two originals can share an ISRC with distinct disc/track tags and art;
+    # collapsing them to one path stamps one twin's metadata onto both refills
+    # and lets the "successful" repair delete the other's only copy.
+    from qobuz_librarian.modes import repair
+
+    album = tmp_path / "Album"
+    (album / "CD 2").mkdir(parents=True)
+    bk = tmp_path / "bk"
+    (bk / "CD 2").mkdir(parents=True)
+    (bk / "01 - Song.flac").write_bytes(b"a")
+    (bk / "CD 2" / "01 - Song.flac").write_bytes(b"b")
+    vt = [{"isrc": "USRC11111111", "path": str(album / "01 - Song.flac")},
+          {"isrc": "USRC11111111", "path": str(album / "CD 2" / "01 - Song.flac")}]
+
+    out = repair._backup_source_by_isrc(vt, album, bk)
+    assert out == {"USRC11111111": [bk / "01 - Song.flac",
+                                    bk / "CD 2" / "01 - Song.flac"]}
+
+
+def test_retag_marks_an_unconsumed_twin_source_failed(tmp_path, monkeypatch):
+    # Two same-ISRC originals but only one refill surfaced in staging: one
+    # original's tags/art never landed anywhere, so the ISRC must read as
+    # failed and the backup (their only copy) kept.
+    from qobuz_librarian.modes import repair
+
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    (staged / "01 - Song.flac").write_bytes(b"x")
+    monkeypatch.setattr(repair, "_FLAC", lambda fp: {"isrc": ["USRC11111111"]})
+    monkeypatch.setattr(repair, "_snapshot_flac_metadata", lambda src: {"of": str(src)})
+    monkeypatch.setattr(repair, "_restore_flac_metadata", lambda fp, snap: True)
+
+    sources = {"USRC11111111": [tmp_path / "a.flac", tmp_path / "b.flac"]}
+    failed = repair._retag_refills_in_staging([staged], sources)
+    assert failed == {"USRC11111111"}
+
+
+def test_retag_callback_records_total_failure_on_exception(monkeypatch):
+    # The executor catches and logs a retag exception, so the carry state is
+    # unknown to the backup resolution — every source must already be marked
+    # failed, or the empty set reads as "all tags carried" and the only copy
+    # of the originals' metadata is deleted.
+    from pathlib import Path
+
+    from qobuz_librarian.modes import repair
+
+    failed = set()
+    sources = {"ISRC1": [Path("/x")], "ISRC2": [Path("/y")]}
+
+    def boom(_dirs, _sources):
+        raise RuntimeError("tag write exploded")
+    monkeypatch.setattr(repair, "_retag_refills_in_staging", boom)
+
+    cb = repair._make_retag_callback(sources, failed)
+    with pytest.raises(RuntimeError):
+        cb([Path("/staged")])
+    assert failed == {"ISRC1", "ISRC2"}
+
+
+def test_repair_pins_the_backup_when_the_tag_carry_fails(tmp_path, monkeypatch):
+    # Audio verifiably repaired but the originals' tags couldn't be carried:
+    # the backup is kept AND pinned — the age sweep proves redundancy by
+    # same-path same-or-larger bytes, which the refill satisfies, so without
+    # the pin the only copy of those tags is reaped on schedule.
+    import qobuz_librarian.modes.repair as repair_mod
+    from qobuz_librarian.library.backup import _UNVERIFIED_UPGRADE_SENTINEL
+
+    album_dir = tmp_path / "Artist" / "Album (2020)"
+    album_dir.mkdir(parents=True)
+    track = album_dir / "01 - Track.flac"
+    track.write_bytes(b"\x00" * 200)
+    monkeypatch.setattr("qobuz_librarian.config.UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    monkeypatch.setattr("qobuz_librarian.config.REPAIR_LOG_PATH", tmp_path / "repair.log")
+    monkeypatch.setattr(repair_mod, "get_album",
+                        lambda aid, tok: {"id": aid, "title": "Album", "tracks": {"items": []}})
+    monkeypatch.setattr(repair_mod, "find_qobuz_album_for_dir", lambda *a, **k: None)
+
+    def fake_execute(queue, args, token):
+        for qi in queue:
+            qi["n_ok"] = 1
+            qi["n_fail"] = 0
+            qi["imported"] = True
+            retag = qi.get("pre_import_retag")
+            if callable(retag):
+                # No staged refill carries any tags — the whole carry fails.
+                retag([])
+
+    monkeypatch.setattr(repair_mod, "_execute_download_queue", fake_execute)
+    monkeypatch.setattr(repair_mod, "append_repair_log", lambda e: True)
+    monkeypatch.setattr(repair_mod, "_refills_present_in", lambda d, w, b: True)
+    monkeypatch.setattr(repair_mod, "_refills_intact", lambda d, w, t, b: True)
+
+    vt = [{"path": str(track), "title": "Track 01", "isrc": "USRC11111111",
+           "qobuz_track": {"id": 1, "title": "Track 01", "album": {"id": "ALB1"}},
+           "file_length": 5.0}]
+    args = Namespace(force=False, yes=True, prefer_hires=False,
+                     consolidate=False, no_upgrade=False)
+    repair_mod.repair_album_dir(album_dir, vt, "Artist", args, "tok")
+
+    backups = tmp_path / "backups"
+    pins = list(backups.rglob(_UNVERIFIED_UPGRADE_SENTINEL))
+    assert pins, "the kept backup must carry a never-reap pin"
+    kept = list(backups.rglob("01 - Track.flac"))
+    assert kept and kept[0].read_bytes() == b"\x00" * 200
+
+
+def test_strict_confirm_reasks_on_a_typo(monkeypatch):
+    # The downsample keep-vs-delete answer is SAVED as the standing default,
+    # so a typo must not read as "delete the originals from now on" — strict
+    # mode re-asks until it gets a real yes or no. Non-strict prompts keep
+    # the old contract (anything not yes is No).
+    from qobuz_librarian.ui_cli import prompts
+
+    answers = iter(["maybe", "y"])
+    monkeypatch.setattr("builtins.input", lambda _p: next(answers))
+    assert prompts.confirm("Keep?", default_yes=True, strict=True) is True
+
+    answers = iter(["whatever", "n"])
+    monkeypatch.setattr("builtins.input", lambda _p: next(answers))
+    assert prompts.confirm("Keep?", default_yes=True, strict=True) is False
+
+    monkeypatch.setattr("builtins.input", lambda _p: "maybe")
+    assert prompts.confirm("Keep?", default_yes=True) is False

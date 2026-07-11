@@ -282,3 +282,26 @@ def test_run_migrate_gates_on_insufficient_destination_space(tmp_path, monkeypat
     with patch("builtins.input", side_effect=["y"]):
         migrate_mode.run_migrate_mode(_args())
     assert executed == [1]
+
+
+def test_place_file_keeps_the_source_when_the_flush_fails(monkeypatch, tmp_path):
+    # Cross-filesystem move: the copy verified byte-for-byte, but its bytes
+    # couldn't be forced to disk. Deleting the source then would leave the
+    # only durable copy nowhere — keep it and let the caller see the move as
+    # not clean.
+    from qobuz_librarian.library import backup as bkmod
+    from qobuz_librarian.library import migrate
+
+    src = tmp_path / "src" / "01 - Track.flac"
+    src.parent.mkdir()
+    src.write_bytes(b"the-master")
+    dst = tmp_path / "dst" / "01 - Track.flac"
+
+    def cross_fs(*_a, **_k):
+        raise OSError(18, "Invalid cross-device link")
+    monkeypatch.setattr(migrate.os, "rename", cross_fs)
+    monkeypatch.setattr(bkmod, "_fsync", lambda _p: False)
+
+    migrate._place_file(src, dst, move=True)
+
+    assert src.exists() and src.read_bytes() == b"the-master"

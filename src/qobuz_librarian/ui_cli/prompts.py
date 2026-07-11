@@ -226,18 +226,29 @@ def _flush_stdin():
         pass
 
 
-def confirm(msg, default_yes=True, auto_yes=False):
+def confirm(msg, default_yes=True, auto_yes=False, on_eof=False, strict=False):
     if auto_yes:
         return True
     suffix = " [Y/n]: " if default_yes else " [y/N]: "
-    try:
-        r = input(fmt(C.CYAN, msg + suffix)).strip().lower()
-    except EOFError:
-        # Closed stdin is not consent.
-        return False
-    if not r:
-        return default_yes
-    return r in ("y", "yes")
+    while True:
+        try:
+            r = input(fmt(C.CYAN, msg + suffix)).strip().lower()
+        except EOFError:
+            # Closed stdin is not consent — and not an answer either. A caller
+            # that RECORDS the response (a saved preference) passes on_eof=None
+            # so it can tell "never answered" apart from an actual No.
+            return on_eof
+        if not r:
+            return default_yes
+        if r in ("y", "yes"):
+            return True
+        if not strict or r in ("n", "no"):
+            return False
+        # strict: the caller SAVES this answer (or destroys something on it),
+        # so a typo must not read as consent — "maybe" mapping to No is
+        # harmless when No is safe, but here No means "delete the originals,
+        # permanently, from now on". Re-ask until it's a real yes or no.
+        print(fmt(C.YELLOW, "  Please answer y or n."))
 
 
 def prompt_album_selection(albums, prefer_hires=False, can_load_more=False):

@@ -1526,3 +1526,21 @@ def test_incomplete_baseline_scan_summary_reports_unchecked_artists(
     # the summary must say so instead of a clean-sounding definitive total.
     assert "1 artist" in job.summary
     assert "resume" in job.summary.lower()
+
+
+def test_scan_signature_covers_candidate_shaping_settings(monkeypatch):
+    """The cheap refresh reuses saved candidates while the signature matches —
+    so every setting that changes WHICH candidates a scan yields has to be in
+    it, or Settings changes leave stale gap/missing lists."""
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.library import library_scan_state as lss
+
+    base = lss.quality_signature()
+    for name in ("SUPPRESS_SINGLE_TRACK_GAPS", "EXCLUDE_LIVE_ALBUMS"):
+        with monkeypatch.context() as mctx:
+            mctx.setattr(cfg, name, not getattr(cfg, name))
+            assert lss.quality_signature() != base, name
+    for name in ("ARTIST_CATALOG_LIMIT", "MISSING_ALBUMS_MIN_TRACKS"):
+        with monkeypatch.context() as mctx:
+            mctx.setattr(cfg, name, int(getattr(cfg, name)) + 1)
+            assert lss.quality_signature() != base, name

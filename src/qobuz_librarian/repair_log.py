@@ -17,6 +17,7 @@ import os
 import shutil
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 
 from qobuz_librarian import config as cfg
@@ -167,12 +168,15 @@ def scan_dir_for_isrc_repairs(album_dir, token,
     report = {
         "verified_truncated": [],
         "verified_ok": 0,
-        # The normalized ISRCs that matched a Qobuz recording AND passed the gate
-        # — i.e. POSITIVELY re-verified, not merely "not flagged truncated". A
-        # track whose lookup returned nothing lands in isrc_no_match, so callers
-        # that must prove a refill is intact (repair backup deletion) check
-        # membership here rather than absence from verified_truncated.
-        "verified_ok_isrcs": set(),
+        # Per-ISRC counts of files that matched a Qobuz recording AND passed
+        # the gate — i.e. POSITIVELY re-verified, not merely "not flagged
+        # truncated". A track whose lookup returned nothing lands in
+        # isrc_no_match, so callers that must prove a refill is intact (repair
+        # backup deletion) check membership here rather than absence from
+        # verified_truncated. A Counter, not a set: two files sharing one ISRC
+        # (a .1.flac collision pair, or the same recording on two discs) must
+        # each verify — one good twin can't vouch for the other.
+        "verified_ok_isrcs": Counter(),
         "no_isrc_tag": [],
         "isrc_no_match": [],
         # FLACs we could not decode-check because the flac tool is absent —
@@ -263,7 +267,7 @@ def scan_dir_for_isrc_repairs(album_dir, token,
             dec = flac_audio_ok(Path(path)) if path else None
             if dec is True:
                 report["verified_ok"] += 1
-                report["verified_ok_isrcs"].add(isrc)
+                report["verified_ok_isrcs"][isrc] += 1
                 continue
             if dec is None:
                 report["unverified"] += 1
@@ -317,7 +321,7 @@ def scan_dir_for_isrc_repairs(album_dir, token,
                 # ISRC matched on Qobuz, file decodes; Qobuz gave no duration so
                 # this is the strongest "ok" we can assert for it.
                 report["verified_ok"] += 1
-                report["verified_ok_isrcs"].add(isrc)
+                report["verified_ok_isrcs"][isrc] += 1
             continue
 
         # Byte-size sanity gate against Qobuz's authoritative duration. Quiet /
@@ -379,7 +383,7 @@ def scan_dir_for_isrc_repairs(album_dir, token,
             continue
 
         report["verified_ok"] += 1
-        report["verified_ok_isrcs"].add(isrc)
+        report["verified_ok_isrcs"][isrc] += 1
     return report
 
 

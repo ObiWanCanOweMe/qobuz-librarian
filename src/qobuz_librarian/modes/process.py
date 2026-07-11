@@ -25,6 +25,7 @@ from qobuz_librarian.library.backup import (
     pin_unverified_upgrade_backup,
     restore_gap_fill_backup,
     restore_upgrade_backup,
+    warn_pin_failed,
 )
 from qobuz_librarian.library.catalog import (
     _disc_scoped_match,
@@ -37,7 +38,9 @@ from qobuz_librarian.library.catalog import (
     find_existing_tracks,
     find_expanded_edition,
     find_extras_in_existing,
+    folder_holds_all_tracks,
     is_lossless_album,
+    pair_existing_tracks,
     prompt_and_migrate_multi_artist_folder,
     track_signatures_for_album_dirs,
 )
@@ -143,34 +146,39 @@ def force_cleanup_preflight(album, args):
 _UPGRADE_VERIFY_DURATION_RATIO = 0.97
 
 
-def _audio_count_and_seconds(folder):
-    """(audio-track count, total playtime in seconds) for an album folder,
-    read through read_album_dir so lengths come from the same reader the rest
-    of the app uses. A folder that can't be read returns (0, 0.0)."""
+def _folder_tracks_checked(folder):
+    """(tracks, degraded) for an album folder, read through read_album_dir so
+    lengths/quality come from the same reader the rest of the app uses.
+    degraded=True means part of the tree couldn't be read, so the list may be
+    INCOMPLETE — counts and quality drawn from it must not authorize deleting
+    anything (a transient read error would read as a smaller album)."""
+    errs = []
+    tracks = read_album_dir(folder, walk_errors=errs)
+    return tracks, bool(errs)
+
+
+def _tracks_seconds(tracks):
     total = 0.0
-    tracks = read_album_dir(folder)
     for t in tracks:
         try:
             total += float(t.get("length") or 0)
         except (TypeError, ValueError):
             pass
-    return len(tracks), total
+    return total
 
 
-def _album_max_quality(folder):
-    """Best (bit_depth, sample_rate) across a folder's audio, or (0, 0).
-
-    Compared as a tuple so 24-bit always beats 16-bit and, within a depth, the
+def _track_quality(t):
+    """(bit_depth, sample_rate) for one track, (0, 0) when unreadable.
+    Compared as tuples so 24-bit always beats 16-bit and, within a depth, the
     higher sample rate wins — the same ordering the upgrade decision uses."""
-    best = (0, 0)
-    for t in read_album_dir(folder):
-        try:
-            q = (int(t.get("bits") or 0), int(t.get("sample_rate") or 0))
-        except (TypeError, ValueError):
-            continue
-        if q > best:
-            best = q
-    return best
+    try:
+        return (int(t.get("bits") or 0), int(t.get("sample_rate") or 0))
+    except (TypeError, ValueError):
+        return (0, 0)
+
+
+def _fmt_quality(q):
+    return f"{q[0]}-bit/{(q[1] or 0) / 1000:g}kHz"
 
 
 def _upgrade_replacement_verified(album, album_dir, backup_path):
@@ -194,8 +202,20 @@ def _upgrade_replacement_verified(album, album_dir, backup_path):
     post_dir = find_album_dir_filesystem(album)
     if not post_dir or not post_dir.exists():
         return False
-    new_n, new_secs = _audio_count_and_seconds(post_dir)
-    old_n, old_secs = _audio_count_and_seconds(backup_path)
+    new_tracks, new_degraded = _folder_tracks_checked(post_dir)
+    old_tracks, old_degraded = _folder_tracks_checked(backup_path)
+    # A degraded walk returns only the READABLE tracks: a transient error on
+    # the backup side lowers the baseline enough for an incomplete replacement
+    # to pass every gate below and delete the only full copy. Unreadable in
+    # part is unverifiable in full — keep the backup.
+    if old_degraded or new_degraded:
+        log.info(fmt(C.YELLOW,
+            "  ⚠  Couldn't fully read the "
+            f"{'backup' if old_degraded else 'imported album'} while verifying "
+            "the upgrade — keeping the backup."))
+        return False
+    new_n, new_secs = len(new_tracks), _tracks_seconds(new_tracks)
+    old_n, old_secs = len(old_tracks), _tracks_seconds(old_tracks)
     # An empty or unreadable backup reads as (0, 0.0), which makes both gates
     # below pass vacuously (new_n < 0 is never true), deleting the only full
     # copy. Treat an unreadable/empty backup as unverifiable and keep it.
@@ -217,16 +237,36 @@ def _upgrade_replacement_verified(album, album_dir, backup_path):
         return False
     # Quality gate: an auto-upgrade exists to RAISE quality, so refuse to delete
     # the original when Qobuz under-delivered (advertised hi-res, served e.g.
-    # 16/44). Same track count + playtime would otherwise pass this vacuously and
-    # permanently replace the user's higher-res files with lower-res ones.
-    new_q = _album_max_quality(post_dir)
-    old_q = _album_max_quality(backup_path)
-    if old_q > (0, 0) and new_q < old_q:
-        log.info(fmt(C.YELLOW,
-            f"  ⚠  Upgrade delivered {new_q[0]}-bit/{(new_q[1] or 0) / 1000:g}kHz "
-            f"where the original was {old_q[0]}-bit/{(old_q[1] or 0) / 1000:g}kHz "
-            f"— keeping the backup (Qobuz under-delivered the advertised quality)."))
-        return False
+    # 16/44). Same track count + playtime would otherwise pass this vacuously
+    # and permanently replace the user's higher-res files with lower-res ones.
+    # Comparing only the endpoints of the quality range is not a proof:
+    # [16/44.1, 24/96, 24/192] against [16/44.1, 24/48, 24/192] passes both
+    # ends with the middle track downgraded. Two checks, both required:
+    #  - ranked multiset: quality-sorted new tracks must cover the sorted
+    #    originals slot for slot. An unreadable (0, 0) new track sorts last, so
+    #    it fails against any known original instead of being ignored;
+    #  - identity: a new track that IS one of the originals (same ISRC/title)
+    #    must not sit below it — rank dominance alone can hide a swap where one
+    #    track went up and another went down.
+    old_qs = sorted((_track_quality(t) for t in old_tracks), reverse=True)
+    new_qs = sorted((_track_quality(t) for t in new_tracks), reverse=True)
+    for oq, nq in zip(old_qs, new_qs):
+        if oq > (0, 0) and nq < oq:
+            log.info(fmt(C.YELLOW,
+                f"  ⚠  Upgrade delivered a {_fmt_quality(nq)} track where the "
+                f"original had {_fmt_quality(oq)} — keeping the backup "
+                f"(a track came back below the original)."))
+            return False
+    pairs, _unpaired = pair_existing_tracks(old_tracks, new_tracks)
+    for ot, nt in pairs:
+        oq, nq = _track_quality(ot), _track_quality(nt)
+        if oq > (0, 0) and nq < oq:
+            log.info(fmt(C.YELLOW,
+                f"  ⚠  Upgrade brought back "
+                f"{truncate(str(ot.get('title') or ''), 40)} at "
+                f"{_fmt_quality(nq)} where the original was {_fmt_quality(oq)} "
+                f"— keeping the backup."))
+            return False
     return True
 
 
@@ -235,27 +275,77 @@ def _carry_non_audio_from_backup(album, album_dir, backup_path):
     art) from an upgrade backup into the rebuilt album before the backup is
     deleted. The audio-only completeness check ignores these files, so without
     this they'd be lost with the backup. Existing destination files are left
-    untouched."""
+    untouched. Returns True when every companion made it across (or there were
+    none); False when the destination can't be resolved or any copy failed, so
+    the caller keeps the backup instead of deleting the only copies."""
+    from qobuz_librarian.library.backup import _SIDECARS, _file_digest, _fsync
+    from qobuz_librarian.library.scanner import iter_tree_no_symlinks
+    if not backup_path.exists():
+        return True
+    # Skip the backup bookkeeping sidecars (.ql_backup_origin etc.) — they
+    # are non-audio but must never be carried into the live library folder.
+    # Walked with an error channel, not rglob: rglob swallows a subtree
+    # listing failure, and if that subtree holds the only booklet/scan,
+    # "saw no companions" would authorize deleting the backup that still
+    # contains it.
+    walk_errors = []
+    companions = []
+    try:
+        for src in iter_tree_no_symlinks(backup_path, errors=walk_errors):
+            try:
+                if (src.is_file() and src.suffix.lower() not in cfg.AUDIO_EXTS
+                        and src.name not in _SIDECARS):
+                    companions.append(src)
+            except OSError as e:
+                walk_errors.append(e)
+    except OSError as e:
+        walk_errors.append(e)
+    if walk_errors:
+        return False
+    if not companions:
+        return True
     dest = find_album_dir_filesystem(album)
     if not dest or not dest.exists():
         dest = album_dir
-    if not dest or not dest.exists() or not backup_path.exists():
-        return
-    from qobuz_librarian.library.backup import _SIDECARS
-    for src in backup_path.rglob("*"):
-        # Skip the backup bookkeeping sidecars (.ql_backup_origin etc.) — they
-        # are non-audio but must never be carried into the live library folder.
-        if (not src.is_file() or src.suffix.lower() in cfg.AUDIO_EXTS
-                or src.name in _SIDECARS):
-            continue
+    if not dest or not dest.exists():
+        return False
+    ok = True
+    for src in companions:
         out = dest / src.relative_to(backup_path)
         if out.exists():
+            # Same name is not the same file: a re-rip lands its own
+            # booklet.pdf/cover under the standard name, and skipping on the
+            # name alone would count the ORIGINAL companion as carried while
+            # its only copy sits in the backup about to be deleted. Only a
+            # byte-identical destination proves it's already across; anything
+            # else (different bytes, unreadable) keeps the backup. Digest
+            # compare, not filecmp — its stat-signature cache can return a
+            # stale verdict for a same-size file replaced within the same
+            # mtime tick.
+            try:
+                if _file_digest(src) == _file_digest(out):
+                    continue
+            except OSError:
+                pass
+            ok = False
             continue
         try:
             out.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(src), str(out))
         except OSError:
-            pass
+            ok = False
+            continue
+        # The copy becomes the ONLY copy the moment the backup is deleted:
+        # prove the bytes landed and force them (and the new directory entry)
+        # to stable storage first. A copy that exists only in the page cache
+        # can vanish in a delayed-writeback failure after the source is gone.
+        try:
+            copied_ok = _file_digest(src) == _file_digest(out)
+        except OSError:
+            copied_ok = False
+        if not (copied_ok and _fsync(out) and _fsync(out.parent)):
+            ok = False
+    return ok
 
 
 def detect_sibling_album_groups(album_dirs):
@@ -958,25 +1048,38 @@ def process_album(album, args, *, allow_force=True, label=None,
             if upgrade_verified:
                 # Carry non-audio companions (booklets, art, .cue/.log) from the
                 # backup into the rebuilt album before deleting it — the
-                # audio-only verification ignores them, so they'd be lost.
-                _carry_non_audio_from_backup(album, album_dir, upgrade_backup_path)
-                try:
-                    shutil.rmtree(upgrade_backup_path)
-                    if auto_upgrade_active and not upgrade_only:
+                # audio-only verification ignores them, so they'd be lost. A
+                # failed carry keeps the backup: it holds the only copies.
+                if _carry_non_audio_from_backup(album, album_dir,
+                                                upgrade_backup_path):
+                    try:
+                        shutil.rmtree(upgrade_backup_path)
+                        if auto_upgrade_active and not upgrade_only:
+                            log.info(fmt(C.GRAY,
+                                "  ✓  Upgrade complete; backup cleared."))
+                    except OSError as e:
+                        log.info(fmt(C.YELLOW,
+                            f"  ⚠  Upgrade succeeded but couldn't remove backup: {e}."))
                         log.info(fmt(C.GRAY,
-                            "  ✓  Upgrade complete; backup cleared."))
-                except OSError as e:
+                            f"     Backup remains at {upgrade_backup_path} "
+                            f"(auto-cleaned after {cfg.UPGRADE_BACKUP_RETENTION_DAYS} days)."))
+                else:
+                    if not pin_unverified_upgrade_backup(upgrade_backup_path):
+                        warn_pin_failed(upgrade_backup_path)
                     log.info(fmt(C.YELLOW,
-                        f"  ⚠  Upgrade succeeded but couldn't remove backup: {e}."))
+                        "  ⚠  Upgrade landed, but the booklet/artwork "
+                        "companions couldn't be copied out of the backup — "
+                        "keeping it."))
                     log.info(fmt(C.GRAY,
-                        f"     Backup remains at {upgrade_backup_path} "
-                        f"(auto-cleaned after {cfg.UPGRADE_BACKUP_RETENTION_DAYS} days)."))
+                        f"     Backup remains at {upgrade_backup_path}; copy "
+                        f"the non-audio files out yourself, then delete it."))
             elif upgrade_succeeded and auto_upgrade_active:
                 # Passed the decode/lossy gate but the rebuilt folder isn't
                 # verifiably as complete as the original — keep the only full
                 # copy instead of deleting it.
                 upgrade_unverified = True
-                pin_unverified_upgrade_backup(upgrade_backup_path)
+                if not pin_unverified_upgrade_backup(upgrade_backup_path):
+                    warn_pin_failed(upgrade_backup_path)
                 log.info(fmt(C.YELLOW,
                     "\n  ⚠  Upgrade couldn't be verified as complete; "
                     "keeping your original."))
@@ -1041,12 +1144,12 @@ def process_album(album, args, *, allow_force=True, label=None,
                 # moved to the backup, so a >0 check passes even when the re-rip
                 # landed elsewhere / imported nothing and the present tracks were
                 # never restored — and the backup (their only copy) would be
-                # deleted. Require the resolved folder to hold the WHOLE album
-                # (present + missing re-downloaded); a count short of that means
-                # the present tracks aren't provably back, so keep the backup.
-                _expected = max(1, len(present) + len(missing))
-                _filled_ok = (_filled is not None and _filled.exists()
-                              and _audio_count_and_seconds(_filled)[0] >= _expected)
+                # deleted. And not a raw file count either: those same extras
+                # (or duplicate files) reach the expected number while an
+                # expected track is absent. Require every expected track to
+                # match one-to-one; anything short means the present tracks
+                # aren't provably back, so keep the backup.
+                _filled_ok = folder_holds_all_tracks(_filled, qobuz_tracks)
                 if _filled_ok:
                     try:
                         shutil.rmtree(gap_fill_backup_path)

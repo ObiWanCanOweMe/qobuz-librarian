@@ -76,18 +76,31 @@
     markSearchDownloadQueued(form);
   });
 
-  // Surface failed htmx requests instead of failing silently.
-  document.addEventListener("htmx:responseError", function () {
-    showToast("That didn't go through. Try again in a moment.", "error");
+  // Surface failed htmx requests instead of failing silently. A short
+  // plain-text body is the route speaking (e.g. "couldn't save that
+  // dismissal"); anything longer or HTML-shaped gets the generic line.
+  document.addEventListener("htmx:responseError", function (evt) {
+    var xhr = evt.detail && evt.detail.xhr;
+    var body = (xhr && xhr.responseText || "").trim();
+    var msg = (body && body.length <= 200 && body.indexOf("<") === -1)
+      ? body : "That didn't go through. Try again in a moment.";
+    showToast(msg, "error");
   });
   document.addEventListener("htmx:sendError", function () {
     showToast("Couldn't reach the server. Check your connection and try again.", "error");
   });
 
-  // Animate a fully hidden artist group before htmx removes it.
+  // Animate a fully hidden artist group before htmx removes it. Dismissals
+  // target the group's positioning SHELL (the dismiss button lives beside the
+  // <details>, not inside it), so match the shell as well as a bare details —
+  // matching only the details left the swap unanimated and, worse, skipped
+  // the qlHidden recount, so an emptied page kept its stale counts.
   document.addEventListener("htmx:beforeSwap", function (evt) {
     var t = evt.detail && evt.detail.target;
-    if (!t || !t.matches || !t.matches("details[data-artist]")) return;
+    if (!t || !t.matches) return;
+    if (!t.matches("details[data-artist]")
+        && !(t.matches(".ql-review-group-shell")
+             && t.querySelector("details[data-artist]"))) return;
     if ((evt.detail.serverResponse || "").trim() !== "") return;
     collapse(t);
     // Recount after the delayed removal has actually finished.
@@ -332,7 +345,8 @@
     nodes.forEach(closeDrawer);
   };
   document.addEventListener("click", function (evt) {
-    var btn = evt.target.closest && evt.target.closest("[aria-haspopup='menu']");
+    // The drawer trigger is its <summary> (a disclosure button, not a menu).
+    var btn = evt.target.closest && evt.target.closest(".ql-mobile-drawer > summary");
     var trigger = (btn && btn.closest(".ql-mobile-drawer")) ? btn : null;
     var triggerDd = trigger ? trigger.closest(".ql-mobile-drawer") : null;
     // Close outside taps and other open drawers.
@@ -467,7 +481,9 @@
           panel.classList.toggle("hidden", panel.dataset.searchViewPanel !== name);
         });
         root.querySelectorAll("[data-search-view]").forEach(function (btn) {
-          btn.classList.toggle("is-active", btn.dataset.searchView === name);
+          var active = btn.dataset.searchView === name;
+          btn.classList.toggle("is-active", active);
+          btn.setAttribute("aria-pressed", active ? "true" : "false");
         });
         try { localStorage.setItem("ql-search-view", name); } catch (e) {}
       }
@@ -635,7 +651,7 @@
     // Once a queued card starts, refresh it into the live running layout.
     var flippedFromPending = false;
     var progId = (surface === "dashboard" ? "dash-prog-" : "card-prog-") + id;
-    var containerId = surface === "dashboard" ? "dashboard-work"
+    var containerId = surface === "dashboard" ? "dashboard-active"
                     : "queue-body";
     var reconnect = surface === "dashboard" ? document.getElementById("dash-reconnect-" + id) : null;
     var src = new EventSource("/api/jobs/" + id + "/stream");
@@ -645,8 +661,7 @@
     }
     function onSwap(e) {
       if (!e.detail || !e.detail.target) return;
-      if (e.detail.target.id === containerId
-          || (surface === "dashboard" && e.detail.target.id === "dashboard-active")) shut();
+      if (e.detail.target.id === containerId) shut();
     }
     document.addEventListener("htmx:beforeSwap", onSwap);
     if (reconnect) {
@@ -708,7 +723,7 @@
       if (surface === "dashboard") {
         if (window.htmx) {
           window.htmx.ajax("GET", "/",
-            { target: "#dashboard-work", swap: "outerHTML", select: "#dashboard-work" });
+            { target: "#dashboard-active", swap: "outerHTML", select: "#dashboard-active" });
         } else { location.reload(); }
       } else if (window.htmx) {
         window.htmx.ajax("GET", "/queue",
@@ -1121,6 +1136,7 @@
     function loadMore(page) {
       if (loading) return;
       loading = true;
+      var gen = ++loadGen;
       var url = "/jobs/" + id + "/review?page=" + (page || 2) +
                 "&q=" + encodeURIComponent(curQuery()) +
                 "&tab=" + encodeURIComponent(curTab());
@@ -1128,6 +1144,7 @@
         .then(function (r) { return r.ok ? r.text() : null; })
         .then(function (txt) {
           loading = false;
+          if (gen !== loadGen) return;
           if (txt == null) { showToast("Couldn't load those results. Try again.", "error"); return; }
           var tmp = document.createElement("div");
           tmp.innerHTML = txt;
@@ -1145,21 +1162,34 @@
           updateHideLabels();
           updateArtistChecks();
         })
-        .catch(function () { loading = false; showToast("Couldn't load those results. Check your connection.", "error"); });
+        .catch(function () { loading = false; if (gen === loadGen) showToast("Couldn't load those results. Check your connection.", "error"); });
     }
 
-    // Fetch and swap one review page.
+    // Fetch and swap one review page. Requests are generation-tagged and only
+    // the newest response may render: a tab click while a fetch is in flight
+    // issues its own request instead of being dropped, and the slow old-tab
+    // response is discarded on arrival — otherwise its rows would paint under
+    // the newly selected tab while the hidden approval field already points
+    // at the new tab.
     var loading = false;
+    var loadGen = 0;
     function loadPage(page, query) {
-      if (loading) return;
-      loading = true;
+      var gen = ++loadGen;
+      loading = false;   // a page swap supersedes any in-flight append
+      // The outgoing page's Load More dies NOW, not when the response lands:
+      // a click on it (or the auto-clicking observer) in that gap would bump
+      // the generation, discard this page-1 response, and append the new
+      // tab's page 2 beneath the old tab's rows. The swap brings its own
+      // control back; on a failed fetch the tab click re-issues the load.
+      var staleMore = document.getElementById("review-loadmore");
+      if (staleMore) staleMore.remove();
       var url = "/jobs/" + id + "/review?page=" + (page || 1) +
                 "&q=" + encodeURIComponent(query || "") +
                 "&tab=" + encodeURIComponent(curTab());
       fetch(url, { headers: { "HX-Request": "true" } })
         .then(function (r) { return r.ok ? r.text() : null; })
         .then(function (txt) {
-          loading = false;
+          if (gen !== loadGen) return;
           if (txt == null) { showToast("Couldn't load those results. Try again.", "error"); return; }
           var host = document.getElementById("review-page");
           if (host) {
@@ -1176,7 +1206,7 @@
             updateArtistChecks();
           }
         })
-        .catch(function () { loading = false; showToast("Couldn't load those results. Check your connection.", "error"); });
+        .catch(function () { if (gen === loadGen) showToast("Couldn't load those results. Check your connection.", "error"); });
     }
 
     // Delegated interactions keep swapped pages wired.

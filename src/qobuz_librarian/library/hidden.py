@@ -150,12 +150,18 @@ def load():
     return base
 
 
+_SAVE_FAILED_MSG = ("Couldn't save that — the data folder looks full or "
+                    "read-only, so it would have come back after a restart.")
+
+
 def save(store):
     # Callers hold _store_lock() across load()+save(), so this writer never races
     # a second writer of the same store. The temp file is still unique per write
     # (mkstemp, not a fixed ".tmp" name): a shared temp name let two concurrent
     # writers — a web hide racing a CLI single-marker during a run-lock handoff —
     # clobber each other's partial write and leave an orphan beside the store.
+    # Returns True when the store hit disk; a mutator whose UI claims success
+    # checks this and raises instead of reporting a change that won't persist.
     try:
         cfg.HIDDEN_FILE.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(cfg.HIDDEN_FILE.parent),
@@ -170,12 +176,11 @@ def save(store):
                     os.unlink(tmp)
                 except OSError:
                     pass
+        return True
     except OSError as e:
-        # Don't fail completely silent: a dismissal/single-mark that didn't
-        # persist (full or read-only data volume) returns a success count but
-        # would re-surface next scan — at least leave a verbose trail.
         from qobuz_librarian.ui_cli.logging import vlog
         vlog(f"hidden-store write failed ({e}); the change may not persist")
+        return False
 
 
 def is_hidden(scope, artist, title, store):
@@ -202,8 +207,8 @@ def hide(scope, items):
             bucket[fp] = {"artist": artist or "", "title": title or "",
                           "year": str(year or ""), "ts": now}
             added += 1
-        if added:
-            save(store)
+        if added and not save(store):
+            raise OSError(_SAVE_FAILED_MSG)
     return added
 
 
@@ -225,7 +230,8 @@ def restore(scope, artists):
             bucket.pop(fp, None)
         if drop:
             store[scope] = bucket
-            save(store)
+            if not save(store):
+                raise OSError(_SAVE_FAILED_MSG)
     return len(drop)
 
 
@@ -238,7 +244,8 @@ def restore_all(scope):
         n = len(bucket)
         if n:
             store[scope] = {}
-            save(store)
+            if not save(store):
+                raise OSError(_SAVE_FAILED_MSG)
     return n
 
 
@@ -256,7 +263,8 @@ def restore_albums(scope, fingerprints):
             bucket.pop(fp, None)
         if drop:
             store[scope] = bucket
-            save(store)
+            if not save(store):
+                raise OSError(_SAVE_FAILED_MSG)
     return len(drop)
 
 
@@ -312,7 +320,8 @@ def mark_single(artist, title, year, album_id):
             "album_id": str(album_id or "") or prev.get("album_id", ""),
             "ts": prev.get("ts") or datetime.now(timezone.utc).isoformat(),
         }
-        save(store)
+        if not save(store):
+            raise OSError(_SAVE_FAILED_MSG)
     return True
 
 
@@ -329,5 +338,8 @@ def unmark_single(artist, title):
             return False
         bucket.pop(fp, None)
         store[SCOPE_SINGLE] = bucket
+        # Best-effort on purpose: unmark runs as internal bookkeeping inside
+        # undo/repair/graduation flows — a failed cleanup write shouldn't
+        # abort those; save() already leaves a verbose trail.
         save(store)
     return True
