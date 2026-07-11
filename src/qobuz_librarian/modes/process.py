@@ -23,6 +23,7 @@ from qobuz_librarian.integrations.rip import (
 from qobuz_librarian.library.backup import (
     backup_album_dir,
     pin_unverified_upgrade_backup,
+    replacement_tree_durable,
     restore_gap_fill_backup,
     restore_upgrade_backup,
     warn_pin_failed,
@@ -257,7 +258,12 @@ def _upgrade_replacement_verified(album, album_dir, backup_path):
                 f"original had {_fmt_quality(oq)} — keeping the backup "
                 f"(a track came back below the original)."))
             return False
-    pairs, _unpaired = pair_existing_tracks(old_tracks, new_tracks)
+    pairs, unpaired = pair_existing_tracks(old_tracks, new_tracks)
+    if unpaired:
+        log.info(fmt(C.YELLOW,
+            f"  ⚠  Upgrade replacement is missing {len(unpaired)} original "
+            "track identity match(es) — keeping the backup."))
+        return False
     for ot, nt in pairs:
         oq, nq = _track_quality(ot), _track_quality(nt)
         if oq > (0, 0) and nq < oq:
@@ -270,18 +276,30 @@ def _upgrade_replacement_verified(album, album_dir, backup_path):
     return True
 
 
-def _carry_non_audio_from_backup(album, album_dir, backup_path):
+def _carry_non_audio_from_backup(album, album_dir, backup_path,
+                                 replacement_dir=None):
     """Copy non-audio companions (booklets, scans, .cue/.log, hand-placed cover
     art) from an upgrade backup into the rebuilt album before the backup is
     deleted. The audio-only completeness check ignores these files, so without
     this they'd be lost with the backup. Existing destination files are left
-    untouched. Returns True when every companion made it across (or there were
-    none); False when the destination can't be resolved or any copy failed, so
-    the caller keeps the backup instead of deleting the only copies."""
-    from qobuz_librarian.library.backup import _SIDECARS, _file_digest, _fsync
+    untouched. The completed replacement tree is then flushed in full. Returns
+    False when the destination can't be resolved, any copy failed, or the tree
+    could not be made durable, so the caller keeps the backup."""
+    from qobuz_librarian.library.backup import (
+        _SIDECARS,
+        _file_digest,
+        replacement_tree_durable,
+    )
     from qobuz_librarian.library.scanner import iter_tree_no_symlinks
     if not backup_path.exists():
         return True
+    dest = replacement_dir
+    if not dest or not dest.exists():
+        dest = find_album_dir_filesystem(album)
+    if not dest or not dest.exists():
+        dest = album_dir
+    if not dest or not dest.exists():
+        return False
     # Skip the backup bookkeeping sidecars (.ql_backup_origin etc.) — they
     # are non-audio but must never be carried into the live library folder.
     # Walked with an error channel, not rglob: rglob swallows a subtree
@@ -301,13 +319,6 @@ def _carry_non_audio_from_backup(album, album_dir, backup_path):
     except OSError as e:
         walk_errors.append(e)
     if walk_errors:
-        return False
-    if not companions:
-        return True
-    dest = find_album_dir_filesystem(album)
-    if not dest or not dest.exists():
-        dest = album_dir
-    if not dest or not dest.exists():
         return False
     ok = True
     for src in companions:
@@ -335,17 +346,16 @@ def _carry_non_audio_from_backup(album, album_dir, backup_path):
         except OSError:
             ok = False
             continue
-        # The copy becomes the ONLY copy the moment the backup is deleted:
-        # prove the bytes landed and force them (and the new directory entry)
-        # to stable storage first. A copy that exists only in the page cache
-        # can vanish in a delayed-writeback failure after the source is gone.
+        # The copy becomes the only copy when the backup is deleted. Verify its
+        # bytes now; the final whole-tree gate below flushes it together with
+        # the audio, nested directories, and any identical retained companion.
         try:
             copied_ok = _file_digest(src) == _file_digest(out)
         except OSError:
             copied_ok = False
-        if not (copied_ok and _fsync(out) and _fsync(out.parent)):
+        if not copied_ok:
             ok = False
-    return ok
+    return ok and replacement_tree_durable(dest)
 
 
 def detect_sibling_album_groups(album_dirs):
@@ -1064,15 +1074,16 @@ def process_album(album, args, *, allow_force=True, label=None,
                             f"     Backup remains at {upgrade_backup_path} "
                             f"(auto-cleaned after {cfg.UPGRADE_BACKUP_RETENTION_DAYS} days)."))
                 else:
+                    upgrade_unverified = True
                     if not pin_unverified_upgrade_backup(upgrade_backup_path):
                         warn_pin_failed(upgrade_backup_path)
                     log.info(fmt(C.YELLOW,
-                        "  ⚠  Upgrade landed, but the booklet/artwork "
-                        "companions couldn't be copied out of the backup — "
-                        "keeping it."))
+                        "  ⚠  Upgrade landed, but the rebuilt album or its "
+                        "companions couldn't be flushed safely — keeping the "
+                        "backup."))
                     log.info(fmt(C.GRAY,
-                        f"     Backup remains at {upgrade_backup_path}; copy "
-                        f"the non-audio files out yourself, then delete it."))
+                        f"     Backup remains at {upgrade_backup_path}; keep it "
+                        "until you've confirmed the rebuilt album is safe."))
             elif upgrade_succeeded and auto_upgrade_active:
                 # Passed the decode/lossy gate but the rebuilt folder isn't
                 # verifiably as complete as the original — keep the only full
@@ -1150,12 +1161,23 @@ def process_album(album, args, *, allow_force=True, label=None,
                 # match one-to-one; anything short means the present tracks
                 # aren't provably back, so keep the backup.
                 _filled_ok = folder_holds_all_tracks(_filled, qobuz_tracks)
-                if _filled_ok:
+                if _filled_ok and replacement_tree_durable(_filled):
                     try:
                         shutil.rmtree(gap_fill_backup_path)
                     except OSError as e:
                         log.info(fmt(C.YELLOW,
                             f"  ⚠  Gap-fill complete but couldn't remove backup: {e}."))
+                elif _filled_ok:
+                    _gap_fill_not_located = True
+                    if not pin_unverified_upgrade_backup(
+                            gap_fill_backup_path,
+                            "gap-fill backup kept — replacement not durable"):
+                        warn_pin_failed(gap_fill_backup_path)
+                    log.info(fmt(C.YELLOW,
+                        "  ⚠  Gap-fill landed, but the filled album couldn't "
+                        "be flushed safely — keeping the backed-up tracks."))
+                    log.info(fmt(C.GRAY,
+                        f"     Backup remains at {gap_fill_backup_path}."))
                 else:
                     _gap_fill_not_located = True
                     log.info(fmt(C.YELLOW,
@@ -1291,12 +1313,11 @@ def process_album(album, args, *, allow_force=True, label=None,
         if auto_upgrade_active and not upgrade_unverified:
             log.info(fmt(C.MAGENTA + C.BOLD,
                 f"  ↑ upgraded · {n_ok} track(s) · {int(elapsed)}s · imported"))
-        elif not auto_upgrade_active:
+        elif not auto_upgrade_active and not upgrade_unverified:
             log.info(fmt(C.GREEN,
                 f"  ✓ {n_ok} downloaded · {int(elapsed)}s · imported"))
-        # else (auto_upgrade_active and upgrade_unverified): the "⚠ Upgrade
-        # couldn't be verified — keeping your original" warning already printed
-        # above, so don't also claim a clean "↑ upgraded · imported".
+        # An unverified replacement already printed the backup warning above;
+        # don't also claim a clean download or upgrade here.
     else:
         section("Result")
         log.info("")

@@ -1015,6 +1015,7 @@ def scan_library(job, token, partial_only=False, force_full=False):
     # Reached here only without an AuthLost/outage abort (that re-raises out
     # above, leaving the checkpoint for resume and not seeding the baseline).
     flush_resolve_cache()
+    baseline_save_failed = False
     if job.cancel_requested:
         # Deliberate stop — discard this kind's progress so it isn't auto-resumed.
         scan_checkpoint.clear(kind)
@@ -1068,7 +1069,8 @@ def scan_library(job, token, partial_only=False, force_full=False):
             # baseline from the catalog snapshot (only the first time; the daily
             # check keeps it fresh after), and clear this kind's checkpoint.
             if not new_releases_mod.is_baseline_complete():
-                new_releases_mod.seed_baseline(baseline_seen)
+                baseline_save_failed = (
+                    new_releases_mod.seed_baseline(baseline_seen) is False)
             scan_checkpoint.clear(kind)
         elif scanned or job.candidates or baseline_seen:
             scan_checkpoint.save(
@@ -1094,6 +1096,9 @@ def scan_library(job, token, partial_only=False, force_full=False):
         job._unchecked_artists = unchecked
         job.summary += (f" {plural(unchecked, 'artist')} couldn't be checked; "
                         "scan again to resume from where it left off.")
+    if baseline_save_failed:
+        job.summary += (" The New Releases baseline couldn't be saved; "
+                        "the next complete scan will try again.")
     log.info(job.summary)
 
 
@@ -1127,6 +1132,7 @@ def scan_new_releases(job, token):
     log.info(f"Checking {plural(len(artists), 'artist')} for new releases…")
     total = 0
     done = 0
+    failed_count = 0
     n = len(artists)
     workers = max(1, int(cfg.ARTIST_SCAN_WORKERS))
     # This run's reached artists; merged over the prior baseline at the end (so a
@@ -1155,12 +1161,17 @@ def scan_new_releases(job, token):
                     f.cancel()
                 raise
             except Exception as e:
+                failed_count += 1
                 log.info(f"    skipped {futures[fut].name}: {e}")
                 job.push_progress("Checking for new releases", done, n,
                                   futures[fut].name, found=total, unit="artist")
                 continue
             if result.artist_id and not getattr(result, "fetch_failed", False):
                 current_seen[result.artist_id] = result.current_ids
+            else:
+                # An unresolved artist and a short/failed catalogue fetch are
+                # both unchecked, not clean zero-release results.
+                failed_count += 1
             for gap in result.new_gaps:
                 # Leave new releases UN-ticked, like the library gap list: a
                 # review is for picking, and one tap must never queue the whole
@@ -1177,6 +1188,7 @@ def scan_new_releases(job, token):
                 log.info(f"  {result.artist_name} — "
                          f"{plural(len(result.new_gaps), 'new release')}")
     flush_resolve_cache()
+    saved = None
     if not job.cancel_requested:
         # UNION each reached artist's snapshot into the prior baseline rather than
         # replacing it. A catalog bigger than the fetch cap comes back as a
@@ -1188,7 +1200,12 @@ def scan_new_releases(job, token):
         merged = dict(seen)
         for aid, ids in current_seen.items():
             merged[aid] = sorted(set(merged.get(aid, [])) | set(ids))
-        new_releases_mod.mark_run(merged, complete=True, baseline_limit=cur_limit)
+        complete = failed_count == 0 and bool(current_seen)
+        saved = new_releases_mod.mark_run(
+            merged,
+            complete=complete,
+            baseline_limit=cur_limit if complete else None,
+        )
     if job.cancel_requested:
         # A cancelled crawl only reached a fraction of the artists, so it can't
         # claim "No new releases" or "First check recorded" definitively.
@@ -1196,20 +1213,50 @@ def scan_new_releases(job, token):
                        f"{plural(total, 'new release')} found so far.")
         log.info(job.summary)
         return
+    if failed_count:
+        job._unchecked_artists = failed_count
+
     if rebaseline and seen:
-        job.summary = ("Catalogue limit changed. Recorded a fresh baseline. "
-                       "Future checks will flag new releases.")
-        log.info("Re-baselined after a catalogue-limit change; nothing surfaced.")
+        if saved is False:
+            job.summary = ("The fresh catalogue baseline couldn't be saved. "
+                           "Check again to retry it.")
+            if failed_count:
+                job.summary += (f" {plural(failed_count, 'artist')} also "
+                                "couldn't be checked.")
+        elif failed_count:
+            job.summary = ("Catalogue rebaseline incomplete. "
+                           f"{plural(failed_count, 'artist')} couldn't be "
+                           "checked; check again to retry them.")
+        else:
+            job.summary = ("Catalogue limit changed. Recorded a fresh baseline. "
+                           "Future checks will flag new releases.")
     elif total:
         job.summary = f"{plural(total, 'new release')} found across the library."
-        log.info(f"Done. {plural(total, 'new release')} across the library.")
+        if failed_count:
+            job.summary += (f" {plural(failed_count, 'artist')} couldn't be "
+                            "checked; check again for a complete result.")
+        if saved is False:
+            job.summary += (" The updated baseline couldn't be saved, so these "
+                            "releases may appear again.")
+    elif failed_count:
+        job.summary = ("No new releases from the artists that could be checked. "
+                       f"{plural(failed_count, 'artist')} couldn't be checked; "
+                       "check again for a complete result.")
+        if saved is False:
+            job.summary += " The partial baseline update couldn't be saved."
     elif not seen:
-        job.summary = ("First check complete. Recorded the current Qobuz "
-                       "catalogue baseline. Future checks will flag new releases.")
-        log.info("Baseline recorded. Future checks will flag new releases.")
+        if saved is False:
+            job.summary = ("The current Qobuz catalogue was checked, but the "
+                           "starting baseline couldn't be saved. Check again.")
+        else:
+            job.summary = ("First check complete. Recorded the current Qobuz "
+                           "catalogue baseline. Future checks will flag new releases.")
+    elif saved is False:
+        job.summary = ("No new releases found, but the updated baseline couldn't "
+                       "be saved. Check again.")
     else:
         job.summary = "No new releases added to your saved baseline."
-        log.info("No new releases added to the saved baseline.")
+    log.info(job.summary)
 
 
 # ── Execute ───────────────────────────────────────────────────────────────────
@@ -2029,9 +2076,12 @@ def _redownload_damaged_album(payload, token):
 
     from qobuz_librarian.library.backup import (
         backup_album_dir,
+        pin_unverified_upgrade_backup,
         restore_upgrade_backup,
+        warn_pin_failed,
     )
     from qobuz_librarian.modes.process import (
+        _carry_non_audio_from_backup,
         _upgrade_replacement_verified,
         process_album,
     )
@@ -2058,8 +2108,22 @@ def _redownload_damaged_album(payload, token):
     if backup:
         if imported_ok and _upgrade_replacement_verified(full, album_dir, backup):
             # The rebuild is verifiably at least as complete as the original
-            # (track count + playtime) — safe to drop the backup.
-            _shutil.rmtree(backup, ignore_errors=True)
+            # and its final tree is durable — safe to drop the backup only
+            # after carrying the original's non-audio companions too.
+            if _carry_non_audio_from_backup(full, album_dir, backup):
+                try:
+                    _shutil.rmtree(backup)
+                except OSError as exc:
+                    log.info(f"  Re-download completed, but the redundant "
+                             f"backup couldn't be removed: {exc}")
+            else:
+                result["repair_unverified"] = True
+                if not pin_unverified_upgrade_backup(
+                        backup, "repair backup kept — replacement not durable"):
+                    warn_pin_failed(backup)
+                log.info("  Re-download landed, but the rebuilt album or its "
+                         "companions couldn't be flushed safely; keeping your "
+                         f"backup at {backup}.")
         elif imported_ok:
             # Imported, but a decode pass alone doesn't prove the re-rip kept
             # every track — a truncated or short result could be WORSE than the
@@ -2272,10 +2336,10 @@ def run_library_lyrics(job, *, rescan=False, synced_only=False):
 def scan_migration(job, src, dest, *, use_acoustid, in_place=False):
     """Analyze the source library and attach one candidate per placeable album.
 
-    Placeable albums become the review list (grouped by artist); files that
-    can't be identified or that would collide are reported in the summary and
-    left untouched. A preview manifest is written to the destination so the plan
-    is auditable before anything is copied.
+    New placements and verified existing copies become the review list (grouped
+    by artist). Files that can't be identified or have unresolved collisions
+    are reported and left untouched. A preview manifest is written to the
+    destination so the plan is reviewable before anything is copied.
     """
     from qobuz_librarian.library import migrate as engine
 
@@ -2290,6 +2354,12 @@ def scan_migration(job, src, dest, *, use_acoustid, in_place=False):
                        if n else "Stopped before anything was scanned.")
         return
     plan = engine.build_plan(items, dest)
+    resume_entries = engine.verified_resume_entries(
+        plan, progress=job.push_progress,
+        cancel_check=lambda: job.cancel_requested)
+    if job.cancel_requested:
+        job.summary = "Stopped while checking existing copies. Nothing was copied."
+        return
 
     manifest = dest / "migration-manifest.csv"
     try:
@@ -2298,27 +2368,59 @@ def scan_migration(job, src, dest, *, use_acoustid, in_place=False):
         log.info(f"Couldn't write the preview manifest: {exc}")
 
     groups: dict = {}
-    for entry in plan.placed:
-        # dest_rel is <artist>/<album (year)>/[Disc N/]<track>; group by album dir.
-        key = (entry.dest_rel.parts[0], entry.dest_rel.parts[1])
-        groups.setdefault(key, []).append(entry)
-    for (artist, album), entries in sorted(groups.items()):
+    for kind, plan_entries in (
+            ("entries", plan.placed), ("resume_entries", resume_entries)):
+        for entry in plan_entries:
+            # dest_rel is <artist>/<album (year)>/[Disc N/]<track>;
+            # group by album directory.
+            key = (entry.dest_rel.parts[0], entry.dest_rel.parts[1])
+            group = groups.setdefault(
+                key, {"entries": [], "resume_entries": []})
+            group[kind].append(entry)
+    for (artist, album), group in sorted(groups.items()):
+        entries = group["entries"]
+        resumes = group["resume_entries"]
+        if entries and resumes:
+            detail = (f"{plural(len(entries), 'track')} to "
+                      f"{'move' if in_place else 'copy'} · "
+                      f"{plural(len(resumes), 'track')} already verified")
+        elif entries:
+            detail = (f"{plural(len(entries), 'track')} → "
+                      f"{artist}/{album}")
+        else:
+            detail = (f"{plural(len(resumes), 'track')} already copied · "
+                      "finish cover art and sidecars")
+        payload = {
+            "entries": [
+                (str(e.source), str(e.dest_rel)) for e in entries],
+            "resume_entries": [
+                (str(e.source), str(e.dest_rel)) for e in resumes],
+        }
         job.add_candidate(
             kind="migrate",
             title=album,
             artist=artist,
-            detail=f"{plural(len(entries), 'track')} → {artist}/{album}",
-            payload={"entries": [(str(e.source), str(e.dest_rel)) for e in entries]},
+            detail=detail,
+            payload=payload,
         )
 
     s = plan.summary()
     verb = "move" if in_place else "copy"
-    parts = [f"{plural(s['place'], 'file')} ready to {verb}"]
+    parts = []
+    if s["place"]:
+        parts.append(f"{plural(s['place'], 'file')} ready to {verb}")
+    if resume_entries:
+        parts.append(
+            f"{plural(len(resume_entries), 'existing file')} verified to resume")
+    if not parts:
+        parts.append("No files ready")
     if s["unplaceable"]:
         parts.append(f"{s['unplaceable']} couldn't be identified")
-    if s["collision"]:
-        parts.append(f"{s['collision']} skipped to avoid name collisions")
-    need, free = engine.space_estimate(plan, in_place=in_place)
+    unsafe_collisions = s["collision"] - len(resume_entries)
+    if unsafe_collisions:
+        parts.append(f"{unsafe_collisions} skipped to avoid name collisions")
+    need, free = engine.space_estimate(
+        plan, in_place=in_place, resume_entries=resume_entries)
     if need and free is not None:
         space = f"≈{format_size(need)} to {verb}, {format_size(free)} free at the destination"
         if need > free:
@@ -2344,6 +2446,10 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
         for src_s, dest_s in c.get("payload", {}).get("entries", []):
             entries.append(engine.PlanEntry(
                 source=Path(src_s), status=engine.PLACE, dest_rel=Path(dest_s)))
+        for src_s, dest_s in c.get("payload", {}).get("resume_entries", []):
+            entries.append(engine.PlanEntry(
+                source=Path(src_s), status=engine.COLLISION,
+                dest_rel=Path(dest_s), reason="destination already exists"))
     if not entries:
         job.push_line("Nothing selected. Nothing to copy.")
         return
@@ -2356,7 +2462,12 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
     # unless the user deliberately overrode the warning — the same gate the CLI
     # enforces with a typed "yes". Copy mode leaves the originals intact, so a
     # partial copy is recoverable and only warns.
-    need, free = engine.space_estimate(plan, in_place=in_place)
+    # These mappings were approved from the scan. The estimate may count their
+    # companion files without rereading the audio; execute_plan performs the
+    # load-bearing identity check immediately before any companion copy.
+    resume_entries = plan.collisions
+    need, free = engine.space_estimate(
+        plan, in_place=in_place, resume_entries=resume_entries)
     if in_place and free is not None and need > free and not allow_low_space:
         job.error = (
             f"Not enough free space at {dest}: the move needs about "
@@ -2382,9 +2493,11 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
             result = engine.execute_plan(
                 plan, in_place=in_place,
                 cancel_check=lambda: job.cancel_requested,
-                progress=job.push_progress)
+                progress=job.push_progress,
+                resume_entries=resume_entries)
             # In-place leaves the emptied source folders behind; clear the husk.
-            pruned = engine.prune_empty_dirs(src) if (in_place and src) else 0
+            pruned = engine.prune_empty_dirs(src) if (
+                in_place and src and not result.cancelled) else 0
         finally:
             set_staging_holder(None)
     # Leave the preview manifest (the full plan, including what was left behind)
@@ -2400,6 +2513,8 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
     parts = [f"{plural(result.copied, 'file')} {verb} into {dest}"]
     if result.skipped:
         parts.append(f"{result.skipped} skipped (already present)")
+    if result.companions:
+        parts.append(f"carried {plural(result.companions, 'cover/sidecar file')}")
     if result.lingered:
         parts.append(f"{result.lingered} moved but the original couldn't be removed")
     if result.failed:

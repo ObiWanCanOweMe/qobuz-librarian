@@ -167,15 +167,20 @@
 
   // Styled confirm prompt (the app-drawn <dialog>, not the browser's popup),
   // falling back to window.confirm where <dialog> is unsupported.
-  window.qlConfirm = function (msg) {
+  window.qlConfirm = function (msg, opts) {
+    opts = opts || {};
     var d = document.getElementById("ql-confirm");
     if (!d || typeof d.showModal !== "function") {
       return Promise.resolve(window.confirm(msg));
     }
     return new Promise(function (resolve) {
       d.querySelector("[data-confirm-text]").textContent = msg;
+      var okButton = d.querySelector("[data-confirm-ok]");
+      okButton.textContent = opts.action || "Continue";
+      okButton.classList.toggle("ql-btn-danger", !!opts.danger);
+      okButton.classList.toggle("ql-btn-primary", !opts.danger);
       var choice = false;
-      d.querySelector("[data-confirm-ok]").onclick = function () { choice = true; d.close(); };
+      okButton.onclick = function () { choice = true; d.close(); };
       d.querySelector("[data-confirm-cancel]").onclick = function () { choice = false; d.close(); };
       d.addEventListener("close", function h() {
         d.removeEventListener("close", h);
@@ -204,7 +209,10 @@
       var m = (el.textContent || "").match(/[\d,]+/);
       msg = msg.replace("{count}", m ? m[0] : "the");
     }
-    window.qlConfirm(msg).then(function (ok) {
+    window.qlConfirm(msg, {
+      action: el.getAttribute("data-confirm-action") || "",
+      danger: el.hasAttribute("data-confirm-danger"),
+    }).then(function (ok) {
       if (!ok) return;
       if (el.tagName === "FORM") {
         // A form's click() never submits it — fire a real submit event so
@@ -224,7 +232,11 @@
     var q = evt.detail && evt.detail.question;
     if (!q) return;
     evt.preventDefault();
-    window.qlConfirm(q).then(function (ok) {
+    var source = evt.detail && evt.detail.elt;
+    window.qlConfirm(q, {
+      action: (source && source.getAttribute("data-confirm-action")) || "",
+      danger: !!(source && source.hasAttribute("data-confirm-danger")),
+    }).then(function (ok) {
       if (ok) evt.detail.issueRequest(true);
     });
   });
@@ -568,7 +580,7 @@
         if (!keys.length || bulkButton.disabled) return;
         var forms = keys.map(firstFormForKey).filter(Boolean);
         if (!forms.length) return;
-        window.qlConfirm("Download " + keys.length + " selected album(s)? They queue now and import into your library.").then(function (ok) {
+        window.qlConfirm("Download " + keys.length + " selected album(s)? They queue now and import into your library.", { action: "Download" }).then(function (ok) {
           if (ok) runBulkDownload(forms);
         });
       }
@@ -1016,9 +1028,15 @@
       });
     }
 
+    function warnPersistFailed(c) {
+      if (!c || !c.persist_failed) return;
+      showToast("Your choices changed, but couldn't be saved to disk. They may not survive a restart. Check the data folder.", "error");
+    }
+
     // Save one checkbox to the server, then refresh counts from its response.
     function saveTick(cb) {
       var previous = !cb.checked;
+      var det = cb.closest("details[data-artist]");
       function revert() {
         cb.checked = previous;
         cb.style.outline = "2px solid #ef4444";
@@ -1029,37 +1047,82 @@
       var body = "cid=" + encodeURIComponent(cb.value) + "&checked=" + (cb.checked ? "1" : "0");
       post("/jobs/" + id + "/select", body)
         .then(function (r) { return r.ok ? r.json() : Promise.reject(); })
-        .then(function (c) { cb.disabled = false; if (c) applyCounts(c); updateHideLabels(); updateArtistChecks(); })
-        .catch(function () { cb.disabled = false; revert(); });
+        .then(function (c) {
+          cb.disabled = false;
+          if (det) delete det.dataset.selectionOverride;
+          if (c) applyCounts(c);
+          updateHideLabels();
+          updateArtistChecks();
+        })
+        .catch(function () {
+          cb.disabled = false;
+          revert();
+          showToast("Couldn't save that choice. Try again.", "error");
+        });
     }
 
     // Guard against overlapping whole-set writes.
     var bulkBusy = false;
-    function bulkSelect(on, scope) {
-      if (bulkBusy) return Promise.resolve();
+    function applyGroupChoice(det, on, commit) {
+      det.querySelectorAll(".cb").forEach(function (cb) { cb.checked = on; });
+      var header = det.querySelector("[data-artist-select]");
+      if (header) {
+        header.checked = on;
+        header.indeterminate = false;
+      }
+      if (commit) {
+        det.dataset.groupSelected = on ? (det.dataset.groupTotal || "0") : "0";
+      }
+    }
+
+    function restoreGroupHeader(det) {
+      var total = parseInt(det.dataset.groupTotal || "0", 10);
+      var picked = parseInt(det.dataset.groupSelected || "0", 10);
+      var header = det.querySelector("[data-artist-select]");
+      if (!header) return;
+      header.checked = total > 0 && picked === total;
+      header.indeterminate = picked > 0 && picked < total;
+    }
+
+    function bulkSelect(on, scope, artist) {
+      if (bulkBusy) {
+        showToast("Another selection is still saving. Try again in a moment.", "error");
+        applyCounts(lastCounts);
+        return Promise.resolve({ ok: false, busy: true });
+      }
       bulkBusy = true;
       var body = "on=" + (on ? "1" : "0") + "&scope=" + scope +
                  "&tab=" + encodeURIComponent(curTab()) +
                  "&q=" + encodeURIComponent(curQuery());
+      if (scope === "artist") body += "&artist=" + encodeURIComponent(artist || "");
       if (scope === "page") {
-        pageBox() && pageBox().querySelectorAll(".cb").forEach(function (cb) {
-          body += "&cid=" + encodeURIComponent(cb.value);
+        pageBox() && pageBox().querySelectorAll("details[data-artist]").forEach(function (det) {
+          body += "&artist=" + encodeURIComponent(det.dataset.artist || "");
         });
       }
       return post("/jobs/" + id + "/select-all", body)
-        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (r) { return r.ok ? r.json() : Promise.reject(); })
         .then(function (c) {
           bulkBusy = false;
-          if (!c) { flashSelectError(); return; }
           applyCounts(c);
-          var on2 = on;
+          warnPersistFailed(c);
           if (scope === "all" || scope === "page") {
-            pageBox() && pageBox().querySelectorAll(".cb").forEach(function (cb) { cb.checked = on2; });
+            pageBox() && pageBox().querySelectorAll("details[data-artist]").forEach(function (det) {
+              det.dataset.selectionOverride = on ? "1" : "0";
+              applyGroupChoice(det, on, true);
+            });
           }
           updateHideLabels();
           updateArtistChecks();
+          return { ok: true, counts: c };
         })
-        .catch(function () { bulkBusy = false; flashSelectError(); });
+        .catch(function () {
+          bulkBusy = false;
+          flashSelectError();
+          showToast("Couldn't confirm those choices. Reloading the review.", "error");
+          setTimeout(function () { location.reload(); }, 900);
+          return { ok: false, busy: false };
+        });
     }
 
     function flashSelectError() {
@@ -1073,31 +1136,35 @@
 
     function groupSelect(det, on) {
       if (det._selecting) return;
-      var pending = Array.prototype.filter.call(det.querySelectorAll(".cb"),
-        function (cb) { return cb.checked !== on; });
-      if (!pending.length) return;
+      var previousRows = Array.prototype.map.call(
+        det.querySelectorAll(".cb"), function (cb) { return cb.checked; });
       det._selecting = true;
-      var failed = false;
-      var chain = Promise.resolve(null);
-      pending.forEach(function (cb) {
-        chain = (function (box, prev) {
-          return prev.then(function (acc) {
-            if (failed) return acc;
-            return post("/jobs/" + id + "/select",
-              "cid=" + encodeURIComponent(box.value) + "&checked=" + (on ? "1" : "0"))
-              .then(function (r) {
-                if (!r.ok) { failed = true; return acc; }
-                box.checked = on;
-                return r.json();
-              })
-              .catch(function () { failed = true; return acc; });
-          });
-        }(cb, chain));
-      });
-      chain.then(function (c) {
+      var header = det.querySelector("[data-artist-select]");
+      if (header) header.disabled = true;
+      det.dataset.selectionOverride = on ? "1" : "0";
+      applyGroupChoice(det, on, false);
+      bulkSelect(on, "artist", det.dataset.artist || "").then(function (result) {
         det._selecting = false;
-        if (c) applyCounts(c);
-        if (failed) flashSelectError();
+        if (header) header.disabled = false;
+        if (result.ok) {
+          applyGroupChoice(det, on, true);
+        } else {
+          delete det.dataset.selectionOverride;
+          det.dataset.selectionRecovering = "1";
+          det.querySelectorAll(".cb").forEach(function (cb, index) {
+            if (index < previousRows.length) cb.checked = previousRows[index];
+          });
+          restoreGroupHeader(det);
+          if (!result.busy) {
+            loadGroupItems(det, true).then(function (loaded) {
+              if (loaded) delete det.dataset.selectionRecovering;
+              updateHideLabels();
+              updateArtistChecks();
+            });
+          } else {
+            delete det.dataset.selectionRecovering;
+          }
+        }
         updateHideLabels();
         updateArtistChecks();
       });
@@ -1108,11 +1175,19 @@
       var box = pageBox();
       if (!box) return;
       box.querySelectorAll("[data-hide]").forEach(function (btn) {
-        var det = btn.closest("details");
+        var shell = btn.closest(".ql-review-group-shell");
+        var det = shell ? shell.querySelector("details[data-artist]") : btn.closest("details");
         var lbl = btn.querySelector("[data-hide-label]");
         if (!det || !lbl) return;
-        var total = det.querySelectorAll(".cb").length;
-        var picked = det.querySelectorAll(".cb:checked").length;
+        var lazy = det.querySelector("[data-lazy-items]");
+        var useSavedCounts = det.dataset.selectionRecovering !== undefined
+          || (lazy && !lazy.dataset.loaded);
+        var total = useSavedCounts
+          ? parseInt(det.dataset.groupTotal || "0", 10)
+          : det.querySelectorAll(".cb").length;
+        var picked = useSavedCounts
+          ? parseInt(det.dataset.groupSelected || "0", 10)
+          : det.querySelectorAll(".cb:checked").length;
         btn.classList.toggle("hidden", total > 0 && picked === total);
         lbl.textContent = artistDismissLabel(picked);
       });
@@ -1125,11 +1200,50 @@
       box.querySelectorAll("[data-artist-select]").forEach(function (cb) {
         var det = cb.closest("details");
         if (!det) return;
-        var total = det.querySelectorAll(".cb").length;
-        var picked = det.querySelectorAll(".cb:checked").length;
+        var lazy = det.querySelector("[data-lazy-items]");
+        var useSavedCounts = det.dataset.selectionRecovering !== undefined
+          || (lazy && !lazy.dataset.loaded);
+        var total = useSavedCounts
+          ? parseInt(det.dataset.groupTotal || "0", 10)
+          : det.querySelectorAll(".cb").length;
+        var picked = useSavedCounts
+          ? parseInt(det.dataset.groupSelected || "0", 10)
+          : det.querySelectorAll(".cb:checked").length;
         cb.checked = total > 0 && picked === total;
         cb.indeterminate = picked > 0 && picked < total;
+        if (!useSavedCounts && !det._selecting) {
+          det.dataset.groupTotal = String(total);
+          det.dataset.groupSelected = String(picked);
+        }
       });
+    }
+
+    function loadGroupItems(det, force) {
+      var boxEl = det.querySelector("[data-lazy-items]");
+      if (!boxEl || (boxEl.dataset.loaded && !force)) return Promise.resolve(true);
+      var generation = (boxEl._loadGeneration || 0) + 1;
+      boxEl._loadGeneration = generation;
+      boxEl.dataset.loading = "1";
+      return fetch(boxEl.dataset.itemsUrl, { headers: { "HX-Request": "true" } })
+        .then(function (r) { return r.ok ? r.text() : Promise.reject(); })
+        .then(function (txt) {
+          if (boxEl._loadGeneration !== generation) return false;
+          delete boxEl.dataset.loading;
+          boxEl.innerHTML = txt;
+          boxEl.dataset.loaded = "1";
+          if (det.dataset.selectionOverride !== undefined) {
+            applyGroupChoice(det, det.dataset.selectionOverride === "1", false);
+          }
+          updateHideLabels();
+          updateArtistChecks();
+          return true;
+        })
+        .catch(function () {
+          if (boxEl._loadGeneration !== generation) return false;
+          delete boxEl.dataset.loading;
+          showToast("Couldn't load this artist's albums. Try opening it again.", "error");
+          return false;
+        });
     }
 
     // Append the next page in place.
@@ -1215,6 +1329,14 @@
       var asel = e.target.closest("[data-artist-select]");
       if (asel) { var ad = asel.closest("details"); if (ad) groupSelect(ad, asel.checked); }
     });
+    // Closed artist groups leave their rows out of the DOM. Fetch the current
+    // server state on first open; generation tags keep a retry from being
+    // overwritten by an older response still in flight.
+    cont.addEventListener("toggle", function (e) {
+      var det = e.target;
+      if (!det || !det.matches || !det.matches("details[data-artist]") || !det.open) return;
+      loadGroupItems(det, false);
+    }, true);
     cont.addEventListener("click", function (e) {
       var t = e.target;
       if (t.closest("[data-hide]")) return;
@@ -1272,7 +1394,9 @@
               ? "Keep the unselected albums matching your filter hi-res? You can downsample later."
               : "Dismiss the unselected " + dismissItemPlural + " matching your filter? You can show them again later.")
           : dismissConfirm(rest);
-        window.qlConfirm(confirmMsg).then(function (ok) {
+        window.qlConfirm(confirmMsg, {
+          action: isDownsampleReview ? "Keep hi-res" : "Dismiss",
+        }).then(function (ok) {
           if (!ok) return;
           var prev = dismissRest.textContent;
           dismissRest.disabled = true;
@@ -1315,7 +1439,7 @@
       var d = e.detail || {};
       if (d.counts) applyCounts(d.counts);
       var box = pageBox();
-      if (box && box.querySelectorAll(":scope > details").length === 0) {
+      if (box && box.querySelectorAll(":scope > .ql-review-group-shell, :scope > details").length === 0) {
         var p = curPage();
         loadPage(p > 1 ? p - 1 : 1, curQuery());
       } else {
@@ -1325,6 +1449,7 @@
     document.body.addEventListener("qlHidden", onQlHidden);
 
     updateHideLabels();
+    updateArtistChecks();
 
     // Keep review pages in sync across tabs.
     var rsrc = new EventSource("/api/jobs/" + id + "/review-stream");

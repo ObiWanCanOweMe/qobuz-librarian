@@ -1,6 +1,8 @@
 """Library migration: placement correctness and the copy-safety guarantees."""
 from pathlib import Path
 
+import pytest
+
 from qobuz_librarian.library import migrate as m
 
 
@@ -137,6 +139,194 @@ def test_execute_never_overwrites_a_destination_that_appears_late(tmp_path):
     assert plan.placed[0].source.exists()
 
 
+def test_resume_carries_companions_only_for_identical_destination_audio(tmp_path):
+    matching = tmp_path / "matching"
+    unrelated = tmp_path / "unrelated"
+    matching.mkdir()
+    unrelated.mkdir()
+    matching_audio = matching / "track.flac"
+    unrelated_audio = unrelated / "track.flac"
+    matching_audio.write_bytes(b"same recording")
+    unrelated_audio.write_bytes(b"source recording")
+    (matching / "cover.jpg").write_bytes(b"matching cover")
+    (unrelated / "cover.jpg").write_bytes(b"wrong cover")
+
+    dest = tmp_path / "dest"
+    matching_dest = dest / "Artist" / "Match (2024)" / "01 - Song.flac"
+    unrelated_dest = dest / "Artist" / "Other (2024)" / "01 - Song.flac"
+    matching_dest.parent.mkdir(parents=True)
+    unrelated_dest.parent.mkdir(parents=True)
+    matching_dest.write_bytes(matching_audio.read_bytes())
+    unrelated_dest.write_bytes(b"different recording")
+
+    plan = m.build_plan([
+        (matching_audio, _meta(album="Match", year=2024), "tags"),
+        (unrelated_audio, _meta(album="Other", year=2024), "tags"),
+    ], dest)
+    assert len(plan.collisions) == 2
+    assert all(entry.dest_rel is not None for entry in plan.collisions)
+
+    preview_progress = []
+    resume_entries = m.verified_resume_entries(
+        plan, progress=lambda *event: preview_progress.append(event))
+    assert len(resume_entries) == 1
+    assert [event[:3] for event in preview_progress] == [
+        ("Checking existing copies", 1, 2),
+        ("Checking existing copies", 2, 2),
+    ]
+    execution_progress = []
+    result = m.execute_plan(
+        plan, in_place=False, resume_entries=resume_entries,
+        progress=lambda *event: execution_progress.append(event))
+
+    assert (matching_dest.parent / "cover.jpg").read_bytes() == b"matching cover"
+    assert not (unrelated_dest.parent / "cover.jpg").exists()
+    assert result.companions == 1
+    assert result.skipped == 1
+    assert [event[:3] for event in execution_progress] == [
+        ("Rechecking existing copies", 1, 1),
+        ("Carrying cover art and sidecars", 0, 0),
+    ]
+
+
+def test_resume_changed_after_preview_is_reported_as_failed(tmp_path):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source = source_dir / "track.flac"
+    source.write_bytes(b"same recording")
+
+    dest = tmp_path / "dest"
+    destination = dest / "Artist" / "Album (2024)" / "01 - Song.flac"
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(source.read_bytes())
+    plan = m.build_plan([
+        (source, _meta(album="Album", year=2024), "tags"),
+    ], dest)
+    resume_entries = m.verified_resume_entries(plan)
+    assert len(resume_entries) == 1
+
+    destination.write_bytes(b"changed after preview")
+    result = m.execute_plan(plan, resume_entries=resume_entries)
+
+    assert result.failed == 1
+    assert result.skipped == 0
+    assert result.outcomes == [(
+        source,
+        Path("Artist/Album (2024)/01 - Song.flac"),
+        m.FAILED,
+        "existing destination could not be reverified",
+    )]
+
+
+def test_web_scan_stops_during_existing_copy_verification(
+        tmp_path, monkeypatch):
+    from qobuz_librarian.web import flows
+    from qobuz_librarian.web import jobs as jm
+
+    source = tmp_path / "source" / "track.flac"
+    source.parent.mkdir()
+    source.write_bytes(b"same recording")
+    dest = tmp_path / "dest"
+    destination = dest / "Artist" / "Album (2024)" / "01 - Song.flac"
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(source.read_bytes())
+    items = [(source, _meta(album="Album", year=2024), "tags")]
+    monkeypatch.setattr(m, "collect_items", lambda *_args, **_kwargs: items)
+
+    comparisons = 0
+    same_content = m._same_content
+
+    def counted_same_content(*args, **kwargs):
+        nonlocal comparisons
+        comparisons += 1
+        return same_content(*args, **kwargs)
+
+    monkeypatch.setattr(m, "_same_content", counted_same_content)
+    job = jm.Job(title="migration")
+
+    def cancel_from_progress(phase, *_args):
+        if phase == "Checking existing copies":
+            job.cancel_requested = True
+
+    job.push_progress = cancel_from_progress
+    flows.scan_migration(
+        job, source.parent, dest, use_acoustid=False, in_place=False
+    )
+
+    assert comparisons == 0
+    assert job.candidates == []
+    assert not (dest / "migration-manifest.csv").exists()
+    assert job.summary == "Stopped while checking existing copies. Nothing was copied."
+
+
+def test_execute_stops_during_existing_copy_recheck(tmp_path):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source = source_dir / "track.flac"
+    source.write_bytes(b"same recording")
+    (source_dir / "cover.jpg").write_bytes(b"cover")
+    dest = tmp_path / "dest"
+    destination = dest / "Artist" / "Album (2024)" / "01 - Song.flac"
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(source.read_bytes())
+    plan = m.build_plan([
+        (source, _meta(album="Album", year=2024), "tags"),
+    ], dest)
+    resume_entries = m.verified_resume_entries(plan)
+    cancelling = False
+
+    def progress(phase, *_args):
+        nonlocal cancelling
+        if phase == "Rechecking existing copies":
+            cancelling = True
+
+    result = m.execute_plan(
+        plan,
+        resume_entries=resume_entries,
+        cancel_check=lambda: cancelling,
+        progress=progress,
+    )
+
+    assert result.cancelled is True
+    assert result.skipped == 0
+    assert result.companions == 0
+    assert not (destination.parent / "cover.jpg").exists()
+
+
+def test_cli_preview_reuses_an_empty_resume_review(tmp_path, monkeypatch):
+    from qobuz_librarian.modes import migrate as cli_migrate
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source = source_dir / "track.flac"
+    source.write_bytes(b"source audio")
+    dest = tmp_path / "dest"
+    destination = dest / "Artist" / "Album (2024)" / "01 - Song.flac"
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"other audio!")
+    plan = m.build_plan([
+        (source, _meta(album="Album", year=2024), "tags"),
+    ], dest)
+
+    comparisons = 0
+    same_content = m._same_content
+
+    def counted_same_content(*args, **kwargs):
+        nonlocal comparisons
+        comparisons += 1
+        return same_content(*args, **kwargs)
+
+    monkeypatch.setattr(m, "_same_content", counted_same_content)
+    resume_entries = m.verified_resume_entries(plan)
+    assert resume_entries == []
+
+    comparisons = 0
+    cli_migrate._print_preview(
+        plan, verbose=False, in_place=False, resume_entries=resume_entries)
+
+    assert comparisons == 0
+
+
 def test_space_estimate_counts_copy_bytes_but_not_same_fs_moves(tmp_path):
     plan = _placed_plan(tmp_path, n=2)
     total = sum(e.source.stat().st_size for e in plan.placed)
@@ -152,6 +342,23 @@ def test_space_estimate_counts_copy_bytes_but_not_same_fs_moves(tmp_path):
     booklet.write_bytes(b"x" * 500)
     assert m.space_estimate(plan, in_place=False)[0] == total + 500
     assert m.space_estimate(plan, in_place=True)[0] == 500
+
+
+def test_collect_items_refuses_an_incomplete_source_walk(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    visible = source / "visible.flac"
+    visible.write_bytes(b"audio")
+
+    def incomplete_walk(_root, errors=None):
+        yield visible
+        if errors is not None:
+            errors.append(OSError("migration subtree EIO"))
+
+    monkeypatch.setattr(m, "iter_tree_no_symlinks", incomplete_walk)
+
+    with pytest.raises(OSError, match="migration subtree EIO"):
+        m.collect_items(source)
 
 
 # ── web flow (scan → review candidates → execute copy) ─────────────────────────
@@ -193,7 +400,10 @@ def test_execute_migration_blocks_low_space_in_place_move(tmp_path, monkeypatch)
     f1.write_bytes(b"one")
     dest = tmp_path / "dest"
     chosen = [{"payload": {"entries": [(str(f1), "Artist/Album (2017)/01 - A.flac")]}}]
-    monkeypatch.setattr(engine, "space_estimate", lambda plan, in_place: (10_000, 10))
+    monkeypatch.setattr(
+        engine, "space_estimate",
+        lambda plan, in_place, resume_entries=None: (10_000, 10),
+    )
 
     job = jm.Job(title="mig")
     flows.execute_migration(job, chosen, str(dest), in_place=True, src=src)
@@ -263,7 +473,10 @@ def test_run_migrate_gates_on_insufficient_destination_space(tmp_path, monkeypat
         return SimpleNamespace(**base)
 
     # Short on space + unattended → refuse, no partial move.
-    monkeypatch.setattr(migrate_mode.engine, "space_estimate", lambda p, in_place: (100, 10))
+    monkeypatch.setattr(
+        migrate_mode.engine, "space_estimate",
+        lambda p, in_place, resume_entries=None: (100, 10),
+    )
     migrate_mode.run_migrate_mode(_args(yes=True))
     assert executed == []
 
@@ -278,7 +491,10 @@ def test_run_migrate_gates_on_insufficient_destination_space(tmp_path, monkeypat
 
     # Enough space → the normal confirm path still runs.
     executed.clear()
-    monkeypatch.setattr(migrate_mode.engine, "space_estimate", lambda p, in_place: (10, 100))
+    monkeypatch.setattr(
+        migrate_mode.engine, "space_estimate",
+        lambda p, in_place, resume_entries=None: (10, 100),
+    )
     with patch("builtins.input", side_effect=["y"]):
         migrate_mode.run_migrate_mode(_args())
     assert executed == [1]

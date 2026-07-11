@@ -182,6 +182,7 @@ def _prepare_staging_tags(roots=None):
         return moved
     from mutagen.flac import FLAC
 
+    from qobuz_librarian.integrations.lyric_fetch import save_flac_tags
     from qobuz_librarian.library.tags import clean_qobuz_string
     scan_roots = roots if roots else [cfg.STAGING_DIR]
     try:
@@ -229,20 +230,12 @@ def _prepare_staging_tags(roots=None):
                 tags[key] = cleaned
                 changed = True
         if changed:
-            # Atomic rewrite: mutagen's in-place save shifts audio frames when
-            # the new comment block outgrows the padding, so a crash mid-save
-            # corrupts the only downloaded copy. Save onto a same-dir temp (a
-            # valid FLAC copy) and os.replace it in.
-            tmp = f.with_name(f.name + ".qltag.tmp")
+            # Mutagen may shift audio frames when a larger comment block no
+            # longer fits its padding. Use the shared durable replacement so
+            # the staged copy is flushed before the import can move it.
             try:
-                shutil.copy2(str(f), str(tmp))
-                tags.save(str(tmp))
-                os.replace(str(tmp), str(f))
+                save_flac_tags(tags, f)
             except Exception as e:
-                try:
-                    tmp.unlink(missing_ok=True)
-                except OSError:
-                    pass
                 vlog(f"couldn't rewrite cleaned tags on {f.name}: {e}")
     if moved:
         log.info(fmt(C.YELLOW,

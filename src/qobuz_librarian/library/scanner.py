@@ -44,8 +44,9 @@ def iter_tree_no_symlinks(root: Path, errors=None):
         # with no signal at all. Surface it (verbose) so vanished files are at
         # least diagnosable.
         vlog(f"scan: couldn't read {getattr(err, 'filename', root)}: {err}")
-        if errors is not None:
-            errors.append(err)
+        if errors is None:
+            raise err
+        errors.append(err)
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False,
                                                 onerror=_onerror):
         dp = Path(dirpath)
@@ -172,7 +173,14 @@ def read_album_dir(album_dir: Path, walk_errors=None):
     caller about to delete something based on these counts must treat that as
     unverifiable rather than as a smaller album.
     """
-    if not album_dir.exists():
+    try:
+        album_dir.stat()
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        if walk_errors is None:
+            raise
+        walk_errors.append(f"{album_dir}: {e}")
         return []
 
     audio_files = []
@@ -191,8 +199,9 @@ def read_album_dir(album_dir: Path, walk_errors=None):
                     walk_errors.append(f"{f}: {e}")
                 vlog(f"skipping unreadable entry {f} in {album_dir}: {e}")
     except OSError as e:
-        if walk_errors is not None:
-            walk_errors.append(f"{album_dir}: {e}")
+        if walk_errors is None:
+            raise
+        walk_errors.append(f"{album_dir}: {e}")
         vlog(f"walk failed in {album_dir}: {e}")
     audio_files.sort()
     vlog(f"found {len(audio_files)} audio file(s) in {album_dir}")
@@ -206,8 +215,9 @@ def read_album_dir(album_dir: Path, walk_errors=None):
             # degraded. The filename fallback below is for files that parse as
             # untagged, not for read failures — those must not enter counts
             # with a blanked ISRC/quality.
-            if walk_errors is not None:
-                walk_errors.append(f"{f}: {e}")
+            if walk_errors is None:
+                raise
+            walk_errors.append(f"{f}: {e}")
             vlog(f"couldn't read tags for {f} in {album_dir}: {e}")
             continue
         if tags is None:
@@ -251,13 +261,13 @@ def read_album_dir(album_dir: Path, walk_errors=None):
 _HAS_AUDIO_CACHE: dict = {}
 
 
-def _has_audio_anywhere(d: Path) -> bool:
-    """True if any audio file exists anywhere under ``d`` (recursive).
+def _has_audio_anywhere(d: Path, walk_errors=None):
+    """True if audio exists, False if none does, or None after a recorded error.
 
-    Walks without following symlinks and bails on the first hit so the
-    cost stays bounded on big trees. Errors during walk count as "no
-    audio present" — they'll also break later scans, so flagging the dir
-    as empty is the helpful answer.
+    Without an explicit ``walk_errors`` list, traversal errors propagate so a
+    production scan cannot consume an incomplete tree as empty. A caller that
+    supplies a list may continue cautiously, but receives None rather than a
+    false claim that the directory contains no audio.
 
     Result cached per path: a single scan calls this once per artist plus
     once per album dir, but artist-walk/upgrade-walk/lyric-walk all hit
@@ -274,29 +284,31 @@ def _has_audio_anywhere(d: Path) -> bool:
     if cached is not None:
         return cached
     exts = set(config.AUDIO_EXTS)
-    walk_errors = []
+    error_count = len(walk_errors) if walk_errors is not None else 0
     try:
         for f in iter_tree_no_symlinks(d, errors=walk_errors):
-            if f.is_file() and f.suffix.lower() in exts:
-                _HAS_AUDIO_CACHE[key] = True
-                return True
-    except OSError:
-        # A transient EACCES/EIO/ESTALE walk failure is NOT proof the dir is
-        # empty — caching a sticky False here would drop a real artist/album
-        # from the whole scan until clear_scan_caches() runs. Answer
-        # conservatively for this call, but don't poison the cache: let the
-        # next call re-check.
-        return False
-    if walk_errors:
+            try:
+                if f.is_file() and f.suffix.lower() in exts:
+                    _HAS_AUDIO_CACHE[key] = True
+                    return True
+            except OSError as e:
+                if walk_errors is None:
+                    raise
+                walk_errors.append(f"{f}: {e}")
+    except OSError as e:
+        if walk_errors is None:
+            raise
+        walk_errors.append(f"{d}: {e}")
+    if walk_errors is not None and len(walk_errors) > error_count:
         # os.walk consumed a scandir failure via the error callback and walked
-        # on without that subtree — the audio may live exactly there. Same
-        # stance as the OSError above: unproven, so don't cache the False.
-        return False
+        # on without that subtree — the audio may live exactly there. Do not
+        # poison the cache or report the directory as empty.
+        return None
     _HAS_AUDIO_CACHE[key] = False
     return False
 
 
-def list_library_artists():
+def list_library_artists(walk_errors=None):
     """List artist directories under MUSIC_ROOT.
 
     Skips dot-folders (startswith(".")) and the staging
@@ -308,23 +320,37 @@ def list_library_artists():
     Used for fuzzy resolution and the library / walk+queue / album-fill
     walks.
     """
-    if not config.MUSIC_ROOT.exists():
-        return []
     artists = []
     empties = []
     try:
-        for d in config.MUSIC_ROOT.iterdir():
+        entries = list(config.MUSIC_ROOT.iterdir())
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        if walk_errors is None:
+            raise
+        walk_errors.append(f"{config.MUSIC_ROOT}: {e}")
+        log.info(f"  ⚠  Couldn’t list MUSIC_ROOT: {e}.")
+        return []
+    try:
+        for d in entries:
             if not d.is_dir():
                 continue
             if d.name.startswith("."):          # skip hidden dirs (.Trash, .DS_Store/, etc.)
                 continue
             if d.resolve() == config.STAGING_DIR.resolve():
                 continue
-            if not _has_audio_anywhere(d):
+            has_audio = _has_audio_anywhere(d, walk_errors=walk_errors)
+            if has_audio is None:
+                continue
+            if not has_audio:
                 empties.append(d.name)
                 continue
             artists.append(d)
     except OSError as e:
+        if walk_errors is None:
+            raise
+        walk_errors.append(f"{config.MUSIC_ROOT}: {e}")
         log.info(f"  ⚠  Couldn’t list MUSIC_ROOT: {e}.")
     if empties:
         names = ", ".join(sorted(empties)[:5])
@@ -333,7 +359,7 @@ def list_library_artists():
     return sorted(artists, key=lambda p: p.name.lower())
 
 
-def list_artist_album_dirs(artist_dir: Path):
+def list_artist_album_dirs(artist_dir: Path, walk_errors=None):
     """Album subdirectories under an artist dir, sorted by name.
 
     Skips hidden dot-folders (.Trash, .DS_Store-style, etc.) and folders with
@@ -343,23 +369,37 @@ def list_artist_album_dirs(artist_dir: Path):
     drops empty artist dirs for the same reason. A short notice names anything
     skipped so the user can hand-clean leftover folders.
     """
-    if not artist_dir.exists():
-        return []
     albums = []
     empties = []
     try:
-        for d in sorted(artist_dir.iterdir(), key=lambda p: p.name.lower()):
+        entries = sorted(artist_dir.iterdir(), key=lambda p: p.name.lower())
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        if walk_errors is None:
+            raise
+        walk_errors.append(f"{artist_dir}: {e}")
+        vlog(f"list_artist_album_dirs: {e}")
+        return []
+    try:
+        for d in entries:
             if not d.is_dir():
                 continue
             if d.name.startswith("."):          # skip hidden dirs (.Trash, .DS_Store/, etc.)
                 continue
             if d.name.endswith(".restore_trash"):  # leftover from an interrupted restore
                 continue
-            if not _has_audio_anywhere(d):
+            has_audio = _has_audio_anywhere(d, walk_errors=walk_errors)
+            if has_audio is None:
+                continue
+            if not has_audio:
                 empties.append(d.name)
                 continue
             albums.append(d)
     except OSError as e:
+        if walk_errors is None:
+            raise
+        walk_errors.append(f"{artist_dir}: {e}")
         vlog(f"list_artist_album_dirs: {e}")
     if empties:
         names = ", ".join(empties[:5])
@@ -391,7 +431,7 @@ def _list_artist_subdirs_cached(artist_dir: Path):
                          key=lambda p: p.name.lower())
     except OSError as e:
         vlog(f"  iterdir failed for {artist_dir}: {e}")
-        subdirs = []
+        raise
     _ARTIST_SUBDIRS_CACHE[key] = subdirs
     return subdirs
 

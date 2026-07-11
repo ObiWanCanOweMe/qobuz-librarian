@@ -12,6 +12,8 @@ import subprocess
 import tomllib
 from pathlib import Path
 
+import pytest
+
 _DEFAULT_TOML = Path(__file__).resolve().parents[1] / "docker" / "streamrip-default.toml"
 _ENTRYPOINT = Path(__file__).resolve().parents[1] / "docker" / "entrypoint.sh"
 _PLACEHOLDER_RE = re.compile(r"\{(\w+)(?::[^}]*)?\}")
@@ -92,3 +94,32 @@ def test_entrypoint_defaults_to_nonroot_user(tmp_path):
     r = _run_entrypoint_head(tmp_path, {"CONFIG_DIR": str(cfg)}, capture=True)
     assert r.returncode == 0
     assert "Running as 1000:1000" in r.stdout
+
+
+def test_cli_privilege_drop_canonicalises_ids_and_rejects_mixed_root(
+        monkeypatch):
+    from qobuz_librarian import cli
+
+    calls = []
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(cli, "_in_container", lambda: True)
+    monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/gosu")
+    monkeypatch.setattr(os, "execvp", lambda program, argv: calls.append(
+        (program, argv)))
+
+    monkeypatch.setenv("PUID", "00")
+    monkeypatch.setenv("PGID", "00")
+    cli._maybe_drop_privileges()
+    assert calls == []
+
+    monkeypatch.setenv("PUID", "1000")
+    monkeypatch.setenv("PGID", "00")
+    with pytest.raises(SystemExit) as exc:
+        cli._maybe_drop_privileges()
+    assert exc.value.code == 64
+    assert calls == []
+
+    monkeypatch.setenv("PUID", "001000")
+    monkeypatch.setenv("PGID", "001001")
+    cli._maybe_drop_privileges()
+    assert calls[0][1][1] == "1000:1001"

@@ -53,15 +53,24 @@ def load() -> dict:
     return base
 
 
-def save(state) -> None:
+def save(state) -> bool:
+    tmp = None
     try:
         cfg.NEW_RELEASE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = cfg.NEW_RELEASE_STATE_FILE.with_suffix(
             cfg.NEW_RELEASE_STATE_FILE.suffix + ".tmp")
         tmp.write_text(json.dumps(state), encoding="utf-8")
         tmp.replace(cfg.NEW_RELEASE_STATE_FILE)
+        tmp = None
+        return True
     except OSError:
-        pass
+        return False
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def last_run() -> float | None:
@@ -74,7 +83,7 @@ def baseline_limit() -> int | None:
     return load().get("baseline_limit")
 
 
-def mark_run(seen, when=None, complete=False, baseline_limit=None) -> None:
+def mark_run(seen, when=None, complete=False, baseline_limit=None) -> bool:
     """Persist the updated per-artist catalog snapshot and the run time, keeping
     the other fields (load-update-save, not a fresh dict). complete=True also
     marks the baseline ready (a full check crawls every artist, like a library
@@ -87,7 +96,7 @@ def mark_run(seen, when=None, complete=False, baseline_limit=None) -> None:
             state["baseline_complete"] = True
         if baseline_limit is not None:
             state["baseline_limit"] = int(baseline_limit)
-        save(state)
+        return save(state)
 
 
 def is_baseline_complete() -> bool:
@@ -97,7 +106,7 @@ def is_baseline_complete() -> bool:
     return bool(load().get("baseline_complete"))
 
 
-def seed_baseline(seen) -> None:
+def seed_baseline(seen) -> bool:
     """Record the per-artist catalog snapshot from a cleanly-completed library
     scan and mark the baseline ready. The scan already fetched every discography,
     so this captures "what exists now" for free; the daily check diffs against it."""
@@ -108,24 +117,24 @@ def seed_baseline(seen) -> None:
         # Stamp the cap this snapshot was taken at, so a later limit bump triggers
         # a re-baseline instead of surfacing the newly-visible back-slice as "new".
         state["baseline_limit"] = int(cfg.ARTIST_CATALOG_LIMIT)
-        save(state)
+        return save(state)
 
 
 def auto_scan_attempted() -> bool:
     return bool(load().get("auto_scan_attempted"))
 
 
-def note_auto_scan_attempted() -> None:
+def note_auto_scan_attempted() -> bool:
     """Remember that the first-run library scan was auto-started, so a fresh one
     isn't relaunched on every load if the user cancels it. (An interrupted scan
     leaves a checkpoint and is auto-resumed regardless of this flag.)"""
     with _lock:
         state = load()
         state["auto_scan_attempted"] = True
-        save(state)
+        return save(state)
 
 
-def touch_run(when=None) -> None:
+def touch_run(when=None) -> bool:
     """Record that a check was attempted (updates last_run only, keeps the
     baseline). Called when the auto-check submits, so a run that fails or is
     cancelled doesn't re-fire on every dashboard load until one happens to
@@ -133,5 +142,4 @@ def touch_run(when=None) -> None:
     with _lock:
         state = load()
         state["last_run"] = float(when) if when is not None else time.time()
-        save(state)
-
+        return save(state)

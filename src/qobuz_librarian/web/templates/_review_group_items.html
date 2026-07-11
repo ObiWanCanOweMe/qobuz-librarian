@@ -1,0 +1,33 @@
+{% for c in items %}
+<label class="ql-review-candidate">
+  <input type="checkbox" class="ql-checkbox cb" name="cid"
+         value="{{ c.cid }}" data-seq="{{ c.seq }}"
+         {% if c.selected %}checked{% endif %}>
+  {% if c.payload.cover %}
+  <img src="{{ c.payload.cover }}" alt="" loading="lazy" width="46" height="46"
+       class="ql-review-cover">
+  {% else %}
+  <span class="ql-review-cover ql-review-cover--empty" aria-hidden="true"></span>
+  {% endif %}
+  <span class="ql-review-candidate-body">
+    <span class="ql-review-candidate-heading">
+      <span class="ql-review-candidate-title">{{ c.title }}</span>{% if c.payload.is_new %}
+      <span class="ql-badge ql-badge-new ql-badge-xs">new</span>{% endif %}
+    </span>
+    <span class="ql-review-candidate-detail">{% if review_tab|default('') == 'gaps' %}{{ c.detail | replace('gap-fill: ', '') }}{% else %}{{ c.detail }}{% endif %}</span>
+    {% if c.payload.verified_truncated %}
+    <span class="ql-review-truncated">
+      {% for t in c.payload.verified_truncated[:12] %}
+      <span class="ql-review-truncated-line">
+        <span class="readout ql-review-track-number">{% if t.track_number %}{{ '%02d'|format(t.track_number) }}{% else %}··{% endif %}</span>
+        {{ t.title }}{% if t.reason == 'decode_failed' %} <span class="ql-review-truncated-muted">· won't decode</span>{% endif %}
+      </span>
+      {% endfor %}
+      {% if (c.payload.verified_truncated | length) > 12 %}
+      <span class="ql-review-truncated-more">+{{ (c.payload.verified_truncated | length) - 12 }} more</span>
+      {% endif %}
+    </span>
+    {% endif %}
+  </span>
+</label>
+{% endfor %}

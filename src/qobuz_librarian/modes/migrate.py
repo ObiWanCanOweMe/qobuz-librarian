@@ -68,20 +68,29 @@ def _artist_count(entries) -> int:
     return len({e.dest_rel.parts[0] for e in entries if e.dest_rel})
 
 
-def _print_preview(plan, verbose: bool, in_place: bool) -> None:
+def _print_preview(plan, verbose: bool, in_place: bool,
+                   resume_entries) -> None:
+    resume_entries = list(resume_entries)
     s = plan.summary()
     log.info("")
     log.info(fmt(C.BOLD + C.CYAN, "  Preview"))
-    log.info(fmt(C.WHITE,
-        f"    {s['place']} file(s) to place across "
-        f"{_artist_count(plan.placed)} artist(s)"))
+    if s["place"]:
+        log.info(fmt(C.WHITE,
+            f"    {s['place']} file(s) to place across "
+            f"{_artist_count(plan.placed)} artist(s)"))
+    if resume_entries:
+        log.info(fmt(C.WHITE,
+            f"    {len(resume_entries)} existing file(s) verified — "
+            "cover art and sidecars can be resumed"))
     if s["unplaceable"]:
         log.info(fmt(C.YELLOW,
             f"    {s['unplaceable']} couldn't be identified — left where they are"))
-    if s["collision"]:
+    unsafe_collisions = s["collision"] - len(resume_entries)
+    if unsafe_collisions:
         log.info(fmt(C.YELLOW,
-            f"    {s['collision']} skipped to avoid a name collision"))
-    need, free = engine.space_estimate(plan, in_place=in_place)
+            f"    {unsafe_collisions} skipped to avoid a name collision"))
+    need, free = engine.space_estimate(
+        plan, in_place=in_place, resume_entries=resume_entries)
     if need:
         verb = "move" if in_place else "copy"
         if free is None:
@@ -137,8 +146,10 @@ def run_migrate_mode(args):
     progress = _progress_printer()
     items = engine.collect_items(src, use_acoustid=use_acoustid, progress=progress)
     plan = engine.build_plan(items, dest)
+    resume_entries = engine.verified_resume_entries(plan, progress=progress)
 
-    _print_preview(plan, bool(getattr(args, "verbose", False)), in_place)
+    _print_preview(plan, bool(getattr(args, "verbose", False)), in_place,
+                   resume_entries)
 
     # A preview always leaves an auditable artifact, even on a dry run.
     manifest = dest / "migration-manifest.csv"
@@ -151,12 +162,13 @@ def run_migrate_mode(args):
     if getattr(args, "dry_run", False):
         log.info(fmt(C.CYAN, "  Dry run — nothing was copied."))
         return
-    if not plan.placed:
+    if not plan.placed and not resume_entries:
         log.info(fmt(C.GRAY, "  Nothing to place. Stopping."))
         return
 
     verb = "Move" if in_place else "Copy"
-    need, free = engine.space_estimate(plan, in_place=in_place)
+    need, free = engine.space_estimate(
+        plan, in_place=in_place, resume_entries=resume_entries)
     short = free is not None and need > free
     if short and bool(getattr(args, "yes", False)):
         log.info(fmt(C.RED,
@@ -176,12 +188,24 @@ def run_migrate_mode(args):
         if ack != "yes":
             log.info(fmt(C.GRAY, "  Cancelled. Nothing changed."))
             return
+    elif resume_entries:
+        action = (f"{verb} {len(plan.placed)} new file(s) and finish "
+                  f"{len(resume_entries)} verified existing file(s)"
+                  if plan.placed else
+                  f"Finish {len(resume_entries)} verified existing file(s)")
+        if not confirm(f"  {action} in {dest}?", default_yes=False,
+                       auto_yes=bool(getattr(args, "yes", False))):
+            log.info(fmt(C.GRAY, "  Cancelled. Nothing changed."))
+            return
     elif not confirm(f"  {verb} {len(plan.placed)} file(s) into {dest}?",
-                     default_yes=False, auto_yes=bool(getattr(args, "yes", False))):
+                     default_yes=False,
+                     auto_yes=bool(getattr(args, "yes", False))):
         log.info(fmt(C.GRAY, "  Cancelled. Nothing changed."))
         return
 
-    result = engine.execute_plan(plan, in_place=in_place, progress=progress)
+    result = engine.execute_plan(
+        plan, in_place=in_place, progress=progress,
+        resume_entries=resume_entries)
 
     # Timestamped so a second run (or a resume after a partial run) doesn't
     # overwrite the only source→destination record of the first run's moves —
@@ -204,6 +228,9 @@ def run_migrate_mode(args):
     if result.skipped:
         log.info(fmt(C.YELLOW,
             f"  ⚠  {result.skipped} skipped (destination already existed)."))
+    if getattr(result, "companions", 0):
+        log.info(fmt(C.GREEN,
+            f"  ✓  {result.companions} cover/sidecar file(s) carried."))
     if result.lingered:
         log.info(fmt(C.YELLOW,
             f"  ⚠  {result.lingered} moved but the original couldn't be removed "

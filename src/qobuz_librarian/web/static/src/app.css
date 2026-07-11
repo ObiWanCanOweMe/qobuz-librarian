@@ -5535,6 +5535,9 @@ details[open] > .ql-disclosure-summary::after {
 .ql-review-items {
   display: grid;
 }
+.ql-review-items-loading {
+  padding: 0.75rem 1rem;
+}
 .ql-review-cover {
   width: 2.875rem;
   height: 2.875rem;

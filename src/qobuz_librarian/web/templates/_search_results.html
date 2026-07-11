@@ -35,6 +35,7 @@
   <form method="post" action="/download" hx-post="/download" hx-target="#download-toast"
         hx-swap="innerHTML" hx-disabled-elt="find button[type=submit]"
         hx-confirm='{% if track_id %}Download "{{ title }}" by {{ artist }}?{% elif as_new_edition %}Download this version of "{{ title }}" as a separate copy alongside the one in your library?{% else %}Download "{{ title }}" by {{ artist }}?{% endif %}'
+        data-confirm-action="Download"
         data-search-download-form data-queue-button>
     <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
     <input type="hidden" name="album_id" value="{{ album_id }}">

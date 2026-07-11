@@ -335,7 +335,8 @@ def build_plan(items, dest_root: Path) -> MigrationPlan:
                 reason="two files map to the same destination", meta=meta))
         elif _dest_exists_or_unstattable(dest_root / rel):
             entries.append(PlanEntry(
-                source=source, status=COLLISION, source_of_truth=sot,
+                source=source, status=COLLISION, dest_rel=rel,
+                source_of_truth=sot,
                 reason="destination already exists", meta=meta))
         else:
             entries.append(PlanEntry(
@@ -507,15 +508,15 @@ def _existing_ancestor(path: Path) -> Optional[Path]:
         p = p.parent
 
 
-def space_estimate(plan: MigrationPlan, *, in_place: bool = False) -> tuple:
+def space_estimate(plan: MigrationPlan, *, in_place: bool = False,
+                   resume_entries=None) -> tuple:
     """``(bytes_to_write, free_bytes_at_dest)`` for carrying out ``plan``.
 
     Only files that actually get written count toward ``bytes_to_write``: every
-    placed file in copy mode, but in in-place mode only those on a different
-    filesystem than the destination, since a same-filesystem move is a rename
-    that consumes no space. ``free_bytes`` is the space available where the new
-    library is built, or None when it can't be read (no existing ancestor, or a
-    stat error)."""
+    placed audio file in copy mode, cross-filesystem audio in in-place mode,
+    and companions for both new placements and verified resumes.
+    ``free_bytes`` is the space available where the new library is built, or
+    None when it can't be read (no existing ancestor, or a stat error)."""
     anchor = _existing_ancestor(plan.dest_root)
     free = dest_dev = None
     if anchor is not None:
@@ -536,6 +537,17 @@ def space_estimate(plan: MigrationPlan, *, in_place: bool = False) -> tuple:
             continue
         if not (in_place and dest_dev is not None and st.st_dev == dest_dev):
             need += st.st_size
+        if entry.dest_rel is not None:
+            companion_targets.setdefault(entry.source.parent, set()).add(
+                (plan.dest_root / entry.dest_rel).parent)
+    # An existing, identical destination needs no audio bytes, but a resumed
+    # run can still carry art and sidecars from its source album folder. A
+    # caller may supply the already-reviewed mappings so this estimate does not
+    # reread every audio pair; execution still verifies each mapping before it
+    # can authorise a companion copy.
+    if resume_entries is None:
+        resume_entries = verified_resume_entries(plan)
+    for entry in resume_entries:
         if entry.dest_rel is not None:
             companion_targets.setdefault(entry.source.parent, set()).add(
                 (plan.dest_root / entry.dest_rel).parent)
@@ -584,12 +596,17 @@ def prune_empty_dirs(root: Path) -> int:
 def _audio_files(source_root: Path) -> list:
     exts = set(config.AUDIO_EXTS)
     files = []
-    for f in iter_tree_no_symlinks(source_root):
+    walk_errors = []
+    for f in iter_tree_no_symlinks(source_root, errors=walk_errors):
         try:
             if f.is_file() and f.suffix.lower() in exts:
                 files.append(f)
-        except OSError:
+        except OSError as e:
+            walk_errors.append(f"{f}: {e}")
             continue
+    if walk_errors:
+        raise OSError(
+            f"Migration source couldn't be read completely: {walk_errors[0]}")
     files.sort()
     return files
 
@@ -604,7 +621,10 @@ _COMPANION_EXTS = {
 
 
 def _carry_companion_files(plan: "MigrationPlan", result: "ExecResult", *,
-                           progress: Optional[Callable] = None) -> None:
+                           resume_entries=None,
+                           progress: Optional[Callable] = None,
+                           cancel_check: Optional[Callable[[], bool]] = None
+                           ) -> None:
     """Copy each migrated album folder's non-audio companions into the
     destination folder(s) that received its audio.
 
@@ -613,15 +633,81 @@ def _carry_companion_files(plan: "MigrationPlan", result: "ExecResult", *,
     folder), the source folder may still hold audio that failed/skipped, and a
     duplicated cover image is harmless. Best-effort — a companion failure is
     logged, never fatal.
-    Same-folder layout only (cover beside the tracks); an album-level cover a
-    level above per-disc track folders is intentionally not chased."""
+    A skipped or pre-existing destination only anchors companions after a
+    fresh byte-for-byte check against its mapped source audio. Same-folder
+    layout only (cover beside the tracks); an album-level cover a level above
+    per-disc track folders is intentionally not chased."""
     folder_map: dict = {}
+
+    def _cancelled() -> bool:
+        if cancel_check is not None and cancel_check():
+            result.cancelled = True
+        return result.cancelled
+
+    def _remember(source, dest_rel, *, verify=False):
+        if dest_rel is None or _cancelled():
+            return False
+        if verify:
+            dst = _verified_existing_audio(
+                plan, source, dest_rel, cancel_check=cancel_check)
+            if dst is None or _cancelled():
+                return False
+        else:
+            dst = plan.dest_root / dest_rel
+        folder_map.setdefault(source.parent, set()).add(dst.parent)
+        return True
+
     for source, dest_rel, status, _reason in result.outcomes:
-        if status != COPIED or dest_rel is None:
-            continue
-        folder_map.setdefault(source.parent, set()).add(
-            (plan.dest_root / dest_rel).parent)
+        if _cancelled():
+            return
+        if status == COPIED:
+            _remember(source, dest_rel)
+        elif status == SKIPPED:
+            # A destination that appeared after planning may be a valid resume
+            # or unrelated audio. Prove which it is immediately before using
+            # its folder as a companion target.
+            _remember(source, dest_rel, verify=True)
+
+    # Planning keeps a destination mapping only for the unambiguous
+    # "already exists" collision. Re-check it here rather than trusting the
+    # preview-time result; the file may have changed while the user reviewed
+    # the plan. Other collision classes never become companion targets.
+    if resume_entries is None:
+        resume_entries = [
+            entry for entry in plan.collisions if _is_resume_collision(entry)
+        ]
+    else:
+        resume_entries = [
+            entry for entry in resume_entries if _is_resume_collision(entry)
+        ]
+    total_resumes = len(resume_entries)
+    for index, entry in enumerate(resume_entries, 1):
+        if _cancelled():
+            return
+        if progress:
+            progress(
+                "Rechecking existing copies", index, total_resumes,
+                entry.source.name,
+            )
+        if _cancelled():
+            return
+        remembered = _remember(entry.source, entry.dest_rel, verify=True)
+        if _cancelled():
+            return
+        if remembered:
+            result.skipped += 1
+            result.outcomes.append((
+                entry.source, entry.dest_rel, SKIPPED,
+                "verified existing copy"))
+        else:
+            result.failed += 1
+            result.outcomes.append((
+                entry.source, entry.dest_rel, FAILED,
+                "existing destination could not be reverified"))
+
     for src_folder, dst_folders in folder_map.items():
+        if _cancelled():
+            return
         try:
             companions = [f for f in src_folder.iterdir()
                           if f.suffix.lower() in _COMPANION_EXTS and f.is_file()]
@@ -629,6 +715,8 @@ def _carry_companion_files(plan: "MigrationPlan", result: "ExecResult", *,
             continue
         for dst_folder in dst_folders:
             for f in companions:
+                if _cancelled():
+                    return
                 dst = dst_folder / f.name
                 # The existence probes are inside the try too: Path.exists()
                 # swallows ENOENT but re-raises EACCES/EPERM on a path component,
@@ -639,6 +727,8 @@ def _carry_companion_files(plan: "MigrationPlan", result: "ExecResult", *,
                         continue
                     if progress:
                         progress("Carrying cover art and sidecars", 0, 0, f.name)
+                    if _cancelled():
+                        return
                     _place_file(f, dst, move=False)
                     result.companions += 1
                 except (OSError, shutil.Error) as e:
@@ -701,15 +791,20 @@ def collect_items(source_root: Path, *, use_acoustid: bool = False,
 
 # ── Execution ─────────────────────────────────────────────────────────────────
 
-def _same_content(a: Path, b: Path, _chunk: int = 1 << 20) -> bool:
+def _same_content(a: Path, b: Path, _chunk: int = 1 << 20, *,
+                  cancel_check: Optional[Callable[[], bool]] = None) -> bool:
     """True iff a and b are byte-for-byte identical. Streams in chunks (bounded
     memory, short-circuits on first difference). Any OSError reads as 'not
     proven identical' — the caller must then keep the source."""
     try:
+        if cancel_check is not None and cancel_check():
+            return False
         if a.stat().st_size != b.stat().st_size:
             return False
         with open(a, "rb") as fa, open(b, "rb") as fb:
             while True:
+                if cancel_check is not None and cancel_check():
+                    return False
                 ca, cb = fa.read(_chunk), fb.read(_chunk)
                 if ca != cb:
                     return False
@@ -717,6 +812,69 @@ def _same_content(a: Path, b: Path, _chunk: int = 1 << 20) -> bool:
                     return True
     except OSError:
         return False
+
+
+def _is_resume_collision(entry: PlanEntry) -> bool:
+    return (entry.status == COLLISION
+            and entry.reason == "destination already exists"
+            and entry.dest_rel is not None)
+
+
+def _existing_destination(plan: MigrationPlan, dest_rel: Path) -> Optional[Path]:
+    """Return a real mapped file inside the destination tree, or None."""
+    try:
+        rel = Path(dest_rel)
+        if (rel.is_absolute() or not rel.parts
+                or any(part in ("", ".", "..") for part in rel.parts)):
+            return None
+        root = Path(plan.dest_root).resolve(strict=True)
+        dst = Path(plan.dest_root) / rel
+        resolved = dst.resolve(strict=True)
+        resolved.relative_to(root)
+        if dst.is_symlink() or not dst.is_file():
+            return None
+        return dst
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _verified_existing_audio(plan: MigrationPlan, source: Path,
+                             dest_rel: Path, *,
+                             cancel_check: Optional[Callable[[], bool]] = None
+                             ) -> Optional[Path]:
+    dst = _existing_destination(plan, dest_rel)
+    if dst is None or not _same_content(
+            Path(source), dst, cancel_check=cancel_check):
+        return None
+    return dst
+
+
+def verified_resume_entries(plan: MigrationPlan, *,
+                            progress: Optional[Callable] = None,
+                            cancel_check: Optional[Callable[[], bool]] = None
+                            ) -> list:
+    """Existing destinations currently proven identical to their sources."""
+    candidates = [
+        entry for entry in plan.collisions if _is_resume_collision(entry)
+    ]
+    verified = []
+    for index, entry in enumerate(candidates, 1):
+        if cancel_check is not None and cancel_check():
+            break
+        if progress:
+            progress(
+                "Checking existing copies", index, len(candidates),
+                entry.source.name,
+            )
+        if cancel_check is not None and cancel_check():
+            break
+        if _verified_existing_audio(
+                plan, entry.source, entry.dest_rel,
+                cancel_check=cancel_check) is not None:
+            verified.append(entry)
+        if cancel_check is not None and cancel_check():
+            break
+    return verified
 
 
 def _place_file(src: Path, dst: Path, *, move: bool) -> None:
@@ -835,9 +993,13 @@ def move_path(src: Path, dst: Path) -> bool:
 
 def execute_plan(plan: MigrationPlan, *, in_place: bool = False,
                  cancel_check: Optional[Callable[[], bool]] = None,
-                 progress: Optional[Callable] = None) -> ExecResult:
-    """Carry out the placements in ``plan``. Only ``PLACE`` entries are touched;
-    unplaceable and colliding files are never read or written here.
+                 progress: Optional[Callable] = None,
+                 resume_entries=None) -> ExecResult:
+    """Carry out placements and finish verified existing-file resumes.
+
+    Audio is written only for ``PLACE`` entries. Existing-destination
+    collisions are read solely to re-prove identity before companion files are
+    copied; unplaceable and unresolved collisions stay untouched.
 
     Copy mode never alters the source. A destination that turns up after
     planning is skipped (not overwritten), and a per-file failure is recorded
@@ -886,8 +1048,13 @@ def execute_plan(plan: MigrationPlan, *, in_place: bool = False,
             if getattr(e, "errno", None) == errno.ENOSPC:
                 result.cancelled = True
                 break
+    if (not result.cancelled and cancel_check is not None
+            and cancel_check()):
+        result.cancelled = True
     if not result.cancelled:
-        _carry_companion_files(plan, result, progress=progress)
+        _carry_companion_files(
+            plan, result, resume_entries=resume_entries, progress=progress,
+            cancel_check=cancel_check)
     return result
 
 
@@ -895,8 +1062,9 @@ def write_manifest(plan: MigrationPlan, path: Path) -> None:
     """Write every decision to a CSV audit trail next to the new library.
 
     One row per file: what happened, what the call was based on, where it went
-    (blank when nothing was placed), and why. This is the record that makes the
-    result reviewable and the whole migration reversible."""
+    or was mapped (blank when no safe destination mapping exists), and why.
+    This is the record that makes the result reviewable and the whole migration
+    reversible."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as fh:

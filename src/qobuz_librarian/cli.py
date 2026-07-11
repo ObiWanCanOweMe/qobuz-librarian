@@ -486,20 +486,63 @@ def main():
         run_downsample_walk_mode(args)
         return
 
-    check_rip()
-    check_media_tools()
-    require_music_root()
+    # Keep the interactive menu and saved-work choices available on a local-only
+    # box. Downloader, media-tool, library, and Qobuz checks run once, only when
+    # the user actually selects work that needs them.
+    download_stack = {}
 
-    from qobuz_librarian.api.auth import verify_streamrip_downloads_folder
-    verify_streamrip_downloads_folder()
-    if not HAVE_MUTAGEN:
-        log.info(fmt(C.YELLOW, "  ⚠  mutagen not installed — falling back to filename-only detection."))
-        if _in_container():
-            log.info(fmt(C.GRAY,
-                "     The bundled image installs mutagen by default — if it's missing here, "
-                "rebuild with `docker compose build --no-cache`."))
-        else:
-            log.info(fmt(C.GRAY, "     Install: `pip install mutagen` (or via pipx)."))
+    def download_token():
+        if "token" in download_stack:
+            return download_stack["token"]
+        check_rip()
+        check_media_tools()
+        require_music_root()
+
+        from qobuz_librarian.api.auth import verify_streamrip_downloads_folder
+        verify_streamrip_downloads_folder()
+        if not HAVE_MUTAGEN:
+            log.info(fmt(C.YELLOW,
+                "  ⚠  mutagen not installed — falling back to filename-only "
+                "detection."))
+            if _in_container():
+                log.info(fmt(C.GRAY,
+                    "     The bundled image installs mutagen by default — if "
+                    "it's missing here, rebuild with `docker compose build "
+                    "--no-cache`."))
+            else:
+                log.info(fmt(C.GRAY,
+                    "     Install: `pip install mutagen` (or via pipx)."))
+        try:
+            user_id, token = load_qobuz_token()
+        except NoCredsError:
+            die(fmt(C.RED,
+                "\n✗  No Qobuz credentials configured.\n"
+                "   Paste your user_auth_token on the Settings page "
+                f"(http://<host>:{cfg.WEB_PORT}/settings)\n"
+                "   or set QOBUZ_USER_AUTH_TOKEN in your environment.\n"),
+                EXIT_AUTH)
+        from qobuz_librarian.api.auth import sync_streamrip_creds_from_env
+        if sync_streamrip_creds_from_env() is False:
+            log.info(fmt(C.YELLOW,
+                "  ⚠  Couldn't write env credentials into the streamrip "
+                f"config ({cfg.STREAMRIP_CONFIG}); downloads may fail."))
+        vlog(f"user_id: {user_id}  •  music root: {cfg.MUSIC_ROOT}")
+        if args.verbose:
+            if _in_container():
+                log.info(fmt(C.GRAY,
+                    f"  compose:    {cfg.COMPOSE_FILE}  "
+                    "(host-side; not visible from container)"))
+            else:
+                log.info(fmt(C.GRAY,
+                    f"  compose:    {cfg.COMPOSE_FILE}  "
+                    f"({'present' if cfg.COMPOSE_FILE.exists() else 'MISSING'})"))
+            log.info(fmt(C.GRAY, f"  staging:    {cfg.STAGING_DIR}"))
+            log.info(fmt(C.GRAY, f"  log file:   {cfg.FETCH_LOG_FILE}"))
+            log.info(fmt(C.GRAY, f"  lock:       {cfg.LOCK_FILE}"))
+        cap_depth, cap_rate = streamrip_quality_cap()
+        vlog(f"streamrip quality cap: {cap_depth}-bit/{cap_rate/1000:g}kHz")
+        download_stack["token"] = token
+        return token
 
     # Sweep upgrade-backup dir of anything older than retention window.
     # Cheap (just stat + rmtree on stale dirs); silent unless something happens.
@@ -530,46 +573,6 @@ def main():
         repair_cache.prune_expired()
     except Exception as e:
         vlog(f"repair-cache prune error: {e}")
-    try:
-        user_id, token = load_qobuz_token()
-    except NoCredsError:
-        die(fmt(C.RED,
-            "\n✗  No Qobuz credentials configured.\n"
-            f"   Paste your user_auth_token on the Settings page (http://<host>:{cfg.WEB_PORT}/settings)\n"
-            "   or set QOBUZ_USER_AUTH_TOKEN in your environment.\n"), EXIT_AUTH)
-    # Env-provided creds authenticate our own API calls, but downloads
-    # shell out to `rip`, which only reads the streamrip config. Mirror
-    # env creds into it so the documented env-var setup actually downloads.
-    from qobuz_librarian.api.auth import sync_streamrip_creds_from_env
-    if sync_streamrip_creds_from_env() is False:
-        log.info(fmt(C.YELLOW,
-            "  ⚠  Couldn't write env credentials into the streamrip "
-            f"config ({cfg.STREAMRIP_CONFIG}); downloads may fail."))
-    vlog(f"user_id: {user_id}  •  music root: {cfg.MUSIC_ROOT}")
-    if args.verbose:
-        # compose.yaml lives on the host filesystem; inside the container
-        # the bind mount isn't visible, so the "MISSING" line is just
-        # noise. Note that fact instead of flagging a fake error.
-        if _in_container():
-            log.info(fmt(C.GRAY,
-                f"  compose:    {cfg.COMPOSE_FILE}  "
-                "(host-side; not visible from container)"))
-        else:
-            log.info(fmt(C.GRAY,
-                f"  compose:    {cfg.COMPOSE_FILE}  "
-                f"({'present' if cfg.COMPOSE_FILE.exists() else 'MISSING'})"))
-        log.info(fmt(C.GRAY, f"  staging:    {cfg.STAGING_DIR}"))
-        log.info(fmt(C.GRAY, f"  log file:   {cfg.FETCH_LOG_FILE}"))
-        log.info(fmt(C.GRAY, f"  lock:       {cfg.LOCK_FILE}"))
-
-    _capbd, _capsr = streamrip_quality_cap()
-    vlog(f"streamrip quality cap: {_capbd}-bit/{_capsr/1000:g}kHz")
-    # Token validation is lazy now — the first API call will raise
-    # AuthLost on a bad token, which _entry catches and exits with
-    # EXIT_AUTH. Modes that act purely on local files (e.g. consolidate
-    # within an artist run that has nothing missing) skip the round-trip
-    # entirely.
-
     # ── Decide the entry mode ─────────────────────────────────────────────────
     # Four entry paths:
     #   1. CLI positional args / URL  → album mode, single shot, no menu loop
@@ -581,7 +584,7 @@ def main():
     # all caught at the bottom by main()'s wrapper.
     if args.artist:
         from qobuz_librarian.modes.artist import run_artist_mode
-        run_artist_mode(args.artist, args, token)
+        run_artist_mode(args.artist, args, download_token())
         return
 
     if args.upgrade_walk:
@@ -591,28 +594,30 @@ def main():
         # without mutating the module global the web Settings page reads.
         args.auto_upgrade = True
         from qobuz_librarian.modes.upgrade import run_upgrade_walk_mode
-        run_upgrade_walk_mode(args, token)
+        run_upgrade_walk_mode(args, download_token())
         return
 
     if args.query:
         from qobuz_librarian.modes.album import run_album_mode
-        run_album_mode(args, token)
+        run_album_mode(args, download_token())
         return
 
     # Crash-recovery: if a previous queueing run died with decisions still
     # in memory, we'd have left .qobuz_pending_queue.json on disk. Offer
-    # to resume those before showing the menu so the user doesn't
-    # accidentally start a new walk on top of pending work.
-    offer_resume_pending_queue(args, token)
+    # to resume those before showing the menu so the user doesn't accidentally
+    # start a new walk on top of pending work. Keep/discard stays local; the
+    # download stack is loaded only if the user chooses Resume.
+    offer_resume_pending_queue(args, download_token)
 
     # Same idea, but for files where every lyric provider was unavailable
     # last run. Surfaced separately because they're orthogonal: a flush
     # can succeed (queue cleared) while individual files in it ended up
     # shipped without lyrics.
     from qobuz_librarian.integrations.lyrics import offer_resume_lyric_retry
-    offer_resume_lyric_retry(args, token)
+    offer_resume_lyric_retry(args)
 
-    # Interactive menu loop
+    # Interactive menu loop. The local tools remain reachable without a Qobuz
+    # token or downloader; network-backed choices initialise that stack lazily.
     from qobuz_librarian.ui_cli.menu import interactive_session_mode
     from qobuz_librarian.ui_cli.sentinels import Mode
     while True:
@@ -625,7 +630,7 @@ def main():
             # without bouncing back to the top menu each time. q/blank at the
             # query prompt returns to the top menu.
             from qobuz_librarian.modes.album import run_album_mode
-            run_album_mode(args, token, query_args=[], loop=True)
+            run_album_mode(args, download_token(), query_args=[], loop=True)
         elif mode == Mode.ARTIST:
             from qobuz_librarian.modes.artist import run_artist_mode
             from qobuz_librarian.ui_cli.prompts import prompt_artist_name
@@ -634,16 +639,16 @@ def main():
                 if artist is None:
                     log.info(fmt(C.GRAY, "  Cancelled."))
                     break
-                run_artist_mode(artist, args, token)
+                run_artist_mode(artist, args, download_token())
         elif mode == Mode.WALK_QUEUE:
             from qobuz_librarian.modes.walk import run_walk_queued_mode
-            run_walk_queued_mode(args, token)
+            run_walk_queued_mode(args, download_token())
         elif mode == Mode.ALBUM_WALK:
             from qobuz_librarian.modes.walk import run_album_walk_mode
-            run_album_walk_mode(args, token)
+            run_album_walk_mode(args, download_token())
         elif mode == Mode.ALBUM_REPAIR:
             from qobuz_librarian.modes.repair import run_album_repair_mode
-            run_album_repair_mode(args, token, loop=True)
+            run_album_repair_mode(args, download_token(), loop=True)
         elif mode == Mode.UPGRADE:
             # Explicit upgrade walk: the user chose this, so enable the
             # upgrade-replace path for its duration regardless of the
@@ -653,16 +658,19 @@ def main():
             saved = getattr(args, "auto_upgrade", cfg.AUTO_UPGRADE_ENABLED)
             args.auto_upgrade = True
             try:
-                run_upgrade_walk_mode(args, token)
+                run_upgrade_walk_mode(args, download_token())
             finally:
                 args.auto_upgrade = saved
         elif mode == Mode.MIGRATE:
             from qobuz_librarian.modes.migrate import run_migrate_mode
             run_migrate_mode(args)
         elif mode == Mode.DOWNSAMPLE:
+            check_media_tools()
+            require_music_root()
             from qobuz_librarian.modes.downsample import run_downsample_walk_mode
             run_downsample_walk_mode(args)
         elif mode == Mode.LYRICS:
+            require_music_root()
             from qobuz_librarian.modes.lyrics import run_library_lyrics_mode
             run_library_lyrics_mode(args)
 
@@ -708,9 +716,16 @@ def _maybe_drop_privileges():
     pgid = pgid or "1000"
     if not (puid.isdigit() and pgid.isdigit()):
         return
-    # A request to run as root is already satisfied — re-execing to uid 0 would
-    # land back here as root and loop forever.
-    if puid == "0":
+    uid = int(puid, 10)
+    gid = int(pgid, 10)
+    if (uid == 0) != (gid == 0):
+        die(fmt(C.RED,
+            f"\n✗  PUID={uid} PGID={gid} mixes root with a non-root ID.\n"
+            "   Use a fully non-root pair, or PUID=0 PGID=0 to run as root.\n"),
+            EXIT_CONFIG)
+    # A deliberate 0:0 request is already satisfied. Canonicalising before
+    # this check also stops values such as 00:00 re-execing as root forever.
+    if uid == 0:
         return
     gosu = shutil.which("gosu")
     if not gosu:
@@ -730,7 +745,7 @@ def _maybe_drop_privileges():
         prog = [sys.executable, "-m", mod]
     else:
         prog = [sys.argv[0]]
-    os.execvp(gosu, [gosu, f"{puid}:{pgid}", "env", f"HOME={home}",
+    os.execvp(gosu, [gosu, f"{uid}:{gid}", "env", f"HOME={home}",
                      *prog, *sys.argv[1:]])
 
 

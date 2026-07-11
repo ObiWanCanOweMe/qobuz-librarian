@@ -77,7 +77,7 @@ def test_cleanup_lossy_sorts_flac_lossy_and_broken(tmp_path):
                side_effect=lambda p: p == good):
         kept, lossy, broken = cleanup_lossy([good, bad, mp3])
     assert kept == [good]
-    assert lossy == ["track"] and broken == ["truncated"]
+    assert lossy == [mp3] and broken == [bad]
     assert not bad.exists() and not mp3.exists()
 
 
@@ -107,6 +107,33 @@ def test_cleanup_staging_residue_keeps_art_beside_leftover_audio(tmp_path, monke
     assert (album / "cover.jpg").exists() and (album / "meta.json").exists()
     assert (boxset / "cover.jpg").exists()
     assert not (orphan / "cover.jpg").exists()
+
+
+def test_cleanup_staging_residue_keeps_art_when_album_walk_fails(
+        tmp_path, monkeypatch):
+    import qobuz_librarian.integrations.rip as rip
+
+    monkeypatch.setattr("qobuz_librarian.config.STAGING_DIR", tmp_path)
+    artist = tmp_path / "Artist"
+    album = artist / "Album"
+    album.mkdir(parents=True)
+    (album / "01 - Track.flac").write_bytes(b"audio")
+    cover = album / "cover.jpg"
+    cover.write_bytes(b"image")
+
+    real_walk = rip.iter_tree_no_symlinks
+
+    def unreadable(path, errors=None):
+        if path == artist:
+            if errors is not None:
+                errors.append(OSError("album subtree EIO"))
+            return iter(())
+        return real_walk(path, errors=errors)
+
+    monkeypatch.setattr(rip, "iter_tree_no_symlinks", unreadable)
+
+    assert cleanup_staging_residue() == 0
+    assert cover.exists()
 
 
 # ── beets: split-folder merge ─────────────────────────────────────────────
@@ -147,6 +174,19 @@ def test_merge_split_folder_repoints_beets_db(tmp_path, monkeypatch):
 
 # ── lyrics: retry manifest + atomic writes ────────────────────────────────
 
+class _FakeLyricFLAC:
+    def __init__(self, path):
+        from mutagen.flac import VCFLACDict
+
+        self.filename = str(path)
+        self.tags = VCFLACDict()
+        self.save_targets = []
+
+    def save(self, target):
+        self.save_targets.append(target)
+        Path(target).write_bytes(b"new-audio+tags")
+
+
 def test_lyric_retry_round_trips_and_clears(tmp_path, monkeypatch):
     rfile = tmp_path / "retry.json"
     monkeypatch.setattr("qobuz_librarian.config.LYRIC_RETRY_FILE", rfile)
@@ -159,24 +199,12 @@ def test_lyric_retry_round_trips_and_clears(tmp_path, monkeypatch):
 
 
 def test_write_lyrics_saves_atomically_and_clears_legacy_tag(tmp_path):
-    from mutagen.flac import VCFLACDict
-
     from qobuz_librarian.integrations import lyric_fetch
 
     real = tmp_path / "track.flac"
     real.write_bytes(b"original-audio")
 
-    class FakeFLAC:
-        def __init__(self, path):
-            self.filename = str(path)
-            self.tags = VCFLACDict()
-            self.save_targets = []
-
-        def save(self, target):
-            self.save_targets.append(target)
-            Path(target).write_bytes(b"new-audio+tags")
-
-    f = FakeFLAC(real)
+    f = _FakeLyricFLAC(real)
     f.tags["UNSYNCEDLYRICS"] = ["stale plain text"]
     lyric_fetch.write_lyrics(f, "[00:01.00]hello")
 
@@ -187,6 +215,80 @@ def test_write_lyrics_saves_atomically_and_clears_legacy_tag(tmp_path):
     assert f.save_targets and all(t != f.filename for t in f.save_targets)
     assert real.read_bytes() == b"new-audio+tags"
     assert not any(p.name.endswith(".tmp") for p in tmp_path.iterdir())
+
+
+def test_write_lyrics_keeps_original_when_replacement_cannot_be_flushed(
+        tmp_path, monkeypatch):
+    from qobuz_librarian.integrations import lyric_fetch
+    from qobuz_librarian.library import backup
+
+    real = tmp_path / "track.flac"
+    real.write_bytes(b"original-audio")
+    monkeypatch.setattr(backup, "_fsync", lambda _path: False)
+
+    with pytest.raises(OSError, match="original left untouched"):
+        lyric_fetch.write_lyrics(_FakeLyricFLAC(real), "lyrics")
+
+    assert real.read_bytes() == b"original-audio"
+    assert not any(p.name.endswith(".tmp") for p in tmp_path.iterdir())
+
+
+def test_write_lyrics_reports_folder_flush_failure(tmp_path, monkeypatch):
+    from qobuz_librarian.integrations import lyric_fetch
+    from qobuz_librarian.library import backup
+
+    real = tmp_path / "track.flac"
+    real.write_bytes(b"original-audio")
+    outcomes = iter((True, False))
+    flushed = []
+
+    def fake_fsync(path):
+        flushed.append(Path(path))
+        return next(outcomes)
+
+    monkeypatch.setattr(backup, "_fsync", fake_fsync)
+
+    with pytest.raises(OSError, match="may not survive a power loss"):
+        lyric_fetch.write_lyrics(_FakeLyricFLAC(real), "lyrics")
+
+    assert real.read_bytes() == b"new-audio+tags"
+    assert len(flushed) == 2
+    assert flushed[1] == tmp_path
+
+
+def test_post_import_sidecar_reports_a_better_existing_file_as_kept(
+        tmp_path, monkeypatch, caplog):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.integrations import lyric_fetch, lyrics
+
+    album = tmp_path / "Album"
+    album.mkdir()
+    track = album / "01.flac"
+    track.write_bytes(b"audio")
+    sidecar = track.with_suffix(".lrc")
+    sidecar.write_text("[00:01.00]better lyrics", encoding="utf-8")
+
+    class FakeFLAC:
+        def __init__(self, _path):
+            self.tags = {"lyrics": ["plain embedded lyrics"]}
+
+    monkeypatch.setattr(cfg, "LYRICS_ENABLED", True)
+    monkeypatch.setattr(cfg, "LYRICS_FORMAT", "sidecar")
+    monkeypatch.setattr(lyrics, "HAVE_LYRIC_FETCH", True)
+    monkeypatch.setattr(lyric_fetch, "FLAC", FakeFLAC)
+
+    def fail_strip(*_args):
+        raise OSError("strip failed")
+
+    monkeypatch.setattr(lyric_fetch, "save_flac_tags", fail_strip)
+    caplog.set_level("INFO", logger="qobuz_librarian")
+
+    lyrics.write_post_import_sidecars([album])
+
+    assert sidecar.read_text(encoding="utf-8") == "[00:01.00]better lyrics"
+    assert "kept 1 better existing .lrc sidecar" in caplog.text
+    assert "wrote 1 .lrc sidecar" not in caplog.text
+    assert "embedded tag removal confirmed for 0 of 1" in caplog.text
 
 
 def test_update_state_reloads_inside_the_lock(tmp_path):
@@ -207,6 +309,45 @@ def test_update_state_reloads_inside_the_lock(tmp_path):
     out = lyric_fetch.load_state(sf)
     assert "a" not in out          # the mutation applied
     assert "b" in out              # the concurrent writer's key was not clobbered
+
+
+def test_library_lyrics_dry_run_keeps_state_file_byte_for_byte(
+        tmp_path, monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.integrations import lyric_fetch
+    from qobuz_librarian.library import lyrics
+
+    state_path = tmp_path / "lyrics-state.json"
+    missing = tmp_path / "moved.flac"
+    lyric_fetch.save_state(
+        {str(missing): lyric_fetch.TrackState(status="transient")},
+        state_path,
+    )
+    before = state_path.read_bytes()
+
+    track = tmp_path / "track.flac"
+    track.write_bytes(b"audio")
+    stat = track.stat()
+    monkeypatch.setattr(cfg, "LYRIC_FETCH_STATE_FILE", state_path)
+    monkeypatch.setattr(
+        lyrics, "iter_library_flacs",
+        lambda **_kwargs: iter([(track, stat.st_mtime, stat.st_size)]),
+    )
+    indexed = []
+    monkeypatch.setattr(
+        lyric_fetch, "index_existing",
+        lambda *_args, **_kwargs: indexed.append(True),
+    )
+    monkeypatch.setattr(lyric_fetch, "AVAILABLE", True)
+    monkeypatch.setattr(
+        lyric_fetch, "process_file",
+        lambda *_args, **_kwargs: "dry:wrote-synced",
+    )
+
+    lyrics.run_library_lyrics(dry_run=True)
+
+    assert indexed == []
+    assert state_path.read_bytes() == before
 
 
 # ── beets: _beets_direct behaviour ─────────────────────────────────────────
@@ -289,6 +430,40 @@ def test_prepare_staging_tags_sets_aside_untagged_keeps_tagged(tmp_path, monkeyp
     assert not untagged.exists() and untagged in moved
     assert not broken.exists() and broken in moved
     assert len(list((data / ".untagged_staging").rglob("*.flac"))) == 2
+
+
+def test_prepare_staging_tags_keeps_original_when_flush_fails(
+        tmp_path, monkeypatch):
+    from mutagen import flac
+
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.integrations import beets
+    from qobuz_librarian.library import backup
+
+    staging = tmp_path / "staging"
+    track = staging / "Artist" / "Album" / "01.flac"
+    track.parent.mkdir(parents=True)
+    track.write_bytes(b"original")
+
+    class DirtyTags(dict):
+        def save(self, target):
+            Path(target).write_bytes(b"rewritten")
+
+    monkeypatch.setattr(cfg, "STAGING_DIR", staging)
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path / "data")
+    monkeypatch.setattr(beets, "HAVE_MUTAGEN", True)
+    monkeypatch.setattr(
+        flac, "FLAC",
+        lambda _path: DirtyTags(
+            album=[" Album "], albumartist=["Artist"], title=["Track"]
+        ),
+    )
+    monkeypatch.setattr(backup, "_fsync", lambda _path: False)
+
+    beets._prepare_staging_tags()
+
+    assert track.read_bytes() == b"original"
+    assert list(track.parent.glob("*.tmp")) == []
 
 
 # ── beets: import override pins non-destructive duplicate handling ─────────

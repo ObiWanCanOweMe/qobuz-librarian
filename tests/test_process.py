@@ -424,7 +424,9 @@ def test_upgrade_verification_keeps_backup_when_replacement_is_short(monkeypatch
     backup.mkdir()
     post = tmp_path / "Album"
     post.mkdir()
-    original = [{"length": 200.0}, {"length": 180.0}, {"length": 240.0}]
+    original = [{"title": "T1", "length": 200.0},
+                {"title": "T2", "length": 180.0},
+                {"title": "T3", "length": 240.0}]
     monkeypatch.setattr(proc, "find_album_dir_filesystem", lambda _a: post)
 
     # A track the matcher dropped: the rebuilt folder has fewer files.
@@ -434,7 +436,9 @@ def test_upgrade_verification_keeps_backup_when_replacement_is_short(monkeypatch
 
     # All tracks present but one re-ripped short (decodes, so flac -t passes):
     # total playtime drops below the original.
-    truncated = [{"length": 200.0}, {"length": 20.0}, {"length": 240.0}]
+    truncated = [{"title": "T1", "length": 200.0},
+                 {"title": "T2", "length": 20.0},
+                 {"title": "T3", "length": 240.0}]
     monkeypatch.setattr(proc, "read_album_dir",
                         lambda f, walk_errors=None: original if f == backup else truncated)
     assert proc._upgrade_replacement_verified({"id": "x"}, post, backup) is False
@@ -461,18 +465,24 @@ def test_upgrade_verification_rejects_a_masked_per_track_downgrade(monkeypatch, 
     backup.mkdir()
     post = tmp_path / "Album"
     post.mkdir()
-    original = [{"length": 200.0, "bits": 24, "sample_rate": 48000},
-                {"length": 180.0, "bits": 24, "sample_rate": 48000}]
-    replacement = [{"length": 200.0, "bits": 24, "sample_rate": 96000},
-                   {"length": 180.0, "bits": 16, "sample_rate": 44100}]
+    original = [{"title": "T1", "length": 200.0,
+                 "bits": 24, "sample_rate": 48000},
+                {"title": "T2", "length": 180.0,
+                 "bits": 24, "sample_rate": 48000}]
+    replacement = [{"title": "T1", "length": 200.0,
+                    "bits": 24, "sample_rate": 96000},
+                   {"title": "T2", "length": 180.0,
+                    "bits": 16, "sample_rate": 44100}]
     monkeypatch.setattr(proc, "find_album_dir_filesystem", lambda _a: post)
     monkeypatch.setattr(proc, "read_album_dir",
                         lambda f, walk_errors=None: original if f == backup else replacement)
     assert proc._upgrade_replacement_verified({"id": "x"}, post, backup) is False
 
     # The same replacement with no downgraded track verifies.
-    fixed = [{"length": 200.0, "bits": 24, "sample_rate": 96000},
-             {"length": 180.0, "bits": 24, "sample_rate": 48000}]
+    fixed = [{"title": "T1", "length": 200.0,
+              "bits": 24, "sample_rate": 96000},
+             {"title": "T2", "length": 180.0,
+              "bits": 24, "sample_rate": 48000}]
     monkeypatch.setattr(proc, "read_album_dir",
                         lambda f, walk_errors=None: original if f == backup else fixed)
     assert proc._upgrade_replacement_verified({"id": "x"}, post, backup) is True
@@ -649,6 +659,31 @@ def test_upgrade_verification_rejects_a_swap_hidden_by_ranking(monkeypatch, tmp_
     assert proc._upgrade_replacement_verified({"id": "x"}, post, backup) is False
 
 
+def test_upgrade_verification_requires_every_original_identity(monkeypatch, tmp_path):
+    """A duplicate replacement must not stand in for a missing original."""
+    from qobuz_librarian.modes import process as proc
+
+    backup = tmp_path / "backup"
+    backup.mkdir()
+    post = tmp_path / "Album"
+    post.mkdir()
+    original = [
+        {"title": "Alpha", "length": 100.0, "bits": 24, "sample_rate": 96000},
+        {"title": "Beta", "length": 100.0, "bits": 24, "sample_rate": 96000},
+    ]
+    replacement = [
+        {"title": "Alpha", "length": 100.0, "bits": 24, "sample_rate": 96000},
+        {"title": "Alpha", "length": 100.0, "bits": 24, "sample_rate": 96000},
+    ]
+    monkeypatch.setattr(proc, "find_album_dir_filesystem", lambda _a: post)
+    monkeypatch.setattr(
+        proc, "read_album_dir",
+        lambda f, walk_errors=None: original if f == backup else replacement,
+    )
+
+    assert proc._upgrade_replacement_verified({"id": "x"}, post, backup) is False
+
+
 def test_upgrade_verification_counts_an_unreadable_track_as_a_downgrade(monkeypatch, tmp_path):
     """One replacement track reads (0, 0) — unknown quality. Ignoring unknowns
     lets it vouch for a 24/96 original it can't be proven to match."""
@@ -715,3 +750,8 @@ def test_companion_carry_requires_a_durable_verified_copy(monkeypatch, tmp_path)
     monkeypatch.setattr(bk, "_fsync", lambda p: True)
     assert proc._carry_non_audio_from_backup({"id": "x"}, dest, backup) is True
     assert (dest / "cover.jpg").read_bytes() == b"art"
+
+    # An identical companion is already present now, but that shortcut must
+    # still flush the replacement audio tree before the backup can be removed.
+    monkeypatch.setattr(bk, "_fsync_tree", lambda _p: False)
+    assert proc._carry_non_audio_from_backup({"id": "x"}, dest, backup) is False

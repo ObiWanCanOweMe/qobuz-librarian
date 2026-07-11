@@ -167,54 +167,52 @@ def init() -> None:
                          "and the app restarts: %s", e)
 
 
-def persist(job) -> None:
-    """Write the job's current state to disk. Idempotent (INSERT OR REPLACE)."""
-    # Serialize the payloads before taking the lock — a parked review can hold
-    # hundreds of candidate dicts, and json.dumps of that shouldn't run while
-    # the single persistence lock is held, stalling a concurrent history read or
-    # the other worker lane's write. default=str so one stray non-JSON value (a
-    # Path that slipped into a payload) coerces to text instead of raising
-    # TypeError, which would escape the sqlite3.Error guard, crash the worker,
-    # and silently drop a parked review the user can't get back.
-    # Snapshot the candidate list under the job's own lock first: set_selected /
-    # set_all_selected mutate it under that lock, so dumping it unlocked could
-    # serialize a torn selection or trip over a concurrent resize.
+def persist(job) -> bool:
+    """Write the job's current state to disk. Return whether it reached disk."""
+    # Keep the job lock through the database commit. Besides producing one
+    # coherent snapshot, this preserves save order: an older delayed save can't
+    # pause after serializing and then overwrite a newer selection. The database
+    # lock is always taken second; readers and cleanup never take a job lock.
+    # default=str keeps one stray Path-like payload from crashing the worker and
+    # silently dropping a parked review the user can't get back.
     with job._lock:
-        candidates_snapshot = list(job.candidates or [])
-    candidates_json = json.dumps(candidates_snapshot, default=str)
-    execute_args_json = json.dumps(job.execute_args or {}, default=str)
-    single_json = json.dumps(job.single or {}, default=str)
-    with _lock:
-        conn = _get_conn()
-        if conn is None:
-            return
-        try:
-            conn.execute(
-                "INSERT OR REPLACE INTO jobs "
-                "(id, title, artist, album_id, kind, status, phase, candidates, "
-                " error, summary, review_verb, execute_kind, execute_args, "
-                " created_at, finished_at, single, attention) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    job.id, job.title or "", job.artist or "",
-                    job.album_id or "", job.kind or "download",
-                    job.status.value if hasattr(job.status, "value") else str(job.status),
-                    job.phase or "",
-                    candidates_json,
-                    job.error,
-                    job.summary or "",
-                    job.review_verb or "Download",
-                    job.execute_kind or "",
-                    execute_args_json,
-                    job.created_at,
-                    job.finished_at,
-                    single_json,
-                    getattr(job, "attention", "") or "",
-                ),
-            )
-            conn.commit()
-        except sqlite3.Error as e:
-            _note_write_failure(f"persist {job.id}", e)
+        candidates_json = json.dumps(job.candidates or [], default=str)
+        execute_args_json = json.dumps(job.execute_args or {}, default=str)
+        single_json = json.dumps(job.single or {}, default=str)
+        values = (
+            job.id, job.title or "", job.artist or "",
+            job.album_id or "", job.kind or "download",
+            job.status.value if hasattr(job.status, "value") else str(job.status),
+            job.phase or "",
+            candidates_json,
+            job.error,
+            job.summary or "",
+            job.review_verb or "Download",
+            job.execute_kind or "",
+            execute_args_json,
+            job.created_at,
+            job.finished_at,
+            single_json,
+            getattr(job, "attention", "") or "",
+        )
+        with _lock:
+            conn = _get_conn()
+            if conn is None:
+                return False
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO jobs "
+                    "(id, title, artist, album_id, kind, status, phase, candidates, "
+                    " error, summary, review_verb, execute_kind, execute_args, "
+                    " created_at, finished_at, single, attention) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    values,
+                )
+                conn.commit()
+                return True
+            except sqlite3.Error as e:
+                _note_write_failure(f"persist {job.id}", e)
+                return False
 
 
 def delete(job_id: str) -> None:

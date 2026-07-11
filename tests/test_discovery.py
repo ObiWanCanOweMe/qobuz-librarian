@@ -242,6 +242,19 @@ def test_resolve_artist_does_not_cache_an_id_less_match(monkeypatch):
     assert "Phantom Singer" not in discovery._resolve_cache
 
 
+def test_artist_search_failure_is_not_returned_as_a_no_match(monkeypatch):
+    monkeypatch.setattr(discovery, "_resolve_cache", {})
+
+    def malformed(*_args, **_kwargs):
+        from qobuz_librarian.api.auth import QobuzError
+        raise QobuzError("malformed artist/search response")
+
+    monkeypatch.setattr(discovery, "search_artists", malformed)
+
+    with pytest.raises(discovery.ArtistSearchUnavailable):
+        discovery.resolve_artist("Phantom Singer", "tok")
+
+
 def test_new_releases_surface_only_what_appeared_since_the_baseline(
         monkeypatch, tmp_path):
     # resolve_artist hands back an int id (as Qobuz does) but the baseline is

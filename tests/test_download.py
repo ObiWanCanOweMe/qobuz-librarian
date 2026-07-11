@@ -24,6 +24,18 @@ def test_match_key_from_stem_keys_a_star_track_to_its_title():
         strip_edition_suffix("Changes"))
 
 
+def test_conflicting_file_identity_does_not_fall_back_to_title(monkeypatch, tmp_path):
+    track = {"id": 1, "title": "Song", "media_number": 1, "track_number": 1}
+    path = tmp_path / "01 - Song.flac"
+    path.write_bytes(b"audio")
+    monkeypatch.setattr(dl, "read_audio_meta", lambda _path: {
+        "title": "Song", "discnumber": 1, "tracknumber": 2,
+    })
+
+    identities = dl._capture_file_identities([path], [track])
+    assert dl._pair_files_to_tracks([path], [track], identities, [track]) == []
+
+
 def _patch(monkeypatch, *, rip, added, cleanup, cancel=False):
     monkeypatch.setattr(dl, "rip_url", rip)
     monkeypatch.setattr(dl, "files_added_since", added)
@@ -42,6 +54,7 @@ def test_full_album_with_present_tracks_counts_fail_against_total(monkeypatch, t
     # re-rip that drops a track reads as clean (n_fail=0) and the executor would
     # be cleared to delete a sibling / drop the gap-fill backup holding it.
     tracks = [{"id": i, "title": f"T{i}", "track_number": i} for i in range(1, 11)]
+    tracks[8]["title"] = "T1"  # same title as a surviving track, distinct slot
     missing = tracks[3:]          # 6 missing, 4 present → full-album strategy
     present = tracks[:4]
     album = tmp_path / "Artist" / "Album (2020)"
@@ -62,25 +75,34 @@ def test_full_album_with_present_tracks_counts_fail_against_total(monkeypatch, t
     assert r["download_full_album"] is True
     assert r["n_ok"] == 8
     assert r["n_fail"] == 2          # 10 total - 8 ok, NOT max(0, 6-8)=0
+    assert r["failed_tracks"] == ["T1", "T10"]
     assert r["n_ok"] + r["n_lossy"] + r["n_fail"] == 10
 
 
 def test_lossy_track_retried_once_and_recovers(monkeypatch, tmp_path):
-    tracks = [{"id": 1, "title": "A", "track_number": 1},
-              {"id": 2, "title": "Star", "track_number": 2}]
-    track_a = tmp_path / "01 - A.flac"
+    tracks = [
+        {"id": 101, "title": "Song", "media_number": 1, "track_number": 1},
+        {"id": 202, "title": "Song", "media_number": 2, "track_number": 1},
+    ]
+    disc_1 = tmp_path / "Disc 1"
+    disc_2 = tmp_path / "Disc 2"
+    disc_1.mkdir()
+    disc_2.mkdir()
+    track_a = disc_1 / "01 - Song.flac"
+    rejected = disc_2 / "01 - Song.mp3"
+    recovered = disc_2 / "01 - Song.flac"
     track_a.write_bytes(b"x")
-    star = tmp_path / "02 - Star.flac"
+    rejected.write_bytes(b"lossy")
     rips = []
 
     def rip(url, **_k):
         rips.append(url)
-        if "track/2" in url:
-            star.write_bytes(b"x")        # the retry produces the missing FLAC
+        if "track/202" in url:
+            recovered.write_bytes(b"x")
         return (0, "")
 
-    deltas = iter([[track_a, tmp_path / "02 - Star.mp3"], [star]])
-    cleans = iter([([track_a], ["02 - Star"], []), ([star], [], [])])
+    deltas = iter([[track_a, rejected], [recovered]])
+    cleans = iter([([track_a], [rejected], []), ([recovered], [], [])])
     _patch(monkeypatch, rip=rip,
            added=lambda _s: next(deltas, []),
            cleanup=lambda _f: next(cleans, ([], [], [])))
@@ -92,7 +114,7 @@ def test_lossy_track_retried_once_and_recovers(monkeypatch, tmp_path):
     # Exactly two rips: the album URL plus one per-track retry. A third would
     # mean the retry loops.
     assert rips == ["https://play.qobuz.com/album/ALB",
-                    "https://play.qobuz.com/track/2"]
+                    "https://play.qobuz.com/track/202"]
     assert (r["n_ok"], r["n_lossy"], r["n_fail"]) == (2, 0, 0)
 
 
@@ -205,21 +227,39 @@ def test_snapshot_staging_skips_the_beets_retry_tree(monkeypatch, tmp_path):
     assert added == {"Artist/Album/2.flac"}
 
 
-def test_recovered_twin_clears_one_reject_not_both(tmp_path):
-    """Two same-titled twins were rejected; the retry recovered ONE file. A
-    set-membership drop would clear both twins off that one recovery, so the
-    other vanishes from the retry and failure accounting and the run reads
-    clean while a track never landed."""
-    from collections import Counter
+def test_wrong_same_title_retry_file_does_not_clear_reject(monkeypatch, tmp_path):
+    tracks = [
+        {"id": 101, "title": "Song", "media_number": 1, "track_number": 1},
+        {"id": 202, "title": "Song", "media_number": 2, "track_number": 1},
+    ]
+    disc_1 = tmp_path / "Disc 1"
+    disc_2 = tmp_path / "Disc 2"
+    wrong_retry_dir = tmp_path / "retry" / "Disc 1"
+    disc_1.mkdir()
+    disc_2.mkdir()
+    wrong_retry_dir.mkdir(parents=True)
+    clean = disc_1 / "01 - Song.flac"
+    rejected = disc_2 / "01 - Song.mp3"
+    wrong_retry = wrong_retry_dir / "01 - Song.flac"
+    clean.write_bytes(b"clean")
+    rejected.write_bytes(b"lossy")
+    wrong_retry.write_bytes(b"wrong disc")
+    rips = []
 
-    from qobuz_librarian.download import (
-        _drop_recovered_rejects,
-        match_key_from_stem,
+    _patch(
+        monkeypatch,
+        rip=lambda url, **_k: (rips.append(url), (0, ""))[1],
+        added=lambda _s, deltas=iter([[clean, rejected], [wrong_retry]]): next(deltas, []),
+        cleanup=lambda _f, outcomes=iter([
+            ([clean], [rejected], []), ([wrong_retry], [], []),
+        ]): next(outcomes, ([], [], [])),
     )
 
-    twin_a = tmp_path / "03 - Song.flac"
-    twin_b = tmp_path / "03 - Song (1).flac"
-    recovered = Counter({match_key_from_stem(twin_a): 1})
+    result = dl.run_album_download(
+        album=_album(tracks), missing=tracks, present=[], album_dir=None,
+        snapshot=set(),
+    )
 
-    remains = _drop_recovered_rejects([twin_a, twin_b], recovered)
-    assert len(remains) == 1
+    assert rips == ["https://play.qobuz.com/album/ALB",
+                    "https://play.qobuz.com/track/202"]
+    assert (result["n_ok"], result["n_lossy"], result["n_fail"]) == (1, 1, 0)

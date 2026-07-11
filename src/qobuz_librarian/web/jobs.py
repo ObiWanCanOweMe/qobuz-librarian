@@ -619,6 +619,29 @@ class JobLogHandler(logging.Handler):
 
 registry = JobRegistry()
 
+# Undo and backup Restore mutate the library directly from request workers
+# rather than through JobRegistry. Keep their short-lived registrations beside
+# the job registry so the web/CLI run-lock handoff sees every active writer.
+_library_operations: dict[str, str] = {}
+_library_operations_lock = threading.Lock()
+
+
+def begin_library_operation(label: str) -> str:
+    token = uuid.uuid4().hex
+    with _library_operations_lock:
+        _library_operations[token] = str(label)
+    return token
+
+
+def end_library_operation(token: str) -> None:
+    with _library_operations_lock:
+        _library_operations.pop(token, None)
+
+
+def active_library_operations() -> list[str]:
+    with _library_operations_lock:
+        return list(_library_operations.values())
+
 # Review ticks save the whole candidate list, and on a big library that list
 # runs to tens of megabytes — written per checkbox, each tap waited on a
 # multi-hundred-ms serialize+write. Coalesce instead: at most one save per job
@@ -895,17 +918,24 @@ def _worker_loop(work_queue: "queue.Queue"):
         # Sole worker thread — catching BaseException ensures one
         # crashed job can't take down the whole queue.
         try:
-            if job.cancel_requested or job.status in TERMINAL:
-                # Cancelled while still queued — drop it instead of flipping
-                # PENDING→RUNNING and running it. request_cancel finalizes such a
-                # job; if the cancel landed in the enqueue→dequeue gap it's still
-                # PENDING here, so finalize it now rather than start it.
-                if job.status not in TERMINAL:
-                    _mark_canceled(job)
-            else:
-                job.status = JobStatus.RUNNING
-                if job.started_at is None:
-                    job.started_at = time.time()
+            canceled_pending = False
+            with job._lock:
+                if job.cancel_requested or job.status in TERMINAL:
+                    # A queued cancel and this worker claim use the same lock.
+                    # Exactly one side can move PENDING to its next state.
+                    if job.status == JobStatus.PENDING:
+                        job.status = JobStatus.CANCELED
+                        job.finished_at = time.time()
+                        canceled_pending = True
+                    claimed = False
+                else:
+                    claimed = True
+                    job.status = JobStatus.RUNNING
+                    if job.started_at is None:
+                        job.started_at = time.time()
+            if canceled_pending:
+                _finish_canceled(job)
+            elif claimed:
                 job_persistence.persist(job)
                 _run_task(job, fn)
         except BaseException as e:  # noqa: BLE001 - must not die
@@ -1283,12 +1313,8 @@ def load_historical_job(job_id: str) -> Optional[Job]:
     )
 
 
-def _mark_canceled(job: Job) -> None:
-    """Finalize a job to CANCELED with the same bookkeeping _run_task's finally
-    does on a terminal transition: stamp the finish time, persist the row, close
-    any open SSE stream."""
-    job.status = JobStatus.CANCELED
-    job.finished_at = time.time()
+def _finish_canceled(job: Job) -> None:
+    """Persist and publish a CANCELED transition made under the job lock."""
     if registry.get(job.id) is not None:
         job_persistence.persist(job)
     job.end_stream()
@@ -1311,16 +1337,19 @@ def request_cancel(job: Job) -> bool:
     # Either it wasn't in review, or an approve() flipped it to PENDING between
     # the check and cancel_review's locked re-check. Fall through to the
     # cooperative flag so that race doesn't swallow the user's cancel.
-    if job.status in TERMINAL:
-        return False
-    job.cancel_requested = True
-    if job.status == JobStatus.PENDING:
-        # A queued job hasn't run yet, so cancel it now instead of waiting for
-        # the worker to reach it — which can be a whole library scan away, the
-        # worker being busy with the job ahead of it. Deferring left it sitting
-        # as "Queued" the entire time, so the cancel looked ignored. The worker
-        # skips a cancelled job when it dequeues one, so this can't double-run.
-        _mark_canceled(job)
+    with job._lock:
+        if job.status in TERMINAL:
+            return False
+        job.cancel_requested = True
+        canceled_pending = job.status == JobStatus.PENDING
+        if canceled_pending:
+            # Finalize immediately rather than leaving a queued cancel behind
+            # whatever is already using the lane. The worker claims PENDING
+            # under this same lock, so it cannot overwrite this transition.
+            job.status = JobStatus.CANCELED
+            job.finished_at = time.time()
+    if canceled_pending:
+        _finish_canceled(job)
     return True
 
 

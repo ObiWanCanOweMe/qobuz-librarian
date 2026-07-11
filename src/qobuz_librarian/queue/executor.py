@@ -28,6 +28,7 @@ from qobuz_librarian.integrations.rip import (
 from qobuz_librarian.library.backup import (
     backup_album_dir,
     pin_unverified_upgrade_backup,
+    replacement_tree_durable,
     restore_gap_fill_backup,
     restore_upgrade_backup,
     warn_pin_failed,
@@ -471,8 +472,11 @@ def _resolve_queue_item(item, args, imported_globally):
         _sibs = item.get("siblings_to_delete", [])
         _sibs_whole = bool(_sibs) and folder_holds_all_tracks(
             post_dir, (item["album"].get("tracks") or {}).get("items") or [])
-        if (item.get("n_fail", 0) == 0 and item.get("n_lossy", 0) == 0
-                and _sibs_whole):
+        _sibs_clean = (item.get("n_fail", 0) == 0
+                       and item.get("n_lossy", 0) == 0)
+        _sibs_durable = (_sibs_clean and _sibs_whole
+                         and replacement_tree_durable(post_dir))
+        if _sibs_clean and _sibs_whole and _sibs_durable:
             for sib_dir in _sibs:
                 if not sib_dir.exists():
                     continue
@@ -498,7 +502,11 @@ def _resolve_queue_item(item, args, imported_globally):
                 except OSError as _e_sib:
                     log.info(fmt(C.YELLOW,
                         f"  ⚠  Couldn't remove {sib_dir.name}: {_e_sib}"))
-        elif _sibs and item.get("n_fail", 0) == 0 and item.get("n_lossy", 0) == 0:
+        elif _sibs_clean and _sibs_whole:
+            log.info(fmt(C.YELLOW,
+                f"  ⚠  Keeping {len(_sibs)} sibling folder(s) — the filled "
+                "album couldn't be flushed safely."))
+        elif _sibs and _sibs_clean:
             log.info(fmt(C.YELLOW,
                 f"  ⚠  Keeping {len(_sibs)} sibling folder(s) — the filled "
                 f"folder couldn't be verified as holding every track, and a "
@@ -534,7 +542,9 @@ def _resolve_queue_item(item, args, imported_globally):
                 # album CLI path in modes/process.py; the bulk artist/upgrade
                 # walks and the web Upgrade action run through this executor.
                 # A failed carry keeps the backup: it holds the only copies.
-                if _carry_non_audio_from_backup(item["album"], album_dir, bp):
+                if _carry_non_audio_from_backup(
+                        item["album"], album_dir, bp,
+                        replacement_dir=post_dir):
                     try:
                         shutil.rmtree(bp)
                     except OSError as e:
@@ -545,11 +555,11 @@ def _resolve_queue_item(item, args, imported_globally):
                         warn_pin_failed(bp)
                     log.info(fmt(C.YELLOW,
                         f"  ⚠  {truncate(album_dir.name, 40)}: upgraded, but "
-                        f"the booklet/artwork companions couldn't be copied "
-                        f"out of the backup — keeping it."))
+                        "the rebuilt album or its companions couldn't be "
+                        "flushed safely — keeping the backup."))
                     log.info(fmt(C.GRAY,
-                        f"     Backup at {bp}; copy the non-audio files out "
-                        f"yourself, then delete it."))
+                        f"     Backup at {bp}; keep it until you've confirmed "
+                        "the rebuilt album is safe."))
             else:
                 if not pin_unverified_upgrade_backup(bp):
                     warn_pin_failed(bp)
@@ -606,12 +616,23 @@ def _resolve_queue_item(item, args, imported_globally):
                          and folder_holds_all_tracks(
                              post_dir,
                              (item["album"].get("tracks") or {}).get("items") or []))
-        if _item_strict_success and _filled_whole:
+        _filled_durable = (_item_strict_success and _filled_whole
+                           and replacement_tree_durable(post_dir))
+        if _item_strict_success and _filled_whole and _filled_durable:
             try:
                 shutil.rmtree(gfb)
             except OSError as e:
                 log.info(fmt(C.YELLOW,
                     f"  ⚠  Gap-fill complete but couldn't remove backup: {e}"))
+        elif _item_strict_success and _filled_whole:
+            if not pin_unverified_upgrade_backup(
+                    gfb, "gap-fill backup kept — replacement not durable"):
+                warn_pin_failed(gfb)
+            log.info(fmt(C.YELLOW,
+                f"  ⚠  {truncate(album_dir.name, 40)}: filled, but the new "
+                "folder couldn't be flushed safely — keeping the backed-up "
+                "tracks."))
+            log.info(fmt(C.GRAY, f"     Backup at {gfb}."))
         elif _item_strict_success:
             # Imported cleanly, but either beets filed the album where the
             # matcher couldn't find it (renamed past the fuzzy gate, or under

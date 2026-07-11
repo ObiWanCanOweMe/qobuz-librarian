@@ -1476,6 +1476,82 @@ def test_new_release_scan_ignores_single_store_when_suppression_off(
 
     assert seen == [None]
 
+
+def test_new_release_scan_keeps_incomplete_rebaseline_truthful(
+        tmp_path, monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.web import flows
+
+    artists = [tmp_path / name for name in ("Good", "Unresolved", "Short", "Error")]
+    for artist in artists:
+        artist.mkdir()
+
+    def fake_find(name, **_kwargs):
+        if name == "Error":
+            raise RuntimeError("temporary failure")
+        if name == "Unresolved":
+            return SimpleNamespace(artist_id=None, fetch_failed=False,
+                                   current_ids=[], new_gaps=[], artist_name=None)
+        return SimpleNamespace(
+            artist_id=name,
+            fetch_failed=name == "Short",
+            current_ids=["album"],
+            new_gaps=[],
+            artist_name=name,
+        )
+
+    marked = {}
+    monkeypatch.setattr(cfg, "ARTIST_SCAN_WORKERS", 1)
+    monkeypatch.setattr(flows, "list_library_artists", lambda: artists)
+    monkeypatch.setattr(flows, "find_new_releases_for_artist", fake_find)
+    monkeypatch.setattr(flows.new_releases_mod, "load", lambda: {
+        "seen": {"Good": []},
+        "baseline_limit": int(cfg.ARTIST_CATALOG_LIMIT) - 1,
+    })
+    monkeypatch.setattr(
+        flows.new_releases_mod,
+        "mark_run",
+        lambda _seen, **kwargs: marked.update(kwargs) or True,
+    )
+    job = jm.Job(title="new releases")
+
+    flows.scan_new_releases(job, "tok")
+
+    assert marked["complete"] is False
+    assert marked["baseline_limit"] is None
+    assert "3 artists couldn't be checked" in job.summary
+    assert "Recorded a fresh baseline" not in job.summary
+
+
+def test_new_release_scan_reports_state_save_failure(tmp_path, monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.web import flows
+
+    artist = tmp_path / "Artist"
+    artist.mkdir()
+    monkeypatch.setattr(flows, "list_library_artists", lambda: [artist])
+    monkeypatch.setattr(
+        flows,
+        "find_new_releases_for_artist",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            artist_id="artist-id",
+            fetch_failed=False,
+            current_ids=["album"],
+            new_gaps=[],
+            artist_name="Artist",
+        ),
+    )
+    monkeypatch.setattr(flows.new_releases_mod, "load", lambda: {
+        "seen": {"artist-id": []},
+        "baseline_limit": int(cfg.ARTIST_CATALOG_LIMIT),
+    })
+    monkeypatch.setattr(flows.new_releases_mod, "mark_run", lambda *_a, **_k: False)
+    job = jm.Job(title="new releases")
+
+    flows.scan_new_releases(job, "tok")
+
+    assert "couldn't be saved" in job.summary
+
 def test_incomplete_baseline_scan_summary_reports_unchecked_artists(
         tmp_path, monkeypatch):
     from qobuz_librarian import config as cfg

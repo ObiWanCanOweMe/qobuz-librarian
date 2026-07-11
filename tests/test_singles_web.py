@@ -8,6 +8,15 @@ from qobuz_librarian.library import hidden
 from qobuz_librarian.web import jobs as jm
 
 
+def _owned_path(root, path):
+    """Filesystem identity record written after a single-track import."""
+    from qobuz_librarian.web.app import _bind_owned_path
+
+    owned = _bind_owned_path(root, path)
+    assert owned is not None
+    return owned
+
+
 @pytest.fixture
 def fresh_singles(tmp_path, monkeypatch):
     from qobuz_librarian import config as cfg
@@ -103,6 +112,8 @@ def test_undo_removes_the_grabbed_track_and_clears_the_mark(client, monkeypatch,
     d.mkdir(parents=True)
     f = d / "03 - Black Eye.flac"
     f.write_bytes(b"flac")
+    cover = d / "cover.jpg"
+    cover.write_bytes(b"older artwork")
     hidden.mark_single("Allie X", "Girl With No Face", "2024", "alb1")
     refresh_calls = []
 
@@ -111,7 +122,8 @@ def test_undo_removes_the_grabbed_track_and_clears_the_mark(client, monkeypatch,
     job.single = {"album_id": "alb1", "track_id": "trk7", "dir": str(d),
                   "isrc": "ISRC1", "track_no": 3, "title": "Black Eye",
                   "artist": "Allie X", "album": "Girl With No Face",
-                  "marked": True, "new_folder": False}
+                  "marked": True, "new_folder": True,
+                  "owned_path": _owned_path(d, f)}
     jm.registry.add(job)
     monkeypatch.setattr(app_mod, "_get_optional_token", lambda: "tok")
     monkeypatch.setattr(
@@ -126,6 +138,8 @@ def test_undo_removes_the_grabbed_track_and_clears_the_mark(client, monkeypatch,
         r = client.post(f"/jobs/{job.id}/undo", follow_redirects=False)
         assert r.status_code in (200, 303)
         assert not f.exists()  # the grabbed track is gone
+        assert cover.read_bytes() == b"older artwork"
+        assert d.is_dir()
         assert hidden.is_single("Allie X", "Girl With No Face", hidden.load()) is False
         assert job.single.get("removed") is True
         assert len(refresh_calls) == 1
@@ -137,6 +151,49 @@ def test_undo_removes_the_grabbed_track_and_clears_the_mark(client, monkeypatch,
         assert kwargs["token"] == "tok"
         assert kwargs["upgrade"] is True
         assert kwargs["downsample"] is True
+    finally:
+        _remove_job(job)
+
+
+def test_undo_refuses_a_replacement_when_the_inode_is_reused(
+        client, monkeypatch, fresh_singles, tmp_path):
+    import qobuz_librarian.integrations.beets as beets_mod
+
+    d = tmp_path / "Artist" / "Album"
+    d.mkdir(parents=True)
+    track = d / "01 - Track.flac"
+    track.write_bytes(b"downloaded copy")
+    owned = _owned_path(d, track)
+
+    track.unlink()
+    replacement = b"my curated replacement audio"
+    track.write_bytes(replacement)
+    replacement_stat = track.stat()
+    # Model the normal delete-then-create case where the filesystem recycles
+    # the old inode. The rest of the original fingerprint must still expose
+    # that these are different bytes.
+    owned["file"]["device"] = replacement_stat.st_dev
+    owned["file"]["inode"] = replacement_stat.st_ino
+
+    job = jm.Job(title="Track", artist="Artist", album_id="album")
+    job.status = jm.JobStatus.DONE
+    job.single = {
+        "dir": str(d), "track_id": "track", "title": "Track",
+        "artist": "Artist", "album": "Album", "marked": False,
+        "owned_path": owned,
+    }
+    jm.registry.add(job)
+    forgotten = []
+    monkeypatch.setattr(
+        beets_mod, "forget_beets_entries",
+        lambda paths: forgotten.extend(paths),
+    )
+    try:
+        response = client.post(f"/jobs/{job.id}/undo", follow_redirects=False)
+        assert response.status_code in (200, 303)
+        assert track.read_bytes() == replacement
+        assert not job.single.get("removed")
+        assert forgotten == []
     finally:
         _remove_job(job)
 
@@ -175,12 +232,55 @@ def test_undo_already_gone_clears_single_mark_and_refreshes_state(
         _remove_job(job)
 
 
-def test_undo_keeps_multidisc_album_dir_with_audio_in_disc_subdirs(
+def test_undo_finishes_when_the_bound_track_is_already_gone(
         client, monkeypatch, fresh_singles, tmp_path):
-    # The grab files a track into a beets multi-disc layout ($album/Disc N/...).
-    # Undo removes the grabbed track but must NOT rmtree the whole album when
-    # other tracks still live in 'Disc N/' subdirs — the old shallow .flac check
-    # at the album root saw none and deleted everything.
+    import qobuz_librarian.integrations.beets as beets_mod
+    import qobuz_librarian.web.app as app_mod
+    import qobuz_librarian.web.flows as flows_mod
+
+    d = tmp_path / "Allie X" / "Girl With No Face (2024)"
+    d.mkdir(parents=True)
+    track = d / "03 - Black Eye.flac"
+    track.write_bytes(b"downloaded copy")
+    owned = _owned_path(d, track)
+    track.unlink()
+    hidden.mark_single("Allie X", "Girl With No Face", "2024", "alb1")
+    refresh_calls = []
+    forgotten = []
+
+    job = jm.Job(title="Black Eye", artist="Allie X", album_id="alb1")
+    job.status = jm.JobStatus.DONE
+    job.single = {
+        "album_id": "alb1", "track_id": "trk7", "dir": str(d),
+        "title": "Black Eye", "artist": "Allie X",
+        "album": "Girl With No Face", "marked": True,
+        "owned_path": owned,
+    }
+    jm.registry.add(job)
+    monkeypatch.setattr(app_mod, "_get_optional_token", lambda: "tok")
+    monkeypatch.setattr(
+        flows_mod,
+        "_refresh_after_local_album_change",
+        lambda *args, **kwargs: refresh_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        beets_mod, "forget_beets_entries",
+        lambda paths: forgotten.extend(paths),
+    )
+    try:
+        response = client.post(f"/jobs/{job.id}/undo", follow_redirects=False)
+        assert response.status_code in (200, 303)
+        assert hidden.is_single("Allie X", "Girl With No Face", hidden.load()) is False
+        assert job.single.get("removed") is True
+        assert "already gone" in job.summary
+        assert len(refresh_calls) == 1
+        assert forgotten == []
+    finally:
+        _remove_job(job)
+
+
+def test_undo_refuses_a_replaced_parent_symlink(
+        client, monkeypatch, fresh_singles, tmp_path):
     import qobuz_librarian.integrations.beets as beets_mod
     import qobuz_librarian.library.scanner as scanner_mod
 
@@ -188,27 +288,32 @@ def test_undo_keeps_multidisc_album_dir_with_audio_in_disc_subdirs(
     disc = d / "Disc 1"
     disc.mkdir(parents=True)
     grabbed = disc / "03 - Grabbed.flac"
-    keep = disc / "01 - Keep.flac"
     grabbed.write_bytes(b"flac")
-    keep.write_bytes(b"flac")
+    owned = _owned_path(d, grabbed)
+
+    # Move the recorded directory, then put a symlink at its old name. The leaf
+    # is still the same inode, so checking only the file would delete outside
+    # the album tree; the complete no-follow directory chain must also match.
+    outside = tmp_path / "outside-disc"
+    disc.rename(outside)
+    disc.symlink_to(outside, target_is_directory=True)
 
     job = jm.Job(title="Grabbed", artist="Artist", album_id="alb9")
     job.status = jm.JobStatus.DONE
     job.single = {"album_id": "alb9", "track_id": "trk3", "dir": str(d),
                   "isrc": "ISRCG", "track_no": 3, "title": "Grabbed",
                   "artist": "Artist", "album": "Box Set",
-                  "marked": False, "new_folder": True}
+                  "marked": False, "new_folder": False,
+                  "owned_path": owned}
     jm.registry.add(job)
     monkeypatch.setattr(scanner_mod, "read_album_dir", lambda _d: [
-        {"path": str(grabbed), "isrc": "ISRCG", "track": 3},
-        {"path": str(keep), "isrc": "ISRCK", "track": 1}])
+        {"path": str(disc / grabbed.name), "isrc": "ISRCG", "track": 3}])
     monkeypatch.setattr(beets_mod, "forget_beets_entries", lambda paths: len(paths))
     try:
         r = client.post(f"/jobs/{job.id}/undo", follow_redirects=False)
         assert r.status_code in (200, 303)
-        assert not grabbed.exists()      # grabbed track removed
-        assert keep.exists()             # the other disc track survives
-        assert d.is_dir()                # album NOT rmtree'd
+        assert (outside / grabbed.name).read_bytes() == b"flac"
+        assert not job.single.get("removed")
     finally:
         _remove_job(job)
 
@@ -253,6 +358,9 @@ def test_undo_no_isrc_removes_the_grabbed_disc_not_a_same_numbered_twin(
         queue[0]["n_fail"] = 0
         queue[0]["_resolved_post_dir"] = str(d)
     monkeypatch.setattr(ex_mod, "_execute_download_queue", fake_exec)
+    monkeypatch.setattr(scanner_mod, "read_album_dir", lambda _d: [
+        {"path": str(cd1_twin), "isrc": "", "tracknumber": 3, "discnumber": 1},
+        {"path": str(cd2_grabbed), "isrc": "", "tracknumber": 3, "discnumber": 2}])
 
     jm.start_worker()
     r = client.post("/download", data={"album_id": "albx", "track_id": "cd2t3"},
@@ -264,10 +372,8 @@ def test_undo_no_isrc_removes_the_grabbed_disc_not_a_same_numbered_twin(
         assert _wait_for(lambda: job.status in (jm.JobStatus.DONE, jm.JobStatus.FAILED))
         assert job.status == jm.JobStatus.DONE
         assert job.single.get("disc_no") == 2
+        assert job.single.get("owned_path")
 
-        monkeypatch.setattr(scanner_mod, "read_album_dir", lambda _d: [
-            {"path": str(cd1_twin), "isrc": "", "tracknumber": 3, "discnumber": 1},
-            {"path": str(cd2_grabbed), "isrc": "", "tracknumber": 3, "discnumber": 2}])
         monkeypatch.setattr(beets_mod, "forget_beets_entries", lambda paths: len(paths))
         client.post(f"/jobs/{job.id}/undo", follow_redirects=False)
         assert not cd2_grabbed.exists()

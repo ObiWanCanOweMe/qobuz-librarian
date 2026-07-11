@@ -78,7 +78,7 @@ def run_library_lyrics(*, dry_run=False, rescan=False, synced_only=False,
     # tracks that actually need them — and its progress count reflects real
     # work instead of ticking through thousands of already-lyriced files. A
     # full rescan re-fetches everything anyway, so it skips this.
-    if not rescan:
+    if not rescan and not dry_run:
         report_progress("Scanning library lyrics", 0, total, "")
         lyric_fetch.index_existing(
             items, state_path=cfg.LYRIC_FETCH_STATE_FILE, log=log,

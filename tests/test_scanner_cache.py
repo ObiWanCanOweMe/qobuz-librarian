@@ -1,3 +1,6 @@
+from pathlib import Path
+
+import pytest
 
 
 def test_census_buckets_tiers_and_reclaims_only_true_hires(tmp_path, monkeypatch):
@@ -51,7 +54,22 @@ def test_walk_error_does_not_cache_dir_as_audioless(tmp_path, monkeypatch):
         return real_walk(root, followlinks=followlinks, onerror=onerror)
 
     monkeypatch.setattr(scanner.os, "walk", flaky_walk)
-    # The degraded walk answers False for this call but must not poison the cache.
-    assert scanner._has_audio_anywhere(tmp_path) is False
-    # The next walk succeeds and must see the audio again.
-    assert scanner._has_audio_anywhere(tmp_path) is True
+    with pytest.raises(OSError, match="transient EIO"):
+        scanner.list_artist_album_dirs(tmp_path)
+    # The failure must not poison the cache; the next complete listing sees it.
+    assert scanner.list_artist_album_dirs(tmp_path) == [tmp_path / "Album"]
+
+
+def test_album_listing_root_error_is_not_an_empty_artist(tmp_path, monkeypatch):
+    from qobuz_librarian.library import scanner
+
+    real_iterdir = Path.iterdir
+
+    def unreadable(path):
+        if path == tmp_path:
+            raise OSError("artist root EIO")
+        return real_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", unreadable)
+    with pytest.raises(OSError, match="artist root EIO"):
+        scanner.list_artist_album_dirs(tmp_path)

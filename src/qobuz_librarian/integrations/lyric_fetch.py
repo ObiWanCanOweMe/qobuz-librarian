@@ -27,7 +27,7 @@ import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
@@ -340,6 +340,39 @@ def get_existing_lyrics(f, path=None, include_sidecar=False) -> Optional[str]:
     return None
 
 
+def _replace_durably(tmp: Path, target: Path) -> None:
+    from qobuz_librarian.library.backup import _fsync
+
+    if not _fsync(tmp):
+        raise OSError(
+            f"{target.name}: replacement couldn't be flushed to disk; "
+            "original left untouched")
+    os.replace(str(tmp), str(target))
+    if not _fsync(target.parent):
+        raise OSError(
+            f"{target.name}: replacement completed, but the folder couldn't "
+            "be flushed to disk; the change may not survive a power loss")
+
+
+def save_flac_tags(f, path: Path) -> None:
+    """Save changed FLAC tags through a durable same-directory replacement."""
+    path = Path(path)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        shutil.copy2(str(path), str(tmp))
+        f.save(str(tmp))
+        _replace_durably(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def write_lyrics(f, content: str) -> None:
     # Vorbis comments are case-insensitive in mutagen, so assigning
     # "lyrics" already replaces any existing lyrics/LYRICS value — and
@@ -351,40 +384,24 @@ def write_lyrics(f, content: str) -> None:
     if "unsyncedlyrics" in f.tags:
         del f.tags["unsyncedlyrics"]
     f.tags["lyrics"] = [content]
-    # mutagen rewrites the metadata in place and shifts the audio frames when
-    # the comment block outgrows the padding, so a crash mid-save can corrupt
-    # the only copy. Save into a same-dir temp copy and swap it in atomically:
-    # the original stays whole until the new file is complete.
-    path = Path(f.filename)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".",
-                               suffix=".tmp")
-    os.close(fd)
-    try:
-        shutil.copy2(str(path), tmp)
-        f.save(tmp)
-        os.replace(tmp, str(path))
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    save_flac_tags(f, Path(f.filename))
 
 
-def write_sidecar(path: Path, content: str) -> None:
+def write_sidecar(path: Path, content: str) -> bool:
     """Write lyrics to a .lrc file next to the track (UTF-8).
 
     Never downgrades a user's sidecar: if a non-empty .lrc already exists and is
     SYNCED while the new content is not, keep the existing one. Combined with
     get_existing_lyrics consulting the sidecar (so synced sidecars short-circuit
     before any fetch), this stops a provider's plain lyrics from overwriting a
-    hand-synced .lrc."""
+    hand-synced .lrc. Return True when a sidecar was written and False when the
+    better existing file was kept."""
     target = path.with_suffix(".lrc")
     try:
         if target.is_file():
             old = target.read_text(encoding="utf-8", errors="replace")
             if old.strip() and classify(old) == "synced" and classify(content) != "synced":
-                return
+                return False
     except OSError:
         pass
     fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=target.name + ".",
@@ -392,7 +409,8 @@ def write_sidecar(path: Path, content: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(content)
-        os.replace(tmp, str(target))
+        _replace_durably(Path(tmp), target)
+        return True
     except BaseException:
         try:
             os.unlink(tmp)
@@ -617,10 +635,16 @@ def process_file(
 ) -> str:
     key = str(path)
     st  = state.get(key) or TrackState()
-    # TrackState is mutated below; if `key` was already present we'd be
-    # mutating the same instance another worker (re-)scheduled would see.
-    # Each path is owned by exactly one worker, so this is safe: only
-    # commits to the shared dict are serialised (via _state_lock).
+    # A preview must not change the loaded state, including by mutating an
+    # existing TrackState in place. Work on a detached copy and make each
+    # commit below a no-op; fetch_for_paths also skips every disk checkpoint.
+    if dry_run:
+        st = replace(st)
+
+        def commit(*_args, **_kwargs):
+            return None
+    else:
+        commit = _commit
 
     try:
         f = FLAC(path)
@@ -628,7 +652,7 @@ def process_file(
         log.error("FLAC open failed: %s — %s", path, e)
         st.status = "error"
         st.last_seen = time.time()
-        _commit(state, key, st)
+        commit(state, key, st)
         return "error"
 
     stat = path.stat()
@@ -640,7 +664,7 @@ def process_file(
         st.status = "skipped"
         st.source = "long-track"
         st.last_seen = time.time()
-        _commit(state, key, st)
+        commit(state, key, st)
         return "skipped-long"
 
     existing      = get_existing_lyrics(
@@ -651,7 +675,7 @@ def process_file(
     if existing_kind == "synced":
         st.status = "synced"
         st.last_seen = time.time()
-        _commit(state, key, st)
+        commit(state, key, st)
         return "already-synced"
 
     if existing_kind == "plain" and skip_existing_plain:
@@ -659,7 +683,7 @@ def process_file(
         # the upgrade pass. Refresh state so should_process keeps skipping it.
         st.status = "plain"
         st.last_seen = time.time()
-        _commit(state, key, st)
+        commit(state, key, st)
         return "already-plain"
 
     query = build_query(f)
@@ -667,7 +691,7 @@ def process_file(
         st.status = "skipped"
         st.source = "missing-tags"
         st.last_seen = time.time()
-        _commit(state, key, st)
+        commit(state, key, st)
         return "skipped-tags"
 
     # If the file already has plain lyrics, the plain-fallback pass is pure
@@ -689,7 +713,7 @@ def process_file(
             # should_process re-checks on the next run.
             st.status = "transient"
             st.source = "providers-unavailable"
-            _commit(state, key, st)
+            commit(state, key, st)
             return "providers-unavailable"
         if existing_kind == "plain":
             # No synced available, but the file already has plain lyrics.
@@ -697,11 +721,11 @@ def process_file(
             # keep trying to upgrade.
             st.status = "plain"
             st.source = "kept-existing"
-            _commit(state, key, st)
+            commit(state, key, st)
             return "kept-existing-plain"
         st.status = "not_found"
         st.source = ""
-        _commit(state, key, st)
+        commit(state, key, st)
         return "not-found"
 
     if kind == "synced":
@@ -711,13 +735,13 @@ def process_file(
     else:
         st.status = "plain"
         st.source = "kept-existing"
-        _commit(state, key, st)
+        commit(state, key, st)
         return "kept-existing-plain"
 
     if dry_run:
         st.status = kind
         st.source = f"{source} (dry-run)"
-        _commit(state, key, st)
+        commit(state, key, st)
         return f"dry:{action}"
 
     try:
@@ -725,7 +749,7 @@ def process_file(
     except Exception as e:
         log.error("write failed: %s — %s", path, e)
         st.status = "error"
-        _commit(state, key, st)
+        commit(state, key, st)
         return "write-error"
 
     st.status = kind
@@ -733,7 +757,7 @@ def process_file(
     stat = path.stat()
     st.mtime = stat.st_mtime
     st.size = stat.st_size
-    _commit(state, key, st)
+    commit(state, key, st)
     return action
 
 
@@ -785,7 +809,8 @@ def fetch_for_paths(
     # update_state so the prune's read and write happen under one cross-process
     # lock — a plain load→save here would clobber entries a concurrent process
     # added in between.
-    update_state(prune_missing, state_path)
+    if not dry_run:
+        update_state(prune_missing, state_path)
     state = load_state(state_path)
     candidates = [Path(p) for p in paths
                   if should_process(Path(p), state.get(str(p)), rescan,
@@ -811,6 +836,8 @@ def fetch_for_paths(
         return outcome
 
     def checkpoint() -> None:
+        if dry_run:
+            return
         try:
             with _state_lock:
                 # Merge into the on-disk state under the cross-process lock so a

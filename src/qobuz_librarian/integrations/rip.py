@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from qobuz_librarian import config as cfg
+from qobuz_librarian.library.scanner import iter_tree_no_symlinks
 from qobuz_librarian.ui_cli.colors import C, fmt
 from qobuz_librarian.ui_cli.logging import log, vlog, wrap_thread_target
 
@@ -439,8 +440,8 @@ def files_added_since(prior_snapshot):
 
 def cleanup_lossy(new_files):
     """Sort freshly-downloaded audio into (kept, lossy, broken), deleting both
-    kinds of reject from staging. Returns the file stems for the two reject
-    buckets so the caller can tell them apart:
+    kinds of reject from staging. Returns Paths for all three buckets so the
+    caller can retain enough identity to retry the exact rejected track:
 
       lossy   — a non-FLAC file (.mp3/.m4a/…). Qobuz served lossy because no
                 lossless master is available for the user's tier; another
@@ -465,7 +466,7 @@ def cleanup_lossy(new_files):
         # imported by beets (move: yes, autotag: no) — the exact lossy/truncated
         # file this discard exists to keep out — so when the unlink fails, move
         # it out of the import tree rather than leaving it to be picked up.
-        bucket.append(f.stem)
+        bucket.append(f)
         try:
             f.unlink()
         except OSError as e:
@@ -527,17 +528,24 @@ def _dir_is_all_residue(d):
 
 
 def _dir_has_audio(d):
-    """True if any audio file exists anywhere under d.
+    """True if audio exists, False if none does, or None if the walk failed.
 
     Used to spare a real leftover album's art/metadata from the residue
     sweep — a cover.jpg beside the tracks is not an orphaned stray.
     """
+    walk_errors = []
     try:
-        for child in d.rglob("*"):
-            if child.is_file() and child.suffix.lower() in cfg.AUDIO_EXTS:
-                return True
-    except OSError:
-        return False
+        for child in iter_tree_no_symlinks(d, errors=walk_errors):
+            try:
+                if child.is_file() and child.suffix.lower() in cfg.AUDIO_EXTS:
+                    return True
+            except OSError as e:
+                walk_errors.append(f"{child}: {e}")
+    except OSError as e:
+        walk_errors.append(f"{d}: {e}")
+    if walk_errors:
+        vlog(f"residue scan kept {d}: couldn't verify it contains no audio")
+        return None
     return False
 
 
@@ -596,7 +604,7 @@ def cleanup_staging_residue():
                 # under ARTWORK=sidecar. Spare any residue whose album root still
                 # holds audio; files directly in STAGING_DIR have no album, so
                 # they're always orphans.
-                if _album_root_has_audio(p):
+                if _album_root_has_audio(p) is not False:
                     continue
                 p.unlink()
                 removed += 1
@@ -604,7 +612,7 @@ def cleanup_staging_residue():
             elif p.is_dir() and p.name.lower() in _RESIDUE_NAMES:
                 # An artwork/cover dir inside a real leftover album is that
                 # album's art, not a stray — spare it like the nested-file case.
-                if _album_root_has_audio(p):
+                if _album_root_has_audio(p) is not False:
                     continue
                 if not _dir_is_all_residue(p):
                     vlog(f"residue dir kept (contains non-residue files): "

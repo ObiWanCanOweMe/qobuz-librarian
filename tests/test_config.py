@@ -44,6 +44,15 @@ def test_env_unit_float_clamps_out_of_range_thresholds(monkeypatch):
     assert cfg._env_unit_float("CONSOLIDATE_THRESH", 0.70) == 0.70
 
 
+def test_numeric_settings_reject_non_finite_values(monkeypatch):
+    for value in ("nan", "inf", "-inf"):
+        monkeypatch.setenv("QL_WEB_FETCH_TIMEOUT", value)
+        assert cfg._env_num_min("QL_WEB_FETCH_TIMEOUT", 12.0, 1.0) == 12.0
+
+        monkeypatch.setenv("CONSOLIDATE_THRESH", value)
+        assert cfg._env_unit_float("CONSOLIDATE_THRESH", 0.70) == 0.70
+
+
 def test_resolve_secret_reads_token_from_a_file(monkeypatch, tmp_path):
     # Docker-secret style: the token lives in a file, not the environment, so
     # it stays out of `docker inspect`. The trailing newline a file carries must

@@ -4,7 +4,9 @@ import concurrent.futures
 import hashlib
 import html
 import json
+import os
 import shutil
+import stat
 import threading
 import time
 import tomllib
@@ -1414,6 +1416,19 @@ async def dashboard_head():
 _auto_check_lock = threading.RLock()
 
 
+def _begin_direct_library_operation(label):
+    """Atomically gate, register, and lock a request-owned library mutation."""
+    with _auto_check_lock:
+        if _web_writes_paused():
+            return "paused", None, None
+        token = job_mgr.begin_library_operation(label)
+        lock = job_mgr.staging_lock()
+        if not lock.acquire(blocking=False):
+            job_mgr.end_library_operation(token)
+            return "busy", None, None
+        return "ok", token, lock
+
+
 def _existing_new_release_check():
     """An active or awaiting-review new-release check, or None — so a second one
     isn't stacked on top of one already queued or waiting for review."""
@@ -2442,6 +2457,161 @@ def _make_download_run(album, token, *, treat_as_new=False):
     return run
 
 
+def _file_identity(st) -> list[int]:
+    return [int(st.st_dev), int(st.st_ino)]
+
+
+def _owned_file_identity(st) -> dict[str, int]:
+    # Inodes can be recycled after a file is replaced. Keep enough of the
+    # original stat record to distinguish that replacement without rereading a
+    # potentially large audio file merely to offer Undo.
+    return {
+        "device": int(st.st_dev),
+        "inode": int(st.st_ino),
+        "size": int(st.st_size),
+        "modified_ns": int(st.st_mtime_ns),
+        "changed_ns": int(st.st_ctime_ns),
+    }
+
+
+def _open_directory_nofollow(path, *, dir_fd=None):
+    """Open one real directory without following a symlink."""
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
+        raise OSError("safe no-follow directory access is unavailable")
+    flags = os.O_RDONLY | nofollow | directory | getattr(os, "O_CLOEXEC", 0)
+    return os.open(path, flags, dir_fd=dir_fd)
+
+
+def _owned_relative(root: Path, path: Path):
+    root = Path(os.path.abspath(os.fspath(root)))
+    path = Path(os.path.abspath(os.fspath(path)))
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return root, None
+    if not rel.parts or any(part in ("", ".", "..") for part in rel.parts):
+        return root, None
+    return root, rel
+
+
+def _bind_owned_path(root, path):
+    """Capture an exact file and every directory identity leading to it."""
+    root, rel = _owned_relative(Path(root), Path(path))
+    if rel is None:
+        return None
+    opened = []
+    try:
+        current = _open_directory_nofollow(root)
+        opened.append(current)
+        directories = [_file_identity(os.fstat(current))]
+        for part in rel.parts[:-1]:
+            current = _open_directory_nofollow(part, dir_fd=current)
+            opened.append(current)
+            directories.append(_file_identity(os.fstat(current)))
+        leaf = os.stat(rel.parts[-1], dir_fd=current, follow_symlinks=False)
+        if not stat.S_ISREG(leaf.st_mode):
+            return None
+        return {
+            "relative": rel.as_posix(),
+            "directories": directories,
+            "file": _owned_file_identity(leaf),
+        }
+    except (OSError, TypeError, ValueError):
+        return None
+    finally:
+        for fd in reversed(opened):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+_OWNED_PATH_MISSING = object()
+
+
+def _unlink_owned_path(root, owned):
+    """Unlink a bound file only while its complete no-follow chain matches.
+
+    A missing path is distinct from a path whose ownership cannot be proved so
+    Undo can finish an already-completed deletion without weakening refusal of
+    replacements or changed files.
+    """
+    if not isinstance(owned, dict):
+        return None
+    relative = owned.get("relative")
+    directories = owned.get("directories")
+    file_identity = owned.get("file")
+    if not isinstance(relative, str) or not isinstance(directories, list):
+        return None
+    root, rel = _owned_relative(Path(root), Path(root) / relative)
+    if rel is None or len(directories) != len(rel.parts):
+        return None
+    if not isinstance(file_identity, dict):
+        return None
+
+    opened = []
+    try:
+        current = _open_directory_nofollow(root)
+        opened.append(current)
+        if _file_identity(os.fstat(current)) != directories[0]:
+            return None
+        for index, part in enumerate(rel.parts[:-1], 1):
+            current = _open_directory_nofollow(part, dir_fd=current)
+            opened.append(current)
+            if _file_identity(os.fstat(current)) != directories[index]:
+                return None
+        leaf = os.stat(rel.parts[-1], dir_fd=current, follow_symlinks=False)
+        if (not stat.S_ISREG(leaf.st_mode)
+                or _owned_file_identity(leaf) != file_identity):
+            return None
+        os.unlink(rel.parts[-1], dir_fd=current)
+        return root / rel
+    except FileNotFoundError:
+        return _OWNED_PATH_MISSING
+    except (OSError, TypeError, ValueError):
+        return None
+    finally:
+        for fd in reversed(opened):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _single_owned_path(album_dir, track):
+    """Bind the unique imported track that matches this single request."""
+    if not album_dir:
+        return None
+    from qobuz_librarian.library.scanner import read_album_dir
+
+    root = Path(album_dir)
+    try:
+        tracks = read_album_dir(root)
+    except OSError:
+        return None
+    want = (track.get("isrc") or "").replace("-", "").upper().strip()
+    track_no = track.get("track_number")
+    disc_no = track.get("media_number") or 1
+    if want:
+        matches = [
+            item for item in tracks
+            if (item.get("isrc") or "").replace("-", "").upper().strip() == want
+        ]
+    elif track_no is not None:
+        matches = [
+            item for item in tracks
+            if item.get("tracknumber") == track_no
+            and (item.get("discnumber") or 1) == disc_no
+        ]
+    else:
+        matches = []
+    if len(matches) != 1 or not matches[0].get("path"):
+        return None
+    return _bind_owned_path(root, Path(matches[0]["path"]))
+
+
 def _make_single_track_run(album, track, token):
     """Run a single-track download: download just ``track`` via the per-track
     queue path (the same isolation repair uses — never a whole-album rip)."""
@@ -2526,26 +2696,35 @@ def _make_single_track_run(album, track, token):
             # Complete means any parked Gap Fill candidate for it is stale.
             from qobuz_librarian.web.flows import prune_library_review_candidates
             prune_library_review_candidates(album)
+        landed_dir = qi.get("_resolved_post_dir") or album_dir
         _refresh_after_local_album_change(
             album,
-            {"dir": qi.get("_resolved_post_dir") or album_dir},
+            {"dir": landed_dir},
             fallback_artist=artist,
             token=token,
             args=args,
             upgrade=True,
             downsample=True,
         )
-        # Record which track was added so /undo can cleanly reverse it.
-        j.single = {
+        # Bind the imported audio to its exact file and directory identities.
+        # Undo is deliberately unavailable if that proof cannot be made: track
+        # tags and folder names can collide, and are not ownership evidence.
+        owned_path = _single_owned_path(landed_dir, track)
+        single = {
             "album_id": str(album.get("id") or ""),
             "track_id": str(track.get("id") or ""),
-            "dir": qi.get("_resolved_post_dir") or (str(album_dir) if album_dir else ""),
+            "dir": str(landed_dir) if landed_dir else "",
             "isrc": track.get("isrc") or "",
             "track_no": track.get("track_number"),
             "disc_no": track.get("media_number") or 1,
             "title": t_title, "artist": artist, "album": title,
             "marked": marked, "new_folder": album_dir is None,
         }
+        if owned_path is not None:
+            single["owned_path"] = owned_path
+        else:
+            j.summary += " Undo isn't available because the downloaded file couldn't be verified."
+        j.single = single
     return run
 
 
@@ -3871,7 +4050,7 @@ def _get_reviewable_job(job_id):
     return job
 
 
-def _selection_payload(job):
+def _selection_payload(job, *, persist_failed=False):
     """JSON the selection/hide endpoints return so every open tab can refresh
     its counts from the server instead of recounting a partial DOM."""
     from qobuz_librarian.ui_cli.colors import format_size
@@ -3883,6 +4062,8 @@ def _selection_payload(job):
         "reclaimable": c["reclaimable"],
         "reclaimable_label": format_size(c["reclaimable"]) if c["reclaimable"] else "",
     }
+    if persist_failed:
+        payload["persist_failed"] = True
     if job.execute_kind == "library":
         totals = _review_tab_totals(job)
         payload["missing_total"] = totals["missing"]
@@ -3932,14 +4113,15 @@ async def job_select(request: Request, job_id: str):
 
 @app.post("/jobs/{job_id}/select-all")
 async def job_select_all(request: Request, job_id: str):
-    """Bulk select/deselect. scope=all flips every candidate across all pages;
-    scope=page flips only the cids posted (the visible page)."""
+    """Bulk select/deselect across the whole view, one page, or one artist."""
     job = _get_reviewable_job(job_id)
     if not job or job.execute_kind not in _SELECTABLE_KINDS:
         return JSONResponse({"error": "not found"}, status_code=404)
     form = await request.form()
     on = (form.get("on") or "").strip().lower() in ("1", "true", "on", "yes")
     scope = (form.get("scope") or "all").strip().lower()
+    if scope not in ("all", "page", "artist"):
+        return JSONResponse({"error": "invalid scope"}, status_code=400)
     cids = form.getlist("cid")[:100000] if scope == "page" else None
     # Tab and filter scoping: on a library review, select-all flips only the
     # active tab's candidates — never the tab the user can't see. And with a
@@ -3947,19 +4129,53 @@ async def job_select_all(request: Request, job_id: str):
     # thousand rows invisibly would overwrite every saved tick on the tab.
     tab = (form.get("tab") or "").strip()
     q = (form.get("q") or "").strip().lower()
+    artist = (form.get("artist") or "").strip()
+    page_artists = set(form.getlist("artist")[:REVIEW_PAGE_ARTISTS])
     tab_scoped = (job.execute_kind == "library" and tab in ("missing", "gaps"))
-    if cids is None and (tab_scoped or q):
+    if (scope == "artist" or (scope == "page" and page_artists)
+            or (cids is None and (tab_scoped or q))):
         from qobuz_librarian.web import flows
         gap_active = tab == "gaps"
         with job._lock:
             cids = [c["cid"] for c in job.candidates
-                    if (not tab_scoped
-                        or flows.is_gap_candidate(c) == gap_active)
+                    if (scope != "artist" or (c.get("artist") or "") == artist)
+                    and (scope != "page"
+                         or not page_artists
+                         or (c.get("artist") or "") in page_artists)
+                    and (not tab_scoped
+                         or flows.is_gap_candidate(c) == gap_active)
                     and (not q or flows.candidate_matches_query(c, q))]
+    persist_failed = False
     if job.set_all_selected(on, cids=cids):
-        job_mgr.persist_soon(job)
+        # Unlike a single tap, a bulk choice is one infrequent operation whose
+        # success needs to mean its complete result is durable. Waiting for the
+        # off-thread write lets this exact response warn if the data volume
+        # rejected it; a delayed coalesced write could only fail after the page
+        # had already claimed success.
+        from qobuz_librarian.web import job_persistence
+        loop = asyncio.get_running_loop()
+        saved = await loop.run_in_executor(
+            None, lambda: job_persistence.persist(job))
+        persist_failed = not saved
         job.notify_review_changed(_review_origin(request))
-    return JSONResponse(_selection_payload(job))
+    return JSONResponse(
+        _selection_payload(job, persist_failed=persist_failed))
+
+
+@app.get("/jobs/{job_id}/review-group-items", response_class=HTMLResponse)
+async def job_review_group_items(request: Request, job_id: str,
+                                 artist: str = "", tab: str = "", q: str = ""):
+    """Render one artist's current rows when a collapsed group is opened."""
+    job = _get_reviewable_job(job_id)
+    if not job or job.execute_kind not in _SELECTABLE_KINDS:
+        return HTMLResponse("", status_code=404)
+    if job.execute_kind != "library" or tab not in ("missing", "gaps"):
+        tab = ""
+    groups = _review_artist_groups(job, query=q, tab=tab)
+    items = next((rows for name, rows in groups if name == artist), [])
+    return _tr(request, "_review_group_items.html", {
+        "job": job, "items": items, "review_tab": tab,
+    })
 
 
 @app.post("/jobs/{job_id}/hide", response_class=HTMLResponse)
@@ -4205,9 +4421,7 @@ async def job_retry(request: Request, job_id: str):
 
 @app.post("/jobs/{job_id}/undo")
 async def job_undo(request: Request, job_id: str):
-    """Reverse a single-track download: delete the track it added, drop the beets row
-    for it, undo the single mark, and remove a folder the download created if it's
-    now empty. Works from the archive too — the single payload is persisted."""
+    """Reverse a single-track download whose exact owned path is still bound."""
     # Undo deletes files and touches the beets DB, so it needs the same run-lock
     # gate every other mutating route has — the in-process staging lock below
     # can't keep it off the library while a CLI session or another instance
@@ -4262,72 +4476,28 @@ async def job_undo(request: Request, job_id: str):
 
         from qobuz_librarian.integrations.beets import forget_beets_entries
         from qobuz_librarian.library import hidden as hidden_mod
-        from qobuz_librarian.library.scanner import read_album_dir
         d = Path(info["dir"])
-        want = (info.get("isrc") or "").replace("-", "").upper().strip()
-        track_no = info.get("track_no")
-        disc_no = info.get("disc_no")
-        removed = None
-        try:
-            tracks = read_album_dir(d)
-            if want:
-                target = next(
-                    (et for et in tracks
-                     if (et.get("isrc") or "").replace("-", "").upper().strip() == want),
-                    None)
-            elif track_no is not None:
-                # No ISRC to match on: fall back to the track number. A multi-disc
-                # album can carry that same per-disc number on another disc, so
-                # require the recorded disc to match — undo must remove the track
-                # the download added, never its twin. A record from before the disc
-                # was captured only deletes when the number is unique in the folder.
-                numbered = [et for et in tracks
-                            if et.get("tracknumber") == track_no]
-                if disc_no is not None:
-                    target = next(
-                        (et for et in numbered
-                         if (et.get("discnumber") or 1) == disc_no), None)
-                else:
-                    target = numbered[0] if len(numbered) == 1 else None
-            else:
-                target = None
-            if target is not None:
-                p = Path(target.get("path") or "")
-                if p.exists():
-                    p.unlink()
-                    removed = p
-        except OSError:
-            pass
-        if removed is not None:
+        removed = _unlink_owned_path(d, info.get("owned_path"))
+        if removed is not None and removed is not _OWNED_PATH_MISSING:
             forget_beets_entries([removed])
             if info.get("marked"):
                 hidden_mod.unmark_single(info.get("artist") or "", info.get("album") or "")
-        # If the download created a brand-new folder and it now holds no audio, take
-        # it back out so a one-off sample doesn't leave an empty album dir behind.
-        try:
-            if (info.get("new_folder") and d.is_dir()
-                    and not any(x.is_file()
-                                and x.suffix.lower() in cfg.AUDIO_EXTS
-                                for x in d.rglob("*"))):
-                import shutil
-                shutil.rmtree(d, ignore_errors=True)
-        except OSError:
-            pass
-        # Return the Path actually deleted (or None when nothing matched) so the
-        # caller can tell a real removal from a no-match — `removed is not None`
-        # would collapse to a bool and make the not-found branch dead code,
-        # reporting false success and burning the one-shot.
         return removed
 
-    # The removal works under the staging mutex. Acquire it non-blocking: the
-    # undo runs from a DONE job page that can't show progress, so blocking here
-    # would hang the request with no feedback for as long as a library-wide
-    # Lyrics scan or a migration holds the lock — bounce naming the holder
-    # instead, like the backup-restore route. A failed non-blocking acquire
-    # returns instantly, so the event loop is never frozen; the file work
-    # itself still runs in a worker.
-    lock = job_mgr.staging_lock()
-    if not lock.acquire(blocking=False):
+    # Register under the same gate as the CLI handoff before taking the staging
+    # mutex. The handoff then either pauses this request before it starts or sees
+    # the active mutation and keeps the cross-process run lock held.
+    loop = asyncio.get_running_loop()
+    state, operation_token, lock = await loop.run_in_executor(
+        None, lambda: _begin_direct_library_operation("Undo"))
+    if state == "paused":
+        paused = _lock_busy_response(request)
+        if paused is not None:
+            return paused
+        return _tr(request, "lock_busy.html", {
+            "msg": "Library writes were paused before Undo could start."
+        }, status_code=503)
+    if state == "busy":
         holder = job_mgr.staging_holder()
         msg = (f"{holder} is using the library right now — try Undo again "
                "when it finishes." if holder else
@@ -4338,39 +4508,49 @@ async def job_undo(request: Request, job_id: str):
                 f'<div id="job-content">'
                 f'{_ql_notice_html("warning", html.escape(msg))}</div>')
         return _tr(request, "lock_busy.html", {"msg": msg}, status_code=503)
-    loop = asyncio.get_running_loop()
+    lock_held = True
     try:
-        removed = await loop.run_in_executor(None, _reverse)
-    finally:
-        lock.release()
-    if removed is not None:
-        await loop.run_in_executor(None, _refresh_after_undo)
-        job.single = {**info, "removed": True}
-        job.summary = f"Removed “{info.get('title')}” and undid the single."
-    else:
-        # File not found at all (deleted externally) — still burn the one-shot
-        # so Undo doesn't loop, but only when the dir is gone too. If the dir
-        # exists but no track matched (ISRC/track_no mismatch), leave removed
-        # unset so the user can attempt a manual fix and retry.
-        from pathlib import Path as _Path
-        dir_gone = not _Path(info["dir"]).exists()
-        if dir_gone:
-            if info.get("marked"):
-                from qobuz_librarian.library import hidden as hidden_mod
-                hidden_mod.unmark_single(info.get("artist") or "", info.get("album") or "")
+        try:
+            removed = await loop.run_in_executor(None, _reverse)
+        finally:
+            lock.release()
+            lock_held = False
+        if removed is not None and removed is not _OWNED_PATH_MISSING:
             await loop.run_in_executor(None, _refresh_after_undo)
             job.single = {**info, "removed": True}
-            job.summary = f"“{info.get('title')}” was already gone; cleared the single mark."
+            job.summary = f"Removed “{info.get('title')}” and undid the single."
         else:
-            job.summary = (f"Couldn't find “{info.get('title')}” by ISRC/track number. "
-                           "Delete it manually if needed.")
-    # Write the burned one-shot (and summary) back to the archive; without this
-    # a restart resurrects the Undo button for a single that's already gone.
-    from qobuz_librarian.web import job_persistence
-    await loop.run_in_executor(None, lambda: job_persistence.persist(job))
-    if _is_htmx(request):
-        return _tr(request, "_job_body.html", {"job": job})
-    return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
+            # If the whole recorded directory is gone, clearing the single mark
+            # cannot delete anything. Otherwise a changed or unverifiable
+            # binding is left for the user rather than guessed from tags or
+            # filenames.
+            from pathlib import Path as _Path
+            dir_gone = not _Path(info["dir"]).exists()
+            if removed is _OWNED_PATH_MISSING or dir_gone:
+                if info.get("marked"):
+                    from qobuz_librarian.library import hidden as hidden_mod
+                    hidden_mod.unmark_single(
+                        info.get("artist") or "", info.get("album") or "")
+                await loop.run_in_executor(None, _refresh_after_undo)
+                job.single = {**info, "removed": True}
+                job.summary = (f"“{info.get('title')}” was already gone; "
+                               "cleared the single mark.")
+            else:
+                job.summary = (f"Couldn't safely verify the downloaded copy of "
+                               f"“{info.get('title')}”. Nothing was removed; "
+                               "delete it manually if needed.")
+        # Persist while the direct-operation registration still holds the web
+        # run lock; a restart must not resurrect an Undo that already removed a
+        # file or cleared its single mark.
+        from qobuz_librarian.web import job_persistence
+        await loop.run_in_executor(None, lambda: job_persistence.persist(job))
+        if _is_htmx(request):
+            return _tr(request, "_job_body.html", {"job": job})
+        return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
+    finally:
+        if lock_held:
+            lock.release()
+        job_mgr.end_library_operation(operation_token)
 
 
 @app.post("/jobs/{job_id}/cancel")
@@ -4869,8 +5049,11 @@ async def set_mode(request: Request, target: str = Form("")):
                 # against is the CLI and a running worker sharing /staging. A
                 # parked review has no worker and can sit for weeks; refusing on
                 # it would make terminal mode unreachable.
-                if any(j.status != job_mgr.JobStatus.AWAITING_REVIEW
-                       for j in job_mgr.registry.pending_and_running()):
+                jobs_active = any(
+                    j.status != job_mgr.JobStatus.AWAITING_REVIEW
+                    for j in job_mgr.registry.pending_and_running()
+                )
+                if jobs_active or job_mgr.active_library_operations():
                     _CLI_MODE = False  # no transfer happened; stay in web mode
                     return False
                 if _RUN_LOCK_HANDLE is not None:
@@ -4885,7 +5068,7 @@ async def set_mode(request: Request, target: str = Form("")):
         loop = asyncio.get_running_loop()
         if not await loop.run_in_executor(None, _handoff):
             return RedirectResponse(url="/settings?error=" + urllib.parse.quote(
-                "Finish or cancel the running job before handing off to the "
+                "Finish or cancel the running library work before handing off to the "
                 "terminal."), status_code=303)
         return RedirectResponse(url="/settings?mode=cli", status_code=303)
     if want == "nolock":
@@ -4978,7 +5161,8 @@ def _diagnostics_fragment(request: Request, checks: list | None = None) -> str:
             f'<input type="hidden" name="_csrf_token" value="{tok}">'
             f'<input type="hidden" name="backup" value="{name}">'
             f'<button type="submit" class="ql-btn ql-btn-sm" '
-            f'data-confirm="Move these files back to {dest}?">Restore</button>'
+            f'data-confirm="Move these files back to {dest}?" '
+            f'data-confirm-action="Restore">Restore</button>'
             f'</form></div></div>'
         )
     try:
@@ -5001,7 +5185,8 @@ def _diagnostics_fragment(request: Request, checks: list | None = None) -> str:
             f'<input type="hidden" name="backup" value="{name}">'
             f'<button type="submit" class="ql-btn ql-btn-sm" '
             f'data-confirm="Put the hi-res originals back at {dest}? '
-            f'This undoes the downsample.">Restore</button>'
+            f'This undoes the downsample." '
+            f'data-confirm-action="Restore">Restore</button>'
             f'</form></div></div>'
         )
     return "\n".join(rows)
@@ -5036,8 +5221,14 @@ def _restore_backup_sync(request: Request, backup: str) -> str:
         return (_ql_notice_html("error", "This backup doesn't record where its "
                                 "files came from; move it back by hand.")
                 + _diagnostics_fragment(request))
-    lock = job_mgr.staging_lock()
-    if not lock.acquire(blocking=False):
+    state, operation_token, lock = _begin_direct_library_operation(
+        "Backup restore")
+    if state == "paused":
+        return (_ql_notice_html(
+                    "warning", "Library writes were paused before Restore "
+                    "could start. Resume the web app, then try again.")
+                + _diagnostics_fragment(request))
+    if state == "busy":
         return (_ql_notice_html("warning", "A job is working in the library "
                                 "right now — try again once it finishes.")
                 + _diagnostics_fragment(request))
@@ -5067,6 +5258,7 @@ def _restore_backup_sync(request: Request, backup: str) -> str:
                         "is untouched; the log has the manual command."))
     finally:
         lock.release()
+        job_mgr.end_library_operation(operation_token)
     return note + _diagnostics_fragment(request)
 
 

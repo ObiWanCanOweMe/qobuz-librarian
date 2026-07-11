@@ -367,6 +367,74 @@ def test_cancel_while_queued_finalizes_and_worker_skips_it():
     assert queued.status == jm.JobStatus.CANCELED
 
 
+def test_pending_cancel_wins_before_the_worker_claims():
+    """A cancel already changing a queued job must finish before the worker
+    can claim and run that same job."""
+    import queue
+    import threading
+
+    cancel_paused = threading.Event()
+    allow_cancel = threading.Event()
+    worker_waiting = threading.Event()
+    ran = threading.Event()
+
+    class PausingJob(jm.Job):
+        @property
+        def cancel_requested(self):
+            return getattr(self, "_cancel_requested", False)
+
+        @cancel_requested.setter
+        def cancel_requested(self, value):
+            if value and threading.current_thread().name == "cancel-race-request":
+                cancel_paused.set()
+                allow_cancel.wait(timeout=5)
+            self._cancel_requested = value
+
+    class TrackedRLock:
+        def __init__(self):
+            self._lock = threading.RLock()
+
+        def __enter__(self):
+            if threading.current_thread().name == "cancel-race-worker":
+                worker_waiting.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_exc):
+            self._lock.release()
+
+    job = PausingJob(title="claim race")
+    job._lock = TrackedRLock()
+    work = queue.Queue()
+    work.put((job, lambda _job: ran.set()))
+    jm._stop_event.clear()
+
+    cancel = threading.Thread(
+        target=jm.request_cancel, args=(job,), name="cancel-race-request"
+    )
+    worker = threading.Thread(
+        target=jm._worker_loop, args=(work,), name="cancel-race-worker"
+    )
+    cancel.start()
+    assert cancel_paused.wait(timeout=5)
+    worker.start()
+    try:
+        assert worker_waiting.wait(timeout=1)
+        assert not ran.is_set()
+    finally:
+        allow_cancel.set()
+        cancel.join(timeout=5)
+        assert _wait_for(lambda: work.unfinished_tasks == 0)
+        jm._stop_event.set()
+        worker.join(timeout=2)
+        jm._stop_event.clear()
+
+    assert not cancel.is_alive()
+    assert not worker.is_alive()
+    assert not ran.is_set()
+    assert job.status == jm.JobStatus.CANCELED
+
+
 def test_approve_flips_status_then_passes_chosen_to_execute(monkeypatch):
     job = jm.Job(title="scan-approve")
     job.kind = "scan"
@@ -2189,6 +2257,131 @@ def test_history_retry_shows_for_archived_failed_download_too(
         _remove_job(live)
 
 
+def test_persist_never_records_half_updated_bulk_selection(monkeypatch):
+    import json
+    import threading
+
+    from qobuz_librarian.web import job_persistence
+
+    serializing = threading.Event()
+    release_dump = threading.Event()
+    selection_attempted = threading.Event()
+    stored = {}
+
+    class PauseDuringDump:
+        def __str__(self):
+            serializing.set()
+            release_dump.wait(timeout=5)
+            return "pause"
+
+    class TrackedRLock:
+        def __init__(self):
+            self._lock = threading.RLock()
+
+        def __enter__(self):
+            if threading.current_thread().name == "bulk-selection":
+                selection_attempted.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_exc):
+            self._lock.release()
+
+    class Connection:
+        def execute(self, _sql, values):
+            stored["candidates"] = values[7]
+
+        def commit(self):
+            pass
+
+    monkeypatch.setattr(job_persistence, "_get_conn", lambda: Connection())
+    job = jm.Job(title="selection snapshot")
+    job._lock = TrackedRLock()
+    job.candidates = [
+        {"cid": "c1", "selected": False, "pause": PauseDuringDump()},
+        {"cid": "c2", "selected": False},
+    ]
+
+    persist = threading.Thread(
+        target=job_persistence.persist, args=(job,), name="candidate-persist"
+    )
+    select = threading.Thread(
+        target=job.set_all_selected, args=(True,), name="bulk-selection"
+    )
+    persist.start()
+    assert serializing.wait(timeout=5)
+    select.start()
+    assert selection_attempted.wait(timeout=5)
+    release_dump.set()
+    persist.join(timeout=5)
+    select.join(timeout=5)
+
+    assert not persist.is_alive()
+    assert not select.is_alive()
+    values = [row["selected"] for row in json.loads(stored["candidates"])]
+    assert values in ([False, False], [True, True])
+
+
+def test_older_persist_cannot_overtake_newer_selection(monkeypatch):
+    import json
+    import threading
+
+    from qobuz_librarian.web import job_persistence
+
+    old_snapshot_ready = threading.Event()
+    release_old = threading.Event()
+    writes = []
+
+    class PauseAfterCandidateDump:
+        def __str__(self):
+            if threading.current_thread().name == "older-persist":
+                old_snapshot_ready.set()
+                release_old.wait(timeout=5)
+            return "pause"
+
+    class Connection:
+        def execute(self, _sql, values):
+            writes.append([
+                row["selected"] for row in json.loads(values[7])
+            ])
+
+        def commit(self):
+            pass
+
+    monkeypatch.setattr(job_persistence, "_get_conn", lambda: Connection())
+    job = jm.Job(title="ordered selection saves")
+    job.candidates = [
+        {"cid": "c1", "selected": False},
+        {"cid": "c2", "selected": False},
+    ]
+    job.execute_args = {"pause": PauseAfterCandidateDump()}
+
+    older = threading.Thread(
+        target=job_persistence.persist, args=(job,), name="older-persist"
+    )
+
+    def select_and_persist():
+        job.set_all_selected(True)
+        job_persistence.persist(job)
+
+    newer = threading.Thread(target=select_and_persist, name="newer-persist")
+    older.start()
+    assert old_snapshot_ready.wait(timeout=5)
+    newer.start()
+    watchdog = threading.Timer(0.2, release_old.set)
+    watchdog.start()
+    try:
+        older.join(timeout=5)
+        newer.join(timeout=5)
+    finally:
+        release_old.set()
+        watchdog.cancel()
+
+    assert not older.is_alive()
+    assert not newer.is_alive()
+    assert writes[-1] == [True, True]
+
+
 def test_archived_job_page_keeps_retry_and_undo(client, monkeypatch):
     from qobuz_librarian.web import job_persistence
 
@@ -2204,7 +2397,17 @@ def test_archived_job_page_keeps_retry_and_undo(client, monkeypatch):
 
     single = jm.Job(title="Archived single", artist="Portishead")
     single.status = jm.JobStatus.DONE
-    single.single = {"dir": "/music/Portishead/Dummy", "track_id": "t1"}
+    single.single = {
+        "dir": "/music/Portishead/Dummy", "track_id": "t1",
+        "owned_path": {
+            "relative": "01 - Track.flac",
+            "directories": [[1, 2]],
+            "file": {
+                "device": 1, "inode": 3, "size": 4,
+                "modified_ns": 5, "changed_ns": 6,
+            },
+        },
+    }
     single.finished_at = time.time()
     job_persistence.persist(single)
 
@@ -2693,6 +2896,60 @@ def test_library_select_all_scoped_to_tab(client):
         assert (c["missing_selected"], c["gap_selected"]) == (1, 0)
         flags = {x["title"]: x["selected"] for x in job.candidates}
         assert flags == {"Third": True, "Dummy": False}
+    finally:
+        _remove_job(job)
+
+
+def test_select_all_reports_its_own_persistence_failure(client, monkeypatch):
+    from qobuz_librarian.web import job_persistence
+
+    job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
+    job.execute_kind = "library"
+    job.add_candidate(kind="album", title="Third", artist="Portishead",
+                      payload={"year": "2008"}, selected=False)
+    monkeypatch.setattr(job_persistence, "persist", lambda _job: False)
+    try:
+        r = client.post(f"/jobs/{job.id}/select-all",
+                        data={"on": "1", "scope": "all", "tab": "missing"})
+
+        assert r.status_code == 200
+        assert r.json()["persist_failed"] is True
+        assert job.candidates[0]["selected"] is True
+    finally:
+        _remove_job(job)
+
+
+def test_lazy_review_group_renders_current_artist_selection(client, monkeypatch):
+    from qobuz_librarian.web import job_persistence
+
+    job = _inject_job(jm.JobStatus.AWAITING_REVIEW)
+    job.execute_kind = "library"
+    job.add_candidate(kind="album", title="Third", artist="Portishead",
+                      payload={"year": "2008"}, selected=False)
+    job.add_candidate(kind="album", title="Untrue", artist="Burial",
+                      payload={"year": "2007"}, selected=False)
+    monkeypatch.setattr(job_persistence, "persist", lambda _job: True)
+    try:
+        page = client.get(f"/jobs/{job.id}")
+        assert page.status_code == 200
+        assert "data-lazy-items" in page.text
+        assert 'class="ql-checkbox cb"' not in page.text
+
+        selected = client.post(
+            f"/jobs/{job.id}/select-all",
+            data={"on": "1", "scope": "artist", "artist": "Portishead",
+                  "tab": "missing"},
+        )
+        assert selected.status_code == 200
+
+        items = client.get(
+            f"/jobs/{job.id}/review-group-items",
+            params={"artist": "Portishead", "tab": "missing"},
+        )
+        assert items.status_code == 200
+        assert 'value="c0"' in items.text
+        assert "checked" in items.text
+        assert "Untrue" not in items.text
     finally:
         _remove_job(job)
 
@@ -3841,6 +4098,99 @@ def test_mode_handoff_to_cli_pauses_web_downloads(client, monkeypatch):
                        follow_redirects=False)
     assert back.status_code == 303 and back.headers["location"] == "/settings?mode=web"
     assert app_mod._CLI_MODE is False
+
+
+@pytest.mark.parametrize("operation", ["undo", "restore"])
+def test_cli_handoff_refuses_while_a_direct_library_mutation_runs(
+        operation, client, monkeypatch, tmp_path):
+    import os
+    import threading
+
+    import qobuz_librarian.integrations.beets as beets_mod
+    import qobuz_librarian.library.backup as backup_mod
+    import qobuz_librarian.library.scanner as scanner_mod
+    import qobuz_librarian.web.app as app_mod
+    from qobuz_librarian import config as cfg
+
+    entered = threading.Event()
+    release = threading.Event()
+    responses, errors = [], []
+
+    class Handle:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    handle = Handle()
+    monkeypatch.setattr(app_mod, "_RUN_LOCK_HANDLE", handle)
+    monkeypatch.setattr(app_mod, "_CLI_MODE", False)
+    monkeypatch.setattr(app_mod.job_mgr.registry, "pending_and_running", lambda: [])
+
+    if operation == "undo":
+        album = tmp_path / "music" / "Artist" / "Album"
+        album.mkdir(parents=True)
+        track = album / "01 - Track.flac"
+        track.write_bytes(b"audio")
+        job = jm.Job(title="Track", artist="Artist", album_id="album")
+        job.status = jm.JobStatus.DONE
+        job.single = {
+            "dir": str(album), "track_id": "track", "isrc": "ISRC1",
+            "track_no": 1, "disc_no": 1, "title": "Track",
+            "artist": "Artist", "album": "Album", "marked": False,
+            "new_folder": False,
+            "owned_path": app_mod._bind_owned_path(album, track),
+        }
+        jm.registry.add(job)
+        monkeypatch.setattr(scanner_mod, "read_album_dir", lambda _d: [{
+            "path": str(track), "isrc": "ISRC1", "tracknumber": 1,
+            "discnumber": 1,
+        }])
+
+        def block_forget(_paths):
+            entered.set()
+            release.wait(timeout=5)
+            return 1
+
+        monkeypatch.setattr(beets_mod, "forget_beets_entries", block_forget)
+        path, data = f"/jobs/{job.id}/undo", {}
+    else:
+        backups = tmp_path / "backups"
+        backup = backups / "20260101_000000_Album"
+        origin = tmp_path / "music" / "Artist" / "Album"
+        backup.mkdir(parents=True)
+        monkeypatch.setattr(cfg, "UPGRADE_BACKUP_DIR", backups)
+        monkeypatch.setattr(backup_mod, "_read_backup_origin", lambda _p: origin)
+
+        def block_restore(_backup, _origin):
+            entered.set()
+            release.wait(timeout=5)
+            return True
+
+        monkeypatch.setattr(backup_mod, "restore_upgrade_backup", block_restore)
+        path, data = "/backups/restore", {"backup": backup.name}
+
+    def run_operation():
+        try:
+            responses.append(client.post(path, data=data, follow_redirects=False))
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_operation, daemon=True)
+    worker.start()
+    assert entered.wait(timeout=3), f"{operation} never reached its mutation"
+    try:
+        handoff = client.post("/settings/mode", data={"target": "cli"},
+                              follow_redirects=False)
+        assert handoff.status_code == 303
+        assert handle.closed is False
+        assert app_mod._CLI_MODE is False
+    finally:
+        release.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert not errors
+    assert responses and responses[0].status_code in (200, 303)
 
 
 # ── web/auth.py: optional login ────────────────────────────────────────────────

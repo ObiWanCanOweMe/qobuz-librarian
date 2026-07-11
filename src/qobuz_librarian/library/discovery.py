@@ -68,6 +68,14 @@ _resolve_cache_dirty = False
 _resolve_cache_lock = threading.Lock()
 
 
+class ArtistSearchUnavailable(Exception):
+    """Artist search did not produce a trustworthy answer.
+
+    This is deliberately distinct from a clean no-match: bulk scans must leave
+    the artist incomplete and retry it instead of saving an empty result.
+    """
+
+
 def _load_resolve_cache() -> dict:
     global _resolve_cache
     # Double-checked lock: the artist scan calls this from a ThreadPoolExecutor,
@@ -138,7 +146,7 @@ def resolve_artist(query, token):
         raise
     except Exception as e:
         log.info(f"  artist search failed for '{query}': {e}")
-        return None, None
+        raise ArtistSearchUnavailable(str(e)) from e
     q = strip_leading_article(query)
 
     def match_score(a):

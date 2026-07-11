@@ -2,6 +2,8 @@
 depends on it), result extraction, pagination, and the album/catalog cache."""
 from unittest.mock import patch
 
+import pytest
+
 from qobuz_librarian.api.auth import QobuzError
 from qobuz_librarian.api.search import (
     find_qobuz_track_by_isrc,
@@ -70,6 +72,25 @@ def test_search_guards_malformed_bodies():
         assert search_albums("q", "tok") == []
     with patch("qobuz_librarian.api.search.qobuz_get", return_value={"tracks": "oops"}):
         assert search_tracks("q", "tok") == []
+
+
+def test_artist_search_rejects_malformed_success_payloads():
+    # A clean empty items list is a real no-match. Missing/wrong envelopes and
+    # non-object entries are incomplete HTTP-200 responses, not the same fact.
+    bad_payloads = (
+        {},
+        {"artists": []},
+        {"artists": {"items": "oops"}},
+        {"artists": {"items": [None]}},
+    )
+    for payload in bad_payloads:
+        with patch("qobuz_librarian.api.search.qobuz_get", return_value=payload):
+            with pytest.raises(QobuzError):
+                search_artists("q", "tok")
+
+    with patch("qobuz_librarian.api.search.qobuz_get",
+               return_value={"artists": {"items": []}}):
+        assert search_artists("q", "tok") == []
 
 
 def test_get_artist_albums_paginates_and_stops_early():

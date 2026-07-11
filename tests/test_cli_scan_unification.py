@@ -623,3 +623,49 @@ def test_cli_new_release_check_refuses_without_baseline(monkeypatch):
     with pytest.raises(SystemExit):
         new_releases.run_check_new_releases_mode(
             SimpleNamespace(dry_run=False))
+
+
+@pytest.mark.parametrize(
+    ("dry_run", "save_result", "expected"),
+    ((True, None, "no changes saved"),
+     (False, False, "couldn't be saved")),
+)
+def test_cli_new_release_summary_matches_persistence(
+        tmp_path, monkeypatch, caplog, dry_run, save_result, expected):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.modes import new_releases
+
+    artist = tmp_path / "Artist"
+    artist.mkdir()
+    saved = []
+
+    monkeypatch.setattr(new_releases, "load_qobuz_token", lambda: ("uid", "tok"))
+    monkeypatch.setattr(new_releases.new_releases_mod,
+                        "is_baseline_complete", lambda: True)
+    monkeypatch.setattr(new_releases, "list_library_artists", lambda: [artist])
+    monkeypatch.setattr(new_releases.new_releases_mod, "load", lambda: {
+        "seen": {"artist-id": ["old"]},
+        "baseline_limit": int(cfg.ARTIST_CATALOG_LIMIT) - 1,
+    })
+    monkeypatch.setattr(
+        new_releases,
+        "find_new_releases_for_artist",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            artist_id="artist-id",
+            fetch_failed=False,
+            current_ids=["old", "new"],
+            new_gaps=[],
+            artist_name="Artist",
+        ),
+    )
+    monkeypatch.setattr(
+        new_releases.new_releases_mod,
+        "mark_run",
+        lambda *_args, **_kwargs: saved.append(True) or save_result,
+    )
+
+    with caplog.at_level("INFO", logger="qobuz_librarian"):
+        new_releases.run_check_new_releases_mode(SimpleNamespace(dry_run=dry_run))
+
+    assert expected in caplog.text
+    assert bool(saved) is not dry_run

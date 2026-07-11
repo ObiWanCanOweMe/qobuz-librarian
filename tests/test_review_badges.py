@@ -1,3 +1,21 @@
+def _mark_badge_in_process(state_path, surface, attempting_lock, done):
+    from pathlib import Path
+
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.web import review_badges
+
+    cfg.REVIEW_BADGE_STATE_FILE = Path(state_path)
+    real_flock = review_badges.fcntl.flock
+
+    def report_lock_attempt(fd, operation):
+        attempting_lock.set()
+        return real_flock(fd, operation)
+
+    review_badges.fcntl.flock = report_lock_attempt
+    review_badges.mark_ready(surface, now=200.0)
+    done.set()
+
+
 def test_mark_ready_wins_over_previous_seen(monkeypatch, tmp_path):
     from qobuz_librarian import config as cfg
     from qobuz_librarian.web import review_badges
@@ -24,3 +42,47 @@ def test_badge_write_failures_are_non_fatal(monkeypatch, tmp_path):
     review_badges.mark_ready("library")
     review_badges.mark_seen("library")
     review_badges.clear_ready("library")
+
+
+def test_badge_updates_wait_for_another_process(monkeypatch, tmp_path):
+    import fcntl
+    import json
+    import multiprocessing
+
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.web import review_badges
+
+    state_path = tmp_path / "review-badges.json"
+    monkeypatch.setattr(cfg, "REVIEW_BADGE_STATE_FILE", state_path)
+    lock_path = state_path.with_name(state_path.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    ctx = multiprocessing.get_context("spawn")
+    attempting_lock = ctx.Event()
+    done = ctx.Event()
+    child = ctx.Process(
+        target=_mark_badge_in_process,
+        args=(str(state_path), "upgrade", attempting_lock, done),
+    )
+
+    with lock_path.open("w", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        child.start()
+        try:
+            assert attempting_lock.wait(timeout=5)
+            assert not done.is_set()
+            state = review_badges._empty()
+            state["surfaces"]["library"]["ready_at"] = 100.0
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    child.join(timeout=5)
+    if child.is_alive():
+        child.terminate()
+        child.join(timeout=5)
+    assert child.exitcode == 0
+    assert done.is_set()
+    snapshot = review_badges.snapshot()
+    assert snapshot["library"] is True
+    assert snapshot["upgrade"] is True

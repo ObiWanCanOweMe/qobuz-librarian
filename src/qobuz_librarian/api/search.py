@@ -88,6 +88,19 @@ def _items(data, key):
     return [x for x in items if isinstance(x, dict)]
 
 
+def _required_items(data, key, endpoint):
+    """Return a structurally valid result list for a lookup whose empty result
+    is durable state. Missing/wrong envelopes are incomplete responses, not a
+    trustworthy empty search result."""
+    envelope = data.get(key)
+    if not isinstance(envelope, dict):
+        raise QobuzError(f"{endpoint} returned a malformed {key} envelope")
+    items = envelope.get("items")
+    if not isinstance(items, list) or any(not isinstance(x, dict) for x in items):
+        raise QobuzError(f"{endpoint} returned malformed {key} items")
+    return items
+
+
 def search_albums(query, token, limit=None):
     limit = limit if limit is not None else config.SEARCH_LIMIT
     data = _expect_dict(
@@ -103,7 +116,9 @@ def search_artists(query, token, limit=10):
     data = _expect_dict(
         qobuz_get("artist/search", {"query": query, "limit": limit}, token),
         "artist/search")
-    items = _items(data, "artists")
+    # A real empty list means "no matching artist" and may influence saved scan
+    # state. Do not turn a partial/malformed HTTP-200 body into that same fact.
+    items = _required_items(data, "artists", "artist/search")
     for a in items:
         if "name" in a:
             a["name"] = clean_qobuz_string(a.get("name"))

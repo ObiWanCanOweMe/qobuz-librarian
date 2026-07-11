@@ -2,7 +2,6 @@
 import fcntl
 import json
 import os
-import shutil
 import tempfile
 from contextlib import contextmanager
 from datetime import datetime
@@ -182,6 +181,8 @@ def write_post_import_sidecars(album_dirs):
     strip_tag = lyr_fmt == "sidecar"
     seen = set()
     written = 0
+    kept = 0
+    stripped = 0
     for d in album_dirs:
         if d is None or not isinstance(d, Path) or not d.exists():
             continue
@@ -209,11 +210,14 @@ def write_post_import_sidecars(album_dirs):
             if not content or not content.strip():
                 continue
             try:
-                lyric_fetch.write_sidecar(fp, content)
+                sidecar_written = lyric_fetch.write_sidecar(fp, content)
             except OSError as e:
                 vlog(f"sidecar: write failed {fp}: {e}")
                 continue
-            written += 1
+            if sidecar_written:
+                written += 1
+            else:
+                kept += 1
             if strip_tag:
                 try:
                     had = False
@@ -222,28 +226,29 @@ def write_post_import_sidecars(album_dirs):
                             del f.tags[_k]
                             had = True
                     if had:
-                        # Atomic save (temp copy + os.replace) like
-                        # lyric_fetch.write_lyrics — a bare in-place save can
-                        # corrupt the library file if a crash interrupts mutagen
-                        # while it rewrites the metadata block.
-                        # Name the temp so it can't be mistaken for a real track
-                        # by a concurrent scan: end it in '.tmp', not '.flac'.
-                        fd, tmp = tempfile.mkstemp(
-                            prefix=fp.name + ".", suffix=".tmp", dir=str(fp.parent))
-                        os.close(fd)
-                        try:
-                            shutil.copy2(str(fp), tmp)
-                            f.save(tmp)
-                            os.replace(tmp, str(fp))
-                        finally:
-                            if os.path.exists(tmp):
-                                os.unlink(tmp)
+                        lyric_fetch.save_flac_tags(f, fp)
+                        stripped += 1
                 except Exception as e:
-                    vlog(f"sidecar: tag strip failed {fp}: {e}")
-    if written:
+                    action = "wrote" if sidecar_written else "kept"
+                    log.info(fmt(C.YELLOW,
+                        f"  ⚠  lyrics: {action} {fp.with_suffix('.lrc').name}, but "
+                        f"couldn't safely remove embedded lyrics from "
+                        f"{fp.name}: {e}."))
+    ready = written + kept
+    if ready:
+        actions = []
+        if written:
+            actions.append(f"wrote {written} .lrc sidecar(s)")
+        if kept:
+            actions.append(f"kept {kept} better existing .lrc sidecar(s)")
+        suffix = ""
+        if strip_tag:
+            suffix = (" (embedded tags removed)" if stripped == ready else
+                      f" (embedded tag removal confirmed for {stripped} of "
+                      f"{ready})")
         log.info(fmt(C.GREEN,
-            f"  ✓  lyrics: wrote {written} .lrc sidecar(s)"
-            f"{' (embedded tag removed)' if strip_tag else ''}."))
+            f"  ✓  lyrics: {'; '.join(actions)}"
+            f"{suffix}."))
 
 
 def _record_post_import_lyric_retry(post_paths):
@@ -432,7 +437,7 @@ def _refresh_lyric_retry(flacs_just_processed):
         save_lyric_retry(still_transient)
 
 
-def offer_resume_lyric_retry(args, token):
+def offer_resume_lyric_retry(args):
     """Startup hook. If files are queued for a lyric retry, prompt to retry
     now / keep for later / discard. Mirrors offer_resume_pending_queue."""
     paths = load_lyric_retry()

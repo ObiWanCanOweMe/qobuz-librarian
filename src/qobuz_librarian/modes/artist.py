@@ -25,6 +25,7 @@ from qobuz_librarian.library.catalog import (
     match_dir_to_catalog,
 )
 from qobuz_librarian.library.discovery import (
+    ArtistSearchUnavailable,
     DiscoveryOpts,
     discover_fully_missing,
     match_album_dir,
@@ -114,7 +115,12 @@ def run_artist_gap_fill(artist_name, artist_dir, args, token, *,
     # sibling quality labels and the per-folder match (zero search-API cost when
     # the folder's album is in it).
     vlog("  Resolving artist + pre-fetching catalog …")
-    artist_id, resolved_name = resolve_artist(artist_name, token)
+    artist_search_failed = False
+    try:
+        artist_id, resolved_name = resolve_artist(artist_name, token)
+    except ArtistSearchUnavailable:
+        artist_id, resolved_name = None, None
+        artist_search_failed = True
     if resolved_name:
         artist_name = resolved_name
     catalog = []
@@ -133,6 +139,10 @@ def run_artist_gap_fill(artist_name, artist_dir, args, token, *,
             log.info(fmt(C.YELLOW,
                 f"  ⚠  catalog pre-fetch failed ({e}); per-folder fallback."))
             catalog = []
+    elif artist_search_failed:
+        log.info(fmt(C.YELLOW,
+            f"  ⚠  Qobuz couldn't complete the artist lookup for "
+            f"{artist_name!r}; trying each album instead."))
     else:
         log.info(fmt(C.YELLOW,
             f"  ⚠  No confident Qobuz artist match for {artist_name!r}; "
@@ -495,7 +505,13 @@ def run_artist_missing_albums(artist_name, owned_titles, args, token,
 
     if artist_id is None:
         log.info(fmt(C.GRAY, "  Looking up artist on Qobuz …"))
-        artist_id, resolved_name = resolve_artist(artist_name, token)
+        try:
+            artist_id, resolved_name = resolve_artist(artist_name, token)
+        except ArtistSearchUnavailable:
+            log.info(fmt(C.YELLOW,
+                "  ⚠  Qobuz couldn't complete the artist lookup. "
+                "Try this step again."))
+            return 0
         if artist_id is None:
             log.info(fmt(C.YELLOW,
                 f"  ⚠  Couldn't find {artist_name!r} on Qobuz. Skipping step 2."))

@@ -78,15 +78,14 @@ def run_check_new_releases_mode(args):
     section(f"New-release check — {plural(len(artists), 'artist')}")
     if not seen:
         log.info(fmt(C.GRAY,
-            "  First check on this library — recording the current catalog "
-            "as the baseline. Nothing surfaces this run; later runs diff "
-            "against this snapshot."))
+            "  First check on this library — the current catalogue is the "
+            "starting baseline, so nothing surfaces until a later check."))
 
     workers = max(1, int(cfg.ARTIST_SCAN_WORKERS))
     current_seen = {}
     total_new = 0
     artists_with_news = 0
-    had_failure = False
+    failed_count = 0
 
     # Managed explicitly rather than via `with ... as ex` so a Ctrl-C / AuthLost
     # doesn't get stuck in the context manager's implicit shutdown(wait=True),
@@ -108,12 +107,12 @@ def run_check_new_releases_mode(args):
                 raise
             except Exception as e:
                 log.info(fmt(C.GRAY, f"    skipped {ad.name}: {e}"))
-                had_failure = True
+                failed_count += 1
                 continue
             if result.artist_id and not getattr(result, "fetch_failed", False):
                 current_seen[result.artist_id] = result.current_ids
             else:
-                had_failure = True
+                failed_count += 1
             if result.new_gaps:
                 artists_with_news += 1
                 log.info(fmt(C.GREEN,
@@ -135,23 +134,7 @@ def run_check_new_releases_mode(args):
         # done, so this is just a clean teardown.
         ex.shutdown(wait=False, cancel_futures=True)
 
-    flush_resolve_cache()
-    log.info("")
-    if rebaseline and seen:
-        log.info(fmt(C.GRAY,
-            "  · Catalogue limit changed — recorded a fresh baseline; "
-            "future checks diff against it."))
-    elif total_new:
-        log.info(fmt(C.BOLD + C.WHITE,
-            f"  ✓  {plural(total_new, 'new release')} across "
-            f"{plural(artists_with_news, 'artist')}."))
-        log.info(fmt(C.GRAY,
-            "  Run the web library scan or the per-artist scan to queue them."))
-    elif seen:
-        log.info(fmt(C.GRAY, "  · Nothing new found."))
-    else:
-        log.info(fmt(C.GRAY, "  · Baseline recorded."))
-
+    saved = None
     if not args.dry_run:
         # UNION each reached artist's snapshot into the prior baseline rather
         # than replacing it — an over-cap catalog comes back as a different
@@ -164,6 +147,77 @@ def run_check_new_releases_mode(args):
         merged = dict(seen)
         for aid, ids in current_seen.items():
             merged[aid] = sorted(set(merged.get(aid, [])) | set(ids))
-        complete = not had_failure and bool(current_seen)
-        new_releases_mod.mark_run(merged, complete=complete,
-                                  baseline_limit=cur_limit)
+        complete = failed_count == 0 and bool(current_seen)
+        saved = new_releases_mod.mark_run(
+            merged,
+            complete=complete,
+            baseline_limit=cur_limit if complete else None,
+        )
+
+    flush_resolve_cache()
+    log.info("")
+    if rebaseline and seen:
+        if args.dry_run:
+            text = "  · Catalogue rebaseline previewed; no changes saved."
+            if failed_count:
+                text = ("  · Catalogue rebaseline preview incomplete — "
+                        f"{plural(failed_count, 'artist')} couldn't be checked; "
+                        "no changes saved.")
+            log.info(fmt(C.YELLOW if failed_count else C.GRAY, text))
+        elif saved is False:
+            text = "  ⚠  The fresh catalogue baseline couldn't be saved."
+            if failed_count:
+                text += (f" {plural(failed_count, 'artist')} also couldn't be "
+                         "checked.")
+            log.info(fmt(C.YELLOW, text + " Run the check again."))
+        elif failed_count:
+            log.info(fmt(C.YELLOW,
+                f"  ⚠  Catalogue rebaseline incomplete — "
+                f"{plural(failed_count, 'artist')} couldn't be checked; "
+                "run the check again."))
+        else:
+            log.info(fmt(C.GRAY,
+                "  · Catalogue limit changed — recorded a fresh baseline; "
+                "future checks diff against it."))
+    elif total_new:
+        log.info(fmt(C.BOLD + C.WHITE,
+            f"  ✓  {plural(total_new, 'new release')} across "
+            f"{plural(artists_with_news, 'artist')}."))
+        log.info(fmt(C.GRAY,
+            "  Run the web library scan or the per-artist scan to queue them."))
+        if failed_count:
+            log.info(fmt(C.YELLOW,
+                f"  ⚠  {plural(failed_count, 'artist')} couldn't be checked; "
+                "run the check again for a complete result."))
+        if args.dry_run:
+            log.info(fmt(C.GRAY, "  Dry run — no changes saved."))
+        elif saved is False:
+            log.info(fmt(C.YELLOW,
+                "  ⚠  The updated baseline couldn't be saved; these releases "
+                "may appear again."))
+    elif failed_count:
+        log.info(fmt(C.YELLOW,
+            "  · No new releases from the artists that could be checked. "
+            f"{plural(failed_count, 'artist')} couldn't be checked; run again."))
+        if args.dry_run:
+            log.info(fmt(C.GRAY, "  Dry run — no changes saved."))
+        elif saved is False:
+            log.info(fmt(C.YELLOW,
+                "  ⚠  The partial baseline update couldn't be saved."))
+    elif seen:
+        if args.dry_run:
+            log.info(fmt(C.GRAY,
+                "  · Nothing new found in this preview; no changes saved."))
+        elif saved is False:
+            log.info(fmt(C.YELLOW,
+                "  ⚠  Nothing new found, but the updated baseline couldn't be "
+                "saved. Run the check again."))
+        else:
+            log.info(fmt(C.GRAY, "  · Nothing new found."))
+    elif args.dry_run:
+        log.info(fmt(C.GRAY, "  · Baseline preview complete; no changes saved."))
+    elif saved is False:
+        log.info(fmt(C.YELLOW,
+            "  ⚠  The baseline couldn't be saved. Run the check again."))
+    else:
+        log.info(fmt(C.GRAY, "  · Baseline recorded."))

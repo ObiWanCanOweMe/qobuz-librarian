@@ -1,12 +1,18 @@
 """Small persistent state for navigation review markers."""
 
+import fcntl
 import json
+import os
+import tempfile
+import threading
 import time
+from contextlib import contextmanager
 
 from qobuz_librarian import config as cfg
 
 SURFACES = {"library", "upgrade", "downsample", "repair"}
 _VERSION = 1
+_STATE_LOCK = threading.RLock()
 
 
 def _empty() -> dict:
@@ -38,13 +44,55 @@ def load() -> dict:
     return state
 
 
+@contextmanager
+def _mutation_lock():
+    """Hold the badge-store lock across one load/change/save cycle."""
+    path = cfg.REVIEW_BADGE_STATE_FILE
+    with _STATE_LOCK:
+        lock_file = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = path.with_name(path.name + ".lock")
+            lock_file = lock_path.open("w", encoding="utf-8")
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            if lock_file is not None:
+                lock_file.close()
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            finally:
+                lock_file.close()
+
+
 def _save(state: dict) -> None:
     path = cfg.REVIEW_BADGE_STATE_FILE
+    fd = None
+    tmp = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+        fd, tmp = tempfile.mkstemp(
+            dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = None
+            handle.write(json.dumps(state, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+        tmp = None
     except OSError:
         pass
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def _ts(now=None) -> float:
@@ -54,19 +102,25 @@ def _ts(now=None) -> float:
 def mark_ready(surface: str, *, now=None) -> None:
     if surface not in SURFACES:
         return
-    state = load()
-    entry = state["surfaces"][surface]
-    seen_at = float(entry.get("seen_at") or 0.0)
-    entry["ready_at"] = max(_ts(now), seen_at + 0.000001)
-    _save(state)
+    with _mutation_lock() as locked:
+        if not locked:
+            return
+        state = load()
+        entry = state["surfaces"][surface]
+        seen_at = float(entry.get("seen_at") or 0.0)
+        entry["ready_at"] = max(_ts(now), seen_at + 0.000001)
+        _save(state)
 
 
 def clear_ready(surface: str) -> None:
     if surface not in SURFACES:
         return
-    state = load()
-    state["surfaces"][surface]["ready_at"] = 0.0
-    _save(state)
+    with _mutation_lock() as locked:
+        if not locked:
+            return
+        state = load()
+        state["surfaces"][surface]["ready_at"] = 0.0
+        _save(state)
 
 
 def set_ready(surface: str, ready: bool, *, now=None) -> None:
@@ -79,10 +133,13 @@ def set_ready(surface: str, ready: bool, *, now=None) -> None:
 def mark_seen(surface: str, *, now=None) -> None:
     if surface not in SURFACES:
         return
-    state = load()
-    entry = state["surfaces"][surface]
-    entry["seen_at"] = max(_ts(now), float(entry.get("ready_at") or 0.0))
-    _save(state)
+    with _mutation_lock() as locked:
+        if not locked:
+            return
+        state = load()
+        entry = state["surfaces"][surface]
+        entry["seen_at"] = max(_ts(now), float(entry.get("ready_at") or 0.0))
+        _save(state)
 
 
 def snapshot() -> dict[str, bool]:

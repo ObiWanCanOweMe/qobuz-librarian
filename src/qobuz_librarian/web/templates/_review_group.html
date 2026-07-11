@@ -1,15 +1,17 @@
 {% import "_job_labels.html" as labels %}
+{% set group_selected = items | selectattr('selected') | list | length %}
 
 {# The dismiss button must stay tappable while the group is COLLAPSED, and a
    <details> hides every non-summary child when closed — so the button lives
    beside the details in a positioning shell, not inside it. #}
 <div class="ql-review-group-shell">
-<details class="ql-review-group{% if triage %} ql-review-group--triage{% endif %}" data-artist="{{ artist }}"{% if open %} open{% endif %}>
+<details class="ql-review-group{% if triage %} ql-review-group--triage{% endif %}" data-artist="{{ artist }}"
+         data-group-total="{{ items | length }}" data-group-selected="{{ group_selected }}"{% if open %} open{% endif %}>
   <summary class="ql-review-summary">
     <span class="ql-review-chevron" aria-hidden="true"></span>
     {% if triage %}
     <input type="checkbox" class="ql-checkbox ql-review-artist-check" data-artist-select value="{{ artist }}"
-           {% if items and (items | selectattr('selected') | list | length) == (items | length) %}checked{% endif %}
+           {% if items and group_selected == (items | length) %}checked{% endif %}
            aria-label="Select shown {{ labels.review_item_plural(job) }} by {{ artist or 'this artist' }} to {{ job.review_verb | lower }}">
     {% endif %}
     <span class="ql-review-title">
@@ -17,41 +19,16 @@
       <span class="ql-review-title-meta">{% if review_tab|default('') == 'gaps' %}{{ items | length }} Gap Fill candidate{{ 's' if (items | length) != 1 }}{% elif review_tab|default('') == 'missing' %}{{ items | length }} missing album{{ 's' if (items | length) != 1 }}{% else %}{{ labels.review_count(job, items | length) }}{% endif %}</span>
     </span>
   </summary>
-  <div class="ql-review-items">
-    {% for c in items %}
-    <label class="ql-review-candidate">
-      <input type="checkbox" class="ql-checkbox cb" name="cid"
-             value="{{ c.cid }}" data-seq="{{ c.seq }}"
-             {% if c.selected %}checked{% endif %}>
-      {% if c.payload.cover %}
-      <img src="{{ c.payload.cover }}" alt="" loading="lazy" width="46" height="46"
-           class="ql-review-cover">
-      {% else %}
-      <span class="ql-review-cover ql-review-cover--empty" aria-hidden="true"></span>
-      {% endif %}
-      <span class="ql-review-candidate-body">
-        <span class="ql-review-candidate-heading">
-          <span class="ql-review-candidate-title">{{ c.title }}</span>{% if c.payload.is_new %}
-          <span class="ql-badge ql-badge-new ql-badge-xs">new</span>{% endif %}
-        </span>
-        <span class="ql-review-candidate-detail">{% if review_tab|default('') == 'gaps' %}{{ c.detail | replace('gap-fill: ', '') }}{% else %}{{ c.detail }}{% endif %}</span>
-        {% if c.payload.verified_truncated %}
-        <span class="ql-review-truncated">
-          {% for t in c.payload.verified_truncated[:12] %}
-          <span class="ql-review-truncated-line">
-            <span class="readout ql-review-track-number">{% if t.track_number %}{{ '%02d'|format(t.track_number) }}{% else %}··{% endif %}</span>
-            {{ t.title }}{% if t.reason == 'decode_failed' %} <span class="ql-review-truncated-muted">· won't decode</span>{% endif %}
-          </span>
-          {% endfor %}
-          {% if (c.payload.verified_truncated | length) > 12 %}
-          <span class="ql-review-truncated-more">+{{ (c.payload.verified_truncated | length) - 12 }} more</span>
-          {% endif %}
-        </span>
-      {% endif %}
-      </span>
-    </label>
-    {% endfor %}
+  {% if lazy | default(false) %}
+  <div class="ql-review-items" data-lazy-items
+       data-items-url="/jobs/{{ job.id }}/review-group-items?artist={{ artist | urlencode }}&tab={{ review_tab | default('') | urlencode }}&q={{ review_query | default('') | urlencode }}">
+    <span class="ql-review-candidate-detail ql-review-items-loading">Loading…</span>
   </div>
+  {% else %}
+  <div class="ql-review-items">
+    {% include "_review_group_items.html" %}
+  </div>
+  {% endif %}
 </details>
 {% if triage %}
 <button type="button" data-hide data-artist="{{ artist }}"

@@ -153,6 +153,24 @@ def _fsync_tree(root: Path) -> bool:
     return _fsync(root) and ok
 
 
+def replacement_tree_durable(root: Path) -> bool:
+    """Flush a completed replacement tree and the directory that names it.
+
+    Call this after the final mutation and before deleting an original or
+    backup. A logical scan can prove the files are present, but only this gate
+    proves their bytes and directory entries are no longer just cached writes.
+    """
+    if root is None:
+        return False
+    try:
+        root = Path(root)
+        if root.is_symlink() or not root.is_dir():
+            return False
+    except OSError:
+        return False
+    return _fsync_tree(root) and _fsync(root.parent)
+
+
 def _tree_digest(d: Path):
     """{relative-path: (size, sha256)} for every regular file under tree d, or
     None on any stat/read error, an unexpected special file, or a symlink whose

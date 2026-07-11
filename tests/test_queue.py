@@ -5,6 +5,8 @@ from argparse import Namespace
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from qobuz_librarian.queue.builder import _build_queue_item
 from qobuz_librarian.queue.persistence import (
     _deserialize_queue_item,
@@ -89,6 +91,55 @@ def test_resume_keeps_pending_file_when_not_drained(tmp_path, monkeypatch):
     monkeypatch.setattr("builtins.input", lambda _prompt: "y")
     offer_resume_pending_queue(Namespace(), "tok")
     assert qfile.exists()   # albums left to retry must survive the resume
+
+
+def test_saved_work_choices_reach_menu_without_download_preflight(
+        tmp_path, monkeypatch):
+    from qobuz_librarian import cli
+    from qobuz_librarian.integrations import lyric_fetch
+    from qobuz_librarian.integrations.lyrics import save_lyric_retry
+
+    qfile = tmp_path / "queue.json"
+    retry_file = tmp_path / "lyrics-retry.json"
+    retry_track = tmp_path / "retry.flac"
+    retry_track.write_bytes(b"audio")
+    monkeypatch.setattr("qobuz_librarian.config.PENDING_QUEUE_FILE", qfile)
+    monkeypatch.setattr("qobuz_librarian.config.LYRIC_RETRY_FILE", retry_file)
+    save_pending_queue([_qitem()], mode="walk_queue")
+    save_lyric_retry([str(retry_track)])
+
+    args = Namespace(
+        reset_walk_seen=False, dry_run=False, verbose=False, quiet=False,
+        no_color=False, migrate=False, lyrics_walk=False,
+        check_new_releases=False, downsample_walk=False, artist=None,
+        upgrade_walk=False, query=None, auto_upgrade=False,
+    )
+    monkeypatch.setattr(cli, "parse_args", lambda: args)
+    monkeypatch.setattr(cli, "attach_file_handler", lambda *_a, **_k: None)
+    monkeypatch.setattr(cli, "banner", lambda *_a, **_k: None)
+    monkeypatch.setattr(cli, "acquire_run_lock", lambda: object())
+    monkeypatch.setattr(cli, "cleanup_old_upgrade_backups", lambda: 0)
+    monkeypatch.setattr(cli, "_prune_lyric_state_orphans", lambda: None)
+    monkeypatch.setattr("qobuz_librarian.web.settings_store.load", lambda: None)
+    monkeypatch.setattr("qobuz_librarian.library.flac_cache.prune_missing",
+                        lambda: None)
+    monkeypatch.setattr("qobuz_librarian.library.repair_cache.prune_expired",
+                        lambda: None)
+    monkeypatch.setattr(lyric_fetch, "AVAILABLE", True)
+
+    def unexpected_preflight(*_args, **_kwargs):
+        pytest.fail("download/Qobuz preflight ran before a saved-work choice")
+
+    monkeypatch.setattr(cli, "check_rip", unexpected_preflight)
+    monkeypatch.setattr(cli, "check_media_tools", unexpected_preflight)
+    monkeypatch.setattr(cli, "load_qobuz_token", unexpected_preflight)
+    answers = iter(("k", "k", "q"))
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+
+    cli.main()
+
+    assert qfile.exists()
+    assert retry_file.exists()
 
 
 def test_executor_gap_fill_backup_restored_when_track_returns_lossy(monkeypatch, tmp_path):
@@ -810,3 +861,39 @@ def test_executor_keeps_siblings_unless_the_filled_folder_is_whole(monkeypatch, 
     (album_dir / "02 - Beta.flac").write_bytes(b"\x00" * 1000)
     executor._resolve_queue_item(item(), args, imported_globally=True)
     assert not sibling.exists()
+
+
+def test_executor_keeps_redundant_copies_until_replacement_is_durable(
+        monkeypatch, tmp_path):
+    from qobuz_librarian.queue import executor
+
+    album_dir = tmp_path / "music" / "Artist" / "Album"
+    album_dir.mkdir(parents=True)
+    (album_dir / "01 - Song.flac").write_bytes(b"new")
+    sibling = tmp_path / "music" / "Artist" / "Album (Old)"
+    sibling.mkdir()
+    (sibling / "01 - Song.flac").write_bytes(b"old sibling")
+    gap_backup = tmp_path / "backups" / "gap"
+    gap_backup.mkdir(parents=True)
+    (gap_backup / "01 - Song.flac").write_bytes(b"old gap copy")
+
+    monkeypatch.setattr(executor, "find_album_dir_filesystem", lambda _a: album_dir)
+    monkeypatch.setattr(executor, "cleanup_duplicate_art", lambda _d: 0)
+    monkeypatch.setattr(executor, "folder_holds_all_tracks", lambda *_a: True)
+    monkeypatch.setattr(executor, "replacement_tree_durable", lambda _d: False)
+
+    item = {
+        "album": {"id": "A", "artist": {"name": "Artist"},
+                  "tracks": {"items": [{"id": 1, "title": "Song"}]}},
+        "album_dir": album_dir,
+        "backup_path": None,
+        "gap_fill_backup_path": gap_backup,
+        "siblings_to_delete": [sibling],
+        "n_ok": 1, "n_fail": 0, "n_lossy": 0,
+        "auto_upgrade": False,
+    }
+    args = Namespace(migrate_multi_artist=False, no_import=False, consolidate=False)
+    executor._resolve_queue_item(item, args, imported_globally=True)
+
+    assert sibling.exists()
+    assert gap_backup.exists()

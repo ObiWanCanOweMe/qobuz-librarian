@@ -4,6 +4,7 @@ Every value here is overridable via an environment variable of the same
 name; the literal in this file is just the fallback when the env is
 unset. `compose.yaml` sets the ones a container deployment needs.
 """
+import math
 import os
 import sys
 from pathlib import Path
@@ -19,11 +20,15 @@ def _env(key, default):
     if val is None:
         return default
     try:
-        return type(default)(val)
+        parsed = type(default)(val)
     except (ValueError, TypeError):
         _warn(f"{key}={val!r} is not a valid {type(default).__name__}; "
               f"using default {default!r}")
         return default
+    if isinstance(parsed, float) and not math.isfinite(parsed):
+        _warn(f"{key}={val!r} must be finite; using default {default!r}")
+        return default
+    return parsed
 
 
 _TRUE_TOKENS  = {"1", "true", "yes", "on", "y", "t"}

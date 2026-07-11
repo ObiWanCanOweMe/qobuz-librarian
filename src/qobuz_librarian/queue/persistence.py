@@ -125,10 +125,10 @@ def clear_pending_queue():
         vlog(f"clear_pending_queue: {e}")
 
 
-def offer_resume_pending_queue(args, token):
+def offer_resume_pending_queue(args, token_source):
     """Startup hook. If a pending queue is present, prompt to resume / keep
-    / discard. Returns True if main() should drop straight back to the
-    menu without running anything else right now."""
+    / discard. ``token_source`` may be a token or a lazy callable; the latter
+    keeps local keep/discard choices reachable without download preflight."""
     items, mode, saved_at = load_pending_queue()
     if not items:
         return False
@@ -164,6 +164,7 @@ def offer_resume_pending_queue(args, token):
             log.info(fmt(C.CYAN,
                 f"\n  ⟳  Resuming flush of {len(items)} album(s)…"))
             try:
+                token = token_source() if callable(token_source) else token_source
                 # Lazy import to avoid a circular dependency at module load:
                 # executor imports several names from this module.
                 from qobuz_librarian.queue.executor import _execute_download_queue

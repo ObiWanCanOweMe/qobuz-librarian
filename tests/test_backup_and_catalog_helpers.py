@@ -569,6 +569,26 @@ def test_cross_fs_backup_refuses_when_flush_fails(tmp_path, monkeypatch):
     assert (album_dir / "01.flac").read_bytes() == b"audio-bytes"
 
 
+def test_replacement_tree_flush_includes_nested_entries_and_parent(tmp_path, monkeypatch):
+    from qobuz_librarian.library import backup as bk
+
+    album = tmp_path / "music" / "Artist" / "Album"
+    disc = album / "Disc 2"
+    disc.mkdir(parents=True)
+    track = disc / "01 - Song.flac"
+    booklet = album / "booklet.pdf"
+    track.write_bytes(b"audio")
+    booklet.write_bytes(b"booklet")
+    flushed = []
+    monkeypatch.setattr(bk, "_fsync", lambda path: flushed.append(path) or True)
+
+    assert bk.replacement_tree_durable(album) is True
+    assert {album, disc, track, booklet, album.parent}.issubset(set(flushed))
+
+    monkeypatch.setattr(bk, "_fsync", lambda path: path != track)
+    assert bk.replacement_tree_durable(album) is False
+
+
 def test_stash_refuses_copies_that_cannot_be_flushed(monkeypatch, tmp_path):
     # The master these copies protect is rewritten in place right after —
     # a verified-but-unflushed copy can vanish in a delayed writeback failure

@@ -52,7 +52,7 @@
         <form action="/downsample" method="post" data-busy-submit>
           <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
           <button type="submit" class="ql-btn ql-btn-secondary ql-secondary-action w-full sm:w-auto"
-                  data-confirm="{{ refresh_confirm }}">Refresh candidates</button>
+                  data-confirm="{{ refresh_confirm }}" data-confirm-action="Refresh">Refresh candidates</button>
         </form>
       </div>
     </section>
@@ -66,7 +66,7 @@
         <form action="/downsample" method="post" data-busy-submit>
           <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
           <button type="submit" class="ql-btn ql-btn-primary w-full sm:w-auto"
-                  data-confirm="{{ refresh_confirm }}">Refresh candidates</button>
+                  data-confirm="{{ refresh_confirm }}" data-confirm-action="Refresh">Refresh candidates</button>
         </form>
       </div>
     </section>
