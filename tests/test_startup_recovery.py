@@ -1,0 +1,1226 @@
+"""Restart recovery settles only work backed by live, exact evidence."""
+
+import os
+from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from qobuz_librarian import config as cfg
+from qobuz_librarian import run_lock
+from qobuz_librarian.completion import (
+    AlbumInventory,
+    CompletionEvidence,
+    CompletionExpectation,
+    CompletionInput,
+    CompletionOrigin,
+    CompletionOriginKind,
+    CompletionScope,
+    DownloadCounts,
+    LandingReceipt,
+    ManagedMapping,
+    QualityTarget,
+    RecoveryOwner,
+    SourceLineage,
+    StagedReceipt,
+    TrackQuality,
+)
+from qobuz_librarian.integrations import beets, staging
+from qobuz_librarian.queue import journal, startup_recovery
+from qobuz_librarian.queue.builder import _build_queue_item
+
+
+def _staging_run_record(saved, item_id, suffix):
+    return {
+        "version": 2,
+        "path": str(Path(cfg.STAGING_DIR) / f".qobuz-run-{suffix}"),
+        "root_identity": [1, int(item_id, 16), 3, 4, 5, 6],
+        "owner": {
+            "operation_id": saved.operation_id,
+            "item_id": item_id,
+        },
+    }
+
+
+def _staging_group_record(saved, item_id, name):
+    return {
+        "version": 2,
+        "kind": "interrupted",
+        "path": str(Path(cfg.STAGING_DIR) / cfg.BEETS_RETRY_DIR / name),
+        "owner": {
+            "operation_id": saved.operation_id,
+            "item_id": item_id,
+        },
+        "sealed_manifest": {
+            "identity": [1, int(item_id, 16), 3, 4, 5, 6],
+            "sha256": "e" * 64,
+        },
+    }
+
+
+def test_startup_recovery_refuses_an_unclaimed_isolated_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(cfg, "QUEUE_JOURNAL_DIR", tmp_path / "journals")
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "run.lock")
+    staging_dir = tmp_path / "staging"
+    monkeypatch.setattr(cfg, "STAGING_DIR", staging_dir)
+    (staging_dir / (".qobuz-run-" + "a" * 24)).mkdir(parents=True)
+
+    authority = run_lock.acquire()
+    try:
+        result = startup_recovery.recover_startup_state(authority=authority)
+    finally:
+        authority.close()
+
+    assert result.status is startup_recovery.StartupRecoveryStatus.ATTENTION_REQUIRED
+    assert result.reason == "unclaimed-staging-run"
+
+
+def test_restart_pins_a_gap_fill_carrier_before_queue_work_can_resume(
+    tmp_path,
+    monkeypatch,
+):
+    from qobuz_librarian.library.backup import (
+        backup_gap_fill_files,
+        library_backup_record,
+    )
+    from qobuz_librarian.queue.durable_album import (
+        initial_completion_input,
+        plan_durable_new_album,
+    )
+
+    music = tmp_path / "music"
+    album_dir = music / "Artist" / "Album"
+    album_dir.mkdir(parents=True)
+    owned = album_dir / "01.flac"
+    owned.write_bytes(b"owned original")
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    monkeypatch.setattr(cfg, "PENDING_QUEUE_FILE", tmp_path / "pending.json")
+    monkeypatch.setattr(cfg, "QUEUE_JOURNAL_DIR", tmp_path / "journals")
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "run.lock")
+    monkeypatch.setattr(cfg, "STAGING_DIR", tmp_path / "staging")
+
+    tracks = [
+        {"id": str(number), "media_number": 1, "track_number": number}
+        for number in range(1, 6)
+    ]
+    queued = _build_queue_item(
+        album={
+            "id": "1",
+            "title": "Album",
+            "maximum_bit_depth": 24,
+            "maximum_sampling_rate": 96,
+            "tracks": {"items": tracks},
+        },
+        album_dir=album_dir,
+        label="Album",
+        missing=tracks[1:],
+        present=tracks[:1],
+        upgrade_only=False,
+        auto_upgrade=False,
+    )
+    current = journal.save_queue_journal(
+        journal.create_queue_journal([queued], mode="album")
+    )
+    item_id = current.items[0].item_id
+    owner = RecoveryOwner(current.operation_id, item_id)
+    owner_record = {
+        "operation_id": owner.operation_id,
+        "item_id": owner.item_id,
+    }
+    plan = plan_durable_new_album(
+        queued,
+        SimpleNamespace(no_import=False, no_downsample=True),
+    )
+    assert plan is not None
+    current = journal.transition_journal_item(
+        current,
+        item_id,
+        journal.QueuePhase.ACTIVE,
+        completion_input=initial_completion_input(
+            plan,
+            owner,
+            CompletionOrigin(
+                CompletionOriginKind.CLI,
+                "test-gap-fill-restart",
+            ),
+        ),
+    )
+
+    def commit_intent(record):
+        nonlocal current
+        current = journal.append_library_backup_intent(
+            current,
+            item_id,
+            record,
+        )
+        assert owned.exists()
+        assert current.items[0].recovery_references[0].kind == (
+            "library-backup-intent"
+        )
+
+    backup = backup_gap_fill_files(
+        [owned],
+        album_dir,
+        owner=owner_record,
+        on_intent=commit_intent,
+    )
+    assert backup is not None and backup.complete and not owned.exists()
+    intent = current.items[0].recovery_references[0]
+    carrier = library_backup_record(backup, expected_owner=owner_record)
+    assert carrier is not None
+    current = journal.promote_library_backup_carrier(
+        current,
+        item_id,
+        intent,
+        carrier,
+    )
+
+    authority = run_lock.acquire()
+    try:
+        result = startup_recovery.recover_startup_state(authority=authority)
+    finally:
+        authority.close()
+
+    assert result.status is startup_recovery.StartupRecoveryStatus.ATTENTION_REQUIRED
+    loaded = journal.load_queue_journal(current.operation_id).journal
+    assert loaded is not None
+    blocked = loaded.items[0]
+    assert blocked.phase is journal.QueuePhase.BLOCKED
+    assert blocked.block_reason == "library-backup-carrier-awaiting-recovery"
+    assert tuple(ref.kind for ref in blocked.recovery_references) == (
+        "library-backup",
+    )
+    assert (backup.path / ".ql_upgrade_unverified").is_file()
+
+
+def test_legacy_backup_settlement_is_upgraded_before_disposal(monkeypatch):
+    from qobuz_librarian.queue import library_backup_recovery as recovery
+
+    owner = RecoveryOwner("a" * 64, "b" * 64)
+    carrier = {"legacy": "carrier"}
+    settlement = journal.RecoveryReference(
+        "library-backup",
+        "library-backup-settlement",
+        {"version": 1, "carrier": carrier},
+    )
+    current = SimpleNamespace(items=(SimpleNamespace(
+        item_id=owner.item_id,
+        recovery_references=(settlement,),
+    ),))
+    backup = object()
+    disposal = {"sealed": "disposal"}
+    upgraded = SimpleNamespace(items=current.items)
+    captured = {}
+
+    monkeypatch.setattr(
+        recovery,
+        "load_library_backup_record",
+        lambda value, *, expected_owner: (
+            backup if value is carrier else None
+        ),
+    )
+    monkeypatch.setattr(
+        recovery,
+        "library_backup_disposal_record",
+        lambda value, *, expected_owner: (
+            disposal if value is backup else None
+        ),
+    )
+
+    def persist_upgrade(value, item_id, reference, *, disposal_record):
+        captured["call"] = value, item_id, reference, disposal_record
+        return upgraded
+
+    monkeypatch.setattr(
+        recovery.queue_state,
+        "upgrade_library_backup_settlement",
+        persist_upgrade,
+    )
+
+    result = recovery.prepare_library_backup_settlement(
+        current,
+        owner.item_id,
+        owner,
+        {},
+        None,
+        authority_check=lambda: None,
+    )
+
+    assert result.status is recovery.LibraryBackupResolutionStatus.READY
+    assert result.journal is upgraded
+    assert captured["call"] == (
+        current,
+        owner.item_id,
+        settlement,
+        disposal,
+    )
+
+
+@pytest.mark.parametrize("reconciliation_state", ("disposed", "none"))
+def test_completed_upgrade_disposal_settles_without_deleted_backup(
+        tmp_path, monkeypatch, reconciliation_state):
+    from qobuz_librarian.queue import library_backup_recovery as recovery
+
+    owner = RecoveryOwner("a" * 64, "b" * 64)
+    replacement_receipt = {"exact": "replacement"}
+    carrier = {"kind": "upgrade"}
+    settlement = journal.RecoveryReference(
+        "library-backup",
+        "library-backup-settlement",
+        {
+            "version": 2,
+            "carrier": carrier,
+            "replacement_path": str(tmp_path / "Album"),
+            "replacement_receipt": replacement_receipt,
+            "disposal": {"sealed": "disposal"},
+        },
+    )
+    current = SimpleNamespace(items=(SimpleNamespace(
+        item_id=owner.item_id,
+        recovery_references=(settlement,),
+    ),))
+    saved = SimpleNamespace(items=())
+
+    monkeypatch.setattr(
+        recovery,
+        "_replacement_validator",
+        lambda *_args: lambda _replacement, _backup: pytest.fail(
+            "a deleted upgrade backup cannot be revalidated by path"
+        ),
+    )
+    monkeypatch.setattr(
+        recovery,
+        "reconcile_library_backup_disposal",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            state=reconciliation_state, quarantine_path=None),
+    )
+    monkeypatch.setattr(
+        recovery,
+        "capture_album_source_receipt",
+        lambda _path: replacement_receipt,
+    )
+    monkeypatch.setattr(
+        recovery,
+        "load_library_backup_record",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        recovery,
+        "library_backup_record_absent",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        recovery.queue_state,
+        "finish_library_backup_settlement",
+        lambda *_args, **_kwargs: saved,
+    )
+
+    result = recovery.finish_library_backup_settlement(
+        current,
+        owner.item_id,
+        owner,
+        {},
+        authority_check=lambda: None,
+    )
+
+    assert result.status is recovery.LibraryBackupResolutionStatus.SETTLED
+    assert result.journal is saved
+
+
+@pytest.mark.parametrize(
+    (
+        "crash_point",
+        "change_replacement",
+        "ambiguous",
+        "persisted_disposal",
+        "expected_state",
+    ),
+    (
+        ("before-move", False, False, True, "none"),
+        ("before-delete", True, False, True, "restored"),
+        ("after-unlink", False, False, True, "disposed"),
+        ("after-unlink", False, True, True, "attention"),
+        ("before-delete", False, False, False, "visible"),
+    ),
+)
+def test_restart_reconciles_exact_backup_disposal_quarantine(
+    tmp_path,
+    monkeypatch,
+    crash_point,
+    change_replacement,
+    ambiguous,
+    persisted_disposal,
+    expected_state,
+):
+    import qobuz_librarian.library.backup as backup_module
+
+    music = tmp_path / "music"
+    album = music / "Artist" / "Album"
+    album.mkdir(parents=True)
+    original = album / "01.flac"
+    original.write_bytes(b"original")
+    backups = tmp_path / "backups"
+    monkeypatch.setattr(backup_module.cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(backup_module.cfg, "UPGRADE_BACKUP_DIR", backups)
+    owner = {"operation_id": "a" * 64, "item_id": "b" * 64}
+    backup = backup_module.backup_gap_fill_files(
+        [original],
+        album,
+        owner=owner,
+        on_intent=lambda _record: None,
+    )
+    assert backup is not None and backup.complete
+    carrier = backup_module.library_backup_record(
+        backup, expected_owner=owner)
+    disposal = backup_module.library_backup_disposal_record(
+        backup, expected_owner=owner)
+    assert carrier is not None and disposal is not None
+    assert backup_module.pin_unverified_upgrade_backup(
+        backup,
+        "kept after settlement",
+        expected_owner=owner,
+    )
+
+    replacement = album / "01.flac"
+    replacement.write_bytes(b"replacement")
+    replacement_receipt = backup_module.capture_album_source_receipt(album)
+    assert replacement_receipt is not None
+    settlement = journal.RecoveryReference(
+        "library-backup",
+        "library-backup-settlement",
+        {
+            "version": 2,
+            "owner": owner,
+            "carrier": carrier,
+            "replacement_path": str(album),
+            "replacement_receipt": replacement_receipt,
+            "disposal": disposal,
+        },
+    )
+    assert journal._strict_library_backup_settlement(
+        settlement,
+        expected_operation_id=owner["operation_id"],
+        expected_item_id=owner["item_id"],
+    )
+
+    child = os.fork()
+    if child == 0:
+        if crash_point == "before-move":
+            backup_module._rename_exact_noreplace_at = (
+                lambda *_args, **_kwargs: os._exit(91)
+            )
+        elif crash_point == "before-delete":
+            backup_module._delete_exact_tree_contents = (
+                lambda *_args, **_kwargs: os._exit(91)
+            )
+        else:
+            original_unlink = backup_module._unlink_exact_at
+
+            def crash_after_unlink(*args, **kwargs):
+                original_unlink(*args, **kwargs)
+                os._exit(91)
+
+            backup_module._unlink_exact_at = crash_after_unlink
+        backup_module.dispose_backup(
+            backup,
+            replacement_path=album,
+            expected_replacement_receipt=replacement_receipt,
+            replacement_validator=lambda *_paths: True,
+            expected_owner=owner,
+            expected_disposal_record=(
+                disposal if persisted_disposal else None
+            ),
+        )
+        os._exit(92)
+
+    _pid, status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(status) == 91
+    quarantine = backups / disposal["quarantine_name"]
+    if crash_point == "before-move":
+        assert backup.path.is_dir()
+        assert quarantine.is_dir()
+        assert not tuple(quarantine.iterdir())
+    else:
+        assert not backup.path.exists()
+        assert (quarantine / "held").is_dir()
+
+    if expected_state == "visible":
+        backup_module._only_copy_cache = None
+        assert (quarantine, album) in backup_module.find_only_copy_backups()
+        return
+
+    if change_replacement:
+        replacement.write_bytes(b"changed replacement")
+    if ambiguous:
+        (quarantine / "held" / "unexpected").write_bytes(b"not owned")
+    reconciled = backup_module.reconcile_library_backup_disposal(
+        carrier,
+        disposal,
+        replacement_path=album,
+        expected_replacement_receipt=replacement_receipt,
+        expected_owner=owner,
+    )
+
+    assert reconciled.state == expected_state
+    if expected_state == "none":
+        assert not quarantine.exists()
+        assert (backup.path / "01.flac").read_bytes() == b"original"
+        assert replacement.read_bytes() == b"replacement"
+    elif expected_state == "attention":
+        assert quarantine.is_dir()
+        assert (quarantine / "held" / "unexpected").read_bytes() == b"not owned"
+        assert not backup.path.exists()
+        assert replacement.read_bytes() == b"replacement"
+    elif expected_state == "restored":
+        assert not quarantine.exists()
+        assert (backup.path / "01.flac").read_bytes() == b"original"
+        assert replacement.read_bytes() == b"changed replacement"
+    else:
+        assert not quarantine.exists()
+        assert not backup.path.exists()
+        assert replacement.read_bytes() == b"replacement"
+
+
+def test_startup_recovery_is_fail_closed_and_settles_exact_work(
+    tmp_path,
+    monkeypatch,
+):
+    journals_dir = tmp_path / "queue-journals"
+    monkeypatch.setattr(cfg, "PENDING_QUEUE_FILE", tmp_path / "pending.json")
+    monkeypatch.setattr(cfg, "QUEUE_JOURNAL_DIR", journals_dir)
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "run.lock")
+    monkeypatch.setattr(cfg, "STAGING_DIR", tmp_path / "staging")
+    monkeypatch.setattr(cfg, "BEETS_DB_PATH", tmp_path / "beets" / "library.db")
+
+    identifiers = iter(f"{number:064x}" for number in range(1, 20))
+    monkeypatch.setattr(journal, "_new_id", lambda: next(identifiers))
+
+    def queue_item(title):
+        return _build_queue_item(
+            album={"id": "1", "title": title},
+            album_dir=Path(f"/music/{title.lower()}"),
+            label=title,
+            missing=[],
+            present=[],
+            upgrade_only=False,
+            auto_upgrade=False,
+        )
+
+    saved = journal.save_queue_journal(
+        journal.create_queue_journal(
+            [
+                queue_item("Retirement"),
+                queue_item("Complete"),
+                queue_item("Sealed"),
+                queue_item("Unsealed"),
+                queue_item("Download incomplete"),
+            ],
+            mode="album",
+        )
+    )
+    (
+        retirement_id,
+        complete_id,
+        sealed_id,
+        unsealed_id,
+        download_incomplete_id,
+    ) = (item.item_id for item in saved.items)
+
+    def completion_input(item_id, *, ready):
+        slot = "qobuz:track-1"
+        return CompletionInput(
+            owner=RecoveryOwner(saved.operation_id, item_id),
+            origin=CompletionOrigin(CompletionOriginKind.CLI, "test-recovery"),
+            expectation=CompletionExpectation(
+                album_id="1",
+                scope=CompletionScope.ALBUM,
+                catalogue_slots=(slot,),
+                requested_slots=(slot,),
+                quality_targets=(QualityTarget(slot, 16, 44_100),),
+            ),
+            effective_tier=2,
+            lineages=(
+                SourceLineage(
+                    slot=slot,
+                    origin=StagedReceipt(
+                        path=f"/staging/{item_id}.flac",
+                        identity=(1, int(item_id, 16), 3, 4, 5, 6),
+                    ),
+                ),
+            )
+            if ready
+            else (),
+            counts=DownloadCounts() if ready else None,
+        )
+
+    def completion_evidence(item_id):
+        frozen = completion_input(item_id, ready=True)
+        lineage = frozen.lineages[0]
+        source = lineage.current
+        destination = (2, int(item_id, 16), 100, 1_000, 3_000)
+        album_identity = (2, int(item_id, 16) + 100, 0, 900, 2_900)
+        destination_path = f"Artist/Album/{item_id[-2:]}.flac"
+        landing = LandingReceipt(
+            lineage.slot,
+            destination_path,
+            destination,
+            "d" * 64,
+        )
+        return CompletionEvidence(
+            owner=frozen.owner,
+            expectation=frozen.expectation,
+            library_root="/music",
+            library_root_identity=(2, 10, 0, 1_000, 2_000),
+            album_path="Artist/Album",
+            album_identity=album_identity,
+            managed_manifest_hash="c" * 64,
+            imports=(
+                ManagedMapping(
+                    lineage.slot,
+                    source.path,
+                    source.identity,
+                    destination_path,
+                    destination,
+                ),
+            ),
+            landings=(landing,),
+            baseline=(),
+            inventory=AlbumInventory(
+                path="Artist/Album",
+                identity=album_identity,
+                audio=(landing,),
+            ),
+            quality=(
+                TrackQuality(
+                    slot=lineage.slot,
+                    path=destination_path,
+                    identity=destination,
+                    sha256=landing.sha256,
+                    served_bits=16,
+                    served_rate=44_100,
+                ),
+            ),
+            counts=DownloadCounts(),
+        )
+
+    def managed_reference(item_id):
+        return journal.RecoveryReference(
+            name="managed-import",
+            kind="managed-beets",
+            data={
+                "version": 1,
+                "path": f"/private/{item_id}.jsonl",
+                "device": 1,
+                "inode": int(item_id, 16),
+                "parent_device": 3,
+                "parent_inode": 4,
+                "nonce": "d" * 64,
+                "owner": {
+                    "operation_id": saved.operation_id,
+                    "item_id": item_id,
+                },
+            },
+        )
+
+    ready_inputs = {
+        item_id: completion_input(item_id, ready=True)
+        for item_id in (
+            retirement_id,
+            complete_id,
+            sealed_id,
+            unsealed_id,
+        )
+    }
+    evidence = {
+        item_id: completion_evidence(item_id) for item_id in (retirement_id, complete_id, sealed_id)
+    }
+
+    def make_resolving(current, item_id):
+        current = journal.transition_journal_item(
+            current,
+            item_id,
+            journal.QueuePhase.ACTIVE,
+            completion_input=ready_inputs[item_id],
+        )
+        return journal.transition_journal_item(
+            current,
+            item_id,
+            journal.QueuePhase.RESOLVING,
+            recovery_references=(managed_reference(item_id),),
+        )
+
+    saved = make_resolving(saved, retirement_id)
+    saved = journal.transition_journal_item(
+        saved,
+        retirement_id,
+        journal.QueuePhase.COMPLETE,
+        completion_evidence=evidence[retirement_id].to_record(),
+    )
+    saved = journal.commit_recovered_completed_item_removal(
+        saved,
+        item_id=retirement_id,
+        live_evidence=evidence[retirement_id],
+    )
+
+    saved = make_resolving(saved, complete_id)
+    saved = journal.transition_journal_item(
+        saved,
+        complete_id,
+        journal.QueuePhase.COMPLETE,
+        completion_evidence=evidence[complete_id].to_record(),
+    )
+    saved = make_resolving(saved, sealed_id)
+    saved = make_resolving(saved, unsealed_id)
+    saved = journal.transition_journal_item(
+        saved,
+        download_incomplete_id,
+        journal.QueuePhase.ACTIVE,
+        completion_input=completion_input(download_incomplete_id, ready=False),
+    )
+
+    events = []
+
+    class ManagedLease:
+        def __init__(self, owner):
+            self.owner = owner
+
+        def revalidate(self):
+            return SimpleNamespace(manifest_hash="c" * 64)
+
+    class LiveLease:
+        def __init__(self, item_id):
+            self.item_id = item_id
+
+        def revalidate(self):
+            events.append(("live-proof", self.item_id))
+            return evidence[self.item_id]
+
+    @contextmanager
+    def reopen(reference, owner):
+        assert reference["owner"] == {
+            "operation_id": owner.operation_id,
+            "item_id": owner.item_id,
+        }
+        events.append(("managed-open", owner.item_id))
+        try:
+            yield ManagedLease(owner)
+        finally:
+            events.append(("managed-close", owner.item_id))
+
+    @contextmanager
+    def capture(*, managed_lease, owner, expectation, download):
+        frozen = ready_inputs[owner.item_id]
+        assert managed_lease.owner == owner
+        assert expectation == frozen.expectation
+        assert download == frozen.download_coverage()
+        events.append(("live-open", owner.item_id))
+        try:
+            yield LiveLease(owner.item_id)
+        finally:
+            events.append(("live-close", owner.item_id))
+
+    def inspect(reference, owner):
+        assert reference["owner"]["item_id"] == owner.item_id
+        events.append(("inspect", owner.item_id))
+        if owner.item_id == sealed_id:
+            return beets.ManagedCarrierInspectionResult(
+                beets.ManagedCarrierInspectionOutcome.SEALED,
+                "c" * 64,
+            )
+        return beets.ManagedCarrierInspectionResult(
+            beets.ManagedCarrierInspectionOutcome.UNSEALED_ACTIVITY,
+        )
+
+    def retire(_reference, owner, _manifest_hash, _quarantine_name):
+        events.append(("retire", owner.item_id))
+        return beets.ManagedCarrierRetirementResult(
+            beets.ManagedCarrierRetirementOutcome.RETIRED,
+        )
+
+    expected_plans = {item.item_id: item.planned for item in saved.items}
+    acknowledged = []
+
+    def acknowledge_completion(
+        origin,
+        owner,
+        *,
+        album_id,
+        completion_hash,
+        planned,
+        post_dir,
+    ):
+        frozen = ready_inputs[owner.item_id]
+        assert origin == frozen.origin
+        assert owner == frozen.owner
+        assert album_id == frozen.expectation.album_id
+        assert len(completion_hash) == 64
+        assert planned == expected_plans[owner.item_id]
+        assert post_dir == "/music/Artist/Album"
+        acknowledged.append(owner.item_id)
+        return True
+
+    monkeypatch.setattr(startup_recovery, "reopen_managed_evidence", reopen)
+    monkeypatch.setattr(startup_recovery, "capture_new_album_completion", capture)
+    monkeypatch.setattr(startup_recovery, "inspect_managed_carrier", inspect)
+    monkeypatch.setattr(beets, "retire_managed_carrier", retire)
+
+    authority = run_lock.acquire()
+    assert authority is not None
+    try:
+        journal_path = journals_dir / f"{saved.operation_id}.json"
+        residue = journals_dir / f".{saved.operation_id}.interrupted.tmp"
+        residue.write_bytes(journal_path.read_bytes())
+        before = journal_path.read_bytes(), residue.read_bytes()
+
+        blocked = startup_recovery.recover_startup_state(authority=authority)
+
+        assert blocked.status is startup_recovery.StartupRecoveryStatus.ATTENTION_REQUIRED
+        assert blocked.reason == "queue-namespace-blocked"
+        assert events == []
+        assert (journal_path.read_bytes(), residue.read_bytes()) == before
+
+        residue.unlink()
+        complete_before = next(
+            item
+            for item in journal.load_queue_journal(saved.operation_id).journal.items
+            if item.item_id == complete_id
+        )
+        deferred = startup_recovery.recover_startup_state(authority=authority)
+        complete_after = next(
+            item
+            for item in journal.load_queue_journal(saved.operation_id).journal.items
+            if item.item_id == complete_id
+        )
+        assert deferred.status is startup_recovery.StartupRecoveryStatus.RESUME_REQUIRED
+        assert complete_after == complete_before
+        assert next(item for item in deferred.items if item.item_id == complete_id).action is (
+            startup_recovery.StartupRecoveryAction.FINALISE_COMPLETION
+        )
+
+        recovered = startup_recovery.recover_startup_state(
+            authority=authority,
+            acknowledge_completion=acknowledge_completion,
+        )
+    finally:
+        authority.close()
+
+    assert recovered.status is startup_recovery.StartupRecoveryStatus.ATTENTION_REQUIRED
+    assert recovered.reason == "queue-item-blocked"
+    assert events[0] == ("retire", retirement_id)
+    assert ("live-proof", complete_id) in events
+    assert ("live-proof", sealed_id) in events
+    assert events.index(("live-close", complete_id)) < events.index(("retire", complete_id))
+    assert events.index(("live-close", sealed_id)) < events.index(("retire", sealed_id))
+    assert acknowledged == [complete_id, sealed_id]
+
+    loaded = journal.load_queue_journal(saved.operation_id)
+    assert loaded.status is journal.QueueLoadStatus.READY
+    final = loaded.journal
+    assert final is not None
+    assert final.retirements == ()
+    remaining = {item.item_id: item for item in final.items}
+    assert set(remaining) == {
+        unsealed_id,
+        download_incomplete_id,
+    }
+    unsealed = remaining[unsealed_id]
+    assert unsealed.phase is journal.QueuePhase.BLOCKED
+    assert unsealed.block_reason == "managed-carrier-unsealed-activity"
+    assert unsealed.recovery_references == (managed_reference(unsealed_id),)
+    assert unsealed.completion_input == ready_inputs[unsealed_id].to_record()
+
+    reported = {item.item_id: item for item in recovered.items}
+    assert (
+        reported[download_incomplete_id].action
+        is startup_recovery.StartupRecoveryAction.RESUME_DOWNLOAD
+    )
+    assert remaining[download_incomplete_id].phase is journal.QueuePhase.ACTIVE
+
+
+def test_resolving_item_replays_postimport_phase_after_staging_reconcile_crash(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(cfg, "PENDING_QUEUE_FILE", tmp_path / "pending.json")
+    monkeypatch.setattr(cfg, "QUEUE_JOURNAL_DIR", tmp_path / "queue-journals")
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "run.lock")
+    monkeypatch.setattr(cfg, "STAGING_DIR", tmp_path / "staging")
+
+    queued = _build_queue_item(
+        album={"id": "1", "title": "Postimport"},
+        album_dir=Path("/music/postimport"),
+        label="Postimport",
+        missing=[],
+        present=[],
+        upgrade_only=False,
+        auto_upgrade=False,
+    )
+    saved = journal.save_queue_journal(journal.create_queue_journal([queued], mode="album"))
+    item_id = saved.items[0].item_id
+    slot = "qobuz:track-1"
+    frozen = CompletionInput(
+        owner=RecoveryOwner(saved.operation_id, item_id),
+        origin=CompletionOrigin(CompletionOriginKind.CLI, "test-recovery"),
+        expectation=CompletionExpectation(
+            album_id="1",
+            scope=CompletionScope.ALBUM,
+            catalogue_slots=(slot,),
+            requested_slots=(slot,),
+            quality_targets=(QualityTarget(slot, 16, 44_100),),
+        ),
+        effective_tier=2,
+        lineages=(
+            SourceLineage(
+                slot=slot,
+                origin=StagedReceipt(
+                    path=f"/staging/{item_id}.flac",
+                    identity=(1, int(item_id, 16), 3, 4, 5, 6),
+                ),
+            ),
+        ),
+        counts=DownloadCounts(),
+    )
+    carrier = journal.RecoveryReference(
+        name="managed-import",
+        kind="managed-beets",
+        data={
+            "version": 1,
+            "path": f"/private/{item_id}.jsonl",
+            "device": 1,
+            "inode": int(item_id, 16),
+            "parent_device": 3,
+            "parent_inode": 4,
+            "nonce": "d" * 64,
+            "owner": {
+                "operation_id": saved.operation_id,
+                "item_id": item_id,
+            },
+        },
+    )
+    saved = journal.transition_journal_item(
+        saved,
+        item_id,
+        journal.QueuePhase.ACTIVE,
+        completion_input=frozen,
+    )
+    saved = journal.transition_journal_item(
+        saved,
+        item_id,
+        journal.QueuePhase.RESOLVING,
+        recovery_references=(carrier,),
+    )
+    saved = journal.append_staging_group_intent(
+        saved,
+        item_id,
+        _staging_group_record(saved, item_id, "postimport"),
+    )
+
+    staging_status = {"value": staging.StagingReferenceStatus.MATCH}
+    managed_inspections = []
+    proof_attempts = []
+
+    def inspect_group(_reference, owner):
+        assert owner == {"operation_id": saved.operation_id, "item_id": item_id}
+        return staging.StagingReferenceInspection(staging_status["value"])
+
+    def inspect_carrier(reference, owner):
+        assert reference == carrier.data
+        assert owner == frozen.owner
+        managed_inspections.append(item_id)
+        return beets.ManagedCarrierInspectionResult(
+            beets.ManagedCarrierInspectionOutcome.SEALED,
+            "c" * 64,
+        )
+
+    @contextmanager
+    def unavailable_completion(_journal, item, *, expected_manifest_hash=None):
+        proof_attempts.append((item.item_id, expected_manifest_hash))
+        raise startup_recovery.LiveCompletionUnavailable("proof unavailable")
+        yield
+
+    monkeypatch.setattr(startup_recovery, "inspect_staging_group_reference", inspect_group)
+    monkeypatch.setattr(startup_recovery, "inspect_managed_carrier", inspect_carrier)
+    monkeypatch.setattr(startup_recovery, "_capture_live_completion", unavailable_completion)
+
+    def acknowledge_completion(
+        origin,
+        owner,
+        *,
+        album_id,
+        completion_hash,
+        planned,
+        post_dir,
+    ):
+        assert origin == frozen.origin
+        assert owner == frozen.owner
+        assert album_id == frozen.expectation.album_id
+        assert len(completion_hash) == 64
+        assert planned == saved.items[0].planned
+        assert post_dir == "/music/Artist/Album"
+        return True
+
+    authority = run_lock.acquire()
+    assert authority is not None
+    try:
+        blocked = startup_recovery.recover_startup_state(
+            authority=authority,
+            acknowledge_completion=acknowledge_completion,
+        )
+        first = journal.load_queue_journal(saved.operation_id).journal.items[0]
+        assert blocked.status is startup_recovery.StartupRecoveryStatus.ATTENTION_REQUIRED
+        assert first.phase is journal.QueuePhase.BLOCKED
+        assert first.block_reason == "staging-group-present"
+        assert managed_inspections == []
+
+        staging_status["value"] = staging.StagingReferenceStatus.ABSENT
+        original_transition = journal.transition_journal_item
+
+        def interrupt_phase_restore(current, candidate_id, phase, **kwargs):
+            if candidate_id == item_id and phase is journal.QueuePhase.RESOLVING:
+                candidate = next(item for item in current.items if item.item_id == candidate_id)
+                if candidate.phase is journal.QueuePhase.BLOCKED:
+                    raise KeyboardInterrupt
+            return original_transition(current, candidate_id, phase, **kwargs)
+
+        monkeypatch.setattr(
+            startup_recovery.queue_state,
+            "transition_journal_item",
+            interrupt_phase_restore,
+        )
+        with pytest.raises(KeyboardInterrupt):
+            startup_recovery.recover_startup_state(
+                authority=authority,
+                acknowledge_completion=acknowledge_completion,
+            )
+        interrupted = journal.load_queue_journal(saved.operation_id).journal.items[0]
+        assert interrupted.phase is journal.QueuePhase.BLOCKED
+        assert interrupted.block_reason == "staging-group-present"
+        assert interrupted.recovery_references == (carrier,)
+
+        monkeypatch.setattr(
+            startup_recovery.queue_state,
+            "transition_journal_item",
+            original_transition,
+        )
+        recovered = startup_recovery.recover_startup_state(
+            authority=authority,
+            acknowledge_completion=acknowledge_completion,
+        )
+    finally:
+        authority.close()
+
+    final = journal.load_queue_journal(saved.operation_id).journal.items[0]
+    assert recovered.status is startup_recovery.StartupRecoveryStatus.ATTENTION_REQUIRED
+    assert final.phase is journal.QueuePhase.BLOCKED
+    assert final.block_reason == "managed-completion-proof-unavailable"
+    assert final.recovery_references == (carrier,)
+    assert managed_inspections == [item_id]
+    assert proof_attempts == [(item_id, "c" * 64)]
+
+
+def test_blocked_prelaunch_work_settles_only_before_beets_activity(
+    tmp_path,
+    monkeypatch,
+):
+    journals_dir = tmp_path / "queue-journals"
+    config_dir = tmp_path / "beets"
+    monkeypatch.setattr(cfg, "PENDING_QUEUE_FILE", tmp_path / "pending.json")
+    monkeypatch.setattr(cfg, "QUEUE_JOURNAL_DIR", journals_dir)
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "run.lock")
+    monkeypatch.setattr(cfg, "STAGING_DIR", tmp_path / "staging")
+    monkeypatch.setattr(cfg, "BEETS_DB_PATH", config_dir / "library.db")
+
+    def queue_item(title):
+        return _build_queue_item(
+            album={"id": "1", "title": title},
+            album_dir=Path(f"/music/{title.lower()}"),
+            label=title,
+            missing=[],
+            present=[],
+            upgrade_only=False,
+            auto_upgrade=False,
+        )
+
+    saved = journal.save_queue_journal(
+        journal.create_queue_journal(
+            [queue_item("Restart"), queue_item("Discard")],
+            mode="album",
+        )
+    )
+    restart_id, discard_id = (item.item_id for item in saved.items)
+
+    def completion_input(item_id):
+        slot = "qobuz:track-1"
+        return CompletionInput(
+            owner=RecoveryOwner(saved.operation_id, item_id),
+            origin=CompletionOrigin(CompletionOriginKind.CLI, "test-recovery"),
+            expectation=CompletionExpectation(
+                album_id="1",
+                scope=CompletionScope.ALBUM,
+                catalogue_slots=(slot,),
+                requested_slots=(slot,),
+                quality_targets=(QualityTarget(slot, 16, 44_100),),
+            ),
+            effective_tier=2,
+            lineages=(
+                SourceLineage(
+                    slot=slot,
+                    origin=StagedReceipt(
+                        path=f"/staging/{item_id}.flac",
+                        identity=(1, int(item_id, 16), 3, 4, 5, 6),
+                    ),
+                ),
+            ),
+            counts=DownloadCounts(),
+        )
+
+    def reservation(item_id, nonce):
+        return journal.RecoveryReference(
+            name="managed-import-reservation",
+            kind="managed-beets-reservation",
+            data={
+                "version": 1,
+                "path": str(config_dir / f".qobuz-managed-beets-{nonce}.jsonl"),
+                "parent_device": 3,
+                "parent_inode": 4,
+                "nonce": nonce,
+                "owner": {
+                    "operation_id": saved.operation_id,
+                    "item_id": item_id,
+                },
+            },
+        )
+
+    def carrier(item_id, nonce):
+        return {
+            "version": 2,
+            "path": str(config_dir / f".qobuz-managed-beets-{nonce}.jsonl"),
+            "device": 5,
+            "inode": int(item_id, 16),
+            "parent_device": 3,
+            "parent_inode": 4,
+            "nonce": nonce,
+            "owner": {
+                "operation_id": saved.operation_id,
+                "item_id": item_id,
+            },
+        }
+
+    restart_nonce = "b" * 64
+    discard_nonce = "c" * 64
+    references = {
+        restart_id: reservation(restart_id, restart_nonce),
+        discard_id: reservation(discard_id, discard_nonce),
+    }
+    for item_id in (restart_id, discard_id):
+        saved = journal.transition_journal_item(
+            saved,
+            item_id,
+            journal.QueuePhase.ACTIVE,
+            completion_input=completion_input(item_id),
+        )
+        saved = journal.reserve_managed_carrier(
+            saved,
+            item_id,
+            references[item_id],
+        )
+        saved = journal.transition_journal_item(
+            saved,
+            item_id,
+            journal.QueuePhase.BLOCKED,
+            block_reason="managed reservation needs attention",
+        )
+
+    carrier_records = {
+        restart_id: carrier(restart_id, restart_nonce),
+    }
+    discard_outcome = beets.ManagedReservationInspectionOutcome.ACTIVITY
+
+    def inspect_reservation(_reference, owner):
+        if owner.item_id == discard_id:
+            return beets.ManagedReservationInspectionResult(discard_outcome)
+        return beets.ManagedReservationInspectionResult(
+            beets.ManagedReservationInspectionOutcome.ORIGIN,
+            carrier_records[owner.item_id],
+            "c" * 64,
+        )
+
+    retired = []
+    interrupt_once = {restart_id}
+
+    def retire(reference, owner, manifest_hash):
+        current = journal.load_queue_journal(saved.operation_id).journal
+        item = next(value for value in current.items if value.item_id == owner.item_id)
+        settlement = item.recovery_references[0]
+        assert settlement.kind == "managed-beets-prelaunch-settlement"
+        assert settlement.data["action"] == "retry"
+        assert settlement.data["carrier"] == reference
+        assert settlement.data["manifest_hash"] == manifest_hash
+        if owner.item_id in interrupt_once:
+            interrupt_once.remove(owner.item_id)
+            raise KeyboardInterrupt
+        retired.append(owner.item_id)
+        return beets.ManagedCarrierRetirementResult(
+            beets.ManagedCarrierRetirementOutcome.RETIRED,
+        )
+
+    monkeypatch.setattr(
+        startup_recovery,
+        "inspect_managed_reservation",
+        inspect_reservation,
+    )
+    monkeypatch.setattr(
+        startup_recovery,
+        "retire_prelaunch_managed_carrier",
+        retire,
+    )
+
+    authority = run_lock.acquire()
+    assert authority is not None
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            startup_recovery.settle_blocked_item(
+                authority=authority,
+                operation_id=saved.operation_id,
+                item_id=restart_id,
+                action=startup_recovery.BlockedItemSettlementAction.RETRY,
+            )
+        recovered = startup_recovery.recover_startup_state(
+            authority=authority,
+        )
+        before = (journals_dir / f"{saved.operation_id}.json").read_bytes()
+        activity_result = startup_recovery.settle_blocked_item(
+            authority=authority,
+            operation_id=saved.operation_id,
+            item_id=discard_id,
+            action=startup_recovery.BlockedItemSettlementAction.DISCARD,
+        )
+        assert (journals_dir / f"{saved.operation_id}.json").read_bytes() == before
+        discard_outcome = beets.ManagedReservationInspectionOutcome.ABSENT
+        discard_result = startup_recovery.settle_blocked_item(
+            authority=authority,
+            operation_id=saved.operation_id,
+            item_id=discard_id,
+            action=startup_recovery.BlockedItemSettlementAction.DISCARD,
+        )
+        retry_recovery = startup_recovery.recover_startup_state(
+            authority=authority,
+        )
+    finally:
+        authority.close()
+
+    assert recovered.status is startup_recovery.StartupRecoveryStatus.ATTENTION_REQUIRED
+    assert retired == [restart_id]
+    assert activity_result.status is (startup_recovery.BlockedItemSettlementStatus.BLOCKED)
+    assert "may have started" in activity_result.reason
+    assert discard_result.status is (startup_recovery.BlockedItemSettlementStatus.DISCARDED)
+    final = journal.load_queue_journal(saved.operation_id).journal
+    assert final is not None
+    assert [item.item_id for item in final.items] == [restart_id]
+    assert final.items[0].phase is journal.QueuePhase.PENDING
+    assert final.items[0].completion_input is None
+    assert not final.items[0].recovery_references
+    assert retry_recovery.status is startup_recovery.StartupRecoveryStatus.RESUME_REQUIRED
+    assert retry_recovery.items[0].action is startup_recovery.StartupRecoveryAction.PENDING

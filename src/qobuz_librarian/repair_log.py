@@ -13,8 +13,11 @@ Two non-obvious bits of behaviour worth preserving:
   stays unambiguously parseable.
 """
 import fcntl
+import hashlib
 import os
+import re
 import shutil
+import stat
 import threading
 import time
 from collections import Counter
@@ -23,9 +26,13 @@ from pathlib import Path
 from qobuz_librarian import config as cfg
 from qobuz_librarian.api.auth import AuthLost, QobuzUnavailable
 from qobuz_librarian.api.search import find_qobuz_track_by_isrc
+from qobuz_librarian.file_exclusion import (
+    acquire_inode_write_exclusion,
+    inode_write_exclusion_scope,
+)
 from qobuz_librarian.integrations.rip import flac_audio_offset, flac_audio_ok
-from qobuz_librarian.library import repair_cache
-from qobuz_librarian.library.scanner import read_album_dir
+from qobuz_librarian.library import repair_cache, scanner
+from qobuz_librarian.library.scanner import iter_tree_no_symlinks, parse_track_num
 from qobuz_librarian.ui_cli.colors import C, fmt
 from qobuz_librarian.ui_cli.logging import log
 
@@ -118,16 +125,381 @@ _BYTE_SIZE_TRUNCATED_RATIO = 0.15
 # the failure mode interrupted-copy corruption produces.
 
 
-def _flac_decode_ok(path):
+def _flac_decode_ok(path, *, descriptor=None):
     """End-to-end FLAC integrity probe via ``flac -t`` (frame-CRC + decode).
     Returns False only on a real decode error (CRC mismatch, broken header,
     premature EOF). A missing file or a missing flac tool returns True so the
     scanner doesn't fabricate verified_truncated entries it can't stand behind.
     """
-    if not path or not os.path.exists(path):
+    if descriptor is None and (not path or not os.path.exists(path)):
         return True
-    ok = flac_audio_ok(Path(path))
+    ok = flac_audio_ok(Path(path), descriptor=descriptor)
     return True if ok is None else ok
+
+
+def _stat_identity(value):
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        stat.S_IFMT(value.st_mode),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
+
+
+class _HeldRepairSource:
+    """One no-follow album file held against writers for its whole diagnosis."""
+
+    def __init__(self, album_dir, path):
+        self.album_dir = Path(os.path.abspath(os.fspath(album_dir)))
+        self.path = Path(os.path.abspath(os.fspath(path)))
+        self._directories = []
+        self._parts = ()
+        self.descriptor = None
+        self.exclusion = None
+        self.source_receipt = None
+        try:
+            relative = self.path.relative_to(self.album_dir)
+            if (not relative.parts
+                    or any(part in ("", ".", "..") for part in relative.parts)):
+                raise OSError("repair source escaped the selected album")
+            self._parts = relative.parts
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            self._directories.append(os.open(self.album_dir, flags))
+            for part in self._parts[:-1]:
+                named = os.stat(
+                    part,
+                    dir_fd=self._directories[-1],
+                    follow_symlinks=False,
+                )
+                child = os.open(part, flags, dir_fd=self._directories[-1])
+                if (_stat_identity(named)[:3]
+                        != _stat_identity(os.fstat(child))[:3]):
+                    os.close(child)
+                    raise OSError("repair source parent changed while opening")
+                self._directories.append(child)
+
+            file_flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NONBLOCK", 0)
+            file_flags |= getattr(os, "O_NOFOLLOW", 0)
+            self.descriptor = os.open(
+                self._parts[-1], file_flags, dir_fd=self._directories[-1])
+            if not stat.S_ISREG(os.fstat(self.descriptor).st_mode):
+                raise OSError("repair source is not a regular file")
+            self.exclusion = acquire_inode_write_exclusion(self.descriptor)
+            if self.exclusion is None:
+                raise OSError("repair source is busy or cannot be held")
+
+            receipt = self._seal_receipt()
+            if receipt is None or not self._receipt_matches(receipt):
+                raise OSError("repair source could not be sealed before diagnosis")
+            self.source_receipt = receipt
+            if not self.intact():
+                raise OSError("repair source changed before diagnosis")
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def size(self):
+        return int(os.fstat(self.descriptor).st_size)
+
+    def _receipt_matches(self, receipt):
+        try:
+            sealed = receipt["file"]
+            value = os.fstat(self.descriptor)
+            return (
+                receipt["relative"] == "/".join(self._parts)
+                and sealed["type"] == stat.S_IFMT(value.st_mode)
+                and sealed["device"] == value.st_dev
+                and sealed["inode"] == value.st_ino
+                and sealed["size"] == value.st_size
+                and sealed["mtime_ns"] == value.st_mtime_ns
+                and sealed["ctime_ns"] == value.st_ctime_ns
+            )
+        except (KeyError, OSError, TypeError, ValueError):
+            return False
+
+    def _seal_receipt(self):
+        before = os.fstat(self.descriptor)
+        digest = hashlib.sha256()
+        offset = 0
+        while True:
+            chunk = os.pread(self.descriptor, 1024 * 1024, offset)
+            if not chunk:
+                break
+            digest.update(chunk)
+            offset += len(chunk)
+        after = os.fstat(self.descriptor)
+        if _stat_identity(before) != _stat_identity(after):
+            return None
+        return {
+            "relative": "/".join(self._parts),
+            "file": {
+                "type": stat.S_IFMT(after.st_mode),
+                "device": int(after.st_dev),
+                "inode": int(after.st_ino),
+                "size": int(after.st_size),
+                "mtime_ns": int(after.st_mtime_ns),
+                "ctime_ns": int(after.st_ctime_ns),
+                "sha256": digest.hexdigest(),
+            },
+        }
+
+    def intact(self):
+        if (self.descriptor is None or self.exclusion is None
+                or not self.exclusion.intact()
+                or not self._receipt_matches(self.source_receipt)):
+            return False
+        try:
+            root_named = os.stat(self.album_dir, follow_symlinks=False)
+            if (_stat_identity(root_named)[:3]
+                    != _stat_identity(os.fstat(self._directories[0]))[:3]):
+                return False
+            for index, part in enumerate(self._parts[:-1]):
+                named = os.stat(
+                    part,
+                    dir_fd=self._directories[index],
+                    follow_symlinks=False,
+                )
+                if (_stat_identity(named)[:3]
+                        != _stat_identity(os.fstat(
+                            self._directories[index + 1]))[:3]):
+                    return False
+            leaf = os.stat(
+                self._parts[-1],
+                dir_fd=self._directories[-1],
+                follow_symlinks=False,
+            )
+            return _stat_identity(leaf) == _stat_identity(
+                os.fstat(self.descriptor))
+        except OSError:
+            return False
+
+    def close(self):
+        if self.exclusion is not None:
+            self.exclusion.close()
+            self.exclusion = None
+        if self.descriptor is not None:
+            os.close(self.descriptor)
+            self.descriptor = None
+        while self._directories:
+            os.close(self._directories.pop())
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        self.close()
+
+
+def _fallback_held_meta(source):
+    stem = source.path.stem
+    match = re.match(r"^(\d+)[\s.\-]+(.+)$", stem)
+    disc_match = re.match(
+        r"(?:disc|cd)\s*0*(\d+)", source.path.parent.name, re.IGNORECASE)
+    return {
+        "title": match.group(2) if match else stem,
+        "tracknumber": int(match.group(1)) if match else 0,
+        "isrc": "",
+        "discnumber": int(disc_match.group(1)) if disc_match else 1,
+        "bits": 0,
+        "sample_rate": 0,
+        "channels": 0,
+        "length": 0.0,
+        "path": str(source.path),
+        "size": source.size,
+    }
+
+
+def _read_held_audio_meta(source):
+    """Read mutagen metadata only through the already-held source descriptor."""
+    if not scanner.HAVE_MUTAGEN:
+        return _fallback_held_meta(source)
+    duplicate = os.dup(source.descriptor)
+    try:
+        with os.fdopen(duplicate, "rb") as fileobj:
+            duplicate = None
+            try:
+                parsed = scanner.mutagen.File(fileobj, easy=True)
+            except OSError:
+                raise
+            except Exception:
+                return _fallback_held_meta(source)
+    finally:
+        if duplicate is not None:
+            os.close(duplicate)
+    if parsed is None:
+        return _fallback_held_meta(source)
+    tags = parsed.tags
+
+    def first(key):
+        value = tags.get(key) if tags else None
+        return value[0] if value and isinstance(value, list) else ""
+
+    title = first("title")
+    if not title:
+        return _fallback_held_meta(source)
+    info = parsed.info
+    return {
+        "title": title,
+        "isrc": first("isrc").strip().replace("-", "").upper(),
+        "tracknumber": parse_track_num(first("tracknumber")),
+        "discnumber": parse_track_num(first("discnumber")) or 1,
+        "bits": getattr(info, "bits_per_sample", 0) if info else 0,
+        "sample_rate": getattr(info, "sample_rate", 0) if info else 0,
+        "channels": getattr(info, "channels", 0) if info else 0,
+        "length": getattr(info, "length", 0.0) if info else 0.0,
+        "path": str(source.path),
+        "size": source.size,
+    }
+
+
+def _repair_flac_paths(album_dir):
+    paths = []
+    for path in iter_tree_no_symlinks(Path(album_dir)):
+        if path.suffix.lower() == ".flac":
+            paths.append(path)
+    return sorted(paths)
+
+
+def _append_verified_truncated(report, source, entry):
+    """Attach only the same exact source held before every diagnostic check."""
+    if not source.intact():
+        report["unverified"] += 1
+        return
+    entry["source_receipt"] = source.source_receipt
+    report["verified_truncated"].append(entry)
+
+
+def _append_verified_ok(report, source, isrc, *, record_isrc=True):
+    if not source.intact():
+        report["unverified"] += 1
+        return
+    report["verified_ok"] += 1
+    if record_isrc:
+        report["verified_ok_isrcs"][isrc] += 1
+
+
+def _scan_held_repair_source(
+        report, source, token, *, min_short_seconds, max_ratio,
+        max_short_seconds, deep, only_isrcs):
+    """Diagnose one file while its descriptor, namespace, and writer lease hold."""
+    et = _read_held_audio_meta(source)
+    path = str(source.path)
+    title = et.get("title") or source.path.stem
+    isrc_raw = et.get("isrc") or ""
+    isrc = isrc_raw.replace("-", "").upper().strip()
+    try:
+        flen = float(et.get("length") or 0)
+    except (TypeError, ValueError):
+        flen = 0.0
+
+    if not isrc:
+        entry = {"path": path, "title": title, "size_bytes": source.size}
+        if source.size < 50_000:
+            entry["diagnostic"] = (
+                f"likely-corrupted ({source.size:,} B); hand-verify "
+                "before refilling")
+        elif not _flac_decode_ok(path, descriptor=source.descriptor):
+            entry["diagnostic"] = (
+                "won't decode (frame-CRC or mid-file damage); "
+                "re-download or replace from another source")
+        if source.intact():
+            report["no_isrc_tag"].append(entry)
+        else:
+            report["unverified"] += 1
+        return
+
+    sample_rate = int(et.get("sample_rate") or 0)
+    bits = int(et.get("bits") or 0)
+    channels = int(et.get("channels") or 2)
+    actual_size = source.size
+    audio_size = max(
+        0,
+        actual_size - flac_audio_offset(
+            path, descriptor=source.descriptor),
+    )
+    looks_byte_short = (
+        sample_rate > 0 and bits > 0 and flen > 0 and audio_size > 0
+        and audio_size < flen * sample_rate * channels * (bits / 8)
+        * _BYTE_SIZE_TRUNCATED_RATIO)
+    if not deep and not looks_byte_short:
+        dec = flac_audio_ok(Path(path), descriptor=source.descriptor)
+        if dec is True:
+            _append_verified_ok(report, source, isrc)
+            return
+        if dec is None:
+            report["unverified"] += 1
+            return
+
+    if only_isrcs is not None and isrc not in only_isrcs:
+        _append_verified_ok(report, source, isrc, record_isrc=False)
+        return
+
+    qt = _qobuz_track_by_isrc(isrc, token)
+    if not source.intact():
+        report["unverified"] += 1
+        return
+    if qt is None:
+        entry = {"path": path, "title": title, "isrc": isrc}
+        if not _flac_decode_ok(path, descriptor=source.descriptor):
+            entry["diagnostic"] = (
+                "won't decode (frame-CRC or mid-file damage); "
+                "re-download or replace from another source")
+            if source.intact():
+                report["no_isrc_tag"].append(entry)
+            else:
+                report["unverified"] += 1
+        elif source.intact():
+            report["isrc_no_match"].append(entry)
+        else:
+            report["unverified"] += 1
+        return
+
+    try:
+        qdur = float(qt.get("duration") or 0)
+    except (TypeError, ValueError):
+        qdur = 0.0
+    entry = {
+        "path": path,
+        "file_length": flen,
+        "qobuz_track": qt,
+        "qobuz_duration": qdur,
+        "isrc": isrc,
+        "title": qt.get("title") or title,
+        "track_number": qt.get("track_number") or et.get("tracknumber") or 0,
+    }
+    if qdur <= 0:
+        if not _flac_decode_ok(path, descriptor=source.descriptor):
+            entry["reason"] = "decode_failed"
+            _append_verified_truncated(report, source, entry)
+        else:
+            _append_verified_ok(report, source, isrc)
+        return
+
+    if sample_rate > 0 and bits > 0 and audio_size > 0:
+        expected_uncompressed = qdur * sample_rate * channels * (bits / 8)
+        if (audio_size < expected_uncompressed * _BYTE_SIZE_TRUNCATED_RATIO
+                and shutil.which("flac") is not None
+                and not _flac_decode_ok(path, descriptor=source.descriptor)):
+            entry.update(actual_size=actual_size, reason="byte_size_short")
+            _append_verified_truncated(report, source, entry)
+            return
+
+    loss = qdur - flen
+    if (flen > 0 and loss > min_short_seconds
+            and (flen < qdur * max_ratio or loss > max_short_seconds)):
+        _append_verified_truncated(report, source, entry)
+        return
+
+    if not _flac_decode_ok(path, descriptor=source.descriptor):
+        entry.update(actual_size=actual_size, reason="decode_failed")
+        _append_verified_truncated(report, source, entry)
+        return
+
+    _append_verified_ok(report, source, isrc)
 
 
 def scan_dir_for_isrc_repairs(album_dir, token,
@@ -183,207 +555,28 @@ def scan_dir_for_isrc_repairs(album_dir, token,
         # counted so the summary can say so, never reported as "verified ok".
         "unverified": 0,
     }
-    existing = read_album_dir(album_dir)
-    if not existing:
+    try:
+        paths = _repair_flac_paths(album_dir)
+    except OSError:
+        report["unverified"] += 1
         return report
 
-    for et in existing:
-        path = et.get("path") or ""
-        # FLAC-only scanner: the integrity probe is `flac -t` and refills are
-        # re-ripped from Qobuz as FLAC. read_album_dir also returns
-        # mp3/m4a/aac/ogg/opus/wav, on which `flac -t` ALWAYS fails — which
-        # would flag a perfectly healthy non-FLAC as verified_truncated and
-        # then delete+refill it. Skip anything that isn't FLAC.
-        if not path.lower().endswith(".flac"):
-            continue
-        title = et.get("title") or Path(path).stem
-        isrc_raw = et.get("isrc") or ""
-        isrc = isrc_raw.replace("-", "").upper().strip()
-        try:
-            flen = float(et.get("length") or 0)
-        except (TypeError, ValueError):
-            flen = 0.0
-
-        if not isrc:
-            entry = {"path": path, "title": title}
+    with inode_write_exclusion_scope():
+        for path in paths:
             try:
-                size_bytes = os.path.getsize(path) if path else 0
+                with _HeldRepairSource(album_dir, path) as source:
+                    _scan_held_repair_source(
+                        report, source, token,
+                        min_short_seconds=min_short_seconds,
+                        max_ratio=max_ratio,
+                        max_short_seconds=max_short_seconds,
+                        deep=deep,
+                        only_isrcs=only_isrcs,
+                    )
+            except (AuthLost, QobuzUnavailable):
+                raise
             except OSError:
-                size_bytes = 0
-            entry["size_bytes"] = size_bytes
-            # A FLAC tagless enough to be missing ISRC and small enough to
-            # be obviously broken is almost certainly a damaged download.
-            # Surface a friendlier hint so the user knows to hand-verify
-            # rather than chasing the bland "skipped — can't verify".
-            if size_bytes < 50_000:
-                entry["diagnostic"] = (
-                    f"likely-corrupted ({size_bytes:,} B); hand-verify "
-                    "before refilling")
-            # A no-ISRC file can't be ISRC-refilled, but it can still be
-            # *broken* — a normal-size FLAC with frame-CRC damage or a middle-
-            # zero gap passes the size check yet won't decode. A deep scan
-            # (single album, or a whole-FLAC pass) probes it locally so a clean
-            # non-Qobuz library still gets its corrupt files surfaced — no token
-            # or ISRC needed. The whole-library sweeps run deep, so a corrupt
-            # no-ISRC file is surfaced library-wide; the cheaper deep=False mode
-            # catches it via the byte-size gate below once it has an ISRC. (No-op
-            # when the flac tool is absent.)
-            elif path and not _flac_decode_ok(path):
-                entry["diagnostic"] = (
-                    "won't decode (frame-CRC or mid-file damage); "
-                    "re-download or replace from another source")
-            report["no_isrc_tag"].append(entry)
-            continue
-
-        # Local-first truncation gate. A cut-off download leaves a FLAC whose
-        # STREAMINFO still claims the full duration while the file on disk is
-        # far too small — provable from the header and size alone, no network.
-        # The cheap deep=False mode only looks a file up on Qobuz when it trips
-        # this gate; deep=True (used by the sweeps) verifies every track, also
-        # catching a file that decodes fine but is genuinely shorter than the
-        # real recording, at one Qobuz call per track (cached on re-scans).
-        sample_rate = int(et.get("sample_rate") or 0)
-        bits = int(et.get("bits") or 0)
-        channels = int(et.get("channels") or 2)
-        try:
-            actual_size = os.path.getsize(path) if path else 0
-        except OSError:
-            actual_size = 0
-        audio_size = max(0, actual_size - flac_audio_offset(path)) if path else 0
-        looks_byte_short = (
-            sample_rate > 0 and bits > 0 and flen > 0 and audio_size > 0
-            and audio_size < flen * sample_rate * channels * (bits / 8)
-            * _BYTE_SIZE_TRUNCATED_RATIO)
-        if not deep and not looks_byte_short:
-            # The cheap gates say "fine" — but frame-CRC or middle-zero damage
-            # leaves the file size and STREAMINFO intact while the audio itself
-            # won't decode. A repair scan must never call a file "ok" it never
-            # read, so decode-probe locally (no network) before trusting it.
-            # A clean file is verified_ok and stays network-free (the common,
-            # fast case); a decode FAILURE falls through to the ISRC lookup +
-            # flag path below so the damage is surfaced and, if matched on
-            # Qobuz, refillable. A missing `flac` tool means we genuinely can't
-            # verify — count it unverified rather than fabricate an "ok".
-            dec = flac_audio_ok(Path(path)) if path else None
-            if dec is True:
-                report["verified_ok"] += 1
-                report["verified_ok_isrcs"][isrc] += 1
-                continue
-            if dec is None:
                 report["unverified"] += 1
-                continue
-            # dec is False → genuinely corrupt; fall through to look up + flag.
-        # Caller only needs a subset of ISRCs positively re-verified (e.g. the
-        # post-repair integrity check on just the refilled tracks): everything
-        # outside that set is counted ok without burning an API call per track.
-        if only_isrcs is not None and isrc not in only_isrcs:
-            report["verified_ok"] += 1
-            continue
-
-        qt = _qobuz_track_by_isrc(isrc, token)
-        if qt is None:
-            entry = {"path": path, "title": title, "isrc": isrc}
-            # Tagged but not on Qobuz (Apple Music rip, delisted release, …) so
-            # it can't be ISRC-refilled — but a deep scan still decode-probes it
-            # so a corrupt-but-unmatched file is surfaced rather than silently
-            # passed. Routed to no_isrc_tag's diagnostic channel (same as a
-            # broken untagged file), since the byID refill can't apply here.
-            if path and not _flac_decode_ok(path):
-                entry["diagnostic"] = (
-                    "won't decode (frame-CRC or mid-file damage); "
-                    "re-download or replace from another source")
-                report["no_isrc_tag"].append(entry)
-            else:
-                report["isrc_no_match"].append(entry)
-            continue
-
-        try:
-            qdur = float(qt.get("duration") or 0)
-        except (TypeError, ValueError):
-            qdur = 0.0
-        if qdur <= 0:
-            # Qobuz didn't report a duration; the byte/duration gates can't run.
-            # A decode probe is duration-independent, so still catch an
-            # outright-corrupt file rather than passing it as ok. (No-op when
-            # the flac tool is absent — _flac_decode_ok returns True.)
-            if path and not _flac_decode_ok(path):
-                report["verified_truncated"].append({
-                    "path": path,
-                    "file_length": flen,
-                    "qobuz_track": qt,
-                    "qobuz_duration": qdur,
-                    "isrc": isrc,
-                    "title": qt.get("title") or title,
-                    "track_number": qt.get("track_number") or et.get("tracknumber") or 0,
-                    "reason": "decode_failed",
-                })
-            else:
-                # ISRC matched on Qobuz, file decodes; Qobuz gave no duration so
-                # this is the strongest "ok" we can assert for it.
-                report["verified_ok"] += 1
-                report["verified_ok_isrcs"][isrc] += 1
-            continue
-
-        # Byte-size sanity gate against Qobuz's authoritative duration. Quiet /
-        # ambient material legitimately compresses this small and decodes fine,
-        # so flag only when a decode probe conclusively fails — and that probe
-        # needs the flac tool, so when it's absent skip the gate rather than flag
-        # a good file into a false re-rip (every other gate degrades to trust
-        # when flac is absent). ``audio_size`` excludes the metadata block so a
-        # multi-MB embedded picture doesn't mask a truncated audio stream.
-        if sample_rate > 0 and bits > 0 and audio_size > 0:
-            expected_uncompressed = qdur * sample_rate * channels * (bits / 8)
-            if (audio_size < expected_uncompressed * _BYTE_SIZE_TRUNCATED_RATIO
-                    and shutil.which("flac") is not None
-                    and path and not _flac_decode_ok(path)):
-                report["verified_truncated"].append({
-                    "path": path,
-                    "file_length": flen,
-                    "qobuz_track": qt,
-                    "qobuz_duration": qdur,
-                    "isrc": isrc,
-                    "title": qt.get("title") or title,
-                    "track_number": qt.get("track_number") or et.get("tracknumber") or 0,
-                    "actual_size": actual_size,
-                    "reason": "byte_size_short",
-                })
-                continue
-
-        loss = qdur - flen
-        if (flen > 0 and loss > min_short_seconds
-                and (flen < qdur * max_ratio or loss > max_short_seconds)):
-            report["verified_truncated"].append({
-                "path": path,
-                "file_length": flen,
-                "qobuz_track": qt,
-                "qobuz_duration": qdur,
-                "isrc": isrc,
-                "title": qt.get("title") or title,
-                "track_number": qt.get("track_number") or et.get("tracknumber") or 0,
-            })
-            continue
-
-        # Both cheap gates passed — STREAMINFO and size look fine. A 10 kB
-        # tail-truncation on a 100 MB file survives both checks, as does
-        # middle-zero damage where the file size is unchanged. Decode
-        # probe catches frame-CRC mismatches that only show up on a
-        # full read.
-        if path and not _flac_decode_ok(path):
-            report["verified_truncated"].append({
-                "path": path,
-                "file_length": flen,
-                "qobuz_track": qt,
-                "qobuz_duration": qdur,
-                "isrc": isrc,
-                "title": qt.get("title") or title,
-                "track_number": qt.get("track_number") or et.get("tracknumber") or 0,
-                "actual_size": actual_size,
-                "reason": "decode_failed",
-            })
-            continue
-
-        report["verified_ok"] += 1
-        report["verified_ok_isrcs"][isrc] += 1
     return report
 
 

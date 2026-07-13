@@ -110,13 +110,22 @@ def _csp(nonce: str) -> str:
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """Adds X-Content-Type-Options, X-Frame-Options, Referrer-Policy,
     Permissions-Policy, a nonce-based Content-Security-Policy, and HSTS on
-    HTTPS requests only."""
+    HTTPS requests only. Private non-static responses are non-storable."""
     async def dispatch(self, request, call_next):
         # Minted before the route renders so templates can stamp it on their
         # inline <script>s via request.state.csp_nonce (mirrors csrf_token).
         nonce = _new_token()
         request.state.csp_nonce = nonce
         response = await call_next(request)
+        cacheable_asset = (
+            request.url.path.startswith("/static/")
+            or request.url.path in {"/favicon.ico", "/sw.js"}
+        )
+        if not cacheable_asset:
+            # Job JSON and event streams contain the same private library data
+            # as the HTML pages. Override weaker route defaults such as SSE's
+            # `no-cache`, which still permits storage and revalidation.
+            response.headers["Cache-Control"] = "no-store"
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "same-origin")

@@ -34,6 +34,7 @@ def _isolate_data_dir():
     cfg.WALK_SEEN_FILE       = tmp_root / ".qobuz_walk_seen.txt"
     cfg.ALBUM_WALK_SEEN_FILE = tmp_root / ".qobuz_album_walk_seen.txt"
     cfg.PENDING_QUEUE_FILE   = tmp_root / ".qobuz_pending_queue.json"
+    cfg.QUEUE_JOURNAL_DIR    = tmp_root / ".qobuz_queue_journals"
     cfg.LYRIC_RETRY_FILE     = tmp_root / ".qobuz_lyric_retry.json"
     cfg.REPAIR_LOG_PATH      = tmp_root / ".qobuz_replaced_tracks.log"
     cfg.CAPPED_FILE          = tmp_root / ".qobuz_upgrade_capped.json"
@@ -54,6 +55,10 @@ def _isolate_data_dir():
     cfg.STREAMRIP_CONFIG     = tmp_root / "streamrip" / "config.toml"
     cfg.QOBUZ_USER_AUTH_TOKEN = ""
     cfg.QOBUZ_USER_ID = ""
+    cfg.BEETS_PYTHON = ""
+    cfg.BEETS_CONFIG_DIR = tmp_root / "beets"
+    cfg.BEETS_CONFIG_DIR.mkdir()
+    cfg.BEETS_DB_PATH = cfg.BEETS_CONFIG_DIR / "musiclibrary.db"
     # Keep MUSIC_ROOT off the dev's real ~/Music — tests that need a library
     # build one under tmp_path and monkeypatch it, but the session default must
     # never be a real path a stray scan could walk.
@@ -88,6 +93,8 @@ def _isolate_data_dir():
                   "AUTO_LIBRARY_SCAN", "ALBUM_CACHE_ENABLED", "FLAC_CACHE_ENABLED",
                   "REPAIR_CACHE_ENABLED",
                   "UPGRADE_SCAN_ENABLED",
+                  "BEETS_PYTHON",
+                  "BEETS_CONFIG_DIR", "BEETS_DB_PATH",
                   "QOBUZ_USER_AUTH_TOKEN", "QOBUZ_USER_ID", "STREAMRIP_CONFIG",
                   "MUSIC_ROOT")}
     os.environ["WEB_AUTH"] = "none"
@@ -101,6 +108,9 @@ def _isolate_data_dir():
     os.environ["ALBUM_CACHE_ENABLED"] = "false"
     os.environ["FLAC_CACHE_ENABLED"] = "false"
     os.environ["REPAIR_CACHE_ENABLED"] = "false"
+    os.environ["BEETS_PYTHON"] = ""
+    os.environ["BEETS_CONFIG_DIR"] = str(cfg.BEETS_CONFIG_DIR)
+    os.environ["BEETS_DB_PATH"] = str(cfg.BEETS_DB_PATH)
     # Same reasoning: clear the Qobuz creds env so a reload(cfg) in a test
     # doesn't pick a leftover dev-shell token back up. STREAMRIP_CONFIG is
     # pointed at the tmp dir above; this complements that by making sure the
@@ -150,6 +160,19 @@ def _clean_job_registry():
     with job_mgr.registry._lock:
         job_mgr.registry._jobs.clear()
         job_mgr.registry._order.clear()
+
+
+@pytest.fixture(autouse=True)
+def _allow_in_memory_job_admission(monkeypatch):
+    """Keep ordinary tests independent of jobs.db without weakening runtime."""
+    from qobuz_librarian.web import job_persistence
+
+    monkeypatch.setattr(job_persistence, "admit", lambda _job: True)
+    monkeypatch.setattr(
+        job_persistence,
+        "admit_review_transition",
+        lambda _job, _parked=(): True,
+    )
 
 
 @pytest.fixture(autouse=True)

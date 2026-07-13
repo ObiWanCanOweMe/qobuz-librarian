@@ -1,135 +1,305 @@
-"""Queue persistence — crash-safe save/load/clear and startup resume hook.
-
-``save_pending_queue`` writes via tmp + ``os.replace`` so a crash mid-save
-never leaves a half-written file. A version field is embedded in the
-payload so a schema bump can be detected and old data discarded cleanly
-on next launch.
-"""
-import json
-import os
-from datetime import datetime, timezone
-from pathlib import Path
+"""Compatibility entry points and the CLI resume prompt for queue journals."""
 
 from qobuz_librarian import config as cfg
 from qobuz_librarian.api.auth import AuthLost
-from qobuz_librarian.queue.builder import _build_queue_item
+from qobuz_librarian.queue.journal import (
+    JournalItem,
+    QueueJournal,
+    QueueJournalBlocked,
+    QueueJournalError,
+    QueueLoad,
+    QueueLoadStatus,
+    QueuePhase,
+    RecoveryReference,
+    _deserialize_queue_item,
+    _serialize_queue_item,
+    clear_pending_queue,
+    clear_queue_journal,
+    commit_completed_item_removal,
+    commit_recovered_completed_item_removal,
+    create_queue_journal,
+    list_queue_journals,
+    load_queue_journal,
+    process_carrier_retirement,
+    save_pending_queue,
+    save_queue_journal,
+    transition_journal_item,
+)
 from qobuz_librarian.ui_cli.colors import C, fmt
-from qobuz_librarian.ui_cli.logging import log, vlog
+from qobuz_librarian.ui_cli.logging import log
 
-
-def _serialize_queue_item(item):
-    """Pull the JSON-safe inputs out of an in-memory queue item."""
-    return {
-        "album": item["album"],
-        "album_dir": str(item["album_dir"]) if item["album_dir"] else None,
-        "label": item["label"],
-        "missing": item["missing"],
-        "present": item["present"],
-        "upgrade_only": bool(item["upgrade_only"]),
-        "auto_upgrade": bool(item["auto_upgrade"]),
-        "siblings_to_delete": [str(p) for p in item.get("siblings_to_delete") or []],
-        "quality": item.get("quality"),
-        "force_track_by_track": bool(item.get("force_track_by_track", False)),
-    }
-
-
-def _deserialize_queue_item(d):
-    """Rebuild a queue item from its on-disk form. Runtime fields
-    (n_ok, backup_path, etc.) come back as fresh defaults from
-    _build_queue_item, which is exactly what we want for replay."""
-    return _build_queue_item(
-        album=d["album"],
-        album_dir=Path(d["album_dir"]) if d.get("album_dir") else None,
-        label=d.get("label", ""),
-        missing=d.get("missing") or [],
-        present=d.get("present") or [],
-        upgrade_only=bool(d.get("upgrade_only", False)),
-        auto_upgrade=bool(d.get("auto_upgrade", False)),
-        siblings_to_delete=[Path(p) for p in d.get("siblings_to_delete") or []],
-        quality=d.get("quality"),
-        force_track_by_track=bool(d.get("force_track_by_track", False)),
-    )
-
-
-def save_pending_queue(items, *, mode):
-    """Persist the current shared_queue to disk (best-effort).
-
-    Write to .tmp, then os.replace, so a *process* crash mid-write can't leave a
-    half-written file at the real path. It is deliberately NOT fsync'd, so a power
-    loss or kernel panic in the write window can still leave a zero-length file —
-    the queue is re-derivable by re-running the walk (the same no-fsync trade the
-    project makes for its other re-derivable state), and load_pending_queue
-    discards an unreadable file cleanly so the walk just rebuilds it. Failures are
-    logged but never raise — persistence is a safety net, not a hard requirement.
-    """
-    try:
-        cfg.PENDING_QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "version": cfg.PENDING_QUEUE_VERSION,
-            "saved_at": datetime.now(timezone.utc).isoformat(),
-            "mode": mode,
-            "count": len(items),
-            "items": [_serialize_queue_item(i) for i in items],
-        }
-        tmp = cfg.PENDING_QUEUE_FILE.with_suffix(cfg.PENDING_QUEUE_FILE.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, cfg.PENDING_QUEUE_FILE)
-    except Exception as e:
-        # Persistence failures shouldn't block the user from continuing
-        # to walk — but they do mean a crash would cost decisions, so
-        # surface them in --verbose.
-        vlog(f"save_pending_queue failed: {e}")
+__all__ = [
+    "JournalItem",
+    "QueueJournal",
+    "QueueJournalBlocked",
+    "QueueJournalError",
+    "QueueLoad",
+    "QueueLoadStatus",
+    "QueuePhase",
+    "RecoveryReference",
+    "_deserialize_queue_item",
+    "_serialize_queue_item",
+    "clear_pending_queue",
+    "clear_queue_journal",
+    "commit_completed_item_removal",
+    "commit_recovered_completed_item_removal",
+    "create_queue_journal",
+    "load_pending_queue",
+    "load_queue_journal",
+    "list_queue_journals",
+    "offer_resume_pending_queue",
+    "offer_resume_startup_recovery",
+    "process_carrier_retirement",
+    "save_pending_queue",
+    "save_queue_journal",
+    "transition_journal_item",
+]
 
 
 def load_pending_queue():
-    """Return (items, mode, saved_at_iso) if a pending file exists and
-    parses, else (None, None, None). Schema-version mismatch returns
-    None too with a user-visible warning."""
-    if not cfg.PENDING_QUEUE_FILE.exists():
-        return None, None, None
+    """Load typed v2 state while preserving tuple unpacking for old callers."""
+    loaded = load_queue_journal()
+    if loaded.status is QueueLoadStatus.BLOCKED:
+        location = loaded.paths[0] if len(loaded.paths) == 1 else cfg.QUEUE_JOURNAL_DIR
+        log.info(fmt(
+            C.YELLOW,
+            f"  ⚠  Saved queue state at {location} needs attention "
+            f"({loaded.reason or 'invalid journal'}); it was left unchanged.",
+        ))
+    return loaded
+
+
+def _load_startup_recovery_queue(recovery):
+    """Bind one typed CLI recovery result back to its exact journal."""
+    from qobuz_librarian.completion import (
+        CompletionOriginKind,
+        RecoveryOwner,
+        normalise_album_id,
+        parse_completion_input_record,
+    )
+    from qobuz_librarian.queue.startup_recovery import (
+        StartupRecoveryAction,
+        StartupRecoveryItem,
+        StartupRecoveryResult,
+        StartupRecoveryStatus,
+    )
+
+    if (
+        type(recovery) is not StartupRecoveryResult
+        or recovery.status is not StartupRecoveryStatus.RESUME_REQUIRED
+        or type(recovery.items) is not tuple
+        or not recovery.items
+        or any(type(item) is not StartupRecoveryItem for item in recovery.items)
+    ):
+        raise QueueJournalBlocked("CLI recovery state is unavailable")
+
+    operations = {
+        (item.operation_id, item.mode)
+        for item in recovery.items
+    }
+    if len(operations) != 1:
+        raise QueueJournalBlocked(
+            "CLI recovery does not name one exact queue operation"
+        )
+    operation_id, mode = operations.pop()
+    if mode.startswith("web-job:"):
+        raise QueueJournalBlocked(
+            "saved Web recovery must be resumed from its exact Web job"
+        )
+
+    loaded = load_queue_journal(operation_id)
+    journal = loaded.journal
+    if (
+        loaded.status is not QueueLoadStatus.READY
+        or journal is None
+        or journal.operation_id != operation_id
+        or journal.mode != mode
+        or journal.retirements
+        or len(journal.items) != len(recovery.items)
+    ):
+        raise QueueJournalBlocked(
+            loaded.reason or "saved CLI recovery no longer matches its journal"
+        )
+
+    recovered_by_id = {item.item_id: item for item in recovery.items}
+    if len(recovered_by_id) != len(recovery.items):
+        raise QueueJournalBlocked("CLI recovery item identities are ambiguous")
+    expected_actions = {
+        QueuePhase.PENDING: StartupRecoveryAction.PENDING,
+        QueuePhase.ACTIVE: StartupRecoveryAction.RESUME_DOWNLOAD,
+        QueuePhase.RESOLVING: StartupRecoveryAction.FINALISE_COMPLETION,
+        QueuePhase.COMPLETE: StartupRecoveryAction.FINALISE_COMPLETION,
+    }
+    recovery_bearing = []
+    for queued in journal.items:
+        recovered = recovered_by_id.get(queued.item_id)
+        if (
+            recovered is None
+            or recovered.operation_id != operation_id
+            or recovered.mode != mode
+            or recovered.phase is not queued.phase
+            or recovered.action is not expected_actions.get(queued.phase)
+            or recovered.reason is not None
+        ):
+            raise QueueJournalBlocked(
+                "saved CLI recovery changed before it could be resumed"
+            )
+        if queued.phase is not QueuePhase.PENDING:
+            recovery_bearing.append(queued)
+
+    if len(recovery_bearing) > 1:
+        raise QueueJournalBlocked(
+            "more than one active CLI queue item requires attention"
+        )
+    if recovery_bearing:
+        queued = recovery_bearing[0]
+        completion_input = parse_completion_input_record(
+            queued.completion_input,
+            expected_owner=RecoveryOwner(operation_id, queued.item_id),
+        )
+        planned_album = queued.planned.get("album")
+        if (
+            completion_input is None
+            or completion_input.origin.kind is not CompletionOriginKind.CLI
+            or completion_input.origin.reference != "download-queue"
+            or not isinstance(planned_album, dict)
+            or normalise_album_id(planned_album.get("id"))
+            != normalise_album_id(completion_input.expectation.album_id)
+        ):
+            raise QueueJournalBlocked(
+                "saved queue item does not belong to this CLI download"
+            )
+
+    ordered = list(journal.items)
+    if recovery_bearing:
+        ordered.remove(recovery_bearing[0])
+        ordered.insert(0, recovery_bearing[0])
     try:
-        payload = json.loads(cfg.PENDING_QUEUE_FILE.read_text(encoding="utf-8"))
-    except Exception as e:
-        log.info(fmt(C.YELLOW,
-            f"  ⚠  {cfg.PENDING_QUEUE_FILE.name} unreadable ({e}); ignoring."))
-        return None, None, None
-    if not isinstance(payload, dict):
-        log.info(fmt(C.YELLOW,
-            f"  ⚠  {cfg.PENDING_QUEUE_FILE.name} is malformed (not an object); "
-            "ignoring."))
-        return None, None, None
-    ver = payload.get("version")
-    if ver != cfg.PENDING_QUEUE_VERSION:
-        log.info(fmt(C.YELLOW,
-            f"  ⚠  {cfg.PENDING_QUEUE_FILE.name} version {ver!r} not supported "
-            f"(expected {cfg.PENDING_QUEUE_VERSION}); ignoring."))
-        return None, None, None
-    # Deserialize per item: one malformed entry must not discard every other
-    # valid queued album. Skip and log the bad ones, keep the rest.
-    items = []
-    for d in payload.get("items") or []:
+        items = [_deserialize_queue_item(item.planned) for item in ordered]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise QueueJournalBlocked("saved CLI queue plan is invalid") from exc
+    return loaded, items, mode, journal.saved_at, operation_id, bool(recovery_bearing)
+
+
+def offer_resume_startup_recovery(args, token_source, recovery):
+    """Offer the exact typed CLI operation named by startup recovery."""
+    (
+        loaded,
+        items,
+        mode,
+        saved_at,
+        operation_id,
+        recovery_bearing,
+    ) = _load_startup_recovery_queue(recovery)
+
+    when = saved_at or "unknown time"
+    label_for_mode = {
+        "album_walk": "Album fill walk",
+        "walk_queue": "Walk + queue",
+    }.get(mode, mode)
+    queue_path = loaded.paths[0] if len(loaded.paths) == 1 else cfg.QUEUE_JOURNAL_DIR
+
+    print()
+    heading = "Interrupted" if recovery_bearing else "Pending"
+    log.info(fmt(
+        C.BOLD + C.YELLOW,
+        f"  ⚠  {heading} queue found: {len(items)} album(s) from {label_for_mode}",
+    ))
+    log.info(fmt(C.GRAY, f"     Saved: {when}"))
+    log.info(fmt(C.GRAY, f"     File:  {queue_path}"))
+    if recovery_bearing:
+        log.info(fmt(C.GRAY,
+            "     The exact interrupted album must finish recovery before "
+            "other work."))
+    else:
+        log.info(fmt(C.GRAY,
+            "     Resuming will download only what is in this saved queue."))
+    print()
+
+    while True:
+        choices = "[Y]es / [k]eep for later"
+        if not recovery_bearing:
+            choices += " / [d]iscard"
         try:
-            items.append(_deserialize_queue_item(d))
-        except Exception as e:
-            log.info(fmt(C.YELLOW,
-                f"  ⚠  {cfg.PENDING_QUEUE_FILE.name} skipped a malformed item "
-                f"({e})."))
-    return items, payload.get("mode"), payload.get("saved_at")
+            ans = input(fmt(C.CYAN, f"  Resume now? {choices}: ")).strip().lower()
+        except EOFError:
+            ans = ""
+        if ans in ("", "y", "yes"):
+            log.info(fmt(C.CYAN,
+                f"\n  ⟳  Resuming {len(items)} saved album(s)…"))
+            try:
+                token = token_source() if callable(token_source) else token_source
+                from qobuz_librarian.queue.executor import _execute_download_queue
 
+                def _save_pending_progress():
+                    save_pending_queue(items, mode=mode)
 
-def clear_pending_queue():
-    """Remove the pending-queue file. Idempotent."""
-    try:
-        cfg.PENDING_QUEUE_FILE.unlink(missing_ok=True)
-    except OSError as e:
-        vlog(f"clear_pending_queue: {e}")
+                _, drained = _execute_download_queue(
+                    items,
+                    args,
+                    token,
+                    on_progress=(
+                        None if recovery_bearing else _save_pending_progress
+                    ),
+                    refresh_review=True,
+                    consolidate_duplicates=mode != "album-now",
+                )
+                if getattr(args, "dry_run", False):
+                    pass
+                elif drained:
+                    clear_queue_journal(operation_id)
+                    log.info(fmt(
+                        C.GREEN,
+                        "  ✓ Resume complete; saved queue cleared.",
+                    ))
+                else:
+                    if recovery_bearing:
+                        log.info(fmt(C.YELLOW,
+                            "  ⚠  The saved queue is not fully settled; its "
+                            "durable recovery was kept for next launch."))
+                    else:
+                        save_pending_queue(items, mode=mode)
+                        log.info(fmt(C.YELLOW,
+                            f"  ⚠  {len(items)} album(s) couldn't be "
+                            "downloaded — saved queue kept for next launch."))
+            except KeyboardInterrupt:
+                log.info(fmt(C.YELLOW,
+                    "\n  ⚠  Resume interrupted; saved queue kept for next launch."))
+            except AuthLost:
+                log.info(fmt(C.RED,
+                    "  ✗ Auth lost during resume; saved queue kept for next launch."))
+                raise
+            except Exception as exc:
+                log.info(fmt(C.YELLOW,
+                    f"  ⚠  Resume failed: {exc}. Saved queue kept for next launch."))
+            return False
+        if ans in ("k", "keep"):
+            log.info(fmt(C.GRAY,
+                "  Keeping the saved queue. It'll prompt again next launch."))
+            return False
+        if not recovery_bearing and ans in ("d", "discard"):
+            try:
+                conf = input(fmt(C.YELLOW,
+                    f"  Really discard {len(items)} queued album(s)? "
+                    "Type DISCARD to confirm: ")).strip()
+            except EOFError:
+                conf = ""
+            if conf == "DISCARD":
+                clear_queue_journal(operation_id, explicit_discard=True)
+                log.info(fmt(C.GRAY, "  Pending queue cleared."))
+            else:
+                log.info(fmt(C.GRAY, "  Discard cancelled."))
+            return False
+        allowed = "Y or k" if recovery_bearing else "Y, k, or d"
+        log.info(fmt(C.GRAY, f"  Enter {allowed}."))
 
 
 def offer_resume_pending_queue(args, token_source):
     """Startup hook. If a pending queue is present, prompt to resume / keep
     / discard. ``token_source`` may be a token or a lazy callable; the latter
     keeps local keep/discard choices reachable without download preflight."""
-    items, mode, saved_at = load_pending_queue()
+    loaded = load_pending_queue()
+    items, mode, saved_at = loaded
     if not items:
         return False
 
@@ -144,7 +314,8 @@ def offer_resume_pending_queue(args, token_source):
     log.info(fmt(C.BOLD + C.YELLOW,
         f"  ⚠  Pending queue found: {len(items)} album(s) from {label_for_mode}"))
     log.info(fmt(C.GRAY, f"     Saved: {when}"))
-    log.info(fmt(C.GRAY, f"     File:  {cfg.PENDING_QUEUE_FILE}"))
+    queue_path = loaded.paths[0] if len(loaded.paths) == 1 else cfg.QUEUE_JOURNAL_DIR
+    log.info(fmt(C.GRAY, f"     File:  {queue_path}"))
     log.info(fmt(C.GRAY,
         "     This means a previous run accumulated download decisions but "
         "didn't"))
@@ -174,27 +345,29 @@ def offer_resume_pending_queue(args, token_source):
 
                 _, drained = _execute_download_queue(
                     items, args, token, on_progress=_save_progress,
-                    refresh_review=True)
+                    refresh_review=True,
+                    consolidate_duplicates=mode != "album-now",
+                )
                 if getattr(args, "dry_run", False):
                     pass  # preview only; leave the pending file untouched
                 elif drained:
                     clear_pending_queue()
-                    log.info(fmt(C.GREEN, "  ✓ Resume complete; pending file cleared."))
+                    log.info(fmt(C.GREEN, "  ✓ Resume complete; saved queue cleared."))
                 else:
                     save_pending_queue(items, mode=mode)
                     log.info(fmt(C.YELLOW,
                         f"  ⚠  {len(items)} album(s) couldn't be downloaded — "
-                        f"pending file kept for next launch."))
+                        f"saved queue kept for next launch."))
             except KeyboardInterrupt:
                 log.info(fmt(C.YELLOW,
-                    "\n  ⚠  Resume interrupted; pending file kept for next launch."))
+                    "\n  ⚠  Resume interrupted; saved queue kept for next launch."))
             except AuthLost:
                 log.info(fmt(C.RED,
-                    "  ✗ Auth lost during resume; pending file kept for next launch."))
+                    "  ✗ Auth lost during resume; saved queue kept for next launch."))
                 raise
             except Exception as e:
                 log.info(fmt(C.YELLOW,
-                    f"  ⚠  Resume failed: {e}. Pending file kept for next launch."))
+                    f"  ⚠  Resume failed: {e}. Saved queue kept for next launch."))
             return False  # fall through to menu
         if ans in ("k", "keep"):
             log.info(fmt(C.GRAY, "  Keeping the pending queue. It'll prompt again next launch."))
@@ -207,7 +380,7 @@ def offer_resume_pending_queue(args, token_source):
             except EOFError:
                 conf = ""
             if conf == "DISCARD":
-                clear_pending_queue()
+                clear_pending_queue(explicit_discard=True)
                 log.info(fmt(C.GRAY, "  Pending queue cleared."))
             else:
                 log.info(fmt(C.GRAY, "  Discard cancelled."))

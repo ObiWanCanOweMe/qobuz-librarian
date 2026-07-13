@@ -151,13 +151,17 @@ def run_migrate_mode(args):
     _print_preview(plan, bool(getattr(args, "verbose", False)), in_place,
                    resume_entries)
 
-    # A preview always leaves an auditable artifact, even on a dry run.
-    manifest = dest / "migration-manifest.csv"
+    # Nothing can be approved until the exact preview has a durable,
+    # non-overwriting audit record beside the destination.
     try:
-        engine.write_manifest(plan, manifest)
+        manifest_artifact = engine.write_manifest(plan)
+        manifest = Path(manifest_artifact["path"])
         log.info(fmt(C.GRAY, f"  Full plan written to {manifest}"))
-    except OSError as e:
-        log.info(fmt(C.YELLOW, f"  ⚠  Couldn't write the manifest ({e})."))
+    except (KeyError, OSError, TypeError, UnicodeError, ValueError) as e:
+        log.info(fmt(C.RED,
+            "  ✗  Couldn't record the migration preview safely, so nothing "
+            f"was approved or copied ({e})."))
+        return
 
     if getattr(args, "dry_run", False):
         log.info(fmt(C.CYAN, "  Dry run — nothing was copied."))
@@ -203,24 +207,46 @@ def run_migrate_mode(args):
         log.info(fmt(C.GRAY, "  Cancelled. Nothing changed."))
         return
 
-    result = engine.execute_plan(
-        plan, in_place=in_place, progress=progress,
-        resume_entries=resume_entries)
+    if not engine.verify_audit_artifact(plan, manifest_artifact):
+        log.info(fmt(C.RED,
+            "  ✗  The reviewed migration record changed or can no longer be "
+            "proved. Nothing was copied; scan again before approving it."))
+        return
 
-    # Timestamped so a second run (or a resume after a partial run) doesn't
-    # overwrite the only source→destination record of the first run's moves —
-    # in-place mode already deleted the sources, so that mapping is otherwise
-    # unrecoverable.
-    from datetime import datetime
-    results_manifest = dest / f"migration-results-{datetime.now():%Y%m%d-%H%M%S}.csv"
+    execution_abort = None
     try:
-        engine.write_results_manifest(result, results_manifest)
-        log.info(fmt(C.GRAY, f"  · Results manifest: {results_manifest}"))
-    except OSError as e:
-        log.info(fmt(C.YELLOW, f"  ⚠  Couldn't write the results manifest ({e})."))
+        result = engine.execute_plan(
+            plan, in_place=in_place, progress=progress,
+            resume_entries=resume_entries)
+    except engine.MigrationExecutionAbort as exc:
+        result = exc.result
+        execution_abort = exc
 
-    # In-place leaves the emptied source folders behind; clear the husk.
-    pruned = engine.prune_empty_dirs(src) if in_place else 0
+    try:
+        results_artifact = engine.write_results_manifest(result, plan=plan)
+        results_manifest = Path(results_artifact["path"])
+        log.info(fmt(C.GRAY, f"  · Results manifest: {results_manifest}"))
+    except BaseException as e:
+        try:
+            log.info(fmt(C.RED,
+                "  ✗  The migration ran, but its durable results record could "
+                f"not be written ({e}). Do not start another migration until "
+                "the destination and its audit files have been checked."))
+            for recovery in getattr(result, "recoveries", ()):
+                log.info(fmt(C.RED,
+                    "     Recovery retained at: "
+                    f"{recovery.get('location', 'unknown location')}"))
+        finally:
+            if execution_abort is not None:
+                execution_abort.reraise(publication_error=e)
+        if not isinstance(e, Exception):
+            raise
+        return
+
+    if execution_abort is not None:
+        execution_abort.reraise()
+
+    pruned = getattr(result, "pruned", 0)
 
     log.info("")
     log.info(fmt(C.GREEN,
@@ -231,6 +257,20 @@ def run_migrate_mode(args):
     if getattr(result, "companions", 0):
         log.info(fmt(C.GREEN,
             f"  ✓  {result.companions} cover/sidecar file(s) carried."))
+    companion_outcomes = getattr(result, "companion_outcomes", ())
+    companion_skipped = sum(
+        status == engine.SKIPPED
+        for _source, _destination, status, _reason in companion_outcomes)
+    companion_failed = sum(
+        status == engine.FAILED
+        for _source, _destination, status, _reason in companion_outcomes)
+    if companion_skipped:
+        log.info(fmt(C.YELLOW,
+            f"  ⚠  {companion_skipped} cover/sidecar file(s) already existed."))
+    if companion_failed:
+        log.info(fmt(C.RED,
+            f"  ✗  {companion_failed} cover/sidecar file(s) could not be "
+            "carried; see the results manifest."))
     if result.lingered:
         log.info(fmt(C.YELLOW,
             f"  ⚠  {result.lingered} moved but the original couldn't be removed "
@@ -248,6 +288,11 @@ def run_migrate_mode(args):
     if result.cancelled:
         log.info(fmt(C.YELLOW,
             "  ⚠  Stopped early; the destination holds a partial copy."))
+    for recovery in getattr(result, "recoveries", ()):
+        log.info(fmt(C.RED,
+            "  ⚠  Recovery retained at "
+            f"{recovery.get('location', 'an unknown location')}. "
+            f"{recovery.get('restart', '')}"))
     log.info(fmt(C.GRAY,
         f"  New library: {dest}\n"
         f"  Plan:        {manifest}\n"

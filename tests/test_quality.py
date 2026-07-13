@@ -71,13 +71,29 @@ def test_compare_album_quality_classifies_and_counts_unknown():
     r = compare_album_quality(
         [{"bits": 16, "sample_rate": 44100}, {"bits": 0, "sample_rate": 0}], qalbum)
     assert r["n_unknown"] == 1
+    assert r["classification"] == "unknown"
+    crossed = compare_album_quality(
+        [{"bits": 16, "sample_rate": 192000}], qalbum)
+    assert crossed["classification"] == "incomparable"
+    assert crossed["n_incomparable"] == 1
+    assert compare_album_quality(
+        [{"bits": 16, "sample_rate": 44100}],
+        {"maximum_bit_depth": 0, "maximum_sampling_rate": 96.0},
+    )["classification"] == "unknown"
 
 
 def test_quality_change_summary_counts_upgrades_and_losses():
-    t = lambda b, r: {"bits": b, "sample_rate": r}
+    t = lambda b, r, channels=2: {
+        "bits": b, "sample_rate": r, "channels": channels,
+    }
     assert quality_change_summary([(t(16, 44100), t(24, 96000))])["upgrading"] == 1
     # A would-be downgrade from hi-res must be flagged so we can refuse it.
     assert quality_change_summary([(t(24, 96000), t(16, 44100))])["losing_hires"] == 1
+    uncertain = quality_change_summary([
+        (t(16, 192000), t(24, 96000)),
+        (t(24, 96000, 6), t(24, 96000, 2)),
+    ])
+    assert uncertain["unknown"] == 2
 
 
 def test_capped_persistence_round_trips_and_prunes(tmp_path, monkeypatch):

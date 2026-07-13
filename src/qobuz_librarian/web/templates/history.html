@@ -20,32 +20,50 @@
         <span class="ql-status-chip is-neutral">Cancelled</span>
       {% elif job.status == 'awaiting_review' %}
         <span class="ql-status-chip is-info">Needs review</span>
+      {% elif job.status == 'pending' %}
+        <span class="ql-status-chip is-info">Queued</span>
+      {% elif job.status in ['running', 'scanning'] %}
+        <span class="ql-status-chip is-info">In progress</span>
       {% else %}
         <span class="ql-status-chip is-error">Failed</span>
       {% endif %}
-      {% if job.attention %}
+      {% if job.recovery_unreadable %}
+        <span class="ql-status-chip is-warning" title="The saved Repair recovery details could not be read.">Recovery unreadable</span>
+      {% elif job.recoveries %}
+        <span class="ql-status-chip is-warning" title="Original files remain in a Repair recovery folder.">Recovery needed</span>
+      {% elif job.attention == 'recovery' %}
+        <span class="ql-status-chip is-warning" title="The saved download recovery must be settled before retrying.">Recovery attention</span>
+      {% elif job.attention %}
         <span class="ql-status-chip is-warning" title="Finished below your target quality — open it for details.">Below target quality</span>
       {% endif %}
       <span class="ql-activity-time tabular-nums"{% if job.when_exact %} title="{{ job.when_exact }}"{% endif %}>{{ job.when }}</span>
       <div class="ql-activity-actions">
-        {% if job.status == 'failed' and job.album_id %}
+        {% set recovery_retry = durable_recovery_control and durable_recovery_control.job_id == job.id %}
+        {% if job.status == 'failed' and job.album_id and (job.attention != 'recovery' or recovery_retry) and not job.recoveries and not job.recovery_unreadable %}
         <form action="/jobs/{{ job.id }}/retry" method="post" class="shrink-0">
           <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+          {% if recovery_retry %}
+          <input type="hidden" name="recovery_operation_id" value="{{ durable_recovery_control.operation_id }}">
+          <input type="hidden" name="recovery_item_id" value="{{ durable_recovery_control.item_id }}">
+          {% endif %}
           <button type="submit" class="ql-btn ql-btn-sm ql-btn-secondary ql-secondary-action" title="Retry">Retry</button>
         </form>
         {% endif %}
+        {% if not job.recovery_unreadable %}
         <a href="{{ '/repair' if job.execute_kind == 'repair' else ('/library' if job.execute_kind == 'library' else '/jobs/' ~ job.id) }}" class="ql-row-open">Open →</a>
+        {% endif %}
       </div>
     </div>
 {%- endmacro %}
 
 {% if bulk_jobs or jobs %}
+{% set history_count = (bulk_jobs | length) + total %}
 <div class="ql-activity-toolbar">
-  <p class="ql-mono-meta">{{ (bulk_jobs | length) + total }} finished job{% if (bulk_jobs | length) + total != 1 %}s{% endif %}</p>
+  <p class="ql-mono-meta">{{ history_count }} job{% if history_count != 1 %}s{% endif %} in history</p>
   <form action="/queue/clear" method="post">
     <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
     <button type="submit" class="ql-btn ql-btn-sm ql-btn-ghost-danger"
-            data-confirm="Clear all finished jobs from history? This permanently removes the records and cannot be undone."
+            data-confirm="Clear finished jobs from history? Recovery records stay until their backups are resolved."
             data-confirm-action="Clear history" data-confirm-danger>Clear history</button>
   </form>
 </div>
@@ -63,9 +81,13 @@
         {{ labels.kind_tile(job, 'ql-job-tile--done') }}
         <div class="ql-activity-main">
           <p class="ql-row-title">
-            <a href="/jobs/{{ job.id }}" class="ql-row-link">{% if job.artist %}{{ job.artist }} — {% endif %}{{ job.title }}</a>
+            <a href="{{ '/settings#diagnostics-list' if job.recovery_unreadable else '/jobs/' ~ job.id }}" class="ql-row-link">{% if job.artist %}{{ job.artist }} — {% endif %}{{ job.title }}</a>
           </p>
-          {% if job.error %}
+          {% if job.recovery_unreadable %}
+          <p class="ql-row-meta ql-row-meta--error">Saved recovery details could not be read. Repair backups were left untouched; inspect them under <a href="/settings#diagnostics-list" class="ql-inline-link">Settings → Diagnostics</a>.</p>
+          {% elif job.recoveries %}
+          <p class="ql-row-meta ql-row-meta--error">Original files are being kept safely. Review or restore them under <a href="/settings#diagnostics-list" class="ql-inline-link">Settings → Diagnostics</a>.</p>
+          {% elif job.error %}
           <p class="ql-row-meta ql-row-meta--error">{{ job.error }}</p>
           {% elif job.summary %}
           <p class="ql-row-meta">{{ job.summary }}</p>

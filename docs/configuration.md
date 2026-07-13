@@ -43,7 +43,6 @@ These settings apply to new jobs. A field you change on the Settings page keeps 
 | `AUTO_UPGRADE_ENABLED` | `false` | CLI-only compatibility option: during CLI gap-fill walks, also offer eligible quality upgrades. In the web UI, use Upgrade for quality work. |
 | `DOWNSAMPLE_HIRES_ENABLED` | `false` | Downsample hi-res FLACs as they download (see below) |
 | `UPGRADE_SINGLES_ENABLED` | `false` | Let the Upgrade walk re-rip tracks you pulled as singles |
-| `MIGRATE_MULTI_ARTIST` | `false` | Re-file `A, B/Album` under `A/Album` after import |
 | `CONSOLIDATE` | `false` | Merge sibling/duplicate album folders (CLI-only) |
 
 `DOWNSAMPLE_HIRES_ENABLED` only touches new downloads (88.2 / 176.4 / 352.8 kHz → 44.1; 96 / 192 / 384 → 48; bit depth preserved, originals replaced atomically). To downsample hi-res already in your library, use the on-demand **Downsample** mode instead.
@@ -78,9 +77,15 @@ The bundled tools' full config files live in the persistent `config` volume, see
 - `…/beets/config.yaml`: tagging, paths, plugins ([beets docs](https://beets.readthedocs.io/))
 - `…/streamrip/config.toml`: downloader settings ([streamrip docs](https://github.com/nathom/streamrip))
 
+The default Compose `/config` named volume is supported for the beets database. If you replace it or set `BEETS_DB_PATH`, run the app on Linux with `/proc/self/fd` and keep the database on a local filesystem that supports hard links, xattrs, advisory `flock`, file leases, atomic `renameat2` exchange, and file and directory `fsync`. NFS, SMB/CIFS, and other network filesystems are not supported for the database; the music library itself may still live on network storage.
+
 Set folder and file naming with `BEETS_PATH_DEFAULT`, `BEETS_PATH_SINGLETON`, and `BEETS_PATH_COMP` on the **Settings** page or in `.env`. These use beets path syntax, for example `$albumartist/$album ($year)/$track - $title`.
 
 Set the loaded plugins with `BEETS_PLUGINS`. The seeded config enables `fetchart` and `inline`; keep `inline`, as it supports the multi-disc folder field. Plugins that need their own config block, such as a lastgenre API key or replaygain backend, still require an edit to `config.yaml`.
+
+For a `pip` or `pipx` installation, install beets 2.12.0 in the same environment. Qobuz Librarian normally finds that environment from the `beet` launcher. If the launcher is an unusual wrapper, set `BEETS_PYTHON` to the absolute path of the Python executable in that environment. Other beets versions are refused because the import and recovery contract is verified against 2.12.0.
+
+Treat enabled beets plugins as trusted code. A plugin must finish all database work before its `beet` command exits; detached or background database writers are unsupported. Stop Qobuz Librarian completely before running a manual `beet` command, since external commands do not participate in the app's database coordination.
 
 For its own imports, the downloader pins four beets settings regardless of your config:
 
@@ -101,6 +106,10 @@ PGID=1000   # id -g
 ```
 
 On boot, the container chowns the app-managed volumes (`config`, `data`, `staging`, `upgrade_backups`) to that user and warns if a mounted path is not writable. `/music` is left alone because it is often a large NAS mount; the run user must be able to write to it.
+
+Operations that replace or remove an existing library file also require the
+share to flush file and directory changes reliably. If the mount cannot do
+that, Qobuz Librarian stops the destructive step and keeps the original.
 
 For a read-only music share, append `:ro` to the `/music` bind and set `QL_CHECK_VOLUMES=0` in `.env`; otherwise write endpoints, including scan starts, return 503 after the write check fails.
 
@@ -131,6 +140,8 @@ sudo chown -R 1000:1000 ./music ./staging ./upgrade_backups
 ## Notifications
 
 `POST_JOB_HOOK` runs a command of your choice every time a job finishes — downloads, scans, repairs, all of it. The job's final state arrives as JSON on stdin (`id`, `status`, `title`, `artist`, `error`, `finished_at`), and `POST_JOB_HOOK_TIMEOUT` (default 10s) caps a slow endpoint. The command runs inside the container, which bundles `curl` and Python for exactly this.
+
+The hook must not run `beet` or otherwise edit its database while Qobuz Librarian is running.
 
 The simplest form pushes the raw JSON to an [ntfy](https://ntfy.sh) topic, straight from `.env`:
 
@@ -174,4 +185,3 @@ On first run the Search page *offers* a one-time baseline scan (`AUTO_LIBRARY_SC
 - **Upgrade** and **Downsample** change files only when you start them. Upgrade backs up the originals first (`UPGRADE_BACKUP_RETENTION_DAYS`); Downsample rewrites in place after verifying each file decodes — or, with *Keep originals when downsampling* set to keep (`DOWNSAMPLE_KEEP_ORIGINALS`; you're asked to choose keep or delete on your first downsample), parks the hi-res copies in the backup area first so the rewrite can be undone from Settings → Diagnostics until the retention window ends.
 - **Lyrics** writes tags or `.lrc` sidecars, not the audio.
 - **Consolidation** (`CONSOLIDATE`, off) merges duplicate folders, CLI-only (it needs per-folder confirmation).
-- **`MIGRATE_MULTI_ARTIST`** (off) re-files `A, B/Album` under `A/Album` after import.

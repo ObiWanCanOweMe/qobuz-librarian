@@ -1,10 +1,9 @@
-"""Tests for compute_missing and catalog matching/dedup helpers — the
-multi-artist, diacritic, edition-strip, and ISRC-share edge cases that
-actually bit us."""
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from qobuz_librarian import config
+from qobuz_librarian.library import catalog
 from qobuz_librarian.library.catalog import (
     _is_split_album_merge,
     album_year,
@@ -14,6 +13,35 @@ from qobuz_librarian.library.catalog import (
     find_album_dir_filesystem,
     find_extras_in_existing,
 )
+
+
+def test_automatic_multi_artist_migration_is_fail_closed(
+        tmp_path, monkeypatch):
+    music_root = tmp_path / "music"
+    source = music_root / "Artist, Other" / "Album"
+    destination = music_root / "Artist" / "Album"
+    source.mkdir(parents=True)
+    destination.mkdir(parents=True)
+    source_track = source / "01 - Source.flac"
+    destination_track = destination / "02 - Existing.flac"
+    source_track.write_bytes(b"source")
+    destination_track.write_bytes(b"destination")
+
+    monkeypatch.setattr(config, "MUSIC_ROOT", music_root)
+    monkeypatch.setattr(
+        catalog, "find_album_dir_filesystem", lambda _album: source)
+    capture = {"stale": True}
+
+    result = catalog.prompt_and_migrate_multi_artist_folder(
+        {"artist": {"name": "Artist"}},
+        SimpleNamespace(yes=True),
+        ownership_move_out=capture,
+    )
+
+    assert result == source
+    assert source_track.read_bytes() == b"source"
+    assert destination_track.read_bytes() == b"destination"
+    assert capture == {}
 
 
 def _qt(title, isrc="", disc=1, **kw):
@@ -32,30 +60,21 @@ def _qalbum(title, year, bd=16, sr=44.1, tc=10):
             "tracks_count": tc}
 
 
-# ── compute_missing: per-layer matching + the edge cases that bit us ────────
-
 def test_compute_missing_disc_and_edition_handling():
-    # A multi-disc album, tagged per disc on both sides: a title repeated across
-    # discs needs a file for each — owning disc 1's copy doesn't cover disc 2's.
     qobuz = [_qt("Intro", disc=1), _qt("Theme", disc=1),
              _qt("Intro", disc=2), _qt("Theme", disc=2)]
     owned = [_et("Intro", disc=1), _et("Theme", disc=1),
              _et("Intro", disc=2), _et("Theme", disc=2)]
     assert not compute_missing(qobuz, owned)[0]
-    m, _ = compute_missing(qobuz, owned[:2])  # own disc 1 only
+    m, _ = compute_missing(qobuz, owned[:2])
     assert sorted(t["media_number"] for t in m) == [2, 2]
-    # Edition suffixes on the Qobuz side strip cleanly and match the bare disk file.
     m, p = compute_missing([_qt("Song (2014 Remaster)")], [_et("Song")])
     assert len(p) == 1 and not m
-    # But (Acoustic) / (Live) are distinct performances and must NOT match.
     m, p = compute_missing([_qt("Song")], [_et("Song (Acoustic)")])
     assert len(m) == 1 and not p
 
 
 def test_flat_untagged_multidisc_album_is_not_reported_missing():
-    # A 2-disc album ripped to one flat folder with no DISCNUMBER tags reads as
-    # all disc 1, while Qobuz numbers the later disc 2. Disc-strict matching
-    # would report the whole second disc missing on an album you fully own.
     qobuz = [_qt("One", disc=1), _qt("Two", disc=1),
              _qt("Three", disc=2), _qt("Four", disc=2)]
     existing = [_et("One"), _et("Two"), _et("Three"), _et("Four")]
@@ -64,60 +83,40 @@ def test_flat_untagged_multidisc_album_is_not_reported_missing():
 
 
 def test_non_latin_titles_match_on_text_not_empty_normalization():
-    # CJK titles fold to '' under normalize. They must match on the exact text,
-    # not collapse to a shared empty key — otherwise '東京' would pair with any
-    # other non-Latin track on the same disc.
     _, p = compute_missing([_qt("東京")], [_et("東京")])
     assert len(p) == 1
     m, p = compute_missing([_qt("東京")], [_et("大阪")])
     assert len(m) == 1 and not p
-    # The same guard protects the upgrade path: a different-titled non-Latin
-    # track on disk must be flagged as an extra, never silently wiped.
     extras = find_extras_in_existing([_qt("東京")], [_et("大阪")])
     assert [t["title"] for t in extras] == ["大阪"]
 
 
-# ── find_extras_in_existing: don't let bonus tracks get wiped on upgrade ─
-
 def test_find_extras_flags_bonus_tracks_for_upgrade_safety():
-    # The whole point: a same-title bonus track on disk must be flagged extra
-    # so an upgrade wipe-replace can't silently delete it.
     extras = find_extras_in_existing(
         [_qt("Time")], [_et("Time"), _et("Time (Bonus Track)")])
     assert len(extras) == 1 and "Bonus" in extras[0]["title"]
 
-    # Same protection when all tracks carry a blank ISRC tag — the off-Qobuz
-    # bonus must still be flagged.
     extras = find_extras_in_existing(
         [_qt("T1", isrc=" "), _qt("T2", isrc=" ")],
         [_et("Bonus", isrc=" "), _et("T1", isrc=" "), _et("T2", isrc=" ")])
     assert [t["title"] for t in extras] == ["Bonus"]
 
 
-# ── album_year + quality helpers ─────────────────────────────────────────
 
 def test_album_year_handles_late_utc_release_correctly():
-    # 11 PM UTC on Dec 31 — local TZ could flip the year. release_date_original
-    # is preferred when present; released_at is interpreted as UTC.
     assert album_year({"release_date_original": "2021-06-15"}) == "2021"
     ts = int(datetime(2019, 12, 31, 23, 0, 0, tzinfo=timezone.utc).timestamp())
     assert album_year({"released_at": ts}) == "2019"
 
 
-# ── Dedup + filters ──────────────────────────────────────────────────────
 
 def test_dedup_album_versions_collapses_editions_but_keeps_distinct_years():
-    # Same title + same year + edition variant → collapse.
     pairs = [_qalbum("Abbey Road", 1969), _qalbum("Abbey Road (Remaster)", 1969)]
     assert len(dedup_album_versions(pairs)) == 1
-    # Same title but different years → two distinct albums.
     pairs = [_qalbum("American Football", 1999), _qalbum("American Football", 2016)]
     assert len(dedup_album_versions(pairs)) == 2
-    # Pure-CJK titles fold to '' under normalize — they must survive as distinct
-    # entries (keyed on the raw text) rather than collapse into one.
     cjk = [_qalbum("東京", 2020), _qalbum("大阪", 2021)]
     assert len(dedup_album_versions(cjk)) == 2
-    # prefer_hires picks the higher-resolution edition within a group.
     pair = [_qalbum("Album", 2020, bd=16, sr=44.1),
             _qalbum("Album", 2020, bd=24, sr=96)]
     result = dedup_album_versions(pair, prefer_hires=True)
@@ -125,59 +124,55 @@ def test_dedup_album_versions_collapses_editions_but_keeps_distinct_years():
 
 
 def test_filter_owned_albums_doesnt_swallow_sequels_or_distinct_years():
-    # Owning 'Load' (1996) must NOT also drop 'Reload' (1997) — title similarity
-    # alone is not identity. Owning 'Album' drops the deluxe edition variant.
     pairs = [({"title": "Reload", "release_date_original": "1997"}, 1),
              ({"title": "Album (Deluxe Edition)", "release_date_original": "2010"}, 1)]
     result = filter_owned_albums(pairs, {"load": [1996], "album": [2010]})
     assert [a["title"] for a, _ in result] == ["Reload"]
 
-    # An exact same-title match counts as owned regardless of the year gap: a
-    # far-off year is a remaster/reissue of the same work, so owning the 1966
-    # Revolver suppresses a 2022 Revolver instead of re-offering it as a
-    # duplicate. (The year window guards the fuzzy path, not the exact one.)
     pairs = [({"title": "Revolver", "release_date_original": "2022"}, 1)]
     assert filter_owned_albums(pairs, {"revolver": [1966]}) == []
 
-    # An owned-year list with None still drops the match.
     pairs = [({"title": "Revolver", "release_date_original": "1966"}, 1)]
     assert filter_owned_albums(pairs, {"revolver": [None]}) == []
 
-    # Owning only the live record must NOT hide the studio album behind it —
-    # the prefix-fuzzy match has to recognise '(Live)' as a distinct release.
     pairs = [({"title": "Wasting Light", "release_date_original": "2011"}, 1)]
     assert [a["title"] for a, _ in
             filter_owned_albums(pairs, {"wastinglightlive": [2019]})] == ["Wasting Light"]
 
 
-# ── _is_split_album_merge: protect against fusing unrelated albums ─────────
 
 def test_split_album_merge_rules(tmp_path):
     art = tmp_path / "Bonobo"
-    # Year-decoration split → mergeable (same album, different folder name).
     (art / "Black Sands").mkdir(parents=True)
     (art / "Black Sands (2010)").mkdir()
-    assert _is_split_album_merge(art / "Black Sands", art / "Black Sands (2010)", "Bonobo") is True
+    assert _is_split_album_merge(art / "Black Sands", art / "Black Sands (2010)", "Bonobo") is False
 
-    # Edition difference (Live vs studio) → NOT mergeable.
+    collaborators = tmp_path / "Bonobo, Andreya Triana"
+    (collaborators / "Black Sands (2010)").mkdir(parents=True)
+    assert _is_split_album_merge(
+        collaborators / "Black Sands (2010)",
+        art / "Black Sands (2010)",
+        "Bonobo",
+    ) is True
+
     (art / "Black Sands (Live)").mkdir()
     assert _is_split_album_merge(art / "Black Sands (Live)", art / "Black Sands (2010)", "Bonobo") is False
 
-    # Same title but different years → distinct albums, never merged.
     (art / "Live (2010)").mkdir()
     (art / "Live (2011)").mkdir()
     assert _is_split_album_merge(art / "Live (2010)", art / "Live (2011)", "Bonobo") is False
 
 
-# ── find_album_dir_filesystem: real-world folder resolution edge cases ────
 
 def test_find_album_dir_does_not_match_a_live_release_to_the_studio_folder(tmp_path, monkeypatch):
-    # 'The North Borders Tour. — Live.' shares the studio title prefix and
-    # scores high on similarity — without a length gate it'd fuse live
-    # tracks into the studio folder. The studio album must still resolve.
-    from qobuz_librarian import config
     from qobuz_librarian.library.scanner import clear_scan_caches
     monkeypatch.setattr(config, "MUSIC_ROOT", tmp_path)
+    missing = {
+        "id": "M",
+        "artist": {"name": "Absent Artist"},
+        "title": "Absent Album",
+    }
+    assert find_album_dir_filesystem(missing) is None
     (tmp_path / "Bonobo" / "The North Borders (2013)").mkdir(parents=True)
     clear_scan_caches()
     live = {"id": "L", "artist": {"name": "Bonobo"},
@@ -193,10 +188,6 @@ def test_find_album_dir_does_not_match_a_live_release_to_the_studio_folder(tmp_p
 
 def test_find_album_dir_falls_through_to_lower_scored_folder_when_top_fails_coverage(
         tmp_path, monkeypatch):
-    # A top-scoring folder that fails the length-coverage gate must not mask
-    # a lower-scored folder in the same artist dir that's the real match.
-    from qobuz_librarian import config
-    from qobuz_librarian.library import catalog
     from qobuz_librarian.library.scanner import clear_scan_caches
     monkeypatch.setattr(config, "MUSIC_ROOT", tmp_path)
     (tmp_path / "Band" / "Wide Awakening Sessions Bonus").mkdir(parents=True)
@@ -210,7 +201,6 @@ def test_find_album_dir_falls_through_to_lower_scored_folder_when_top_fails_cove
     assert found is not None and found.name == "Wide Awaknng"
 
 
-# ── find_expanded_edition: ranking is the gnarly bit ──────────────────────
 
 def _exp_album(album_id, bd, sr, tracks):
     return {"id": album_id, "artist": {"name": "Test Artist"},
@@ -237,15 +227,11 @@ def test_find_expanded_edition_prefers_quality_when_extras_tied(tmp_path):
 
 
 def test_folder_holds_all_tracks_matches_identity_not_count(tmp_path):
-    # Gates gap-fill backup deletion: an extra or duplicate file reaches the
-    # expected COUNT while an expected track is absent, and the backup being
-    # deleted holds that track's only copy. Identity has to match one-to-one.
     from qobuz_librarian.library.catalog import folder_holds_all_tracks
 
     expected = [{"id": 1, "title": "Alpha"}, {"id": 2, "title": "Beta"}]
     folder = tmp_path / "Album"
     folder.mkdir()
-    # Two audio files — the count is satisfied — but Beta is absent.
     (folder / "01 - Alpha.flac").write_bytes(b"x")
     (folder / "09 - Bonus.flac").write_bytes(b"x")
     assert folder_holds_all_tracks(folder, expected) is False
@@ -253,17 +239,11 @@ def test_folder_holds_all_tracks_matches_identity_not_count(tmp_path):
     (folder / "02 - Beta.flac").write_bytes(b"x")
     assert folder_holds_all_tracks(folder, expected) is True
 
-    # Unverifiable inputs keep the backup: no expected list, missing folder.
     assert folder_holds_all_tracks(folder, []) is False
     assert folder_holds_all_tracks(tmp_path / "gone", expected) is False
 
 
 def test_title_fallback_cannot_hand_an_isrc_twin_to_another_track():
-    # Expected: two same-titled tracks with DIFFERENT ISRCs. On disk: two
-    # files both tagged as the FIRST recording. The ISRC layer claims one;
-    # the title fallback must not hand the second file (a twin of A) to B —
-    # that reads the folder as whole while B never landed, and the deletion
-    # gates built on this matcher would discard the backup holding B.
     qobuz = [
         {"title": "Song", "media_number": 1, "isrc": "USAAA0000001"},
         {"title": "Song", "media_number": 1, "isrc": "USBBB0000002"},
@@ -276,19 +256,12 @@ def test_title_fallback_cannot_hand_an_isrc_twin_to_another_track():
     assert [t["isrc"] for t in missing] == ["USBBB0000002"]
     assert len(present) == 1
 
-    # A file whose ISRC matches nothing on the expected side (a different
-    # edition's rip) still pairs by title — that's not a twin conflict, and
-    # blocking it would invent gaps for every remaster.
     other_edition = [{"title": "Song", "discnumber": 1, "isrc": "GBZZZ9999999"}]
     missing, _ = compute_missing([qobuz[0]], other_edition)
     assert not missing
 
 
 def test_folder_completeness_requires_a_full_tree_walk(monkeypatch, tmp_path):
-    # folder_holds_all_tracks gates gap-fill backup deletion: a walk that
-    # couldn't cover the whole folder lists only the readable part, and pairing
-    # against that can prove "complete" while the right file sits in the
-    # unreadable subtree.
     from qobuz_librarian.library import catalog as cat
 
     folder = tmp_path / "Album"
@@ -308,3 +281,110 @@ def test_folder_completeness_requires_a_full_tree_walk(monkeypatch, tmp_path):
     monkeypatch.setattr(cat, "read_album_dir",
                         lambda f, walk_errors=None: list(tracks))
     assert cat.folder_holds_all_tracks(folder, qobuz) is True
+
+
+def test_disposal_completeness_requires_strict_identity_and_slots(
+        monkeypatch, tmp_path):
+    from qobuz_librarian.library import catalog as cat
+
+    folder = tmp_path / "Album"
+    folder.mkdir()
+    expected = [
+        {"title": "Same", "media_number": 1, "track_number": 1,
+         "duration": 100, "isrc": "USAAA1234567"},
+        {"title": "Same", "media_number": 1, "track_number": 2,
+         "duration": 100, "isrc": "USBBB1234568"},
+    ]
+    duplicate_blanks = [
+        {"title": "Same", "discnumber": 1, "tracknumber": 1,
+         "length": 100.0, "isrc": ""},
+        {"title": "Same", "discnumber": 1, "tracknumber": 1,
+         "length": 100.0, "isrc": ""},
+    ]
+    monkeypatch.setattr(
+        cat, "read_album_dir",
+        lambda _folder, walk_errors=None: list(duplicate_blanks[:1]),
+    )
+    assert cat.folder_holds_all_tracks(folder, expected[:1]) is True
+    assert cat.folder_holds_all_tracks(
+        folder, expected[:1], destructive=True) is False
+
+    placeholder_expected = [{**expected[0], "isrc": "N/A"}]
+    placeholder_existing = [{**duplicate_blanks[0], "isrc": "N/A"}]
+    monkeypatch.setattr(
+        cat, "read_album_dir",
+        lambda _folder, walk_errors=None: list(placeholder_existing),
+    )
+    assert cat.folder_holds_all_tracks(
+        folder, placeholder_expected, destructive=True) is False
+
+    for field, placeholder in (
+        ("isrc", "000000000000"),
+        ("mb_trackid", "00000000-0000-0000-0000-000000000000"),
+    ):
+        malformed_expected = [{
+            **expected[0], "isrc": "", field: placeholder}]
+        malformed_existing = [{
+            **duplicate_blanks[0], "title": "Different", field: placeholder}]
+        monkeypatch.setattr(
+            cat, "read_album_dir",
+            lambda _folder, walk_errors=None,
+            tracks=malformed_existing: list(tracks),
+        )
+        assert cat.folder_holds_all_tracks(
+            folder, malformed_expected, destructive=True) is False
+
+    unidentified_expected = [{**track, "isrc": ""} for track in expected]
+    edition_variant = [{
+        **duplicate_blanks[0], "title": "Same (Remaster)"}]
+    monkeypatch.setattr(
+        cat, "read_album_dir",
+        lambda _folder, walk_errors=None: list(edition_variant),
+    )
+    assert cat.folder_holds_all_tracks(
+        folder, unidentified_expected[:1]) is True
+    assert cat.folder_holds_all_tracks(
+        folder, unidentified_expected[:1], destructive=True) is False
+
+    monkeypatch.setattr(
+        cat, "read_album_dir",
+        lambda _folder, walk_errors=None: list(duplicate_blanks),
+    )
+    assert cat.folder_holds_all_tracks(folder, unidentified_expected) is True
+    assert cat.folder_holds_all_tracks(
+        folder, unidentified_expected, destructive=True) is False
+
+    verified = [
+        {**track, "discnumber": 1, "tracknumber": index,
+         "length": 100.0}
+        for index, track in enumerate(expected, 1)
+    ]
+    monkeypatch.setattr(
+        cat, "read_album_dir",
+        lambda _folder, walk_errors=None: list(verified),
+    )
+    assert cat.folder_holds_all_tracks(
+        folder, expected, destructive=True) is True
+
+    verified_unidentified = [{**track, "isrc": ""} for track in verified]
+    monkeypatch.setattr(
+        cat, "read_album_dir",
+        lambda _folder, walk_errors=None: list(verified_unidentified),
+    )
+    assert cat.folder_holds_all_tracks(
+        folder, unidentified_expected, destructive=True) is True
+
+    malformed_values = (
+        ("media_number", True),
+        ("track_number", 1.9),
+        ("duration", True),
+    )
+    for field, value in malformed_values:
+        malformed_expected = [{
+            **unidentified_expected[0], field: value}]
+        monkeypatch.setattr(
+            cat, "read_album_dir",
+            lambda _folder, walk_errors=None: list(verified_unidentified[:1]),
+        )
+        assert cat.folder_holds_all_tracks(
+            folder, malformed_expected, destructive=True) is False

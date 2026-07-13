@@ -12,6 +12,7 @@ import threading
 from typing import Optional
 
 from qobuz_librarian import config as cfg
+from qobuz_librarian.ui_cli.errors import plural
 
 log = logging.getLogger("qobuz_librarian")
 
@@ -29,9 +30,6 @@ BEHAVIOR_FIELDS = [
      "When several editions are available, choose the highest quality allowed "
      "by your download quality setting. Turn this off to favour the original "
      "edition."),
-    ("MIGRATE_MULTI_ARTIST", "Migrate multi-artist folders",
-     "After import, file albums credited to multiple artists under the primary "
-     "album artist instead of a combined artist folder."),
     ("DOWNSAMPLE_HIRES_ENABLED", "Downsample new hi-res downloads",
      "Before import, reduce newly downloaded hi-res FLACs to 44.1 or 48 kHz. "
      "The hi-res files are not kept."),
@@ -223,12 +221,14 @@ def _validate_list(key, items):
 def _dropped_warning(key, dropped):
     names = ", ".join(dropped)
     if key == "LYRICS_PROVIDERS":
-        return (f"Ignored unrecognised lyrics provider(s): {names}. "
+        return (f"Ignored {plural(len(dropped), 'unrecognised lyrics provider')}: "
+                f"{names}. "
                 f"Known providers are {', '.join(LYRICS_PROVIDER_CHOICES)}.")
     if key == "BEETS_PLUGINS":
-        return (f"Ignored beets plugin(s) not installed on this server: {names}. "
+        return (f"Ignored {plural(len(dropped), 'beets plugin')} not installed "
+                f"on this server: {names}. "
                 "Check the spelling, or install them and add them back.")
-    return f"Ignored unrecognised value(s) for {key}: {names}."
+    return f"Ignored {plural(len(dropped), 'unrecognised value')} for {key}: {names}."
 
 
 def current() -> dict:

@@ -3,7 +3,6 @@ name: Docker
 on:
   release:
     types: [published]
-  workflow_dispatch:
 
 # Reads the repo, writes to Docker Hub via secrets — no GitHub Packages
 # writes here, so contents: read is enough.

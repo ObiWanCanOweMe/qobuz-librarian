@@ -59,6 +59,20 @@
   {% set _back_href, _back_label = '/queue', 'Back to Queue' %}
   {% endif %}
 
+  {% if job.recoveries %}
+  <div class="ql-notice ql-notice-warning ql-job-error" role="alert">
+    <div class="ql-notice-copy">
+      <strong>Original files kept safely</strong>
+      {% for recovery in job.recoveries %}
+      <div>
+        {{ recovery.backed_up }} of {{ recovery.requested }} original file{% if recovery.requested != 1 %}s{% endif %} kept while Repair stopped.
+      </div>
+      {% endfor %}
+      <span>Review or restore {% if job.recoveries|length == 1 %}it{% else %}them{% endif %} under <a href="/settings#diagnostics-list" class="ql-inline-link">Settings → Diagnostics</a>.</span>
+    </div>
+  </div>
+  {% endif %}
+
   {% if s == 'awaiting_review' %}
     {# The review tools row already states the live count; repeating the scan
        summary above it printed the same fact twice. Keep the box only when it
@@ -88,9 +102,9 @@
             data-empty-label="{{ labels.review_empty_label(job) }}"
             {% if not _bar_selected %} disabled{% endif %}
             {%- if job.execute_kind == 'downsample' %} data-confirm="{% if not ds_originals_chosen() %}Downsample the selected albums now? You'll first choose whether to keep your hi-res originals — nothing is rewritten until you do.{% elif keeps_ds_originals() %}Downsample the selected albums now? Each file is rewritten in place at 44.1 / 48 kHz; the hi-res originals are kept for {{ backup_retention_days }} day{{ 's' if backup_retention_days != 1 }} and can be restored from Settings.{% else %}Downsample the selected albums now? This cannot be undone. Each file is rewritten in place at 44.1 / 48 kHz and hi-res originals are not kept.{% endif %}"
-            {%- elif job.execute_kind == 'migration' %} data-confirm="{% if job.review_verb == 'Move' %}Move the selected files now? This relocates your originals instead of copying them, and removes the folders it empties.{% else %}Copy {count} selected folder(s) into the organised library? Your original files stay where they are.{% endif %}"
-            {%- elif job.execute_kind == 'repair' %} data-confirm="Repair {count} selected file(s)? Files are replaced only after each new copy verifies."
-            {%- else %} data-confirm="Download {count} selected album(s)? They queue now and import into your library."
+            {%- elif job.execute_kind == 'migration' %} data-confirm="{% if job.review_verb == 'Move' %}Move the selected files now? This relocates your originals instead of copying them, and removes the folders it empties.{% else %}Copy selected folders ({count}) into the organised library? Your original files stay where they are.{% endif %}"
+            {%- elif job.execute_kind == 'repair' %} data-confirm="Repair selected files ({count})? Files are replaced only after each new copy verifies."
+            {%- else %} data-confirm="Download selected albums ({count})? They queue now and import into your library."
             {%- endif %}
             {%- if job.execute_kind == 'downsample' %} data-confirm-action="{% if ds_originals_chosen() %}Downsample{% else %}Continue{% endif %}"{% if ds_originals_chosen() and not keeps_ds_originals() %} data-confirm-danger{% endif %}
             {%- elif job.execute_kind == 'migration' %} data-confirm-action="{{ job.review_verb }}"{% if job.review_verb == 'Move' %} data-confirm-danger{% endif %}
@@ -185,13 +199,18 @@
     <p class="ql-job-muted">No log output was retained for this job.</p>
     {% endif %}
     <div class="ql-job-actions">
-      {% if s == 'failed' and job.album_id %}
+      {% set recovery_retry = durable_recovery_control and durable_recovery_control.job_id == job.id %}
+      {% if s == 'failed' and job.album_id and (job.attention != 'recovery' or recovery_retry) %}
       <form action="/jobs/{{ job.id }}/retry" method="post">
         <input type="hidden" name="_csrf_token" value="{{ request.state.csrf_token }}">
+        {% if recovery_retry %}
+        <input type="hidden" name="recovery_operation_id" value="{{ durable_recovery_control.operation_id }}">
+        <input type="hidden" name="recovery_item_id" value="{{ durable_recovery_control.item_id }}">
+        {% endif %}
         <button type="submit" class="ql-btn ql-btn-primary ql-btn-sm">Retry</button>
       </form>
       {% endif %}
-      {% if s == 'done' and job.single and job.single.get('owned_path') and not job.single.get('removed') %}
+      {% if s in ('done', 'failed') and job.single and job.single.get('owned_path') and not job.single.get('removed') %}
       <form action="/jobs/{{ job.id }}/undo" method="post"
             hx-post="/jobs/{{ job.id }}/undo" hx-target="#job-content" hx-swap="outerHTML"
             data-confirm="Remove the downloaded track and undo the single?"

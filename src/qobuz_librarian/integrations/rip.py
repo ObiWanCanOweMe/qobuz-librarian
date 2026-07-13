@@ -9,7 +9,17 @@ import time
 from pathlib import Path
 
 from qobuz_librarian import config as cfg
-from qobuz_librarian.library.scanner import iter_tree_no_symlinks
+from qobuz_librarian.integrations.staging import (
+    StagedFile,
+    StagingSnapshot,
+    capture_file,
+    inspect_retry_groups,
+    list_file_groups,
+    list_groups,
+    quarantine_file,
+    reconcile_legacy_file_groups,
+)
+from qobuz_librarian.recovery import normalise_recovery_owner
 from qobuz_librarian.ui_cli.colors import C, fmt
 from qobuz_librarian.ui_cli.logging import log, vlog, wrap_thread_target
 
@@ -100,7 +110,7 @@ def _flac_signature(path: Path):
 
 # ── FLAC validation ───────────────────────────────────────────────────────────
 
-def flac_audio_ok(path):
+def flac_audio_ok(path, *, descriptor=None):
     """Verify a FLAC's audio with ``flac -t`` (decode + per-frame CRC check).
 
     Returns True/False, or None when the flac tool isn't installed so the
@@ -114,9 +124,15 @@ def flac_audio_ok(path):
     if shutil.which("flac") is None:
         return None
     try:
+        command_path = str(path)
+        run_kwargs = {}
+        if descriptor is not None:
+            command_path = f"/proc/self/fd/{int(descriptor)}"
+            run_kwargs["pass_fds"] = (int(descriptor),)
         proc = subprocess.run(
-            ["flac", "-t", "-s", str(path)],
-            capture_output=True, timeout=300, stdin=subprocess.DEVNULL)
+            ["flac", "-t", "-s", command_path],
+            capture_output=True, timeout=300, stdin=subprocess.DEVNULL,
+            **run_kwargs)
     except subprocess.TimeoutExpired:
         return False
     except (FileNotFoundError, OSError):
@@ -124,14 +140,18 @@ def flac_audio_ok(path):
     return proc.returncode == 0
 
 
-def flac_audio_offset(path):
+def flac_audio_offset(path, *, descriptor=None):
     """Byte offset of the first audio frame — the ``fLaC`` marker plus every
     metadata block. Lets a caller weigh the audio stream apart from metadata and
     embedded art, which don't shrink on resample and survive the tail damage that
     truncates the audio. Returns 0 when the file isn't a plain FLAC or the header
     is unreadable, so callers fall back to a whole-file size, not a wrong answer."""
     try:
-        with open(path, "rb") as fh:
+        if descriptor is None:
+            fh = open(path, "rb")
+        else:
+            fh = open(f"/proc/self/fd/{int(descriptor)}", "rb")
+        with fh:
             if fh.read(4) != b"fLaC":
                 return 0
             fh.seek(0, 2)
@@ -242,7 +262,8 @@ def _terminate(proc, reader):
 
 # ── streamrip wrapper ─────────────────────────────────────────────────────────
 
-def rip_url(url, timeout=None, live_output=False, quality=None):
+def rip_url(url, timeout=None, live_output=False, quality=None,
+            staging_dir=None):
     """Run `rip url <url>`, returning (returncode, combined_output_string).
 
     live_output=True: stream rip's output to the terminal in real time via a
@@ -272,6 +293,8 @@ def rip_url(url, timeout=None, live_output=False, quality=None):
     # web Settings page writes credentials to cfg.STREAMRIP_CONFIG, so we
     # must point rip at that file explicitly or the saved creds are ignored.
     cmd += ["--config-path", str(cfg.STREAMRIP_CONFIG)]
+    if staging_dir is not None:
+        cmd += ["--folder", str(staging_dir)]
     if quality is not None:
         cmd += ["-q", str(quality)]
     cmd += ["url", url]
@@ -431,16 +454,36 @@ def _iter_staging_files():
 
 
 def snapshot_staging():
-    return set(_iter_staging_files())
+    sealed = []
+    for path in _iter_staging_files():
+        receipt = capture_file(path)
+        if receipt is not None:
+            sealed.append(receipt)
+    return StagingSnapshot(sealed)
 
 
 def files_added_since(prior_snapshot):
-    return [p for p in _iter_staging_files() if p not in prior_snapshot]
+    added = []
+    identities = getattr(prior_snapshot, "identities", {})
+    for path in _iter_staging_files():
+        if path in prior_snapshot:
+            # A pre-existing name whose identity changed is not output owned by
+            # this run. Leave it alone instead of adopting the replacement.
+            if identities:
+                receipt = capture_file(path)
+                if (receipt is not None
+                        and receipt.identity != identities.get(path)):
+                    continue
+            continue
+        receipt = capture_file(path)
+        if receipt is not None:
+            added.append(receipt)
+    return added
 
 
-def cleanup_lossy(new_files):
-    """Sort freshly-downloaded audio into (kept, lossy, broken), deleting both
-    kinds of reject from staging. Returns Paths for all three buckets so the
+def cleanup_lossy(new_files, *, owner=None, on_intent=None):
+    """Sort freshly-downloaded audio into (kept, lossy, broken), setting both
+    kinds of reject aside. Returns Paths for all three buckets so the
     caller can retain enough identity to retry the exact rejected track:
 
       lossy   — a non-FLAC file (.mp3/.m4a/…). Qobuz served lossy because no
@@ -449,12 +492,30 @@ def cleanup_lossy(new_files):
       broken  — a .flac that won't decode (truncated/interrupted download).
                 A re-rip usually fixes it.
     """
+    owner = normalise_recovery_owner(owner)
+    if (owner is None) != (on_intent is None):
+        raise ValueError("owned reject cleanup requires an intent checkpoint")
+    if on_intent is not None and not callable(on_intent):
+        raise ValueError("reject cleanup checkpoint must be callable")
+
     kept, lossy, broken = [], [], []
     for f in new_files:
+        receipt = f if isinstance(f, StagedFile) else capture_file(f)
+        path = Path(f)
         ext = f.suffix.lower()
         if ext == ".flac":
-            if is_flac(f):
-                kept.append(f)
+            if is_flac(path):
+                # Validation belongs to the exact receipt, not the public
+                # filename. A replacement that arrived while flac(1) ran is
+                # neither credited nor moved by this run.
+                if (receipt is not None
+                        and capture_file(
+                            receipt.path, expected=receipt.identity) is not None):
+                    kept.append(receipt)
+                else:
+                    log.info(fmt(C.YELLOW,
+                        f"  ⚠  {path.name} changed while it was being checked; "
+                        "it was left untouched and will not be imported."))
                 continue
             bucket, what = broken, "broken FLAC"
         elif ext in cfg.AUDIO_EXTS:
@@ -466,161 +527,62 @@ def cleanup_lossy(new_files):
         # imported by beets (move: yes, autotag: no) — the exact lossy/truncated
         # file this discard exists to keep out — so when the unlink fails, move
         # it out of the import tree rather than leaving it to be picked up.
-        bucket.append(f)
-        try:
-            f.unlink()
-        except OSError as e:
-            if _quarantine_reject(f):
-                vlog(f"set aside undeletable {what} {f.name} so it isn't imported")
-            else:
-                log.info(fmt(C.YELLOW,
-                    f"  ⚠  Couldn't remove or set aside {what} {f.name}: {e}; "
-                    "remove it from staging by hand before the next import."))
+        bucket.append(receipt or f)
+        if owner is None:
+            quarantined = (
+                receipt is not None and _quarantine_reject(receipt))
+        else:
+            quarantined = (
+                receipt is not None
+                and _quarantine_reject(
+                    receipt, owner=owner, on_intent=on_intent)
+            )
+        if quarantined:
+            vlog(f"set aside {what} {f.name} so it isn't imported")
+        else:
+            log.info(fmt(C.YELLOW,
+                f"  ⚠  Couldn't safely set aside {what} {f.name}; it changed "
+                "after the download and was left untouched."))
     return kept, lossy, broken
 
 
-def _quarantine_reject(path):
-    """Move a reject that wouldn't delete out of the staging import tree (into a
-    quarantine under DATA_DIR) so beets can't pick it up. Returns True on a
-    successful move."""
-    try:
-        rel = path.relative_to(cfg.STAGING_DIR)
-    except ValueError:
-        rel = Path(path.name)
-    dest = cfg.DATA_DIR / ".rejected_staging" / rel
-    try:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        # Quarantine persists across runs, so a same-named reject from a later
-        # attempt would otherwise silently overwrite the earlier one — suffix
-        # on collision instead.
-        if dest.exists():
-            stem, suffix = dest.stem, dest.suffix
-            n = 1
-            while dest.exists():
-                dest = dest.with_name(f"{stem}.{n}{suffix}")
-                n += 1
-        shutil.move(str(path), str(dest))
-        return True
-    except OSError:
-        return False
-
-
-# Known non-audio artifacts that streamrip leaves in STAGING_DIR between runs.
-# These inflate the leftover count and can trigger the --yes abort threshold.
-# .pdf covers booklets left behind by an older config (downloads are off now).
-_RESIDUE_EXTS  = {".jpg", ".jpeg", ".png", ".gif", ".json", ".log", ".toml", ".pdf"}
-_RESIDUE_NAMES = {"cover", "albumartwork", "artwork"}
-
-
-def _dir_is_all_residue(d):
-    """True if every file under d has a residue extension (or d is empty).
-
-    A .cue, .nfo, or any non-residue file makes this return False, keeping the
-    directory intact even if it has a residue-like name.
-    """
-    try:
-        for child in d.rglob("*"):
-            if child.is_file() and child.suffix.lower() not in _RESIDUE_EXTS:
-                return False
-    except OSError:
-        return False
-    return True
-
-
-def _dir_has_audio(d):
-    """True if audio exists, False if none does, or None if the walk failed.
-
-    Used to spare a real leftover album's art/metadata from the residue
-    sweep — a cover.jpg beside the tracks is not an orphaned stray.
-    """
-    walk_errors = []
-    try:
-        for child in iter_tree_no_symlinks(d, errors=walk_errors):
-            try:
-                if child.is_file() and child.suffix.lower() in cfg.AUDIO_EXTS:
-                    return True
-            except OSError as e:
-                walk_errors.append(f"{child}: {e}")
-    except OSError as e:
-        walk_errors.append(f"{d}: {e}")
-    if walk_errors:
-        vlog(f"residue scan kept {d}: couldn't verify it contains no audio")
-        return None
-    return False
-
-
-def _album_root_has_audio(p):
-    """True when the staging album that contains p still holds audio anywhere
-    under it — so p (a nested cover.jpg / booklet, or a residue-named art dir) is
-    sidecar art for a real leftover, not an orphaned stray. Checks the album root,
-    not p's immediate folder, so art tucked in a subfolder of a real album is
-    spared too. A file or dir directly in STAGING_DIR has no album above it, so
-    this is False — a genuine orphan."""
-    try:
-        rel = p.relative_to(cfg.STAGING_DIR)
-    except ValueError:
-        return False
-    if len(rel.parts) < 2:
-        return False
-    return _dir_has_audio(cfg.STAGING_DIR / rel.parts[0])
+def _quarantine_reject(path, *, owner=None, on_intent=None):
+    """Move an exact reject to private staging recovery so beets skips it."""
+    if owner is None:
+        return quarantine_file(path, ".rejected") is not None
+    return quarantine_file(
+        path, ".rejected", owner=owner, on_intent=on_intent) is not None
 
 
 def cleanup_staging_residue():
-    """Remove known streamrip non-audio residue from STAGING_DIR.
-
-    Streamrip can leave cover art (cover.jpg), JSON metadata, and log files
-    behind after failed or interrupted downloads. These accumulate across runs
-    and bloat the staging leftover count, triggering --yes to abort at
-    LEFTOVER_WARN_LIMIT even when there are no actual leftover audio files.
-
-    A residue-named directory (cover/, artwork/, albumartwork/) is only removed
-    when every file inside it has a residue extension. A .cue sheet, .nfo, or
-    any audio file saves it — it's a real album that happens to share a name
-    with a common streamrip artefact.
-
-    Returns the number of items removed.
-    """
-    if not cfg.STAGING_DIR.exists():
-        return 0
-    removed = 0
-    retry_dir_name = getattr(cfg, "BEETS_RETRY_DIR", None)
-    # Walk dirs bottom-up so we can rmdir empty residue dirs after unlinking files.
-    for p in sorted(cfg.STAGING_DIR.rglob("*"), key=lambda x: -len(x.parts)):
-        # Skip the parked-retry subtree so a stash of albums waiting on a
-        # manual retry doesn't get its cover art / .log files swept out from
-        # under it.
-        if retry_dir_name:
-            try:
-                rel = p.relative_to(cfg.STAGING_DIR)
-                if rel.parts and rel.parts[0] == retry_dir_name:
-                    continue
-            except ValueError:
-                pass
-        try:
-            if p.is_file() and p.suffix.lower() in _RESIDUE_EXTS:
-                # Don't sweep art/metadata that belongs to a real leftover album
-                # the user is about to import: a cover.jpg beside the tracks (or in
-                # a booklet/scans subfolder) is the filesystem fetchart source
-                # under ARTWORK=sidecar. Spare any residue whose album root still
-                # holds audio; files directly in STAGING_DIR have no album, so
-                # they're always orphans.
-                if _album_root_has_audio(p) is not False:
-                    continue
-                p.unlink()
-                removed += 1
-                vlog(f"residue removed: {p.relative_to(cfg.STAGING_DIR)}")
-            elif p.is_dir() and p.name.lower() in _RESIDUE_NAMES:
-                # An artwork/cover dir inside a real leftover album is that
-                # album's art, not a stray — spare it like the nested-file case.
-                if _album_root_has_audio(p) is not False:
-                    continue
-                if not _dir_is_all_residue(p):
-                    vlog(f"residue dir kept (contains non-residue files): "
-                         f"{p.relative_to(cfg.STAGING_DIR)}")
-                    continue
-                shutil.rmtree(p)
-                removed += 1
-                vlog(f"residue dir removed: {p.relative_to(cfg.STAGING_DIR)}")
-        except OSError:
-            pass
-    return removed
+    """Keep legacy residue for preflight instead of deleting by name alone."""
+    reconciled = reconcile_legacy_file_groups()
+    if reconciled:
+        vlog(f"recorded {reconciled} legacy rejected staging file(s) for recovery")
+    unresolved = list_file_groups()
+    if unresolved:
+        log.info(fmt(C.YELLOW,
+            f"  ⚠  {len(unresolved)} staging file(s) are retained in "
+            f"{cfg.BEETS_RETRY_DIR} for retry or manual recovery."))
+    interrupted = list_groups(kind="interrupted")
+    if interrupted:
+        log.info(fmt(C.YELLOW,
+            f"  ⚠  {len(interrupted)} interrupted download(s) are retained in "
+            f"{cfg.BEETS_RETRY_DIR} for manual recovery."))
+    inspections = inspect_retry_groups()
+    hidden = [
+        inspection for inspection in inspections
+        if inspection.status in {"incomplete", "malformed", "blocked"}
+    ]
+    if hidden:
+        counts = {
+            status: sum(item.status == status for item in hidden)
+            for status in ("incomplete", "malformed", "blocked")
+        }
+        summary = ", ".join(
+            f"{count} {status}" for status, count in counts.items() if count)
+        log.info(fmt(C.YELLOW,
+            f"  ⚠  {len(hidden)} staging recovery group(s) need attention "
+            f"({summary}) in {cfg.BEETS_RETRY_DIR}."))
+    # Inspection is visibility, not cleanup. No residue is deleted here.
+    return 0

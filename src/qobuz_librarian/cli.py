@@ -22,6 +22,7 @@ from qobuz_librarian.library.backup import cleanup_old_upgrade_backups
 from qobuz_librarian.quality.tiers import streamrip_quality_cap
 from qobuz_librarian.queue.persistence import (
     offer_resume_pending_queue,
+    offer_resume_startup_recovery,
 )
 from qobuz_librarian.ui_cli.colors import C, banner, fmt, set_color_enabled
 from qobuz_librarian.ui_cli.errors import (
@@ -33,6 +34,8 @@ from qobuz_librarian.ui_cli.errors import (
     die,
 )
 from qobuz_librarian.ui_cli.logging import attach_file_handler, log, set_quiet, set_verbose, vlog
+
+_STARTUP_RECOVERY_RESULT = None
 
 # ── URL parsers ───────────────────────────────────────────────────────────────
 
@@ -56,6 +59,290 @@ def parse_qobuz_url(url: str) -> tuple[str, str] | None:
 
 # ── Single-instance lock ──────────────────────────────────────────────────────
 
+def _recover_startup_queue(authority):
+    """Inspect durable queue state without starting download/import work."""
+    from qobuz_librarian.queue.startup_recovery import recover_startup_state
+
+    return recover_startup_state(authority=authority)
+
+
+def _record_startup_recovery(authority):
+    global _STARTUP_RECOVERY_RESULT
+    _STARTUP_RECOVERY_RESULT = _recover_startup_queue(authority)
+    return _STARTUP_RECOVERY_RESULT
+
+
+def _startup_recovery_status():
+    return getattr(_STARTUP_RECOVERY_RESULT, "status", None)
+
+
+def _cli_blocked_settlement_binding(result):
+    """Bind one safe pre-launch abort to its frozen CLI completion owner."""
+    from qobuz_librarian.completion import (
+        CompletionOriginKind,
+        RecoveryOwner,
+        normalise_album_id,
+        parse_completion_input_record,
+    )
+    from qobuz_librarian.queue import journal as queue_state
+    from qobuz_librarian.queue.startup_recovery import (
+        StartupRecoveryAction,
+        StartupRecoveryStatus,
+    )
+
+    items = tuple(getattr(result, "items", ()))
+    blocked = tuple(
+        item
+        for item in items
+        if item.phase is queue_state.QueuePhase.BLOCKED
+        and item.action is StartupRecoveryAction.BLOCKED
+    )
+    if (
+        result.status is not StartupRecoveryStatus.ATTENTION_REQUIRED
+        or result.reason != "queue-item-blocked"
+        or len(blocked) != 1
+        or not items
+        or any(
+            item.operation_id != blocked[0].operation_id
+            or item.mode != blocked[0].mode
+            or (
+                item is not blocked[0]
+                and (
+                    item.phase is not queue_state.QueuePhase.PENDING
+                    or item.action is not StartupRecoveryAction.PENDING
+                )
+            )
+            for item in items
+        )
+    ):
+        return None
+    target = blocked[0]
+    if target.mode.startswith("web-job:"):
+        return None
+    loaded = queue_state.load_queue_journal(target.operation_id)
+    journal = loaded.journal
+    if (
+        loaded.status is not queue_state.QueueLoadStatus.READY
+        or journal is None
+        or journal.operation_id != target.operation_id
+        or journal.mode != target.mode
+        or journal.retirements
+        or len(journal.items) != len(items)
+    ):
+        return None
+    classified = {item.item_id: item for item in items}
+    if len(classified) != len(items):
+        return None
+    for queued in journal.items:
+        recovered = classified.get(queued.item_id)
+        if recovered is None or recovered.phase is not queued.phase:
+            return None
+        expected_action = (
+            StartupRecoveryAction.BLOCKED
+            if queued.item_id == target.item_id
+            else StartupRecoveryAction.PENDING
+        )
+        if recovered.action is not expected_action:
+            return None
+    queued = next(
+        (item for item in journal.items if item.item_id == target.item_id),
+        None,
+    )
+    allowed_blocks = {
+        ("managed-beets-reservation", "managed-reservation-absent"),
+        ("managed-beets-reservation", "managed-reservation-origin"),
+        ("managed-beets", "managed-carrier-unsealed-origin"),
+    }
+    if (
+        queued is None
+        or len(queued.recovery_references) != 1
+        or (
+            queued.recovery_references[0].kind,
+            queued.block_reason,
+        )
+        not in allowed_blocks
+    ):
+        return None
+    completion_input = parse_completion_input_record(
+        queued.completion_input,
+        expected_owner=RecoveryOwner(target.operation_id, target.item_id),
+    )
+    planned_album = queued.planned.get("album")
+    if (
+        completion_input is None
+        or completion_input.origin.kind is not CompletionOriginKind.CLI
+        or completion_input.origin.reference != "download-queue"
+        or not isinstance(planned_album, dict)
+        or normalise_album_id(planned_album.get("id"))
+        != normalise_album_id(completion_input.expectation.album_id)
+    ):
+        return None
+    label = planned_album.get("title") or queued.planned.get("label") or "download"
+    return target, str(label)
+
+
+def _cli_retry_settlement_matches(result, target) -> bool:
+    from qobuz_librarian.queue import journal as queue_state
+    from qobuz_librarian.queue.startup_recovery import (
+        StartupRecoveryAction,
+        StartupRecoveryStatus,
+    )
+
+    if result.status is not StartupRecoveryStatus.RESUME_REQUIRED:
+        return False
+    recovered = next(
+        (
+            item
+            for item in result.items
+            if item.operation_id == target.operation_id
+            and item.item_id == target.item_id
+            and item.mode == target.mode
+        ),
+        None,
+    )
+    loaded = queue_state.load_queue_journal(target.operation_id)
+    if (
+        recovered is None
+        or recovered.phase is not queue_state.QueuePhase.PENDING
+        or recovered.action is not StartupRecoveryAction.PENDING
+        or loaded.status is not queue_state.QueueLoadStatus.READY
+        or loaded.journal is None
+        or loaded.journal.mode != target.mode
+    ):
+        return False
+    queued = next(
+        (
+            item
+            for item in loaded.journal.items
+            if item.item_id == target.item_id
+        ),
+        None,
+    )
+    return (
+        queued is not None
+        and queued.phase is queue_state.QueuePhase.PENDING
+        and not queued.recovery_references
+        and queued.block_reason is None
+        and queued.completion_input is None
+        and queued.completion_evidence is None
+    )
+
+
+def _cli_discard_settlement_matches(result, target) -> bool:
+    from qobuz_librarian.queue import journal as queue_state
+    from qobuz_librarian.queue.startup_recovery import StartupRecoveryStatus
+
+    if result.status not in {
+        StartupRecoveryStatus.CLEAR,
+        StartupRecoveryStatus.RESUME_REQUIRED,
+    } or any(
+        item.operation_id == target.operation_id
+        and item.item_id == target.item_id
+        for item in result.items
+    ):
+        return False
+    loaded = queue_state.load_queue_journal(target.operation_id)
+    return loaded.status is queue_state.QueueLoadStatus.ABSENT or (
+        loaded.status is queue_state.QueueLoadStatus.READY
+        and loaded.journal is not None
+        and loaded.journal.mode == target.mode
+        and all(
+            item.item_id != target.item_id for item in loaded.journal.items
+        )
+    )
+
+
+def _offer_blocked_cli_settlement(authority, result):
+    """Offer an explicit decision for one exact pre-launch CLI abort."""
+    from qobuz_librarian.queue.startup_recovery import (
+        BlockedItemSettlementAction,
+        BlockedItemSettlementStatus,
+        settle_blocked_item,
+    )
+
+    binding = _cli_blocked_settlement_binding(result)
+    if binding is None:
+        return result, False
+    item, label = binding
+
+    prompt = (
+        f"\n  The interrupted download “{label}” stopped before Beets changed "
+        "the library.\n"
+        "  Retry it, keep it blocked for later, or discard its saved queue "
+        "entry?\n"
+        "  Choice [r=retry, Enter=keep, d=discard]: "
+    )
+    while True:
+        try:
+            choice = input(fmt(C.CYAN, prompt)).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            choice = ""
+        if choice in {"", "k", "keep"}:
+            return result, True
+        if choice in {"r", "retry"}:
+            action = BlockedItemSettlementAction.RETRY
+            expected = BlockedItemSettlementStatus.RETRYABLE
+            break
+        if choice in {"d", "discard"}:
+            try:
+                confirmed = input(fmt(
+                    C.RED,
+                    "  Type DISCARD to remove this saved queue entry: ",
+                )).strip()
+            except (EOFError, KeyboardInterrupt):
+                confirmed = ""
+            if confirmed != "DISCARD":
+                return result, True
+            action = BlockedItemSettlementAction.DISCARD
+            expected = BlockedItemSettlementStatus.DISCARDED
+            break
+        prompt = "  Enter r to retry, d to discard, or press Enter to keep it: "
+
+    try:
+        settled = settle_blocked_item(
+            authority=authority,
+            operation_id=item.operation_id,
+            item_id=item.item_id,
+            action=action,
+        )
+        fresh = _record_startup_recovery(authority)
+    except Exception:
+        return result, False
+    if settled.status is not expected:
+        log.info(fmt(C.YELLOW, f"  {settled.reason}"))
+        return result, False
+    verified = (
+        _cli_retry_settlement_matches(fresh, item)
+        if action is BlockedItemSettlementAction.RETRY
+        else _cli_discard_settlement_matches(fresh, item)
+    )
+    return (fresh, False) if verified else (result, False)
+
+
+def _die_unsettled_startup_recovery(authority, *, kept: bool = False) -> None:
+    try:
+        authority.close()
+    except OSError:
+        pass
+    if kept:
+        message = (
+            "\n  The interrupted download was kept for later.\n"
+            "   Its saved queue entry was left unchanged and no other work "
+            "was started.\n"
+        )
+        color = C.YELLOW
+    else:
+        message = (
+            "\n✗  An interrupted download could not be verified safely.\n"
+            "   The saved queue and staged files were left unchanged. Check "
+            "the application log for the blocked recovery reason, correct the "
+            "reported path or permission problem, then restart Qobuz "
+            "Librarian.\n"
+        )
+        color = C.RED
+    die(fmt(color, message), EXIT_GENERAL)
+
+
 def _compose_service_name() -> str:
     """Best-effort docker compose service name for diagnostic hints.
 
@@ -74,7 +361,7 @@ def _compose_service_name() -> str:
 def acquire_run_lock():
     """Acquire the single-writer run lock or exit."""
     try:
-        return run_lock.acquire()
+        lease = run_lock.acquire()
     except run_lock.LockBusy as busy:
         _svc = _compose_service_name()
         die(fmt(C.RED,
@@ -88,6 +375,25 @@ def acquire_run_lock():
             f"        then re-run, then `docker compose start {_svc}`.\n\n"
             f"   Only one writer can use /staging at a time.\n"),
             EXIT_LOCK_BUSY)
+    if lease is not None and lease.intact() is True:
+        result = _record_startup_recovery(lease)
+        from qobuz_librarian.queue.startup_recovery import StartupRecoveryStatus
+        kept = False
+        if result.status is StartupRecoveryStatus.ATTENTION_REQUIRED:
+            result, kept = _offer_blocked_cli_settlement(lease, result)
+        if result.status is StartupRecoveryStatus.ATTENTION_REQUIRED:
+            _die_unsettled_startup_recovery(lease, kept=kept)
+        return lease
+    if lease is not None:
+        lease.close()
+    die(fmt(
+        C.RED,
+        "\n✗  The single-writer safety lock could not be established.\n"
+        f"   Lock file: {cfg.LOCK_FILE}\n\n"
+        "   Refusing to modify staging or the library without exclusive "
+        "write authority. Check the data-volume permissions and filesystem "
+        "locking support, then try again.\n",
+    ), EXIT_GENERAL)
 
 
 # ── Pre-flight checks ─────────────────────────────────────────────────────────
@@ -273,10 +579,6 @@ def parse_args():
                    action="store_true",
                    help="force-skip pre-import downsampling for this run "
                         "(only relevant when DOWNSAMPLE_HIRES_ENABLED is on)")
-    p.add_argument("--migrate-multi-artist", dest="migrate_multi_artist",
-                   action=argparse.BooleanOptionalAction,
-                   default=cfg.MIGRATE_MULTI_ARTIST,
-                   help="after import, merge 'Primary, Other' folders into 'Primary'")
     p.add_argument("--migrate", action="store_true",
                    help="one-time setup: reorganise an existing library into the "
                         "Artist/Album layout (local-only; no Qobuz login needed)")
@@ -385,10 +687,8 @@ def parse_args():
 
 def main():
     # Apply the web Settings page's persisted overrides before parse_args
-    # reads cfg.* into the default flags. Without this, a user who toggles
-    # MIGRATE_MULTI_ARTIST on in Settings has the change silently ignored
-    # by CLI runs — the web process applies it on startup but the CLI never
-    # reloads from disk.
+    # reads cfg.* into the default flags. The web process applies these on
+    # startup, while CLI runs load them here.
     try:
         from qobuz_librarian.web import settings_store
         settings_store.load()
@@ -423,6 +723,26 @@ def main():
     # Single-instance lock first — fail fast before doing any other work.
     # Hold the file handle for the lifetime of main() so the lock persists.
     _lockfile = acquire_run_lock()  # noqa: F841
+
+    from qobuz_librarian.queue.startup_recovery import StartupRecoveryStatus
+    resume_interrupted_queue = (
+        _startup_recovery_status() is StartupRecoveryStatus.RESUME_REQUIRED)
+    if resume_interrupted_queue and any((
+        args.reset_walk_seen,
+        args.migrate,
+        args.lyrics_walk,
+        args.check_new_releases,
+        args.downsample_walk,
+        args.artist,
+        args.upgrade_walk,
+        args.query,
+    )):
+        die(fmt(
+            C.YELLOW,
+            "\n⚠  An interrupted download must be resumed before other work.\n"
+            "   Run Qobuz Librarian without a mode or search argument and "
+            "choose Resume when it offers the saved queue.\n",
+        ), EXIT_GENERAL)
 
     if args.reset_walk_seen:
         removed = []
@@ -543,6 +863,36 @@ def main():
         vlog(f"streamrip quality cap: {cap_depth}-bit/{cap_rate/1000:g}kHz")
         download_stack["token"] = token
         return token
+
+    if resume_interrupted_queue:
+        # Keep this launch recovery-only. The queue executor independently
+        # proves the exact saved operation before it downloads or imports; no
+        # unrelated housekeeping or menu action can run first.
+        try:
+            offer_resume_startup_recovery(
+                args,
+                download_token,
+                _STARTUP_RECOVERY_RESULT,
+            )
+        except (AuthLost, QobuzUnavailable):
+            raise
+        except Exception as exc:
+            die(fmt(
+                C.RED,
+                "\n✗  The interrupted queue could not be resumed safely.\n"
+                f"   {exc}\n"
+                "   Its saved recovery state was left unchanged.\n",
+            ), EXIT_GENERAL)
+        result = _record_startup_recovery(_lockfile)
+        if result.status is StartupRecoveryStatus.ATTENTION_REQUIRED:
+            _die_unsettled_startup_recovery(_lockfile)
+        if result.status is StartupRecoveryStatus.RESUME_REQUIRED:
+            log.info(fmt(
+                C.YELLOW,
+                "  Interrupted queue kept. Other work remains paused until it "
+                "is resumed.",
+            ))
+        return
 
     # Sweep upgrade-backup dir of anything older than retention window.
     # Cheap (just stat + rmtree on stale dirs); silent unless something happens.

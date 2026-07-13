@@ -80,17 +80,27 @@ def run_library_lyrics(*, dry_run=False, rescan=False, synced_only=False,
     # full rescan re-fetches everything anyway, so it skips this.
     if not rescan and not dry_run:
         report_progress("Scanning library lyrics", 0, total, "")
-        lyric_fetch.index_existing(
-            items, state_path=cfg.LYRIC_FETCH_STATE_FILE, log=log,
+        indexed = lyric_fetch.index_existing(
+            items, owned_root=cfg.MUSIC_ROOT,
+            state_path=cfg.LYRIC_FETCH_STATE_FILE, log=log,
             should_stop=should_stop,
             progress_cb=lambda c, t, name: report_progress(
                 "Scanning library lyrics", c, t, name),
         )
-        if should_stop and should_stop():
-            return {"total": total, "stopped": 1}
+        if indexed.get("stopped"):
+            processed = sum(
+                count for outcome, count in indexed.items()
+                if outcome not in {"stopped", "stop-total"})
+            return {
+                "total": total,
+                "processed": processed,
+                "stop_total": indexed.get("stop-total", total),
+                "stopped": 1,
+            }
 
     counts = lyric_fetch.fetch_for_paths(
         paths,
+        owned_root=cfg.MUSIC_ROOT,
         providers=cfg.LYRICS_PROVIDERS or None,
         lyrics_format=cfg.LYRICS_FORMAT,
         dry_run=dry_run,
@@ -103,4 +113,9 @@ def run_library_lyrics(*, dry_run=False, rescan=False, synced_only=False,
     )
     result = dict(counts)
     result["total"] = total
+    result["processed"] = sum(
+        count for outcome, count in counts.items()
+        if outcome not in {"stopped", "stop-total"})
+    if counts.get("stopped"):
+        result["stop_total"] = counts.get("stop-total", result["processed"])
     return result

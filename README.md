@@ -31,7 +31,7 @@ Qobuz Librarian searches Qobuz for artists, albums, and tracks, downloads what y
 - **Clean import.** beets handles tagging and cover art, and files land in your library in a single move. Lyrics are fetched on import; **Lyrics** mode backfills tracks you already have.
 - **Repair.** ISRC-anchored scanning finds truncated or corrupt FLACs and repairs exact tracks when matching is safe. If a damaged file cannot be matched by ID, the review can offer a whole-album redownload instead.
 - **Library migration.** **Migrate** reorganises an existing library into the folder structure `Artist/Album (Year)`. Copy mode leaves the original library in place; optional move mode relocates originals after preview. Merging existing duplicate album folders is a CLI-only option.
-- **Crash-safe queue.** Job records and review lists survive restarts; interrupted downloads are marked failed and can be retried. A per-run lock keeps two instances off the same library.
+- **Crash-safe queue.** Job records and review lists survive restarts; interrupted downloads are marked failed and can be retried. A shared run lock keeps the web app and CLI from writing at the same time within one deployment.
 
 ## How it works
 
@@ -70,7 +70,7 @@ Then open <http://localhost:8666>. The first visit sets a web username and passw
 
 On Windows, run the setup in WSL or Git Bash. `compose.yaml` pulls the prebuilt `latest` image from Docker Hub as `dinkeyes/qobuz-librarian` (that account name differs from the GitHub project, which is expected); to build it yourself, see [Development](#development). On a shared or untrusted network, lock down access before the first boot; see [Security](#security).
 
-Docker is the supported way to run the **web UI**: the image bundles streamrip, beets, the FLAC tools, and the compiled stylesheet. A `pip`/`pipx` install gives you the `qobuz-librarian` **CLI** for scripted runs against an existing streamrip/beets setup; for lyrics features there, install the extra with `pip install qobuz-librarian[lyrics]` (Docker already bundles it). To run the web UI outside Docker, use a source checkout and build the CSS once (`npm ci && npm run build`), then start `qobuz-librarian-web`.
+Docker is the supported way to run the **web UI**: the image bundles streamrip, beets 2.12.0, the FLAC tools, and the compiled stylesheet. A `pip`/`pipx` install gives you the `qobuz-librarian` **CLI** for scripted runs against an existing streamrip/beets 2.12.0 setup; for lyrics features there, install the extra with `pip install qobuz-librarian[lyrics]` (Docker already bundles it). If beets uses a separate environment and its `beet` launcher has an unusual wrapper, set `BEETS_PYTHON` to that environment's Python executable. To run the web UI outside Docker, use a source checkout and build the CSS once (`npm ci && npm run build`), then start `qobuz-librarian-web`.
 
 ### Your Qobuz token
 
@@ -96,8 +96,11 @@ On first boot there is no account yet, and the setup screen stays open until one
 
 For internet exposure, put it behind an authenticating reverse proxy, a VPN, or Tailscale rather than relying on the built-in login alone. See [SECURITY.md](SECURITY.md), and [Configuration](docs/configuration.md#deployment) for the deployment knobs.
 
-## Limitations
+## Operational limitations
 
+- **Stop before database maintenance.** Never sync, restore, or replace the live beets/SQLite database while Qobuz Librarian is running; stop the app first.
+- **Review Repair recovery backups.** Repair keeps the original files it replaces (or the full original album for whole-album Repair) in a recovery backup because it cannot yet prove an exact requested-track result. Review the repaired album and its recovery notice before restoring or removing that backup.
+- **Some filesystem metadata may differ after a copy.** Cross-filesystem migrations and safety backups preserve the music and ordinary file metadata, but do not guarantee exact extended attributes, access-control lists (ACLs), or file ownership.
 - **One library, one container.** The staging area is single-writer. The run-lock keeps the CLI and web container from running at the same time in one stack, but two stacks pointed at the same mount can still conflict.
 - **Qobuz only.** This drives streamrip's Qobuz path; Tidal, Deezer, and SoundCloud are not supported.
 - **FLAC output only.** Imports, repairs, upgrades, and downsampling keep the library in FLAC; MP3 and other lossy output formats are not supported.

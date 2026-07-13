@@ -57,7 +57,7 @@ Review AcoustID matches before using the migrated library; fingerprint matches a
 
 ## Bringing an existing beets database
 
-The container creates `/config/beets/musiclibrary.db` on first start if none exists. To use yours, stop the container and copy your DB and config into the `qobuz-librarian-config` volume (the DB must end up named `musiclibrary.db`):
+The app creates `/config/beets/musiclibrary.db` the first time an import uses beets, not when the container starts. To use yours, stop the container and copy your DB and config into the `qobuz-librarian-config` volume (the DB must end up named `musiclibrary.db`):
 
 ```bash
 docker run --rm -v qobuz-librarian-config:/dest -v /your/beets/dir:/src alpine \
@@ -66,6 +66,8 @@ docker run --rm -v qobuz-librarian-config:/dest -v /your/beets/dir:/src alpine \
 ```
 
 Replace `library.db` with your filename (check the `library:` path in your `config.yaml` if unsure), or bind-mount a host directory at `/config/beets` instead. The container will not overwrite either file on start. If renaming the DB to `musiclibrary.db` is not convenient, point `BEETS_DB_PATH` at your file instead (e.g. `BEETS_DB_PATH=/config/beets/library.db`) and the app reads it from there.
+
+The default Compose config volume provides the local Linux filesystem guarantees the database needs. If you replace it, run the app on Linux with `/proc/self/fd` and use a local mount that provides hard links, xattrs, advisory `flock`, file leases, atomic `renameat2` exchange, and file and directory `fsync`; do not place the database on NFS or SMB/CIFS. See [Configuration](configuration.md#beets--streamrip-config) for details.
 
 ## Optional beets fingerprinting
 
@@ -76,11 +78,13 @@ docker compose run --rm qobuz-librarian \
   beet -c /app/docker/beets-chroma.yaml import /music/<your-untagged-folder>
 ```
 
-It shows the matching MusicBrainz releases one album at a time, for you to accept, skip, or replace. Lookups use beets' built-in AcoustID key; you only need your own (from <https://acoustid.org/new-application>, added as `acoustid: {apikey: "KEY"}`) to submit fingerprints with `beet submit`. Run it when no download is active, since both use the same beets database. To also re-folder the files into the layout, use [Migrate](#migrating-into-the-layout) instead.
+It shows the matching MusicBrainz releases one album at a time, for you to accept, skip, or replace. Lookups use beets' built-in AcoustID key; you only need your own (from <https://acoustid.org/new-application>, added as `acoustid: {apikey: "KEY"}`) to submit fingerprints with `beet submit`.
+
+Stop Qobuz Librarian completely before running this or any other manual `beet` command. Waiting for downloads to finish is not enough: manual commands do not participate in the app's database coordination and must not run alongside it. To also re-folder the files into the layout, use [Migrate](#migrating-into-the-layout) instead.
 
 ## The first scan on a big library
 
-A library-wide scan makes roughly one Qobuz call per artist directory (cached on re-scans, so repeated scans mostly use cached data), fanned across a few artists at once (`ARTIST_SCAN_WORKERS`, default 4). There is no artificial delay between calls (`ARTIST_API_DELAY`, default 0); Qobuz's rate limit is handled by automatic retry and back-off, so raise it only if you get throttled. It is scan-then-review, not a daemon; re-run after adding music. Singles and very short EPs are hidden from the missing-albums step by default; lower `MISSING_ALBUMS_MIN_TRACKS` (e.g. to 1) to surface them. (A single-artist run can also pass `--include-singles`.)
+A library-wide scan makes roughly one Qobuz call per artist directory (cached on re-scans, so repeated scans mostly use cached data), fanned across a few artists at once (`ARTIST_SCAN_WORKERS`, default 4). There is no artificial delay between calls (`ARTIST_API_DELAY`, default 0); Qobuz's rate limit is handled by automatic retry and back-off, so raise it only if you get throttled. It is scan-then-review, not a daemon. After the baseline, use the Library refresh for music added outside the app. Singles and very short EPs are hidden from the missing-albums step by default; lower `MISSING_ALBUMS_MIN_TRACKS` (e.g. to 1) to surface them. (A single-artist run can also pass `--include-singles`.)
 
 Review choices are remembered, so a large library can be handled over several sessions. Library dismissals hide missing-album suggestions, Upgrade dismissals hide skipped upgrades, and Downsample remembers albums you keep hi-res. Restore them from the **Hidden** view. Saved choices are per album, so a new release by an already-reviewed artist still surfaces. Explicit single-artist CLI scans do not use the hidden list.
 

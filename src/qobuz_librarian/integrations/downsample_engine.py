@@ -15,15 +15,23 @@ Quality settings:
   - Source bit depth preserved (16-bit stays 16-bit, 24-bit stays 24-bit).
   - FLAC compression level 5 (default — lossless, fast encode).
 """
+import hashlib
 import os
+import secrets
 import shutil
 import stat
 import subprocess
-import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from qobuz_librarian import config as cfg
+from qobuz_librarian.file_exclusion import acquire_inode_write_exclusion
+from qobuz_librarian.integrations.lyric_fetch import (
+    _exchange_existing,
+    _named_identity,
+    _regular_identity,
+    _unlink_held_name,
+)
 from qobuz_librarian.integrations.rip import flac_audio_offset
 from qobuz_librarian.library import flac_cache
 
@@ -131,7 +139,7 @@ def parse_flac_info(data: bytes):
     return sr, bps
 
 
-def read_local_bit_depth(path: Path) -> int:
+def read_local_bit_depth(path: Path, *, pass_fds=()) -> int:
     """Bit depth of a local FLAC. The 1 KB header byte-parse settles the common
     case in a single read; metaflac backstops a file whose STREAMINFO sits past
     the probe window (a leading ID3 tag would do it) so the resample never
@@ -152,7 +160,8 @@ def read_local_bit_depth(path: Path) -> int:
     try:
         out = subprocess.run(
             ["metaflac", "--show-bps", str(path)],
-            capture_output=True, text=True, timeout=10).stdout.strip()
+            capture_output=True, text=True, timeout=10,
+            pass_fds=tuple(pass_fds)).stdout.strip()
         return int(out) if out else 0
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired, ValueError):
         return 0
@@ -174,7 +183,7 @@ def _cached_sample_rate(path: Path) -> int:
         return 0
 
 
-def read_sample_rate(path: Path) -> int:
+def read_sample_rate(path: Path, *, pass_fds=()) -> int:
     """Sample rate of a local FLAC. The 1 KB header byte-parse settles the
     common case in a single read; metaflac backstops files whose STREAMINFO
     sits past the probe window (a leading ID3 tag would do it), so a hi-res
@@ -197,7 +206,8 @@ def read_sample_rate(path: Path) -> int:
     try:
         out = subprocess.run(
             ["metaflac", "--show-sample-rate", str(path)],
-            capture_output=True, text=True, timeout=10).stdout.strip()
+            capture_output=True, text=True, timeout=10,
+            pass_fds=tuple(pass_fds)).stdout.strip()
         return int(out) if out else 0
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired, ValueError):
         return 0
@@ -220,7 +230,7 @@ def parse_flac_total_samples(data: bytes) -> int:
             | data[si + 17])
 
 
-def read_total_samples(path: Path) -> int:
+def read_total_samples(path: Path, *, pass_fds=()) -> int:
     """Total decoded sample count of a local FLAC, or 0 if unknown/unreadable.
 
     Same shape as read_sample_rate: the 1 KB header byte-parse settles the
@@ -238,7 +248,8 @@ def read_total_samples(path: Path) -> int:
     try:
         out = subprocess.run(
             ["metaflac", "--show-total-samples", str(path)],
-            capture_output=True, text=True, timeout=10).stdout.strip()
+            capture_output=True, text=True, timeout=10,
+            pass_fds=tuple(pass_fds)).stdout.strip()
         return int(out) if out else 0
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired, ValueError):
         return 0
@@ -289,7 +300,7 @@ def scan_dir_for_hires(directory):
     return {"hires": hires, "n_flac": n_flac}
 
 
-def _decode_ok(path):
+def _decode_ok(path, *, pass_fds=()):
     """True only if the FLAC at `path` decodes cleanly (flac -t, frame-CRC +
     decode).
 
@@ -301,7 +312,8 @@ def _decode_ok(path):
     try:
         r = subprocess.run(["flac", "-t", "-s", str(path)],
                            capture_output=True, timeout=300,
-                           stdin=subprocess.DEVNULL)
+                           stdin=subprocess.DEVNULL,
+                           pass_fds=tuple(pass_fds))
     except (OSError, subprocess.TimeoutExpired):
         return False
     return r.returncode == 0
@@ -313,7 +325,7 @@ def _decode_ok(path):
 _TARGET_PEAK_DBFS = -1.0
 
 
-def _resampled_peak_dbfs(src, af_filter, rate):
+def _resampled_peak_dbfs(src, af_filter, rate, *, pass_fds=()):
     """Peak level (dBFS) the resampled signal reaches, on a float render.
 
     soxr's reconstruction can push a hot (loud) source past full scale; the
@@ -328,7 +340,8 @@ def _resampled_peak_dbfs(src, af_filter, rate):
             ["ffmpeg", "-hide_banner", "-nostdin", "-i", str(src),
              "-map", "0:a", "-af", f"{af_filter},astats=metadata=1:reset=0",
              "-ar", str(rate), "-c:a", "pcm_f32le", "-f", "null", "-"],
-            capture_output=True, timeout=600, stdin=subprocess.DEVNULL)
+            capture_output=True, timeout=600, stdin=subprocess.DEVNULL,
+            pass_fds=tuple(pass_fds))
     except (OSError, subprocess.TimeoutExpired):
         return None
     peaks = []
@@ -341,11 +354,241 @@ def _resampled_peak_dbfs(src, af_filter, rate):
     return max(peaks) if peaks else None
 
 
-# Resample output is written to a dot-prefixed temp beside the source, then
-# atomically swapped in. The dot keeps the library scanner from indexing it
-# mid-encode; the shared prefix lets a later run recognise and sweep one an
-# interrupt left behind.
+# Resample output is written to an unpredictable, exclusively-created temp
+# beside the source, then atomically exchanged with the exact held master. The
+# dot keeps the library scanner from indexing an in-flight encode.
 _TMP_PREFIX = ".compress-"
+
+
+class _BoundSource:
+    """One regular file beneath a fully held, no-follow absolute root chain."""
+
+    def __init__(self, path: Path, owned_root: Path):
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        directory = getattr(os, "O_DIRECTORY", None)
+        if nofollow is None or directory is None:
+            raise OSError("safe no-follow file operations are unavailable")
+
+        self.path = Path(os.path.abspath(os.fspath(path)))
+        self.root = Path(os.path.abspath(os.fspath(owned_root)))
+        try:
+            relative = self.path.relative_to(self.root)
+        except ValueError:
+            raise OSError(
+                f"{self.path}: source is outside the downsample root") from None
+        if not relative.parts or any(
+                part in ("", ".", "..") for part in relative.parts):
+            raise OSError(f"{self.path}: invalid source path")
+
+        root_parts = self.root.parts
+        if not root_parts or root_parts[0] != os.path.sep:
+            raise OSError(f"{self.root}: invalid downsample root")
+        self._directory_fds = []
+        self._directory_names = []
+        self.track_fd = None
+        directory_flags = os.O_RDONLY | directory | nofollow
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        try:
+            filesystem_root_fd = os.open(os.path.sep, directory_flags)
+            self._directory_fds.append(filesystem_root_fd)
+            for part in (*root_parts[1:], *relative.parts[:-1]):
+                child_fd = os.open(
+                    part,
+                    directory_flags,
+                    dir_fd=self._directory_fds[-1],
+                )
+                if not self._directory_entry_matches(
+                        self._directory_fds[-1], part, child_fd):
+                    os.close(child_fd)
+                    raise OSError(f"{self.path}: directory chain changed")
+                self._directory_names.append(part)
+                self._directory_fds.append(child_fd)
+
+            track_flags = (
+                os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0))
+            track_flags |= getattr(os, "O_CLOEXEC", 0)
+            self.track_fd = os.open(
+                relative.parts[-1],
+                track_flags,
+                dir_fd=self._directory_fds[-1],
+            )
+            self.identity = _regular_identity(os.fstat(self.track_fd))
+            if (
+                self.identity is None
+                or not self.chain_is_named()
+                or self.named_identity() != self.identity
+            ):
+                raise OSError(f"{self.path}: source identity changed")
+        except BaseException:
+            self.close()
+            raise
+
+    @staticmethod
+    def _directory_entry_matches(parent_fd, name, descriptor) -> bool:
+        try:
+            held = os.fstat(descriptor)
+            named = os.stat(
+                name, dir_fd=parent_fd, follow_symlinks=False)
+            return (
+                stat.S_ISDIR(held.st_mode)
+                and stat.S_ISDIR(named.st_mode)
+                and held.st_dev == named.st_dev
+                and held.st_ino == named.st_ino
+            )
+        except OSError:
+            return False
+
+    @property
+    def parent_fd(self) -> int:
+        return self._directory_fds[-1]
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+    def chain_is_named(self) -> bool:
+        try:
+            held_root = os.fstat(self._directory_fds[0])
+            named_root = os.stat(os.path.sep, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(held_root.st_mode)
+                or not stat.S_ISDIR(named_root.st_mode)
+                or held_root.st_dev != named_root.st_dev
+                or held_root.st_ino != named_root.st_ino
+            ):
+                return False
+            for index, name in enumerate(self._directory_names, start=1):
+                if not self._directory_entry_matches(
+                        self._directory_fds[index - 1],
+                        name,
+                        self._directory_fds[index],
+                ):
+                    return False
+        except (OSError, IndexError):
+            return False
+        return True
+
+    def named_identity(self):
+        try:
+            return _named_identity(self.parent_fd, self.name)
+        except OSError:
+            return None
+
+    def exact_track_is_named(self) -> bool:
+        if self.track_fd is None or not self.chain_is_named():
+            return False
+        try:
+            return (
+                _regular_identity(os.fstat(self.track_fd)) == self.identity
+                and self.named_identity() == self.identity
+            )
+        except OSError:
+            return False
+
+    def close(self) -> None:
+        if self.track_fd is not None:
+            try:
+                os.close(self.track_fd)
+            except OSError:
+                pass
+            self.track_fd = None
+        for descriptor in reversed(self._directory_fds):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        self._directory_fds.clear()
+
+
+def _descriptor_path(descriptor: int) -> Path:
+    return Path(f"/proc/self/fd/{descriptor}")
+
+
+def _make_encode_temp(parent_fd: int):
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise OSError("safe no-follow file operations are unavailable")
+    flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | nofollow
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    for _ in range(16):
+        name = f"{_TMP_PREFIX}{secrets.token_hex(16)}.flac"
+        try:
+            return name, os.open(name, flags, 0o600, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+    raise FileExistsError("couldn't reserve a downsample temporary file")
+
+
+def _exact_temp_is_named(parent_fd: int, name: str, descriptor: int,
+                         expected=None) -> bool:
+    try:
+        frozen = expected or _regular_identity(os.fstat(descriptor))
+        return (
+            frozen is not None
+            and _regular_identity(os.fstat(descriptor)) == frozen
+            and _named_identity(parent_fd, name) == frozen
+        )
+    except OSError:
+        return False
+
+
+def _reopen_encode_temp_readonly(parent_fd: int, name: str, descriptor: int):
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise OSError("safe no-follow file operations are unavailable")
+    expected = _regular_identity(os.fstat(descriptor))
+    if expected is None or not _exact_temp_is_named(
+            parent_fd, name, descriptor, expected):
+        raise OSError("resampled output changed while it was being opened")
+    flags = os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    readonly_fd = os.open(name, flags, dir_fd=parent_fd)
+    if not _exact_temp_is_named(parent_fd, name, readonly_fd, expected):
+        os.close(readonly_fd)
+        raise OSError("resampled output changed while it was being opened")
+    return readonly_fd, expected
+
+
+def _sha256_fd(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        chunk = os.pread(descriptor, 1024 * 1024, offset)
+        if not chunk:
+            return digest.hexdigest()
+        digest.update(chunk)
+        offset += len(chunk)
+
+
+def _receipt_matches_source(binding, receipt, exclusion) -> bool:
+    if not isinstance(receipt, dict) or not exclusion.intact():
+        return False
+    try:
+        value = os.fstat(binding.track_fd)
+        identity = receipt.get("identity")
+        expected_identity = (
+            stat.S_IFMT(value.st_mode), int(value.st_dev), int(value.st_ino))
+        if (
+            not isinstance(identity, (tuple, list))
+            or tuple(identity) != expected_identity
+            or receipt.get("size") != int(value.st_size)
+            or receipt.get("mtime_ns") != int(value.st_mtime_ns)
+            or receipt.get("changed_ns") != int(value.st_ctime_ns)
+            or not isinstance(receipt.get("sha256"), str)
+            or len(receipt["sha256"]) != 64
+            or not binding.exact_track_is_named()
+        ):
+            return False
+        digest = _sha256_fd(binding.track_fd)
+        after = os.fstat(binding.track_fd)
+        return (
+            exclusion.intact()
+            and binding.exact_track_is_named()
+            and _regular_identity(after) == binding.identity
+            and digest == receipt["sha256"]
+        )
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 def _encode_opts_for_bps(bps, af_filter):
@@ -367,28 +610,50 @@ def _encode_opts_for_bps(bps, af_filter):
     return af_filter, "s32", []
 
 
-def resample_one(rel, sr, rate, af_filter, *, base_dir=None):
+def resample_one(rel, sr, rate, af_filter, *, base_dir=None,
+                 expected_source_receipt=None):
     """Resample one file. Returns (rel, sr, rate, saved_bytes, error_msg).
 
     base_dir defaults to MUSIC_ROOT. Pass an alternate root (e.g.
     STAGING_DIR) when operating on files that have not been imported
     onto the canonical music tree yet.
     """
-    src = (base_dir or MUSIC_ROOT) / rel
-    # Encode to a temp file in the SAME directory as the source, then swap it
-    # in with os.replace() — an atomic same-filesystem rename, so an interrupt
-    # (Ctrl+C / OOM / power loss) always leaves either the intact original or
-    # the fully-encoded replacement, never a half-written file. The same-dir
-    # temp is what keeps the rename on one filesystem: a cross-device move
-    # degrades to copy-then-unlink, where an interrupt mid-copy would destroy
-    # the only lossless copy.
-    tmp = None
+    root = Path(base_dir or MUSIC_ROOT)
+    src = root / rel
+    binding = None
+    exclusion = None
+    temp_exclusion = None
+    temp_fd = None
+    temp_name = None
     try:
-        st = src.stat()
+        binding = _BoundSource(src, root)
+        exclusion = acquire_inode_write_exclusion(binding.track_fd)
+        if exclusion is None:
+            return (rel, sr, rate, None,
+                    "source is open for writing or cannot be protected; "
+                    "left the original untouched")
+        if (
+            expected_source_receipt is not None
+            and not _receipt_matches_source(
+                binding, expected_source_receipt, exclusion)
+        ):
+            return (rel, sr, rate, None,
+                    "source no longer matches its kept original; "
+                    "left it untouched")
+
+        st = os.fstat(binding.track_fd)
         in_size = st.st_size
         src_mode = stat.S_IMODE(st.st_mode)
+        source_path = _descriptor_path(binding.track_fd)
+        source_fds = (binding.track_fd,)
 
-        bps = read_local_bit_depth(src)
+        held_sr = read_sample_rate(source_path, pass_fds=source_fds)
+        if held_sr != sr or target_rate(held_sr) != rate:
+            return (rel, sr, rate, None,
+                    "source sample rate changed after the scan; "
+                    "left the original untouched")
+
+        bps = read_local_bit_depth(source_path, pass_fds=source_fds)
         # An unreadable source bit depth (bps == 0) can't be pinned — the encode
         # would default to 32-bit and inflate a 24-bit master — and can't be
         # re-verified afterward, so refuse rather than overwrite the master in
@@ -407,19 +672,22 @@ def resample_one(rel, sr, rate, af_filter, *, base_dir=None):
         # everything else stays bit-untouched). A failed measurement falls back
         # to no attenuation, no worse than before.
         enc_af = af
-        _peak = _resampled_peak_dbfs(src, af_filter, rate)
+        _peak = _resampled_peak_dbfs(
+            source_path, af_filter, rate, pass_fds=source_fds)
         if _peak is not None and _peak > 0.0:
             enc_af = f"volume={_TARGET_PEAK_DBFS - _peak:.3f}dB,{af}"
+        if not exclusion.intact() or not binding.exact_track_is_named():
+            return (rel, sr, rate, None,
+                    "source changed while it was being checked; "
+                    "left the current file untouched")
 
-        fd, tmp_name = tempfile.mkstemp(
-            dir=str(src.parent), prefix=_TMP_PREFIX, suffix=".flac")
-        os.close(fd)
-        tmp = Path(tmp_name)
+        temp_name, temp_fd = _make_encode_temp(binding.parent_fd)
+        temp_path = _descriptor_path(temp_fd)
 
         subprocess.run(
             [
                 "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
-                "-i", str(src),
+                "-i", str(source_path),
                 # Map every input stream so all embedded PICTURE blocks
                 # (front+back cover) survive — ffmpeg's default selection keeps
                 # only one video stream and would drop the rest.
@@ -435,25 +703,46 @@ def resample_one(rel, sr, rate, af_filter, *, base_dir=None):
                 # audio savings and make the output net-larger).
                 "-c:v", "copy",
                 "-map_metadata", "0",
-                "-y", str(tmp),
+                "-f", "flac",
+                "-y", str(temp_path),
             ],
             check=True,
             capture_output=True,
             # A hung NFS/FUSE mount must not freeze the worker forever; cap the
             # encode. Generous even for a long 24/192 file on slow hardware.
             timeout=600,
+            pass_fds=(binding.track_fd, temp_fd),
         )
-        out_size = tmp.stat().st_size
+        readonly_fd, temp_identity = _reopen_encode_temp_readonly(
+            binding.parent_fd, temp_name, temp_fd)
+        writable_fd = temp_fd
+        temp_fd = readonly_fd
+        os.close(writable_fd)
+        temp_path = _descriptor_path(temp_fd)
+        temp_exclusion = acquire_inode_write_exclusion(temp_fd)
+        if (
+            temp_exclusion is None
+            or temp_identity is None
+            or not _exact_temp_is_named(
+                binding.parent_fd, temp_name, temp_fd, temp_identity)
+            or not exclusion.intact()
+            or not temp_exclusion.intact()
+            or not binding.exact_track_is_named()
+        ):
+            return (rel, sr, rate, None,
+                    "source or resampled output changed during encoding; "
+                    "left the current file untouched")
+        out_size = temp_identity["size"]
         # Verify the encode decodes before it overwrites the source. A
         # downsample has no re-download to fall back on, so a corrupt encode
         # must never replace a good original.
-        if not _decode_ok(tmp):
+        if not _decode_ok(temp_path, pass_fds=(temp_fd,)):
             return (rel, sr, rate, None, "resampled file failed verification")
         # Never let a resample silently change the bit depth — a 24-bit master
         # must not come back 32-bit, nor an 8-bit file get padded to 24. The
         # source depth is known here (an unreadable one was refused above), so
         # this always runs. Original untouched on a mismatch.
-        out_bps = read_local_bit_depth(tmp)
+        out_bps = read_local_bit_depth(temp_path, pass_fds=(temp_fd,))
         if out_bps != bps:
             return (rel, sr, rate, None,
                     f"resampled to {out_bps}-bit, expected {bps}-bit; "
@@ -465,8 +754,8 @@ def resample_one(rel, sr, rate, af_filter, *, base_dir=None):
         # catch) could be silently replaced by a shortened encode, laundering
         # the damage out of every later integrity probe. Compare the output's
         # sample count to the source scaled by the rate ratio.
-        in_samples = read_total_samples(src)
-        out_samples = read_total_samples(tmp)
+        in_samples = read_total_samples(source_path, pass_fds=source_fds)
+        out_samples = read_total_samples(temp_path, pass_fds=(temp_fd,))
         if not (in_samples and out_samples):
             # A 0 = STREAMINFO 'unknown' on either side means the length can't
             # be verified, and a truncated-but-decodable encode would slip
@@ -493,29 +782,65 @@ def resample_one(rel, sr, rate, af_filter, *, base_dir=None):
             return (rel, sr, rate, None,
                     "resampled output not smaller than source; "
                     "left the original untouched")
-        # tempfile.mkstemp makes the temp 0o600; carry the source's mode across
-        # the swap so a downsample doesn't quietly tighten a 0o644 library file
-        # to owner-only (an annoyance on shared/NAS libraries).
+        # The exclusive temp starts at 0o600; carry the source's mode across the
+        # swap so a downsample doesn't quietly tighten a 0o644 library file to
+        # owner-only (an annoyance on shared/NAS libraries).
         try:
-            os.chmod(str(tmp), src_mode)
+            os.fchmod(temp_fd, src_mode)
         except OSError:
             pass
+        temp_identity = _regular_identity(os.fstat(temp_fd))
+        if (
+            temp_identity is None
+            or not _exact_temp_is_named(
+                binding.parent_fd, temp_name, temp_fd, temp_identity)
+            or not exclusion.intact()
+            or not temp_exclusion.intact()
+            or not binding.exact_track_is_named()
+        ):
+            return (rel, sr, rate, None,
+                    "source or resampled output changed before replacement; "
+                    "left the current file untouched")
         # The swap overwrites the only lossless master, so a flush that
         # genuinely fails (ENOSPC/EIO — not a mount that can't fsync) must
         # refuse the replace: the encode may exist only in the page cache.
         from qobuz_librarian.library.backup import _fsync
-        if not _fsync(tmp):
+        if not _fsync(temp_path):
             return (rel, sr, rate, None,
                     "resampled copy couldn't be flushed to disk; "
                     "left the original untouched")
-        os.replace(str(tmp), str(src))
-        tmp = None
+        if (
+            not exclusion.intact()
+            or not temp_exclusion.intact()
+            or not binding.exact_track_is_named()
+            or not _exact_temp_is_named(
+                binding.parent_fd, temp_name, temp_fd, temp_identity)
+        ):
+            return (rel, sr, rate, None,
+                    "source or resampled output changed before replacement; "
+                    "left the current file untouched")
+
+        # _exchange_existing acquires its own fresh lease at the final identity
+        # gate. Release this long-held encode lease first; any write landing in
+        # the narrow handoff changes the full source identity and is refused.
+        exclusion.close()
+        exclusion = None
+        _exchange_existing(
+            binding.parent_fd,
+            temp_name,
+            binding.name,
+            temp_fd,
+            binding.track_fd,
+            expected_identity=binding.identity,
+            new_identity=temp_identity,
+            post_exchange_guard=binding.chain_is_named,
+        )
         # The encode itself was flushed above, so rename atomicity leaves a
         # valid file either way — but a directory flush that genuinely fails
         # means the swap may quietly revert on a crash while the run reports
         # it done. Nothing here can be undone; say so instead of staying quiet.
         from qobuz_librarian.library.backup import _fsync
-        if not _fsync(src.parent):
+        if not _fsync(_descriptor_path(binding.parent_fd)):
             return (rel, sr, rate, in_size - out_size,
                     "resampled, but the folder couldn't be flushed to disk — "
                     "the swap may not survive a power loss; check the drive")
@@ -529,33 +854,53 @@ def resample_one(rel, sr, rate, af_filter, *, base_dir=None):
     except Exception as e:
         return (rel, sr, rate, None, str(e))
     finally:
-        # Remove the leftover temp on any failure (ffmpeg error, interrupt,
-        # exception). On success tmp is None and src is already swapped.
-        if tmp is not None:
+        try:
+            if exclusion is not None:
+                exclusion.close()
+        finally:
             try:
-                tmp.unlink()
-            except OSError:
-                pass
+                # A mutable filename is never enough ownership evidence.
+                # Remove only the exact held temp this operation created;
+                # after a successful swap its descriptor names the published
+                # output, not temp_name, so this is safely a no-op.
+                if (
+                    temp_fd is not None
+                    and binding is not None
+                    and temp_name is not None
+                ):
+                    try:
+                        identity = _regular_identity(os.fstat(temp_fd))
+                        if identity is not None:
+                            _unlink_held_name(
+                                binding.parent_fd,
+                                temp_name,
+                                temp_fd,
+                                identity,
+                                write_exclusion=temp_exclusion,
+                            )
+                    except OSError:
+                        pass
+            finally:
+                try:
+                    if temp_exclusion is not None:
+                        temp_exclusion.close()
+                finally:
+                    try:
+                        if temp_fd is not None:
+                            os.close(temp_fd)
+                    finally:
+                        if binding is not None:
+                            binding.close()
 
 
 def sweep_stale_encodes(directory):
-    """Delete orphaned resample temps under `directory`, returning the count.
+    """Compatibility no-op: a filename pattern is not proof of ownership.
 
-    A temp only survives the resample_one finally-cleanup if the process was
-    hard-killed (OOM/power loss/SIGKILL) mid-encode. downsample_dir never runs
-    concurrently against the same tree — the web path holds the staging lock,
-    the CLI is single-threaded — so any temp present here is a dead orphan, not
-    an encode in flight. Left alone they hide from the library scanner (dot
-    prefix) but quietly accumulate disk.
+    Live operations remove their exact held temporary file. Residue left by a
+    hard kill is preserved for manual inspection because it has no durable
+    receipt that distinguishes it from a user-owned dotfile.
     """
-    removed = 0
-    for p in Path(directory).rglob(_TMP_PREFIX + "*.flac"):
-        try:
-            p.unlink()
-            removed += 1
-        except OSError:
-            pass
-    return removed
+    return 0
 
 
 def downsample_dir(directory, *, verbose=True, base_dir=None, log=print,
@@ -584,8 +929,6 @@ def downsample_dir(directory, *, verbose=True, base_dir=None, log=print,
     directory = Path(directory)
     if not directory.exists() or not directory.is_dir():
         return {"resampled": 0, "errors": 0, "saved_bytes": 0}
-
-    sweep_stale_encodes(directory)
 
     _bd = base_dir or MUSIC_ROOT
     af_filter, _ = detect_resampler_filter()
@@ -619,11 +962,23 @@ def downsample_dir(directory, *, verbose=True, base_dir=None, log=print,
                 "cancelled": True}
 
     n_uncopied = 0
+    source_receipts = {}
     if keep_originals:
         from qobuz_librarian.library.backup import stash_downsample_originals
-        kept_dir, copied = stash_downsample_originals(
-            [_bd / rel for rel, _, _ in candidates], directory)
-        protected = [c for c in candidates if _bd / c[0] in copied]
+        kept_dir, copied, receipts = stash_downsample_originals(
+            [_bd / rel for rel, _, _ in candidates],
+            directory,
+            include_identity_receipts=True,
+        )
+        protected = [
+            c for c in candidates
+            if _bd / c[0] in copied
+            and isinstance(receipts.get(_bd / c[0]), dict)
+        ]
+        source_receipts = {
+            c[0]: receipts[_bd / c[0]]
+            for c in protected
+        }
         n_uncopied = len(candidates) - len(protected)
         if n_uncopied:
             log(f"  ⚠ downsample: {n_uncopied} file(s) have no safety copy — "
@@ -666,8 +1021,14 @@ def downsample_dir(directory, *, verbose=True, base_dir=None, log=print,
             saved_total += saved
 
     with ThreadPoolExecutor(max_workers=RESAMPLE_WORKERS) as ex:
-        futs = {ex.submit(resample_one, rel, sr, rate, af_filter, base_dir=_bd): rel
-                for rel, sr, rate in candidates}
+        futs = {}
+        for rel, sr, rate in candidates:
+            kwargs = {"base_dir": _bd}
+            if keep_originals:
+                kwargs["expected_source_receipt"] = source_receipts[rel]
+            future = ex.submit(
+                resample_one, rel, sr, rate, af_filter, **kwargs)
+            futs[future] = rel
         try:
             for fut in as_completed(futs):
                 _tally(fut)

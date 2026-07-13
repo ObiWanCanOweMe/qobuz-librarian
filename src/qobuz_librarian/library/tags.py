@@ -12,6 +12,56 @@ from functools import lru_cache
 # ── Path sanitization ─────────────────────────────────────────────────────────
 _NORMALIZE_RE       = re.compile(r"[^a-z0-9]+")
 _WHITESPACE_RUN_RE  = re.compile(r"\s+")
+_CANONICAL_ISRC_RE  = re.compile(
+    r"[a-z]{2}[a-z0-9]{3}\d{7}\Z", re.IGNORECASE | re.ASCII)
+_CANONICAL_MBID_RE  = re.compile(r"[a-f0-9]{32}\Z", re.IGNORECASE | re.ASCII)
+
+
+def canonical_recording_id(value, field):
+    """Canonical destructive recording ID, or ``None`` when malformed.
+
+    The empty string means the tag is genuinely absent. Callers can therefore
+    distinguish missing authority (which may use a strict metadata fallback)
+    from a nonblank placeholder or damaged tag (which must fail closed).
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value:
+        return ""
+    canonical = value.replace("-", "")
+    if field == "isrc":
+        return canonical.upper() if _CANONICAL_ISRC_RE.fullmatch(canonical) else None
+    if field == "mb_trackid":
+        if canonical == "0" * 32:
+            return None
+        return canonical.lower() if _CANONICAL_MBID_RE.fullmatch(canonical) else None
+    return None
+
+
+def canonical_track_slot(track, disc_field, number_field):
+    """Return a strict positive ``(disc, track)`` pair, or ``None``.
+
+    Missing disc tags mean disc one. Explicit booleans, floats, zeroes, and
+    malformed values are uncertainty; coercing them can make two unrelated
+    tracks appear to occupy the same destructive-matching slot.
+    """
+    disc_value = track.get(disc_field)
+    if disc_value is None or disc_value == "":
+        disc_value = 1
+    number_value = track.get(number_field)
+    if isinstance(disc_value, (bool, float)) or isinstance(number_value, (bool, float)):
+        return None
+    try:
+        disc = int(disc_value)
+        number = int(number_value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if disc <= 0 or number <= 0:
+        return None
+    return disc, number
 
 # beets' own default `replace` rules (its config_default.yaml), in the order it
 # applies them. Running a name through these gives the exact folder/file beets
@@ -200,6 +250,14 @@ def strip_trailing_parens(title):
         if not head:
             return s
         s = head
+
+
+def canonical_track_title(value):
+    """Exact title key that keeps non-Latin title text distinguishable."""
+    if not isinstance(value, str):
+        return ""
+    normalized = unicodedata.normalize("NFKD", value).casefold()
+    return "".join(character for character in normalized if character.isalnum())
 
 
 # ── Album-name decoration stripping ──────────────────────────────────────────

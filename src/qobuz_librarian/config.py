@@ -210,6 +210,9 @@ BEETS_DB_PATH = _env_path(
     "BEETS_DB_PATH",
     BEETS_CONFIG_DIR / "musiclibrary.db",
 )
+# Normally inferred from the `beet` console script. This explicit path covers
+# uncommon launchers whose shebang does not expose their Python environment.
+BEETS_PYTHON = os.environ.get("BEETS_PYTHON", "").strip()
 
 # Optional beets path/naming overrides. Empty = leave beets to its own
 # config.yaml (fully editable in the /config volume) / built-in defaults.
@@ -262,6 +265,7 @@ LOG_LEVEL            = os.environ.get("LOG_LEVEL", "INFO")
 WALK_SEEN_FILE       = DATA_DIR / ".qobuz_walk_seen.txt"
 ALBUM_WALK_SEEN_FILE = DATA_DIR / ".qobuz_album_walk_seen.txt"
 PENDING_QUEUE_FILE   = DATA_DIR / ".qobuz_pending_queue.json"
+QUEUE_JOURNAL_DIR    = DATA_DIR / ".qobuz_queue_journals"
 LYRIC_RETRY_FILE     = DATA_DIR / ".qobuz_lyric_retry.json"
 REPAIR_LOG_PATH      = DATA_DIR / ".qobuz_replaced_tracks.log"
 CAPPED_FILE          = DATA_DIR / ".qobuz_upgrade_capped.json"
@@ -315,7 +319,7 @@ WEB_HOST = os.environ.get("WEB_HOST", "0.0.0.0")
 WEB_PORT = _env("WEB_PORT", 8666)
 
 # ── Versioned file schemas ────────────────────────────────────────────────────
-PENDING_QUEUE_VERSION = 1
+PENDING_QUEUE_VERSION = 2
 LYRIC_RETRY_VERSION   = 1
 
 # ── API ───────────────────────────────────────────────────────────────────────
@@ -543,13 +547,11 @@ DOWNSAMPLE_KEEP_ORIGINALS = _env_downsample_choice()
 # so shared options behave the same across interfaces.
 #   PREFER_HIRES         pick the hi-res master when an album has several versions
 #   CONSOLIDATE          after import, merge sibling/duplicate album folders
-#   MIGRATE_MULTI_ARTIST move "Primary, Other/<album>" into "Primary/<album>"
 # CONSOLIDATE defaults off: it moves/merges folders, which is opinionated for
 # someone else's library layout. It's CLI-only and prompts per folder anyway;
 # turn it on via env or CLI if you want it.
 PREFER_HIRES         = _env_bool("PREFER_HIRES",         True)
 CONSOLIDATE          = _env_bool("CONSOLIDATE",          False)
-MIGRATE_MULTI_ARTIST = _env_bool("MIGRATE_MULTI_ARTIST", False)
 
 # Drop obvious live/tour/session/acoustic releases from the "missing albums"
 # gap list. Off by default so behaviour is unchanged: many people do want the

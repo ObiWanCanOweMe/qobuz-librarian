@@ -580,7 +580,8 @@
         if (!keys.length || bulkButton.disabled) return;
         var forms = keys.map(firstFormForKey).filter(Boolean);
         if (!forms.length) return;
-        window.qlConfirm("Download " + keys.length + " selected album(s)? They queue now and import into your library.", { action: "Download" }).then(function (ok) {
+        var albumLabel = keys.length === 1 ? "album" : "albums";
+        window.qlConfirm("Download " + keys.length + " selected " + albumLabel + "? They queue now and import into your library.", { action: "Download" }).then(function (ok) {
           if (ok) runBulkDownload(forms);
         });
       }

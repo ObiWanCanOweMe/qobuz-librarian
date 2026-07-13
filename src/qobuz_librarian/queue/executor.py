@@ -1,13 +1,30 @@
 """Queue executor — download, pre-import hooks, beets, backup resolution."""
 import errno
-import re
-import shutil
+import os
+import stat
+import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
 
 from qobuz_librarian import config as cfg
+from qobuz_librarian import run_lock
 from qobuz_librarian.api.auth import AuthLost
-from qobuz_librarian.download import run_album_download
+from qobuz_librarian.completion import (
+    CompletionOrigin,
+    CompletionOriginKind,
+    RecoveryOwner,
+    SourceTransitionKind,
+    normalise_album_id,
+    parse_completion_input_record,
+)
+from qobuz_librarian.download import (
+    download_staged_files,
+    retain_download_staging,
+    retire_empty_download_staging,
+    run_album_download,
+    validated_staged_album_dirs,
+)
 from qobuz_librarian.integrations.beets import (
     _consolidate_duplicate_albums,
     beets_import_albums,
@@ -21,14 +38,22 @@ from qobuz_librarian.integrations.lyrics import (
     write_post_import_sidecars,
 )
 from qobuz_librarian.integrations.rip import (
-    files_added_since,
     is_cancel_requested,
     snapshot_staging,
 )
+from qobuz_librarian.integrations.staging import (
+    capture_tree,
+    list_groups,
+    park_trees,
+    reconcile_imported_group,
+    tree_matches,
+)
 from qobuz_librarian.library.backup import (
     backup_album_dir,
+    capture_album_source_receipt,
+    carry_backup_companions,
+    dispose_backup,
     pin_unverified_upgrade_backup,
-    replacement_tree_durable,
     restore_gap_fill_backup,
     restore_upgrade_backup,
     warn_pin_failed,
@@ -36,18 +61,32 @@ from qobuz_librarian.library.backup import (
 from qobuz_librarian.library.catalog import (
     _count_audio_files_in,
     _is_split_album_merge,
-    cleanup_duplicate_art,
     find_album_dir_by_track_signatures,
     find_album_dir_filesystem,
     folder_holds_all_tracks,
-    prompt_and_migrate_multi_artist_folder,
     track_signatures_for_album_dirs,
 )
-from qobuz_librarian.library.scanner import clear_scan_caches, iter_tree_no_symlinks
+from qobuz_librarian.library.scanner import clear_scan_caches
 from qobuz_librarian.quality.decision import mark_local_album_capped
 from qobuz_librarian.quality.verify import (
     redownload_with_staged_fallback,
+    retry_preserves_track_coverage,
     verify_and_recover,
+)
+from qobuz_librarian.queue import journal as queue_state
+from qobuz_librarian.queue.durable_album import (
+    plan_durable_new_album,
+    queue_item_may_create_library_backup,
+)
+from qobuz_librarian.queue.durable_runner import (
+    DurableAlbumStatus,
+    DurableAlbumUnavailable,
+    execute_durable_new_album,
+)
+from qobuz_librarian.queue.startup_recovery import (
+    StartupRecoveryAction,
+    StartupRecoveryStatus,
+    recover_startup_state,
 )
 from qobuz_librarian.repair_log import warn_if_download_truncated
 from qobuz_librarian.ui_cli.colors import C, fmt, section, truncate
@@ -58,6 +97,485 @@ from qobuz_librarian.ui_cli.prompts import log_fetch
 # under the quality target after the recovery attempt, so the owning job can
 # carry an attention marker. The CLI leaves it unset.
 on_quality_shortfall = None
+
+
+def _seal_queue_item_siblings(item):
+    receipts = []
+    for sibling in item.get("siblings_to_delete", []):
+        receipt = capture_album_source_receipt(sibling)
+        receipts.append(receipt)
+        if receipt is None:
+            log.info(fmt(
+                C.YELLOW,
+                f"  ⚠  Keeping sibling {Path(sibling).name} — it couldn't "
+                "be sealed safely before the download.",
+            ))
+    item["_sibling_cleanup_receipts"] = tuple(receipts)
+
+
+_IMPORT_OWNERSHIP_IDENTITY_FIELDS = (
+    "device",
+    "inode",
+    "size",
+    "modified_ns",
+    "changed_ns",
+)
+
+
+def _valid_import_ownership_identity(value):
+    return (
+        isinstance(value, dict)
+        and all(type(value.get(field)) is int
+                for field in _IMPORT_OWNERSHIP_IDENTITY_FIELDS)
+    )
+
+
+def _valid_import_ownership_relative(value):
+    if not isinstance(value, str) or not value or "\x00" in value:
+        return False
+    relative = PurePosixPath(value)
+    return (
+        not relative.is_absolute()
+        and relative.as_posix() == value
+        and all(part not in ("", ".", "..") for part in relative.parts)
+    )
+
+
+def _valid_import_ownership_location(value):
+    return (
+        _valid_import_ownership_identity(value)
+        and _valid_import_ownership_relative(value.get("relative"))
+    )
+
+
+def _ownership_location(relative, identity):
+    return {"relative": relative, **{
+        field: identity[field] for field in _IMPORT_OWNERSHIP_IDENTITY_FIELDS
+    }}
+
+
+def _ownership_identity_from_location(value):
+    return {
+        field: value[field] for field in _IMPORT_OWNERSHIP_IDENTITY_FIELDS
+    }
+
+
+def _ownership_identity_from_stat(value):
+    return {
+        "device": int(value.st_dev),
+        "inode": int(value.st_ino),
+        "size": int(value.st_size),
+        "modified_ns": int(value.st_mtime_ns),
+        "changed_ns": int(value.st_ctime_ns),
+    }
+
+
+def _exact_import_ownership_identity(value):
+    return (
+        _valid_import_ownership_identity(value)
+        and set(value) == set(_IMPORT_OWNERSHIP_IDENTITY_FIELDS)
+    )
+
+
+def _validated_import_album_scope(record, file_relative):
+    scope = record.get("album_scope") if isinstance(record, dict) else None
+    if (
+        not isinstance(scope, dict)
+        or set(scope) != {"relative", "directory", "ancestors"}
+        or not _valid_import_ownership_relative(scope.get("relative"))
+        or not _exact_import_ownership_identity(scope.get("directory"))
+        or not isinstance(scope.get("ancestors"), list)
+    ):
+        return None
+    scope_parts = PurePosixPath(scope["relative"]).parts
+    file_parts = file_relative.parts
+    if (
+        not scope_parts
+        or len(scope_parts) >= len(file_parts)
+        or file_parts[:len(scope_parts)] != scope_parts
+        or len(scope["ancestors"]) != len(scope_parts) - 1
+    ):
+        return None
+    identities = []
+    for length, ancestor in enumerate(scope["ancestors"], start=1):
+        expected_relative = PurePosixPath(*scope_parts[:length]).as_posix()
+        if (
+            not isinstance(ancestor, dict)
+            or set(ancestor) != {"relative", "directory"}
+            or ancestor.get("relative") != expected_relative
+            or not _exact_import_ownership_identity(
+                ancestor.get("directory")
+            )
+        ):
+            return None
+        identities.append(ancestor["directory"])
+    identities.append(scope["directory"])
+    return scope_parts, identities
+
+
+def _verified_import_album_dir(item):
+    """Locate the landed album from the sealed one-file import receipt."""
+    payload = item.get("_import_ownership")
+    root = Path(os.path.abspath(os.fspath(cfg.MUSIC_ROOT)))
+    if (
+        not isinstance(payload, dict)
+        or type(payload.get("version")) is not int
+        or payload.get("version") != 1
+        or payload.get("sealed") is not True
+        or payload.get("root") != str(root)
+        or not _exact_import_ownership_identity(payload.get("root_identity"))
+    ):
+        return None
+    records = payload.get("items")
+    if not isinstance(records, list) or len(records) != 1:
+        return None
+    record = records[0]
+    if (
+        not isinstance(record, dict)
+        or not _exact_import_ownership_identity(record.get("file"))
+        or not _valid_import_ownership_relative(record.get("relative"))
+    ):
+        return None
+    relative = PurePosixPath(record["relative"])
+    if len(relative.parts) < 2:
+        return None
+    validated_scope = _validated_import_album_scope(record, relative)
+    if validated_scope is None:
+        return None
+    album_parts, directory_identities = validated_scope
+
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
+        return None
+    dir_flags = os.O_RDONLY | nofollow | directory | getattr(
+        os, "O_CLOEXEC", 0)
+    leaf_flags = (
+        os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    chain = []
+    leaf_fd = None
+    try:
+        chain.append(os.open(root, dir_flags))
+        for part in relative.parts[:-1]:
+            chain.append(os.open(part, dir_flags, dir_fd=chain[-1]))
+
+        root_stat = os.fstat(chain[0])
+        named_root = os.stat(root, follow_symlinks=False)
+        expected_root = payload["root_identity"]
+        if (
+            not stat.S_ISDIR(root_stat.st_mode)
+            or not stat.S_ISDIR(named_root.st_mode)
+            or _ownership_identity_from_stat(root_stat) != expected_root
+            or _ownership_identity_from_stat(named_root) != expected_root
+        ):
+            return None
+
+        for index, part in enumerate(relative.parts[:-1]):
+            held = os.fstat(chain[index + 1])
+            named = os.stat(
+                part, dir_fd=chain[index], follow_symlinks=False
+            )
+            if (
+                not stat.S_ISDIR(held.st_mode)
+                or not stat.S_ISDIR(named.st_mode)
+                or _ownership_identity_from_stat(named)
+                != _ownership_identity_from_stat(held)
+                or (
+                    index < len(directory_identities)
+                    and _ownership_identity_from_stat(held)
+                    != directory_identities[index]
+                )
+            ):
+                return None
+
+        leaf_name = relative.parts[-1]
+        named_before = os.stat(
+            leaf_name, dir_fd=chain[-1], follow_symlinks=False
+        )
+        leaf_fd = os.open(leaf_name, leaf_flags, dir_fd=chain[-1])
+        held_leaf = os.fstat(leaf_fd)
+        named_after = os.stat(
+            leaf_name, dir_fd=chain[-1], follow_symlinks=False
+        )
+        if (
+            not stat.S_ISREG(named_before.st_mode)
+            or not stat.S_ISREG(held_leaf.st_mode)
+            or not stat.S_ISREG(named_after.st_mode)
+            or _ownership_identity_from_stat(named_before) != record["file"]
+            or _ownership_identity_from_stat(held_leaf) != record["file"]
+            or _ownership_identity_from_stat(named_after) != record["file"]
+        ):
+            return None
+
+        # Confirm the entire held path is still publicly named after the leaf
+        # was opened. The receipt's explicit scope is accepted only while this
+        # descriptor chain and the exact sealed identities still agree.
+        named_root = os.stat(root, follow_symlinks=False)
+        if _ownership_identity_from_stat(named_root) != expected_root:
+            return None
+        for index, part in enumerate(relative.parts[:-1]):
+            held = os.fstat(chain[index + 1])
+            named = os.stat(
+                part, dir_fd=chain[index], follow_symlinks=False
+            )
+            if (
+                _ownership_identity_from_stat(named)
+                != _ownership_identity_from_stat(held)
+                or (
+                    index < len(directory_identities)
+                    and _ownership_identity_from_stat(held)
+                    != directory_identities[index]
+                )
+            ):
+                return None
+        if (
+            _ownership_identity_from_stat(os.fstat(leaf_fd))
+            != record["file"]
+            or _ownership_identity_from_stat(os.stat(
+                leaf_name, dir_fd=chain[-1], follow_symlinks=False
+            )) != record["file"]
+        ):
+            return None
+    except (OSError, TypeError, ValueError):
+        return None
+    finally:
+        if leaf_fd is not None:
+            try:
+                os.close(leaf_fd)
+            except OSError:
+                pass
+        for descriptor in reversed(chain):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    return root.joinpath(*album_parts)
+
+
+def _clear_import_ownership(item):
+    item.pop("_import_ownership", None)
+    item.pop("_import_ownership_created_directories", None)
+    item.pop("_import_ownership_created_files", None)
+    item.pop("_import_ownership_directory_changes", None)
+
+
+def _post_import_change_within_item(item, change):
+    scope = item.get("_resolved_post_dir")
+    path = change.get("path") if isinstance(change, dict) else None
+    if scope is None or not isinstance(path, str) or not path or "\x00" in path:
+        return False
+    try:
+        scope = Path(os.path.abspath(os.fspath(scope)))
+        path = Path(os.path.abspath(path))
+        relative = path.relative_to(scope)
+    except (OSError, TypeError, ValueError):
+        return False
+    return bool(relative.parts) and all(
+        part not in ("", ".", "..") for part in relative.parts
+    )
+
+
+def _post_import_directory_change_within_item(item, change):
+    scope = item.get("_resolved_post_dir")
+    path = change.get("path") if isinstance(change, dict) else None
+    if scope is None or not isinstance(path, str) or not path or "\x00" in path:
+        return False
+    try:
+        scope = Path(os.path.abspath(os.fspath(scope)))
+        path = Path(os.path.abspath(path))
+        relative = path.relative_to(scope)
+    except (OSError, TypeError, ValueError):
+        return False
+    return all(part not in ("", ".", "..") for part in relative.parts)
+
+
+def _advance_created_directory_identities(item, payload, directory_changes):
+    records = payload.get("items") if isinstance(payload, dict) else None
+    root = payload.get("root") if isinstance(payload, dict) else None
+    if (
+        not isinstance(records, list)
+        or not records
+        or not isinstance(root, str)
+        or not os.path.isabs(root)
+    ):
+        return False
+    groups = [record.get("created_directories") for record in records]
+    extra = item.get("_import_ownership_created_directories")
+    if extra is not None:
+        groups.append(extra)
+    if not all(isinstance(group, list) for group in groups):
+        return False
+    for group in groups:
+        for record in group:
+            if not _valid_import_ownership_location(record):
+                return False
+            expected_path = os.path.abspath(os.fspath(
+                Path(root).joinpath(*PurePosixPath(record["relative"]).parts)
+            ))
+            current = _ownership_identity_from_location(record)
+            used = set()
+            while True:
+                matching = [
+                    (index, change)
+                    for index, change in enumerate(directory_changes)
+                    if index not in used
+                    and change["path"] == expected_path
+                    and change["before"] == current
+                ]
+                if not matching:
+                    break
+                if len(matching) != 1:
+                    return False
+                index, change = matching[0]
+                if not _post_import_directory_change_within_item(item, change):
+                    return False
+                used.add(index)
+                current = dict(change["after"])
+            for field in _IMPORT_OWNERSHIP_IDENTITY_FIELDS:
+                record[field] = current[field]
+    return True
+
+
+def _advance_import_ownership_identities(
+        items, changes, created_files=None, directory_changes=None):
+    """Carry exact post-import file proofs into each sealed import item."""
+    if created_files is None:
+        created_files = []
+    if directory_changes is None:
+        directory_changes = []
+    if (
+        not isinstance(changes, list)
+        or not isinstance(created_files, list)
+        or not isinstance(directory_changes, list)
+    ):
+        return
+    validated_directory_changes = []
+    for change in directory_changes:
+        path = change.get("path") if isinstance(change, dict) else None
+        before = change.get("before") if isinstance(change, dict) else None
+        after = change.get("after") if isinstance(change, dict) else None
+        if (
+            not isinstance(path, str)
+            or not os.path.isabs(path)
+            or not _valid_import_ownership_identity(before)
+            or not _valid_import_ownership_identity(after)
+        ):
+            for queue_item in items:
+                if isinstance(queue_item.get("_import_ownership"), dict):
+                    _clear_import_ownership(queue_item)
+            return
+        validated_directory_changes.append({
+            "path": os.path.abspath(path),
+            "before": dict(before),
+            "after": dict(after),
+        })
+    for queue_item in items:
+        payload = queue_item.get("_import_ownership")
+        records = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(records, list) or not records:
+            continue
+        root = payload.get("root") if isinstance(payload, dict) else None
+        if not isinstance(root, str) or root != os.path.abspath(
+                os.fspath(cfg.MUSIC_ROOT)):
+            _clear_import_ownership(queue_item)
+            continue
+        item_created_files = []
+        refused_item = False
+        for record in records:
+            current = record.get("file") if isinstance(record, dict) else None
+            relative = (
+                record.get("relative") if isinstance(record, dict) else None
+            )
+            if (
+                not _valid_import_ownership_identity(current)
+                or not _valid_import_ownership_relative(relative)
+            ):
+                refused_item = True
+                break
+            current = dict(current)
+            expected_path = os.path.abspath(os.fspath(
+                Path(root).joinpath(*PurePosixPath(relative).parts)
+            ))
+            expected_sidecar = os.path.abspath(os.fspath(
+                Path(expected_path).with_suffix(".lrc")
+            ))
+            matching_created = [
+                receipt
+                for receipt in created_files
+                if (
+                    isinstance(receipt, dict)
+                    and receipt.get("track") == current
+                    and receipt.get("track_path") == expected_path
+                )
+            ]
+            if len(matching_created) > 1:
+                refused_item = True
+                break
+            if matching_created:
+                receipt = matching_created[0]
+                created_identity = receipt.get("file")
+                created_path = receipt.get("path")
+                if (
+                    not _valid_import_ownership_identity(created_identity)
+                    or not _post_import_change_within_item(queue_item, receipt)
+                    or not isinstance(created_path, str)
+                    or not os.path.isabs(created_path)
+                    or os.path.abspath(created_path) != expected_sidecar
+                ):
+                    refused_item = True
+                    break
+                item_created_files.append({
+                    "path": os.path.abspath(created_path),
+                    "file": dict(created_identity),
+                })
+            used = set()
+            advanced = False
+            refused = False
+            while True:
+                matching = [
+                    (index, change)
+                    for index, change in enumerate(changes)
+                    if index not in used
+                    and isinstance(change, dict)
+                    and change.get("before") == current
+                    and change.get("path") == expected_path
+                ]
+                if not matching:
+                    break
+                if len(matching) != 1:
+                    refused = True
+                    break
+                index, change = matching[0]
+                after = change.get("after")
+                if (
+                    not _valid_import_ownership_identity(after)
+                    or not _post_import_change_within_item(queue_item, change)
+                ):
+                    refused = True
+                    break
+                used.add(index)
+                current = dict(after)
+                advanced = True
+            if refused:
+                refused_item = True
+                break
+            if advanced:
+                record["file"] = current
+        if refused_item:
+            _clear_import_ownership(queue_item)
+            continue
+        if item_created_files:
+            queue_item["_import_ownership_created_files"] = item_created_files
+        else:
+            queue_item.pop("_import_ownership_created_files", None)
+        if (
+            isinstance(queue_item.get("_import_ownership"), dict)
+            and not _advance_created_directory_identities(
+                queue_item, payload, validated_directory_changes)
+        ):
+            _clear_import_ownership(queue_item)
 
 
 def _download_for_queue_item(item):
@@ -78,27 +596,16 @@ def _download_for_queue_item(item):
     )
 
 
-_DISC_FOLDER_RE = re.compile(r"^(?:disc|cd)\s*\d+", re.IGNORECASE)
-
-
-def staged_album_dirs_since(snapshot):
-    """Top-level album dirs holding audio added since a staging snapshot."""
-    audio = [p for p in files_added_since(snapshot or set())
-             if p.suffix.lower() in cfg.AUDIO_EXTS]
-    album_dirs = set()
-    for p in audio:
-        parent = p.parent
-        if _DISC_FOLDER_RE.match(parent.name):
-            parent = parent.parent
-        album_dirs.add(parent)
-    return sorted(album_dirs)
-
-
 def _staged_album_dirs(item):
-    return staged_album_dirs_since(item.get("snapshot_before"))
+    return validated_staged_album_dirs(item)
 
 
-def _run_pre_import_hooks_for_dirs(album_dirs, args):
+def _run_pre_import_hooks_for_dirs(
+    album_dirs,
+    args,
+    *,
+    on_sources_changed=None,
+):
     """Run downsample + lyric hooks scoped to ``album_dirs``.
 
     Returns ``(lyric_sigs, resampled_total)`` so post-import code can map
@@ -118,6 +625,8 @@ def _run_pre_import_hooks_for_dirs(album_dirs, args):
                 raise
             except Exception as _ce:
                 log.info(fmt(C.YELLOW, f"  ⚠  downsample hook failed: {_ce}"))
+        if on_sources_changed is not None:
+            on_sources_changed(SourceTransitionKind.DOWNSAMPLE)
     for d in album_dirs:
         try:
             lh_result = _run_lyric_hook(d)
@@ -140,30 +649,49 @@ def _run_pre_import_hooks_for_dirs(album_dirs, args):
                 pass
         if isinstance(lh_result, tuple) and len(lh_result) == 2:
             sigs.extend(lh_result[1])
+    if on_sources_changed is not None:
+        on_sources_changed(SourceTransitionKind.LYRICS_TAG)
     return sigs, resampled_total
 
 
-def _pre_import_staging_hooks(args):
-    """Whole-staging pre-import hooks for single-album runs.
+def _pre_import_staging_hooks(args, album_dirs=None):
+    """Compatibility wrapper for the single-album pre-import hooks.
 
-    Used by the single-album process path (``modes/process.py``) where
-    staging holds exactly one album at hook time, so scoping to the whole
-    staging dir is equivalent to per-album. The queue executor calls
-    ``_run_pre_import_hooks_for_dirs`` directly with the per-item album dirs.
+    New downloads pass their validated per-run album roots. The whole-staging
+    default remains only for older direct callers.
     """
-    return _run_pre_import_hooks_for_dirs([cfg.STAGING_DIR], args)
+    return _run_pre_import_hooks_for_dirs(
+        album_dirs or [cfg.STAGING_DIR], args)
 
 
-def _import_album_with_retry(album_dirs):
+def _import_album_with_retry(
+        album_dirs, *, ownership_out=None, source_receipts=None):
     """Run beets import on ``album_dirs`` with up to ``BEETS_MAX_ATTEMPTS``
     attempts, retrying only on idle-timeout (other failures aren't transient).
     Returns True on import success, False on permanent failure."""
     if not album_dirs:
         return True
+    if ownership_out is not None:
+        ownership_out.clear()
     max_attempts = max(1, int(cfg.BEETS_MAX_ATTEMPTS))
     for attempt in range(1, max_attempts + 1):
-        kind = beets_import_albums(album_dirs)
+        if source_receipts is not None and not all(
+                tree_matches(receipt) for receipt in source_receipts):
+            return False
+        if ownership_out is None:
+            kind = beets_import_albums(album_dirs)
+            attempt_capture = None
+        else:
+            attempt_capture = {}
+            kind = beets_import_albums(
+                album_dirs,
+                ownership_out=attempt_capture,
+            )
         if kind == "ok":
+            if ownership_out is not None:
+                result = attempt_capture.get("result")
+                if isinstance(result, dict):
+                    ownership_out["result"] = result
             return True
         if kind == "timeout" and attempt < max_attempts:
             log.info(fmt(C.YELLOW,
@@ -175,118 +703,43 @@ def _import_album_with_retry(album_dirs):
     return False
 
 
-def _move_to_beets_retry(album_dirs, label):
-    """Move album dirs that failed all beets attempts into
-    STAGING_DIR/<BEETS_RETRY_DIR>/<timestamp>-<label>/ so the next batch
-    isn't dragged down by them. The user can replay later with
-    ``beet import`` of that subtree."""
+def _move_to_beets_retry(album_dirs, label, *, expected=None):
+    """Park exact failed-import trees with durable replay manifests."""
+    album_dirs = [Path(directory) for directory in album_dirs]
     if not album_dirs:
-        return
-    retry_root = cfg.STAGING_DIR / cfg.BEETS_RETRY_DIR
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", label)[:60] or "album"
-    dest_parent = retry_root / f"{stamp}-{safe_label}"
-    try:
-        dest_parent.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        log.info(fmt(C.YELLOW,
-            f"  ⚠  couldn't create {dest_parent}: {e}; leaving album in staging."))
-        return
+        return []
+    expected_provided = expected is not None
+    expected_by_path = {
+        receipt.path: receipt for receipt in (expected or ())
+    }
+    parked = []
     moved = 0
-    for d in album_dirs:
-        if not d.exists():
-            continue
-        try:
-            shutil.move(str(d), str(dest_parent / d.name))
-            moved += 1
-        except OSError as e:
+    for index, directory in enumerate(album_dirs):
+        receipt = expected_by_path.get(directory)
+        if expected_provided and receipt is None:
             log.info(fmt(C.YELLOW,
-                f"  ⚠  couldn't move {d.name} to {dest_parent}: {e}"))
-    if moved:
-        log.info(fmt(C.YELLOW,
-            f"  ⏭  parked {moved} album dir(s) at "
-            f"{dest_parent.relative_to(cfg.STAGING_DIR)}/ "
-            f"— will re-import on the next download run."))
-
-
-def _dir_has_audio(d):
-    """True if any audio file remains under d — i.e. beets didn't move it out.
-    Walked with an error channel, not rglob: rglob swallows a subtree listing
-    failure, and audio sitting exactly there would read as "none left" to the
-    husk delete that follows."""
-    walk_errors = []
-    try:
-        for f in iter_tree_no_symlinks(d, errors=walk_errors):
-            if f.is_file() and f.suffix.lower() in cfg.AUDIO_EXTS:
-                return True
-    except OSError:
-        return True  # can't tell → assume tracks remain, never delete blindly
-    return bool(walk_errors)
-
-
-def _parked_companions(d):
-    """Non-audio companion files under a parked album dir worth keeping after
-    beets has moved the audio out — booklets, scans, .cue/.log, hand-placed
-    cover art. Skips hidden/bookkeeping dotfiles and streamrip's `__artwork`
-    cover orphans (swept separately), which aren't user content.
-
-    Returns None when the dir can't be listed or the walk couldn't cover the
-    whole tree — "couldn't read" must not read as "nothing to keep" to a
-    caller about to delete the tree."""
-    out = []
-    walk_errors = []
-    try:
-        for f in iter_tree_no_symlinks(d, errors=walk_errors):
-            try:
-                if (not f.is_file()
-                        or f.suffix.lower() in cfg.AUDIO_EXTS
-                        or f.name.startswith(".")
-                        or "__artwork" in f.parts):
-                    continue
-            except OSError:
-                return None
-            out.append(f)
-    except OSError:
-        return None
-    if walk_errors:
-        return None
-    return out
-
-
-def _preserve_parked_companions(group, d):
-    """Move a parked album's leftover non-audio companions out of the retry tree
-    before the husk is deleted, so beets importing the audio doesn't silently
-    take booklets/scans/.cue/.log down with the staging folder. They land under
-    DATA_DIR/import_leftovers/<group>/<album>/ — outside the retry tree (so they
-    aren't rescanned every flush) and on the persistent volume — and the move is
-    logged so the user can rescue them.
-
-    Returns True when the husk is safe to delete: every companion made it out
-    (or there were none). A failed move — or a dir that couldn't even be
-    listed — returns False, because the recursive delete that follows would
-    take down precisely the file the move failed to preserve."""
-    companions = _parked_companions(d)
-    if companions is None:
-        return False
-    if not companions:
-        return True
-    dest = cfg.DATA_DIR / "import_leftovers" / group.name / d.name
-    moved = 0
-    failed = 0
-    for f in companions:
-        out = dest / f.relative_to(d)
-        try:
-            out.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(f), str(out))
+                f"  ⚠  couldn't safely park {directory.name}; no exact "
+                "pre-import receipt was available, so it was left in staging."))
+            continue
+        group = park_trees(
+            [directory],
+            f"{label}-{index + 1}",
+            kind="beets",
+            expected=[receipt] if receipt is not None else None,
+        )
+        if group is not None:
+            parked.append(group)
             moved += 1
-        except OSError:
-            failed += 1
+        else:
+            log.info(fmt(C.YELLOW,
+                f"  ⚠  couldn't safely park {directory.name}; it changed "
+                "during the import attempt and was left in staging."))
     if moved:
         log.info(fmt(C.YELLOW,
-            f"  📎  Kept {moved} non-audio file(s) from "
-            f"{truncate(d.name, 40)} at {dest} — beets imported the audio but "
-            f"left these behind."))
-    return failed == 0
+            f"  ⏭  parked {moved} album dir(s) under "
+            f"{cfg.BEETS_RETRY_DIR}/ "
+            f"— will re-import on the next download run."))
+    return parked
 
 
 def _reimport_parked_albums():
@@ -299,76 +752,47 @@ def _reimport_parked_albums():
     landed_library_dirs): the flag drives the duplicate-album fold, and the
     resolved dirs feed the post-import lyric finaliser — a parked reimport
     that skipped it kept its embedded lyrics and never got its .lrc sidecar."""
-    retry_root = cfg.STAGING_DIR / cfg.BEETS_RETRY_DIR
-    if not retry_root.is_dir():
-        return False, []
-    groups = sorted(d for d in retry_root.iterdir() if d.is_dir())
+    groups = list_groups(kind="beets")
     any_ok = False
     landed_dirs = []
     for group in groups:
-        album_dirs = sorted(d for d in group.iterdir() if d.is_dir())
-        if not album_dirs:
-            try:
-                group.rmdir()
-            except OSError:
-                pass
-            continue
+        album_dirs = [tree.path for tree in group.trees]
         log.info(fmt(C.GRAY,
-            f"  ↻  Re-importing parked album(s): {truncate(group.name, 50)}"))
+            f"  ↻  Re-importing parked album(s): "
+            f"{truncate(group.path.name, 50)}"))
         # Tag signatures survive beets moving/renaming the files, so the
         # landed folder is findable after the import for the lyric finaliser.
         sigs_by_dir = {d: track_signatures_for_album_dirs([d])
                        for d in album_dirs}
-        _import_album_with_retry(album_dirs)
-        # Trust the disk, not the return value. The import-success check counts
-        # audio before/after, but it can't see inside the retry tree — so a
-        # beets run that exits 0 while skipping a parked album (a library
-        # duplicate under `duplicate_action: skip`) would look successful even
-        # though it moved nothing. Removing only the album dirs whose tracks
-        # actually left keeps the skipped ones parked instead of deleting the
-        # only copy.
-        kept = []
-        husks_kept = 0
-        for d in album_dirs:
-            if _dir_has_audio(d):
-                kept.append(d)
-            else:
-                any_ok = True
-                # beets moved the audio into the library; rescue any non-audio
-                # companions it left behind before removing the husk, so the
-                # booklet/scans/cue aren't silently deleted with the staging dir.
-                # A failed rescue keeps the husk — deleting it would take down
-                # exactly the companion the move failed to preserve.
-                if _preserve_parked_companions(group, d):
-                    shutil.rmtree(d, ignore_errors=True)
-                else:
-                    husks_kept += 1
-                    log.info(fmt(C.YELLOW,
-                        f"  ⚠  Couldn't move {truncate(d.name, 40)}'s non-audio "
-                        f"files out — keeping the folder at {d} so they aren't "
-                        f"lost; move them out by hand."))
+        _import_album_with_retry(
+            album_dirs, source_receipts=group.trees)
+        outcome = reconcile_imported_group(group)
+        if outcome["moved_audio"]:
+            any_ok = True
+            for directory in album_dirs:
                 try:
-                    landed = find_album_dir_by_track_signatures(sigs_by_dir.get(d))
+                    landed = find_album_dir_by_track_signatures(
+                        sigs_by_dir.get(directory))
                 except Exception as _e_sig:
                     landed = None
                     vlog(f"parked reimport: couldn't locate landed dir: {_e_sig}")
                 if landed is not None:
                     landed_dirs.append(landed)
-        if kept:
+        if outcome["reason"] == "tracks":
             log.info(fmt(C.YELLOW,
-                f"  ⏭  {len(kept)} parked album(s) in {truncate(group.name, 50)} "
-                f"still hold tracks — left for a later run."))
-        elif not husks_kept:
-            # Every album in the group moved out, so the group holds no tracks —
-            # clear it (and any stray non-audio leftover) rather than leaving an
-            # empty husk to be rescanned each flush.
-            shutil.rmtree(group, ignore_errors=True)
+                f"  ⏭  Parked album in {truncate(group.path.name, 50)} still "
+                "holds exact tracks — left for a later run."))
+        elif outcome["reason"] in {"changed", "companions"}:
+            log.info(fmt(C.YELLOW,
+                f"  ⚠  Kept recovery folder {group.path}: it contains "
+                "unverified changes or companion files and won't be "
+                "automatically replayed again."))
     return any_ok, landed_dirs
 
 
 _RETRYABLE_STOP_RESULTS = {
     "cancelled", "interrupted", "auth_lost", "disk_full", "io_error",
-    "upgrade_aborted_backup_failed",
+    "upgrade_aborted_backup_failed", "import_failed",
 }
 
 
@@ -376,11 +800,10 @@ def _queue_item_needs_retry(item):
     """Whether an item should stay queued for a later run.
 
     Kept: items stopped before they could finish (cancel / interrupt / auth
-    loss / disk full / an upgrade whose backup couldn't be taken) and downloads
-    that landed nothing — re-running those is safe and can recover. Dropped:
-    anything that landed audio. Those files are now in the library, parked under
-    .beets_retry/, or a partial a later scan will pick up, so re-downloading
-    would only duplicate them."""
+    loss / disk full / an upgrade whose backup couldn't be taken), imports that
+    were not transactionally accepted, and downloads that landed nothing.
+    Dropped: only completed download-phase items without one of those explicit
+    retry markers."""
     if item.get("result") in _RETRYABLE_STOP_RESULTS:
         return True
     return item.get("n_ok", 0) == 0
@@ -389,16 +812,18 @@ def _queue_item_needs_retry(item):
 def _resolve_queue_item(item, args, imported_globally):
     """Resolve backup and compute result for one completed queue item.
 
-    Handles art cleanup, split-folder merge, sibling deletion, and backup
+    Handles art cleanup, split-folder detection, sibling retention, and backup
     restoration. Mutates item["imported"] and item["_resolved_post_dir"].
     Returns a result dict in process_album's shape.
     """
     item["imported"] = imported_globally
     bp = item.get("backup_path")
     album_dir = item["album_dir"]
+    _sibs = item.get("siblings_to_delete", [])
+    item["_siblings_preserved"] = [os.fspath(path) for path in _sibs]
 
-    # One strict per-album success flag — art cleanup, sibling deletion,
-    # backup resolution, and migration must all agree. A partial result
+    # One strict per-album success flag — art cleanup, sibling deletion, and
+    # backup resolution must all agree. A partial result
     # (e.g. 5/12 tracks ok) must not delete backups or siblings.
     _item_strict_success = (
         imported_globally
@@ -406,11 +831,16 @@ def _resolve_queue_item(item, args, imported_globally):
         and item.get("n_fail", 0) == 0
         and item.get("n_lossy", 0) == 0
     )
-    if (getattr(args, "migrate_multi_artist", False) and _item_strict_success):
-        _migrated = prompt_and_migrate_multi_artist_folder(item["album"], args)
-    else:
-        _migrated = None
-    post_dir = _migrated
+    post_dir = None
+    ownership_scope_used = False
+    if (
+        post_dir is None
+        and imported_globally
+        and album_dir is None
+        and item.get("_capture_import_ownership") is True
+    ):
+        post_dir = _verified_import_album_dir(item)
+        ownership_scope_used = post_dir is not None
     if post_dir is None and imported_globally:
         post_dir = find_album_dir_by_track_signatures(
             item.get("post_import_signatures"))
@@ -433,6 +863,7 @@ def _resolve_queue_item(item, args, imported_globally):
     # Stash resolved post-import dir so the lyric-retry resolver can
     # use it without redoing the find_album_dir_filesystem dance.
     item["_resolved_post_dir"] = post_dir
+    item["_resolved_post_dir_from_import_ownership"] = ownership_scope_used
     had_any_success = (
         imported_globally and item.get("n_ok", 0) > 0 and album_has_content
     )
@@ -441,71 +872,127 @@ def _resolve_queue_item(item, args, imported_globally):
         if post_dir:
             if item.get("resampled_n", 0) > 0:
                 mark_local_album_capped(post_dir, qobuz_album=item["album"])
-            cleanup_duplicate_art(post_dir)
-        # Split-folder auto-merge: a gap-fill against a folder beets doesn't
-        # name canonically (multi-artist, or missing the year) makes it file
-        # the new tracks elsewhere, splitting the album. Pull the old tracks
-        # into the dir that now holds the fresh ones.
-        try:
-            split_artist = (item["album"].get("artist") or {}).get("name") or ""
-            if _is_split_album_merge(album_dir, post_dir, split_artist):
-                from qobuz_librarian.integrations.beets import _merge_split_folder
-                n_merged = _merge_split_folder(post_dir, album_dir)
-                if n_merged:
-                    log.info(fmt(C.GREEN,
-                        f"  ✓  Consolidated {n_merged} existing track(s) "
-                        f"into {truncate(post_dir.name, 40)}"))
-                else:
-                    log.info(fmt(C.YELLOW,
-                        f"  ⚠  Split for {truncate(album_dir.name, 40)} "
-                        f"but nothing merged (overlap conflicts in {album_dir})."))
-        except Exception as _e_sf:
-            vlog(f"split-folder merge raised: {_e_sf}")
-        # Sibling deletion requires n_fail == 0 AND n_lossy == 0 — a partial
-        # download must not wipe the sibling that may hold the missing tracks.
-        # And the clean-run flags alone aren't proof the album LANDED whole:
-        # beets reports success when it moved any audio (leftovers allowed),
-        # so "imported + folder has audio" can be one track in place while a
-        # sibling marked for deletion holds the only copy of the rest. Clear
-        # the same one-to-one bar the gap-fill backup gate uses; unverifiable
-        # keeps the siblings.
-        _sibs = item.get("siblings_to_delete", [])
-        _sibs_whole = bool(_sibs) and folder_holds_all_tracks(
-            post_dir, (item["album"].get("tracks") or {}).get("items") or [])
+        split_artist = (item["album"].get("artist") or {}).get("name") or ""
+        if (
+            not ownership_scope_used
+            and _is_split_album_merge(album_dir, post_dir, split_artist)
+        ):
+            log.info(fmt(C.YELLOW,
+                "  ⚠  Beets placed this album across two artist folders; "
+                "both were left unchanged for manual review."))
+        # A sibling is only eligible for retirement after a clean, complete
+        # replacement. Bind each move to its pre-download receipt, carry its
+        # unique companion files without overwrite, then retire only the exact
+        # recovery backup while the replacement is held and revalidated.
+        _album_tracks = (
+            (item["album"].get("tracks") or {}).get("items") or []
+        )
+        _sibs_whole = (
+            bool(_sibs)
+            and not ownership_scope_used
+            and folder_holds_all_tracks(
+                post_dir, _album_tracks, destructive=True)
+        )
         _sibs_clean = (item.get("n_fail", 0) == 0
                        and item.get("n_lossy", 0) == 0)
-        _sibs_durable = (_sibs_clean and _sibs_whole
-                         and replacement_tree_durable(post_dir))
-        if _sibs_clean and _sibs_whole and _sibs_durable:
-            for sib_dir in _sibs:
-                if not sib_dir.exists():
-                    continue
-                # Never rmtree the folder beets just imported into: the
-                # split-folder merge above can have moved the user's kept tracks
-                # into post_dir, and sibling groups are keyed on a
-                # decoration-stripped name, so post_dir can collide with a
-                # sibling marked for deletion — deleting it would destroy the
-                # freshly-imported album.
-                same_as_post = False
-                if post_dir is not None:
+        if _sibs_clean and _sibs_whole:
+            replacement_receipt = capture_album_source_receipt(post_dir)
+            receipts = item.get("_sibling_cleanup_receipts")
+            if not isinstance(receipts, tuple) or len(receipts) != len(_sibs):
+                receipts = (None,) * len(_sibs)
+            if replacement_receipt is None:
+                log.info(fmt(
+                    C.YELLOW,
+                    f"  ⚠  Keeping {len(_sibs)} sibling folder(s) — the "
+                    "replacement couldn't be held as an exact safe tree.",
+                ))
+            else:
+                for sib_dir, receipt in zip(_sibs, receipts):
+                    sibling_path = Path(sib_dir)
+                    name = sibling_path.name
+                    if receipt is None:
+                        log.info(fmt(
+                            C.YELLOW,
+                            f"  ⚠  Kept sibling {name} — it wasn't sealed "
+                            "before the download.",
+                        ))
+                        continue
+                    sibling_backup = backup_album_dir(
+                        sibling_path, expected_receipt=receipt)
+                    if sibling_backup is None:
+                        log.info(fmt(
+                            C.YELLOW,
+                            f"  ⚠  Kept sibling {name} — its exact tree "
+                            "changed or couldn't be moved safely.",
+                        ))
+                        continue
+                    if sibling_backup.complete is not True:
+                        from qobuz_librarian.modes.process import (
+                            _recover_incomplete_upgrade_backup,
+                        )
+
+                        _recover_incomplete_upgrade_backup(
+                            sibling_backup,
+                            sibling_path,
+                            operation="sibling retirement backup",
+                        )
+                        log.info(fmt(
+                            C.RED,
+                            "  ✗  Sibling retirement stopped part-way; "
+                            "the original reconciliation is reported above.",
+                        ))
+                        break
+                    carried_receipt = carry_backup_companions(
+                        sibling_backup,
+                        post_dir,
+                        expected_replacement_receipt=replacement_receipt,
+                    )
+                    if carried_receipt is None:
+                        if not pin_unverified_upgrade_backup(
+                                sibling_backup,
+                                "sibling backup kept — companion carry was "
+                                "not exact"):
+                            warn_pin_failed(sibling_backup)
+                        log.info(fmt(
+                            C.YELLOW,
+                            f"  ⚠  Kept sibling recovery for {name} at "
+                            f"{sibling_backup.path}; its companion files "
+                            "couldn't be carried without uncertainty.",
+                        ))
+                        break
+                    replacement_receipt = carried_receipt
+                    retired = dispose_backup(
+                        sibling_backup,
+                        replacement_path=post_dir,
+                        expected_replacement_receipt=replacement_receipt,
+                        replacement_validator=lambda replacement, _backup: (
+                            folder_holds_all_tracks(
+                                replacement, _album_tracks,
+                                destructive=True)
+                        ),
+                    )
+                    if not retired:
+                        if not pin_unverified_upgrade_backup(
+                                sibling_backup,
+                                "sibling backup kept — final exact "
+                                "replacement proof did not hold"):
+                            warn_pin_failed(sibling_backup)
+                        log.info(fmt(
+                            C.YELLOW,
+                            f"  ⚠  Kept sibling recovery for {name} at "
+                            f"{sibling_backup.path}; the final exact "
+                            "replacement proof did not hold.",
+                        ))
+                        break
                     try:
-                        same_as_post = sib_dir.resolve() == post_dir.resolve()
-                    except OSError:
-                        same_as_post = sib_dir == post_dir
-                if same_as_post:
-                    log.info(fmt(C.GRAY,
-                        f"  · Keeping {sib_dir.name} — it's the imported folder"))
-                    continue
-                try:
-                    shutil.rmtree(sib_dir)
-                    log.info(fmt(C.GRAY, f"  🗑  Removed sibling: {sib_dir.name}"))
-                except OSError as _e_sib:
-                    log.info(fmt(C.YELLOW,
-                        f"  ⚠  Couldn't remove {sib_dir.name}: {_e_sib}"))
-        elif _sibs_clean and _sibs_whole:
-            log.info(fmt(C.YELLOW,
-                f"  ⚠  Keeping {len(_sibs)} sibling folder(s) — the filled "
-                "album couldn't be flushed safely."))
+                        item["_siblings_preserved"].remove(
+                            os.fspath(sibling_path))
+                    except ValueError:
+                        pass
+                    log.info(fmt(
+                        C.GREEN,
+                        f"  ✓  Safely consolidated sibling {name}.",
+                    ))
         elif _sibs and _sibs_clean:
             log.info(fmt(C.YELLOW,
                 f"  ⚠  Keeping {len(_sibs)} sibling folder(s) — the filled "
@@ -516,6 +1003,7 @@ def _resolve_queue_item(item, args, imported_globally):
                 f"  · Keeping {len(_sibs)} sibling(s) "
                 f"— partial result (n_fail={item.get('n_fail', 0)}, "
                 f"n_lossy={item.get('n_lossy', 0)})"))
+    item.pop("_sibling_cleanup_receipts", None)
 
     if bp is not None:
         # Backup resolution uses stricter success than art/sibling cleanup —
@@ -523,7 +1011,11 @@ def _resolve_queue_item(item, args, imported_globally):
         # drop it when the new folder is whole (n_fail == 0 AND n_lossy == 0).
         # _item_strict_success is the download-and-import-was-clean signal,
         # independent of whether we then relocated the imported folder.
-        if _item_strict_success and album_has_content:
+        if (
+            _item_strict_success
+            and album_has_content
+            and not ownership_scope_used
+        ):
             # bp is set only for an auto-upgrade, which wiped the only full copy,
             # so clear the same bar process.py does before deleting the backup:
             # the rebuilt folder must be verifiably at least as complete as the
@@ -533,6 +1025,7 @@ def _resolve_queue_item(item, args, imported_globally):
             from qobuz_librarian.modes.process import (
                 _carry_non_audio_from_backup,
                 _upgrade_replacement_verified,
+                _upgrade_trees_verified,
             )
             if _upgrade_replacement_verified(item["album"], album_dir, bp):
                 # Carry non-audio companions (booklets, scans, .cue/.log,
@@ -542,14 +1035,25 @@ def _resolve_queue_item(item, args, imported_globally):
                 # album CLI path in modes/process.py; the bulk artist/upgrade
                 # walks and the web Upgrade action run through this executor.
                 # A failed carry keeps the backup: it holds the only copies.
-                if _carry_non_audio_from_backup(
+                carried = _carry_non_audio_from_backup(
                         item["album"], album_dir, bp,
-                        replacement_dir=post_dir):
-                    try:
-                        shutil.rmtree(bp)
-                    except OSError as e:
+                        replacement_dir=post_dir)
+                if carried is not None:
+                    replacement_path, replacement_receipt = carried
+                    if not dispose_backup(
+                        bp,
+                        replacement_path=replacement_path,
+                        expected_replacement_receipt=replacement_receipt,
+                        replacement_validator=_upgrade_trees_verified,
+                    ):
+                        if not pin_unverified_upgrade_backup(
+                                bp,
+                                "upgrade kept — final exact replacement "
+                                "proof did not hold"):
+                            warn_pin_failed(bp)
                         log.info(fmt(C.YELLOW,
-                            f"  ⚠  Couldn't remove backup for {truncate(album_dir.name, 40)}: {e}"))
+                            f"  ⚠  Couldn't safely remove the exact backup "
+                            f"for {truncate(album_dir.name, 40)}."))
                 else:
                     if not pin_unverified_upgrade_backup(bp):
                         warn_pin_failed(bp)
@@ -575,6 +1079,11 @@ def _resolve_queue_item(item, args, imported_globally):
             # matcher found), so post_dir fell back to the original we'd moved
             # aside. Restoring it now would duplicate the content beside the
             # fresh import — keep the backup and let the user reconcile.
+            if not pin_unverified_upgrade_backup(
+                    bp,
+                    "upgrade backup kept — the clean imported replacement "
+                    "could not be located"):
+                warn_pin_failed(bp)
             log.info(fmt(C.YELLOW,
                 f"  ⚠  {truncate(album_dir.name, 40)}: imported, but the new "
                 f"folder couldn't be located — keeping the backup rather than "
@@ -583,6 +1092,11 @@ def _resolve_queue_item(item, args, imported_globally):
                 f"     Backup at {bp}; remove it once you've confirmed the "
                 f"upgrade landed."))
         elif args.no_import:
+            if not pin_unverified_upgrade_backup(
+                    bp,
+                    "upgrade backup kept — --no-import leaves the replacement "
+                    "outside the verified library flow"):
+                warn_pin_failed(bp)
             log.info(fmt(C.YELLOW,
                 f"  ⚠  {truncate(album_dir.name, 40)}: backup kept at {bp}"))
         else:
@@ -591,6 +1105,11 @@ def _resolve_queue_item(item, args, imported_globally):
             if restore_upgrade_backup(bp, album_dir):
                 log.info(fmt(C.GREEN, f"  ✓  Restored {truncate(album_dir.name, 50)}"))
             else:
+                if not pin_unverified_upgrade_backup(
+                        bp,
+                        "upgrade backup kept — automatic restore did not "
+                        "complete"):
+                    warn_pin_failed(bp)
                 log.info(fmt(C.RED, f"  ✗  Auto-restore failed. Backup: {bp}"))
                 log.info(fmt(C.WHITE, f"     Manual: mv {bp} {album_dir}"))
 
@@ -612,18 +1131,40 @@ def _resolve_queue_item(item, args, imported_globally):
         # extras, duplicate files, or pre-existing tracks reach the expected
         # number while an expected track is absent. Require every expected
         # track to match one-to-one, like process.py's gate.
-        _filled_whole = (album_has_content
-                         and folder_holds_all_tracks(
-                             post_dir,
-                             (item["album"].get("tracks") or {}).get("items") or []))
-        _filled_durable = (_item_strict_success and _filled_whole
-                           and replacement_tree_durable(post_dir))
-        if _item_strict_success and _filled_whole and _filled_durable:
-            try:
-                shutil.rmtree(gfb)
-            except OSError as e:
+        _filled_whole = (
+            not ownership_scope_used
+            and album_has_content
+            and folder_holds_all_tracks(
+                post_dir,
+                (item["album"].get("tracks") or {}).get("items") or [],
+                destructive=True,
+            )
+        )
+        _filled_receipt = (
+            capture_album_source_receipt(post_dir)
+            if _item_strict_success and _filled_whole else None
+        )
+        if _item_strict_success and _filled_whole and _filled_receipt is not None:
+            if not dispose_backup(
+                gfb,
+                replacement_path=post_dir,
+                expected_replacement_receipt=_filled_receipt,
+                replacement_validator=lambda replacement, _backup: (
+                    folder_holds_all_tracks(
+                        replacement,
+                        (item["album"].get("tracks") or {}).get("items") or [],
+                        destructive=True,
+                    )
+                ),
+            ):
+                if not pin_unverified_upgrade_backup(
+                        gfb,
+                        "gap-fill backup kept — final exact replacement "
+                        "proof did not hold"):
+                    warn_pin_failed(gfb)
                 log.info(fmt(C.YELLOW,
-                    f"  ⚠  Gap-fill complete but couldn't remove backup: {e}"))
+                    "  ⚠  Gap-fill complete but the exact backup couldn't "
+                    "be safely removed."))
         elif _item_strict_success and _filled_whole:
             if not pin_unverified_upgrade_backup(
                     gfb, "gap-fill backup kept — replacement not durable"):
@@ -641,6 +1182,11 @@ def _resolve_queue_item(item, args, imported_globally):
             # strand them beside the fresh import and destroy the only backup
             # — keep it and let the user reconcile, exactly as the upgrade
             # branch above does.
+            if not pin_unverified_upgrade_backup(
+                    gfb,
+                    "gap-fill backup kept — the clean imported replacement "
+                    "could not be confirmed whole"):
+                warn_pin_failed(gfb)
             log.info(fmt(C.YELLOW,
                 f"  ⚠  {truncate(album_dir.name, 40)}: filled, but the new "
                 f"folder couldn't be confirmed whole — keeping the backed-up "
@@ -651,6 +1197,11 @@ def _resolve_queue_item(item, args, imported_globally):
         else:
             _restore_target = album_dir or post_dir
             if _restore_target is None:
+                if not pin_unverified_upgrade_backup(
+                        gfb,
+                        "gap-fill backup kept — no bound album path was "
+                        "available for restore"):
+                    warn_pin_failed(gfb)
                 log.info(fmt(C.YELLOW,
                     f"  ⚠  Gap-fill failed and no album dir to restore to. "
                     f"Backed-up tracks at: {gfb}"))
@@ -669,14 +1220,19 @@ def _resolve_queue_item(item, args, imported_globally):
                         f"did not succeed; restoring backed-up tracks…"))
                 _n_back = restore_gap_fill_backup(gfb, _restore_target,
                                                   keep_larger_dst=False)
-                if _n_back:
+                if _n_back and not gfb.exists():
                     log.info(fmt(C.GREEN,
                         f"  ✓  Restored {_n_back} track(s) to "
                         f"{truncate(_restore_target.name, 50)}"))
                 else:
+                    if gfb.exists() and not pin_unverified_upgrade_backup(
+                            gfb,
+                            "gap-fill backup kept — automatic restore was "
+                            "partial or failed"):
+                        warn_pin_failed(gfb)
                     log.info(fmt(C.RED,
-                        f"  ✗  Couldn't restore the backed-up tracks. They're "
-                        f"preserved at:\n     {gfb}"))
+                        f"  ✗  Restored {_n_back} track(s); remaining originals "
+                        f"are preserved at:\n     {gfb}"))
 
     n_ok = item.get("n_ok", 0)
     n_fail = item.get("n_fail", 0)
@@ -690,7 +1246,9 @@ def _resolve_queue_item(item, args, imported_globally):
     # briefly landed, so the n_ok branch below would mislabel a discarded cancel
     # as "downloaded" in the fetch log.
     _stop = item.get("result")
-    if _stop in ("cancelled", "disk_full", "io_error", "auth_lost"):
+    if _stop in (
+            "cancelled", "disk_full", "io_error", "auth_lost",
+            "import_failed"):
         status = _stop
     elif n_ok and n_fail:
         status = "partial"
@@ -714,6 +1272,7 @@ def _resolve_queue_item(item, args, imported_globally):
         "failed_titles": item.get("failed_tracks", []),
         "lossy_titles": item.get("lossy_tracks", []),
         "broken_titles": item.get("broken_tracks", []),
+        "siblings_preserved": item.get("_siblings_preserved", []),
         "imported": imported_globally,
         "auto_upgrade": item["auto_upgrade"],
         "elapsed_s": int(item.get("elapsed", 0)),
@@ -725,6 +1284,7 @@ def _resolve_queue_item(item, args, imported_globally):
         "n_ok": n_ok,
         "n_fail": n_fail,
         "n_lossy": item.get("n_lossy", 0),
+        "siblings_preserved": item.get("_siblings_preserved", []),
         "imported": imported_globally,
         "auto_upgrade": item["auto_upgrade"],
     }
@@ -793,8 +1353,279 @@ def _refresh_review_state_after_downloads(results, token, args):
         vlog(f"post-download review-badge refresh failed: {e}")
 
 
+def _require_executor_authority(authority):
+    if (
+        authority is None
+        or type(authority) is not run_lock.RunLockLease
+        or authority.intact() is not True
+    ):
+        raise DurableAlbumUnavailable(
+            "the run lock is unavailable; no queue work was started"
+        )
+
+
+def _durable_execution_origin():
+    """Bind durable work and its acknowledgement to one exact owner."""
+    jobs_module = sys.modules.get("qobuz_librarian.web.jobs")
+    if jobs_module is not None:
+        current_job_id = getattr(jobs_module, "current_job_id", None)
+        if callable(current_job_id):
+            job_id = current_job_id()
+            if job_id is not None:
+                current_album_id = getattr(
+                    jobs_module,
+                    "current_job_album_id",
+                    None,
+                )
+                acknowledge_completion = getattr(
+                    jobs_module,
+                    "acknowledge_current_job_durable_completion",
+                    None,
+                )
+                return (
+                    CompletionOrigin(CompletionOriginKind.WEB_JOB, job_id),
+                    f"web-job:{job_id}",
+                    (
+                        current_album_id()
+                        if callable(current_album_id)
+                        else None
+                    ),
+                    (
+                        acknowledge_completion
+                        if callable(acknowledge_completion)
+                        else None
+                    ),
+                )
+    return (
+        CompletionOrigin(CompletionOriginKind.CLI, "download-queue"),
+        "cli:download-queue",
+        None,
+        None,
+    )
+
+
+def _durable_plan_allowed(items, item, *, execution_mode, web_album_id):
+    """Keep the first Web lane to one job-bound, canonical album only."""
+    if not execution_mode.startswith("web-job:"):
+        return True
+    item_album_id = normalise_album_id(item["album"].get("id"))
+    return (
+        len(items) == 1
+        and item_album_id is not None
+        and normalise_album_id(web_album_id) == item_album_id
+    )
+
+
+def _recovered_completion_details(
+    item,
+    *,
+    expected_origin,
+    execution_mode,
+    origin,
+    owner,
+    album_id,
+    planned,
+    post_dir,
+):
+    """Validate one recovery callback against its journal and caller item."""
+    try:
+        caller_planned = queue_state._serialize_queue_item(item)
+    except (KeyError, TypeError, ValueError):
+        return None
+    expected_album_id = normalise_album_id(item["album"].get("id"))
+    if (
+        type(origin) is not CompletionOrigin
+        or origin != expected_origin
+        or type(owner) is not RecoveryOwner
+        or expected_album_id is None
+        or normalise_album_id(album_id) != expected_album_id
+        or planned != caller_planned
+        or type(post_dir) is not str
+        or not os.path.isabs(post_dir)
+        or "\x00" in post_dir
+    ):
+        return None
+
+    loaded = queue_state.load_queue_journal(owner.operation_id)
+    journal = loaded.journal
+    if (
+        loaded.status is not queue_state.QueueLoadStatus.READY
+        or journal is None
+        or (
+            execution_mode.startswith("web-job:")
+            and journal.mode != execution_mode
+        )
+        or (
+            not execution_mode.startswith("web-job:")
+            and journal.mode.startswith("web-job:")
+        )
+    ):
+        return None
+    saved = next(
+        (entry for entry in journal.items if entry.item_id == owner.item_id),
+        None,
+    )
+    if (
+        saved is None
+        or saved.phase not in {
+            queue_state.QueuePhase.RESOLVING,
+            queue_state.QueuePhase.COMPLETE,
+        }
+        or saved.planned != planned
+    ):
+        return None
+    completion_input = parse_completion_input_record(
+        saved.completion_input,
+        expected_owner=owner,
+    )
+    coverage = (
+        completion_input.download_coverage()
+        if completion_input is not None
+        else None
+    )
+    if (
+        coverage is None
+        or completion_input.origin != origin
+        or coverage.album_id != expected_album_id
+    ):
+        return None
+    return (
+        Path(post_dir),
+        len(coverage.bindings),
+        coverage.counts.failed,
+        coverage.counts.lossy,
+    )
+
+
+def _recovered_owner_settled(owner):
+    """Confirm recovery removed both the item and its carrier retirement."""
+    if type(owner) is not RecoveryOwner:
+        return False
+    loaded = queue_state.load_queue_journal(owner.operation_id)
+    if loaded.status is queue_state.QueueLoadStatus.ABSENT:
+        return True
+    journal = loaded.journal
+    return (
+        loaded.status is queue_state.QueueLoadStatus.READY
+        and journal is not None
+        and all(entry.item_id != owner.item_id for entry in journal.items)
+        and all(
+            retirement.item_id != owner.item_id
+            for retirement in journal.retirements
+        )
+    )
+
+
+def _exact_resume_owner(recovery, item, *, execution_mode):
+    """Match one returned startup identity to this exact planned item."""
+    if recovery.status is StartupRecoveryStatus.CLEAR:
+        return None, execution_mode
+    if recovery.status is StartupRecoveryStatus.ATTENTION_REQUIRED:
+        raise DurableAlbumUnavailable(
+            recovery.reason or "saved queue recovery needs attention"
+        )
+    if recovery.status is not StartupRecoveryStatus.RESUME_REQUIRED:
+        raise DurableAlbumUnavailable("saved queue recovery is unavailable")
+
+    try:
+        planned = queue_state._serialize_queue_item(item)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DurableAlbumUnavailable(
+            "the queued album no longer matches its saved plan"
+        ) from exc
+
+    web_execution = execution_mode.startswith("web-job:")
+    candidates = []
+    for recovered in recovery.items:
+        if recovered.action not in {
+            StartupRecoveryAction.PENDING,
+            StartupRecoveryAction.RESUME_DOWNLOAD,
+        }:
+            continue
+        if web_execution:
+            if recovered.mode != execution_mode:
+                continue
+        elif recovered.mode.startswith("web-job:"):
+            continue
+        loaded = queue_state.load_queue_journal(recovered.operation_id)
+        journal = loaded.journal
+        if (
+            loaded.status is not queue_state.QueueLoadStatus.READY
+            or journal is None
+            or journal.mode != recovered.mode
+        ):
+            continue
+        saved = next(
+            (
+                entry
+                for entry in journal.items
+                if entry.item_id == recovered.item_id
+            ),
+            None,
+        )
+        if (
+            saved is not None
+            and saved.phase is recovered.phase
+            and saved.planned == planned
+        ):
+            candidates.append(recovered)
+
+    if len(candidates) != 1:
+        raise DurableAlbumUnavailable(
+            "the exact saved queue item cannot safely resume"
+        )
+    recovered = candidates[0]
+    return (
+        RecoveryOwner(recovered.operation_id, recovered.item_id),
+        recovered.mode,
+    )
+
+
+def _durable_completed_result(item, post_dir):
+    """Publish the ordinary queue/log shape without heuristic resolution."""
+    item["imported"] = True
+    item["_resolved_post_dir"] = post_dir
+    item["_resolved_post_dir_from_import_ownership"] = False
+    item["_siblings_preserved"] = []
+    n_ok = item.get("n_ok", 0)
+    n_fail = item.get("n_fail", 0)
+    status = "partial" if n_ok and n_fail else "downloaded"
+    log_fetch({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "album_id": item["album"].get("id"),
+        "artist": (item["album"].get("artist") or {}).get("name"),
+        "title": item["album"].get("title"),
+        "result": status,
+        "tracks_total": len(
+            (item["album"].get("tracks") or {}).get("items") or []
+        ),
+        "tracks_downloaded": n_ok,
+        "tracks_failed": n_fail,
+        "tracks_lossy_deleted": item.get("n_lossy", 0),
+        "failed_titles": item.get("failed_tracks", []),
+        "lossy_titles": item.get("lossy_tracks", []),
+        "broken_titles": item.get("broken_tracks", []),
+        "siblings_preserved": [],
+        "imported": True,
+        "auto_upgrade": bool(item.get("auto_upgrade")),
+        "elapsed_s": int(item.get("elapsed", 0)),
+        "queued": True,
+    })
+    return {
+        "dir": post_dir,
+        "result": status,
+        "n_ok": n_ok,
+        "n_fail": n_fail,
+        "n_lossy": item.get("n_lossy", 0),
+        "siblings_preserved": [],
+        "imported": True,
+        "auto_upgrade": bool(item.get("auto_upgrade")),
+    }
+
+
 def _execute_download_queue(queue, args, token, *, on_progress=None,
-                            refresh_review=False):
+                            refresh_review=False,
+                            consolidate_duplicates=True):
     """Flush a batch of pre-confirmed download decisions, one album at a time.
 
     Each item runs through its own pipeline — download → downsample → lyrics →
@@ -809,8 +1640,9 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
     never landed and never what already imported. ``on_progress`` (when given)
     fires after each change so the caller can re-persist the shrinking queue.
 
-    Returns ``(results, drained)``. ``results`` stays 1:1 with the items passed
-    in; ``drained`` is True once nothing is left to retry.
+    Returns ``(results, drained)``. A durable safety stop may return before the
+    rest of the batch has results; ``drained`` is True only when nothing is
+    left to retry or recover.
     """
     if not queue:
         return [], True
@@ -831,8 +1663,14 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
                                     "n_missing": len(item["missing"])})
         return dry_run_results, True
 
-    staging_preflight(args)
-
+    authority = run_lock.current_lease()
+    _require_executor_authority(authority)
+    (
+        origin,
+        execution_mode,
+        web_album_id,
+        external_acknowledge_completion,
+    ) = _durable_execution_origin()
     items = list(queue)
     n_items = len(items)
     interrupted = False
@@ -841,15 +1679,33 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
     io_error = False
     auth_lost_exc = None
     queue_transient_lyric_sigs = []
-    any_imported, _parked_post_dirs = _reimport_parked_albums()
+    any_imported = False
+    _parked_post_dirs = []
+    preflight_done = False
+    durable_stopped = False
+    recovery_persist_blocked = False
     results = []
 
     def _persist():
         if on_progress is not None:
-            try:
-                on_progress()
-            except Exception as e:
-                vlog(f"queue progress hook failed: {e}")
+            # This is the durable commit gate for the caller's shrinking
+            # queue.  Continuing after an I/O/CAS failure lets memory claim an
+            # item is finished while the saved journal still says it is
+            # pending, so stop before another album can mutate the library.
+            on_progress()
+
+    def _ensure_preflight():
+        nonlocal any_imported, _parked_post_dirs, preflight_done
+        if preflight_done:
+            return
+        _require_executor_authority(authority)
+        staging_preflight(args)
+        _require_executor_authority(authority)
+        parked_imported, parked_dirs = _reimport_parked_albums()
+        _require_executor_authority(authority)
+        any_imported = any_imported or parked_imported
+        _parked_post_dirs.extend(parked_dirs)
+        preflight_done = True
 
     def _drop(item):
         """An item that's fully handled leaves the queue so a retry won't redo
@@ -884,6 +1740,7 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
 
     def _handle_download_exception(item, exc):
         nonlocal interrupted, disk_full, io_error, auth_lost_exc
+        retain_download_staging(item)
         if isinstance(exc, KeyboardInterrupt):
             log.info(fmt(C.YELLOW,
                 "\n    Interrupted. Stopping further downloads — "
@@ -914,7 +1771,189 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
             raise exc
         results.append(_resolve_queue_item(item, args, False))
 
+    def _record_durable_completion(item, post_dir, idx):
+        nonlocal any_imported, cancelled
+        any_imported = True
+        lyric_sigs = item.get("_durable_lyric_sigs")
+        if isinstance(lyric_sigs, (list, tuple)):
+            queue_transient_lyric_sigs.extend(lyric_sigs)
+        results.append(_durable_completed_result(item, post_dir))
+        log.info(fmt(
+            C.GREEN,
+            f"    ✓ {item.get('n_ok', 0)} track(s) · "
+            f"{int(item.get('elapsed', 0))}s",
+        ))
+        if token and item.get("n_ok", 0) > 0:
+            try:
+                warn_if_download_truncated(
+                    post_dir,
+                    token,
+                    item["album"].get("title"),
+                )
+            except Exception as _e_rc:
+                vlog(f"post-download recheck raised: {_e_rc}")
+        if idx < n_items:
+            cooldown = (
+                cfg.RATE_LIMIT_COOLDOWN if item.get("rate_limited") else 0
+            )
+            if cooldown:
+                log.info(fmt(
+                    C.YELLOW,
+                    f"    ⏳ Qobuz rate-limit detected — cooling down "
+                    f"{int(cooldown)}s before the next album "
+                    f"(set RATE_LIMIT_COOLDOWN=0 to disable).",
+                ))
+                if _sleep_unless_cancelled(cooldown, is_cancel_requested):
+                    cancelled = True
+            else:
+                _sleep_unless_cancelled(
+                    cfg.DELAY_BETWEEN,
+                    is_cancel_requested,
+                )
+
     for idx, item in enumerate(items, 1):
+        _require_executor_authority(authority)
+        requires_library_backup = queue_item_may_create_library_backup(item)
+        plan = plan_durable_new_album(item, args)
+        if plan is not None and not _durable_plan_allowed(
+            items,
+            item,
+            execution_mode=execution_mode,
+            web_album_id=web_album_id,
+        ):
+            plan = None
+
+        recovered_completion = {}
+
+        def _acknowledge_recovered_completion(
+            recovered_origin,
+            recovered_owner,
+            *,
+            album_id,
+            completion_hash,
+            planned,
+            post_dir,
+        ):
+            if plan is None:
+                return False
+            details = _recovered_completion_details(
+                item,
+                expected_origin=origin,
+                execution_mode=execution_mode,
+                origin=recovered_origin,
+                owner=recovered_owner,
+                album_id=album_id,
+                planned=planned,
+                post_dir=post_dir,
+            )
+            if details is None:
+                return False
+            if execution_mode.startswith("web-job:") and (
+                len(queue) != 1
+                or queue[0] is not item
+                or not callable(external_acknowledge_completion)
+            ):
+                return False
+            if recovered_origin.kind is CompletionOriginKind.WEB_JOB:
+                if external_acknowledge_completion(
+                    recovered_origin,
+                    recovered_owner,
+                    album_id=album_id,
+                    completion_hash=completion_hash,
+                    planned=planned,
+                    post_dir=post_dir,
+                ) is not True:
+                    return False
+            _require_executor_authority(authority)
+            caller_index = next(
+                (
+                    index
+                    for index, queued in enumerate(queue)
+                    if queued is item
+                ),
+                None,
+            )
+            if caller_index is None:
+                return False
+            del queue[caller_index]
+            recovered_completion.update(
+                post_dir=details[0],
+                n_ok=details[1],
+                n_fail=details[2],
+                n_lossy=details[3],
+                owner=recovered_owner,
+            )
+            return True
+
+        startup = recover_startup_state(
+            authority=authority,
+            acknowledge_completion=_acknowledge_recovered_completion,
+        )
+        _require_executor_authority(authority)
+        if recovered_completion:
+            if (
+                startup.status is StartupRecoveryStatus.ATTENTION_REQUIRED
+                or not _recovered_owner_settled(
+                    recovered_completion["owner"]
+                )
+            ):
+                recovery_persist_blocked = True
+                durable_stopped = True
+                log.info(fmt(
+                    C.YELLOW,
+                    "  ⚠  Saved completion recovery remains unsettled; "
+                    "stopping this batch.",
+                ))
+                break
+            item.update(
+                n_ok=recovered_completion["n_ok"],
+                n_fail=recovered_completion["n_fail"],
+                n_lossy=recovered_completion["n_lossy"],
+                elapsed=0.0,
+            )
+            _persist()
+            _record_durable_completion(
+                item,
+                recovered_completion["post_dir"],
+                idx,
+            )
+            continue
+        try:
+            resume_owner, durable_mode = _exact_resume_owner(
+                startup,
+                item,
+                execution_mode=execution_mode,
+            )
+        except DurableAlbumUnavailable:
+            if any_imported:
+                durable_stopped = True
+                log.info(fmt(
+                    C.YELLOW,
+                    "  ⚠  Remaining saved queue work needs exact recovery; "
+                    "stopping this batch.",
+                ))
+                break
+            raise
+        if resume_owner is not None and plan is None:
+            if any_imported:
+                durable_stopped = True
+                log.info(fmt(
+                    C.YELLOW,
+                    "  ⚠  Remaining saved queue work is not yet supported "
+                    "by safe recovery; stopping this batch.",
+                ))
+                break
+            raise DurableAlbumUnavailable(
+                "the saved queue item is not yet supported by safe recovery"
+            )
+        if requires_library_backup and plan is None:
+            raise DurableAlbumUnavailable(
+                "this library-changing queue item is not yet supported by "
+                "crash-safe recovery"
+            )
+        if resume_owner is None:
+            _ensure_preflight()
+
         # A cancel raised while the PREVIOUS album was importing (i.e. after its
         # own post-download checkpoint at the bottom of the loop) hasn't set
         # `cancelled` yet. Re-check here so the next album short-circuits at the
@@ -923,6 +1962,8 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
         # the auth_lost fallback.
         if not cancelled and is_cancel_requested():
             cancelled = True
+        if resume_owner is not None and cancelled:
+            raise KeyboardInterrupt
         if (interrupted or cancelled or disk_full or io_error
                 or auth_lost_exc is not None):
             _short_circuit(item)
@@ -944,8 +1985,70 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
         log.info(fmt(C.BOLD + C.WHITE,
             f"  [Q {idx}/{n_items}] {truncate(title, 55)}"))
 
+        if plan is not None:
+            def _prepare_staged(album_dirs, checkpoint_sources):
+                return _run_pre_import_hooks_for_dirs(
+                    album_dirs,
+                    args,
+                    on_sources_changed=checkpoint_sources,
+                )
+
+            outcome = execute_durable_new_album(
+                queue,
+                item,
+                args,
+                plan=plan,
+                origin=origin,
+                mode=durable_mode,
+                authority=authority,
+                resume_owner=resume_owner,
+                prepare_staged=_prepare_staged,
+                acknowledge_completion=external_acknowledge_completion,
+            )
+            removed = all(queued is not item for queued in queue)
+            if removed:
+                _persist()
+            if outcome.status is not DurableAlbumStatus.COMPLETE:
+                results.append({
+                    "dir": outcome.post_dir,
+                    "result": outcome.status.value,
+                    "n_ok": item.get("n_ok", 0),
+                    "n_fail": item.get("n_fail", 0),
+                    "n_lossy": item.get("n_lossy", 0),
+                    "siblings_preserved": [],
+                    "imported": False,
+                    "auto_upgrade": bool(item.get("auto_upgrade")),
+                })
+                durable_stopped = True
+                log.info(fmt(
+                    C.YELLOW,
+                    "    ⚠  This album needs a safe retry or recovery; "
+                    "stopping the queue.",
+                ))
+                break
+            if not removed or outcome.post_dir is None:
+                raise DurableAlbumUnavailable(
+                    "the completed durable album was not finalised exactly"
+                )
+            _record_durable_completion(item, outcome.post_dir, idx)
+            continue
+
+        _seal_queue_item_siblings(item)
         if item["auto_upgrade"] and album_dir and album_dir.exists():
             bp = backup_album_dir(album_dir)
+            if bp is not None and not bp.complete:
+                from qobuz_librarian.modes.process import (
+                    _recover_incomplete_upgrade_backup,
+                )
+
+                _recover_incomplete_upgrade_backup(
+                    bp, album_dir, operation="queued upgrade backup")
+                log.info(fmt(C.RED,
+                    "    ✗  The backup was interrupted; skipping this "
+                    "album."))
+                item["result"] = "upgrade_aborted_backup_failed"
+                results.append(_resolve_queue_item(item, args, False))
+                continue
             if bp is None:
                 log.info(fmt(C.RED,
                     "    ✗  Could not back up; skipping this album."))
@@ -965,12 +2068,12 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
             continue
 
         if is_cancel_requested():
-            from qobuz_librarian.modes.process import _discard_staged_since
-            _discard_staged_since(item["snapshot_before"])
+            retain_download_staging(item)
             item["result"] = "cancelled"
             cancelled = True
             log.info(fmt(C.YELLOW,
-                "    Cancelled — discarded this album's partial download."))
+                "    Cancelled — retained this album's partial download "
+                "for review."))
             results.append(_resolve_queue_item(item, args, False))
             continue
 
@@ -988,7 +2091,11 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
         # ── Per-album pre-import + beets import ──────────────────────────
         item_imported = False
         if summary_n_ok > 0 and not args.no_import:
-            album_dirs = _staged_album_dirs(item)
+            try:
+                album_dirs = _staged_album_dirs(item)
+            except OSError as exc:
+                _handle_download_exception(item, exc)
+                continue
             if not album_dirs:
                 log.info(fmt(C.YELLOW,
                     "    ⚠  No staged audio dir found for this album — skipping beets."))
@@ -996,7 +2103,6 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
                 effective_tier = item.get("quality") or cfg.STREAMRIP_QUALITY
 
                 def _redownload_at_max():
-                    from qobuz_librarian.modes.process import _discard_staged_since
                     saved_q = item.get("quality")
                     retry_item = dict(item)
                     retry_item["quality"] = 4
@@ -1007,20 +2113,38 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
                     try:
                         fresh_dirs, retry_kept = redownload_with_staged_fallback(
                             album_dirs,
-                            discard_retry_output=lambda: _discard_staged_since(
-                                item["snapshot_before"]),
                             run_retry=_run_retry,
-                            collect_staged_dirs=lambda: _staged_album_dirs(item))
+                            collect_staged_dirs=lambda: (
+                                _staged_album_dirs(retry_item)
+                                if retry_item.get("n_ok", 0) > 0 else []),
+                            collect_retry_files=lambda: download_staged_files(
+                                retry_item),
+                            retry_preserves_original=lambda: (
+                                retry_preserves_track_coverage(
+                                    item, retry_item)))
                     except Exception:
                         item["quality"] = saved_q
                         raise
                     if retry_kept:
+                        retire_empty_download_staging(item)
                         for key in ("n_ok", "n_fail", "n_lossy",
                                     "failed_tracks", "lossy_tracks",
                                     "broken_tracks", "elapsed",
-                                    "gap_fill_backup_path"):
+                                    "gap_fill_backup_path", "_staging_run",
+                                    "_staging_run_retained",
+                                    "_expected_track_keys",
+                                    "_clean_track_keys",
+                                    "_exact_track_coverage",
+                                    "_unmatched_audio",
+                                    "_clean_staged_files",
+                                    "_all_staged_audio",
+                                    "_staged_track_bindings"):
                             if key in retry_item:
                                 item[key] = retry_item[key]
+                            else:
+                                item.pop(key, None)
+                    else:
+                        retire_empty_download_staging(retry_item)
                     item["quality"] = saved_q
                     return fresh_dirs
 
@@ -1076,8 +2200,26 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
                     results.append(_resolve_queue_item(item, args, False))
                     continue
 
+                parking_receipts = tuple(
+                    capture_tree(directory) for directory in album_dirs)
+                if any(receipt is None for receipt in parking_receipts):
+                    parking_receipts = ()
                 try:
-                    item_imported = _import_album_with_retry(album_dirs)
+                    ownership_capture = (
+                        {} if item.get("_capture_import_ownership") is True
+                        else None
+                    )
+                    if ownership_capture is None:
+                        item_imported = _import_album_with_retry(album_dirs)
+                    else:
+                        item_imported = _import_album_with_retry(
+                            album_dirs,
+                            ownership_out=ownership_capture,
+                        )
+                    if item_imported and ownership_capture is not None:
+                        ownership_result = ownership_capture.get("result")
+                        if isinstance(ownership_result, dict):
+                            item["_import_ownership"] = ownership_result
                 except KeyboardInterrupt:
                     log.info(fmt(C.YELLOW,
                         "\n  beets interrupted. Resolving backups based on disk."))
@@ -1089,10 +2231,32 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
                     results.append(_resolve_queue_item(item, args, False))
                     continue
 
-                if item_imported:
+                if item_imported and (
+                    "_staging_run" not in item
+                    or retire_empty_download_staging(item)
+                ):
                     any_imported = True
                 else:
-                    _move_to_beets_retry(album_dirs, title)
+                    if item_imported:
+                        log.info(fmt(
+                            C.RED,
+                            "  ✗  The exact download run was not empty "
+                            "after beets; the import was not accepted.",
+                        ))
+                    item_imported = False
+                    item["result"] = "import_failed"
+                    retained = retain_download_staging(
+                        item, label="beets-incomplete")
+                    if retained:
+                        log.info(fmt(
+                            C.YELLOW,
+                            "  ⚠  Kept the exact residual download run in "
+                            "private staging recovery; the queue item remains "
+                            "pending.",
+                        ))
+                    else:
+                        _move_to_beets_retry(
+                            album_dirs, title, expected=parking_receipts)
         elif args.no_import:
             log.info(fmt(C.YELLOW,
                 f"  --no-import: skipping beets. Files in {cfg.STAGING_DIR}/"))
@@ -1140,14 +2304,52 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
             else:
                 _sleep_unless_cancelled(cfg.DELAY_BETWEEN, is_cancel_requested)
 
+    if not preflight_done and not durable_stopped:
+        _require_executor_authority(authority)
+        final_startup = recover_startup_state(
+            authority=authority,
+            acknowledge_completion=None,
+        )
+        _require_executor_authority(authority)
+        if final_startup.status is StartupRecoveryStatus.CLEAR:
+            _ensure_preflight()
+        else:
+            durable_stopped = True
+            log.info(fmt(
+                C.YELLOW,
+                "  ⚠  Saved queue recovery remains unfinished; "
+                "skipping unrelated staging work.",
+            ))
+
     # ── Post-batch: consolidate duplicate albums once if anything landed.
     # The fold is a library-wide pass, so running it per-album would waste
     # work; once at end is enough.
-    if any_imported:
+    ownership_scope_resolved = any(
+        item.get("_resolved_post_dir_from_import_ownership") is True
+        for item in items
+    )
+    if (consolidate_duplicates
+            and any_imported
+            and not ownership_scope_resolved):
         try:
-            _consolidate_duplicate_albums()
+            protected_ownership_dirs = [
+                item.get("_resolved_post_dir")
+                for item in items
+                if isinstance(item.get("_import_ownership"), dict)
+                and item.get("_resolved_post_dir") is not None
+            ]
+            if protected_ownership_dirs:
+                _consolidate_duplicate_albums(
+                    protected_paths=protected_ownership_dirs)
+            else:
+                _consolidate_duplicate_albums()
         except Exception as _e_c:
             vlog(f"consolidate duplicate albums raised: {_e_c}")
+    elif consolidate_duplicates and ownership_scope_resolved:
+        vlog(
+            "skipping duplicate consolidation for descriptor-verified "
+            "one-track ownership scope"
+        )
 
     # ── Post-batch lyric-retry resolution.
     print()
@@ -1192,11 +2394,48 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
     # The lyric hook always embeds and relies on this post-import pass to emit
     # the sidecars; gating it on transient sigs broke LYRICS_FORMAT=sidecar/both
     # on the normal happy path. No-op when LYRICS_FORMAT is embed.
-    if any_imported and (_post_dirs or _parked_post_dirs):
+    ownership_tracks = [
+        it["_import_ownership"]
+        for it in items
+        if isinstance(it.get("_import_ownership"), dict)
+    ]
+    if any_imported and (
+            _post_dirs or _parked_post_dirs or ownership_tracks):
+        capture_ownership = bool(ownership_tracks)
+        ownership_changes = [] if capture_ownership else None
+        ownership_created_files = [] if capture_ownership else None
+        ownership_directory_changes = (
+            [
+                change
+                for item in items
+                for change in item.get(
+                    "_import_ownership_directory_changes", [])
+            ]
+            if capture_ownership else None
+        )
         try:
-            write_post_import_sidecars(_post_dirs + _parked_post_dirs)
+            if ownership_changes is None:
+                write_post_import_sidecars(_post_dirs + _parked_post_dirs)
+            else:
+                write_post_import_sidecars(
+                    _post_dirs + _parked_post_dirs,
+                    identity_changes_out=ownership_changes,
+                    created_files_out=ownership_created_files,
+                    directory_changes_out=ownership_directory_changes,
+                    owned_tracks=ownership_tracks,
+                )
         except Exception as _e_sc:
             vlog(f"post-import sidecar write raised: {_e_sc}")
+        finally:
+            if capture_ownership:
+                _advance_import_ownership_identities(
+                    items,
+                    ownership_changes,
+                    ownership_created_files,
+                    ownership_directory_changes,
+                )
+                for item in items:
+                    item.pop("_import_ownership_directory_changes", None)
 
     n_success = sum(1 for r in results
                     if r.get("result") in ("downloaded", "partial"))
@@ -1207,7 +2446,8 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
         f"{n_total_ok} track{'s' if n_total_ok != 1 else ''} downloaded · "
         f"{n_total_fail} failed"))
 
-    _persist()
+    if not recovery_persist_blocked:
+        _persist()
     if auth_lost_exc is not None:
         raise auth_lost_exc
     # Re-raising KeyboardInterrupt is what stops _flush_queue in modes 4/5
@@ -1222,4 +2462,4 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
     # and repair calls this per album in a loop (one artist re-scan per album).
     if refresh_review:
         _refresh_review_state_after_downloads(results, token, args)
-    return results, not queue
+    return results, not queue and not durable_stopped

@@ -1,10 +1,15 @@
 """FastAPI web application for Qobuz Librarian."""
 import asyncio
 import concurrent.futures
+import ctypes
+import errno
 import hashlib
 import html
 import json
+import logging
 import os
+import re
+import secrets
 import shutil
 import stat
 import threading
@@ -30,6 +35,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from qobuz_librarian import config as cfg
 from qobuz_librarian.api.auth import NoCredsError
+from qobuz_librarian.file_exclusion import acquire_inode_write_exclusion
+from qobuz_librarian.ui_cli.errors import plural
 from qobuz_librarian.web import auth as web_auth
 from qobuz_librarian.web import jobs as job_mgr
 from qobuz_librarian.web.csrf import (
@@ -55,15 +62,496 @@ _CLI_MODE = False
 # run_lock.acquire() returned None: the data dir can't ENFORCE the
 # single-writer lock (unwritable path, or a mount without file locking).
 # Silently running would leave the corruption guard quietly off, so
-# destructive routes refuse until the user explicitly accepts the risk via
-# Settings → Mode; the override lasts until restart.
+# destructive routes stay paused until the filesystem is fixed and the app
+# restarts.
 _LOCK_UNENFORCEABLE = False
-_LOCK_OVERRIDE = False
+# Exact result from the most recent run-lock acquisition. Startup recovery is
+# inspection/reconciliation only; it never starts a download or import.
+_STARTUP_RECOVERY_RESULT = None
+# True while an authoritative refresh is running or after it raised. Treat it
+# as ATTENTION even if the last cached result was CLEAR: the journal may have
+# changed before inspection failed.
+_STARTUP_RECOVERY_UNKNOWN = False
+_STARTUP_RECOVERY_LOCK = threading.RLock()
+# Set before lifespan shutdown starts so no new mutating request can register
+# while the workers and request-owned library operations are draining.
+_SHUTTING_DOWN = False
+# Persisted Web jobs are restored only after this process holds exact write
+# authority. The lock also makes startup retry and a Settings mode change
+# converge on the same one-time restore.
+_JOBS_RESTORED = False
+_JOBS_RESTORE_LOCK = threading.Lock()
 # Tri-state result of the startup token probe. None until the probe runs
 # (or if the network glitched); True if Qobuz accepted the saved token;
 # False if Qobuz returned AuthLost. The dashboard banner only fires on the
 # explicit False so a transient network blip doesn't nag the user.
 _TOKEN_VALID: bool | None = None
+
+
+def _run_lock_intact() -> bool:
+    intact = getattr(_RUN_LOCK_HANDLE, "intact", None)
+    return callable(intact) and intact() is True
+
+
+def _beets_runtime_diagnostic() -> tuple[str | None, str]:
+    """Distinguish an absent launcher from a failed runtime verification."""
+    from qobuz_librarian.integrations import beets as beets_mod
+
+    configured = getattr(cfg, "BEETS_PYTHON", "")
+    discovered = None if configured else shutil.which("beet")
+    try:
+        candidate = beets_mod._beets_python_from_launcher()
+    except (OSError, TypeError, ValueError):
+        candidate = None
+    if candidate is None:
+        if configured or discovered:
+            return (
+                None,
+                "The Beets launcher could not be resolved to a verifiable "
+                "Python executable",
+            )
+        return (
+            None,
+            "No Beets launcher was found on PATH and BEETS_PYTHON is unset",
+        )
+    runtime = beets_mod._checked_beets_runtime(candidate)
+    if runtime is None:
+        return (
+            None,
+            "The configured Beets launcher could not be verified as an "
+            "executable Python runtime",
+        )
+    if beets_mod._configured_beets_plugins(runtime) is None:
+        return (
+            None,
+            "Could not verify a Beets 2.12.0 runtime and readable "
+            f"configuration using {runtime.python}",
+        )
+    return runtime.python, runtime.python
+
+
+def _recover_startup_queue(authority):
+    from qobuz_librarian.completion import (
+        CompletionOrigin,
+        CompletionOriginKind,
+        RecoveryOwner,
+    )
+    from qobuz_librarian.queue.startup_recovery import recover_startup_state
+    from qobuz_librarian.web import job_persistence
+
+    # COMPLETE/RESOLVING recovery retires its queue proof only after the exact
+    # original Web job has durably acknowledged it.  Initialise that store
+    # before inspection; restore_jobs() runs later in the lifespan.
+    job_persistence.init()
+
+    def _acknowledge(
+        origin,
+        owner,
+        *,
+        album_id,
+        completion_hash,
+        planned,
+        post_dir,
+    ):
+        from qobuz_librarian.completion import normalise_album_id
+
+        planned_album = (
+            planned.get("album") if isinstance(planned, dict) else None
+        )
+        if (
+            type(origin) is not CompletionOrigin
+            or type(owner) is not RecoveryOwner
+            or normalise_album_id(
+                planned_album.get("id")
+                if isinstance(planned_album, dict)
+                else None
+            )
+            != album_id
+            or type(post_dir) is not str
+            or not os.path.isabs(post_dir)
+            or "\x00" in post_dir
+        ):
+            return False
+        if origin.kind is CompletionOriginKind.CLI:
+            return origin.reference == "download-queue"
+        if (
+            origin.kind is not CompletionOriginKind.WEB_JOB
+            or not origin.reference
+        ):
+            return False
+        return job_persistence.acknowledge_durable_completion(
+            origin.reference,
+            owner,
+            album_id=album_id,
+            completion_hash=completion_hash,
+        )
+
+    return recover_startup_state(
+        authority=authority,
+        acknowledge_completion=_acknowledge,
+    )
+
+
+def _record_startup_recovery(authority):
+    global _STARTUP_RECOVERY_RESULT, _STARTUP_RECOVERY_UNKNOWN
+    with _STARTUP_RECOVERY_LOCK:
+        _STARTUP_RECOVERY_UNKNOWN = True
+        result = _recover_startup_queue(authority)
+        _STARTUP_RECOVERY_RESULT = result
+        _STARTUP_RECOVERY_UNKNOWN = False
+        job_mgr.set_durable_recovery_job_id(_startup_recovery_web_job_id())
+        return _STARTUP_RECOVERY_RESULT
+
+
+def _startup_recovery_status_value() -> str | None:
+    if _STARTUP_RECOVERY_UNKNOWN:
+        return "attention_required"
+    return _recovery_status_value(_STARTUP_RECOVERY_RESULT)
+
+
+def _recovery_status_value(result) -> str | None:
+    status = getattr(result, "status", None)
+    return getattr(status, "value", None)
+
+
+def _startup_recovery_binding():
+    """Load the one exact queue item behind the current recovery result."""
+    if _startup_recovery_status_value() not in {
+        "attention_required",
+        "resume_required",
+    }:
+        return None
+    items = getattr(_STARTUP_RECOVERY_RESULT, "items", ())
+    if len(items) != 1:
+        return None
+    recovery_item = items[0]
+    try:
+        from qobuz_librarian.completion import (
+            RecoveryOwner,
+            parse_completion_input_record,
+        )
+        from qobuz_librarian.queue import journal as queue_state
+
+        loaded = queue_state.load_queue_journal(recovery_item.operation_id)
+        if (
+            loaded.status is not queue_state.QueueLoadStatus.READY
+            or loaded.journal is None
+            or loaded.journal.operation_id != recovery_item.operation_id
+            or loaded.journal.mode != recovery_item.mode
+        ):
+            return None
+        matches = tuple(
+            item
+            for item in loaded.journal.items
+            if item.item_id == recovery_item.item_id
+        )
+        if len(matches) != 1:
+            return None
+        queued_item = matches[0]
+        if queued_item.phase is not recovery_item.phase:
+            return None
+        if queued_item.completion_input is None:
+            if (
+                queued_item.phase is queue_state.QueuePhase.PENDING
+                and getattr(recovery_item.action, "value", None) == "pending"
+                and not queued_item.recovery_references
+                and queued_item.block_reason is None
+                and queued_item.completion_evidence is None
+            ):
+                return recovery_item, loaded.journal, queued_item, None
+            return None
+        completion_input = parse_completion_input_record(
+            queued_item.completion_input,
+            expected_owner=RecoveryOwner(
+                recovery_item.operation_id,
+                recovery_item.item_id,
+            ),
+        )
+        if completion_input is None:
+            return None
+        from qobuz_librarian.completion import normalise_album_id
+
+        planned_album = queued_item.planned.get("album")
+        if normalise_album_id(
+            planned_album.get("id") if isinstance(planned_album, dict) else None
+        ) != normalise_album_id(completion_input.expectation.album_id):
+            return None
+        return recovery_item, loaded.journal, queued_item, completion_input.origin
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _startup_recovery_origin_value() -> str | None:
+    """Read the exact saved completion origin when one has been frozen."""
+    binding = _startup_recovery_binding()
+    if binding is None or binding[3] is None:
+        return None
+    return binding[3].kind.value
+
+
+def _startup_recovery_web_job_id() -> str | None:
+    binding = _startup_recovery_binding()
+    if binding is None:
+        return None
+    recovery_item, _journal, queued_item, origin = binding
+    mode = getattr(recovery_item, "mode", None)
+    prefix = "web-job:"
+    if not isinstance(mode, str) or not mode.startswith(prefix):
+        return None
+    job_id = mode[len(prefix):]
+    if not job_id:
+        return None
+    try:
+        from qobuz_librarian.completion import normalise_album_id
+        from qobuz_librarian.web import job_persistence
+
+        row = job_persistence.load_one(job_id)
+        planned_album = queued_item.planned.get("album")
+        if (
+            row is None
+            or normalise_album_id(row.get("album_id"))
+            != normalise_album_id(
+                planned_album.get("id")
+                if isinstance(planned_album, dict)
+                else None
+            )
+        ):
+            return None
+    except (OSError, TypeError, ValueError):
+        return None
+    if origin is None:
+        return job_id if getattr(queued_item.phase, "value", None) == "pending" else None
+    if origin.kind.value != "web-job" or origin.reference != job_id:
+        return None
+    return job_id
+
+
+def _durable_resume_allowed(job_id: str, *, refresh: bool = False) -> bool:
+    if refresh:
+        if not _run_lock_intact():
+            return False
+        _record_startup_recovery(_RUN_LOCK_HANDLE)
+    return (
+        isinstance(job_id, str)
+        and job_id == _startup_recovery_web_job_id()
+    )
+
+
+def _durable_recovery_matches_job(job) -> bool:
+    """Bind RESUME to one exact Web job and its one canonical album."""
+    if type(job) is not job_mgr.Job or not _durable_resume_allowed(job.id):
+        return False
+    binding = _startup_recovery_binding()
+    if binding is None:
+        return False
+    recovery_item, loaded_journal, queued_item, origin = binding
+    try:
+        from qobuz_librarian.completion import normalise_album_id
+        if (
+            loaded_journal.mode != f"web-job:{job.id}"
+            or len(loaded_journal.items) != 1
+        ):
+            return False
+        planned_album = queued_item.planned.get("album")
+        planned_id = normalise_album_id(
+            planned_album.get("id") if isinstance(planned_album, dict) else None
+        )
+        job_id = normalise_album_id(job.album_id)
+        return (
+            queued_item.item_id == recovery_item.item_id
+            and planned_id is not None
+            and planned_id == job_id
+            and (
+                origin is None
+                or (
+                    origin.kind.value == "web-job"
+                    and origin.reference == job.id
+                )
+            )
+            and _run_lock_intact()
+        )
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
+def _durable_recovery_planned(job):
+    """Copy the validated saved plan for this exact Web resume, or refuse."""
+    with _STARTUP_RECOVERY_LOCK:
+        if (
+            _startup_recovery_status_value() != "resume_required"
+            or not _durable_recovery_matches_job(job)
+        ):
+            return None
+        binding = _startup_recovery_binding()
+        if binding is None:
+            return None
+        queued_item = binding[2]
+        try:
+            from qobuz_librarian.queue import journal as queue_state
+
+            # Loading the journal already validates its schema. Round-trip the
+            # one planned item once more so the worker receives its own
+            # canonical copy, never a mutable reference into cached recovery.
+            planned = queue_state._serialize_queue_item(
+                queue_state._deserialize_queue_item(queued_item.planned)
+            )
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
+        return planned if planned == queued_item.planned else None
+
+
+def _settle_durable_web_recovery(job, action):
+    """Settle only the exact blocked recovery owned by one durable Web job."""
+    from qobuz_librarian.queue.startup_recovery import (
+        BlockedItemSettlementAction,
+        BlockedItemSettlementStatus,
+        settle_blocked_item,
+    )
+
+    if type(action) is not BlockedItemSettlementAction:
+        raise ValueError("a blocked-item settlement action is required")
+    with _STARTUP_RECOVERY_LOCK:
+        if not _run_lock_intact():
+            return False, "The single-writer safety lock is unavailable."
+        try:
+            recovery = _record_startup_recovery(_RUN_LOCK_HANDLE)
+        except Exception:
+            return False, "The saved recovery state could not be checked safely."
+        if (
+            _recovery_status_value(recovery) != "attention_required"
+            or not _durable_recovery_matches_job(job)
+        ):
+            return False, "The blocked recovery does not match this exact download."
+        binding = _startup_recovery_binding()
+        if binding is None:
+            return False, "The blocked recovery identity could not be verified."
+        recovery_item = binding[0]
+        try:
+            settled = settle_blocked_item(
+                authority=_RUN_LOCK_HANDLE,
+                operation_id=recovery_item.operation_id,
+                item_id=recovery_item.item_id,
+                action=action,
+            )
+        except Exception:
+            return False, "The blocked recovery could not be settled safely."
+        expected = (
+            BlockedItemSettlementStatus.RETRYABLE
+            if action is BlockedItemSettlementAction.RETRY
+            else BlockedItemSettlementStatus.DISCARDED
+        )
+        if settled.status is not expected:
+            return False, settled.reason
+        try:
+            refreshed = _record_startup_recovery(_RUN_LOCK_HANDLE)
+        except Exception:
+            return False, "The settled recovery could not be verified safely."
+        if action is BlockedItemSettlementAction.RETRY:
+            if (
+                _recovery_status_value(refreshed) != "resume_required"
+                or not _durable_recovery_matches_job(job)
+            ):
+                return False, "The settled download is not safe to resume."
+        elif _recovery_status_value(refreshed) != "clear":
+            return False, "The discarded recovery did not clear completely."
+        return True, settled.reason
+
+
+def _durable_recovery_control():
+    """Describe the one exact retry control safe to render, if any."""
+    binding = _startup_recovery_binding()
+    job_id = _startup_recovery_web_job_id()
+    if binding is None or job_id is None:
+        return None
+    recovery_item, _journal, _queued_item, _origin = binding
+    try:
+        from qobuz_librarian.web import job_persistence
+
+        row = job_persistence.load_one(job_id)
+        if row is None or job_persistence.durable_completion_acknowledged(
+            job_id,
+            job_created_at=row.get("created_at"),
+            album_id=row.get("album_id"),
+        ) is not False:
+            return None
+    except (OSError, TypeError, ValueError):
+        return None
+    return {
+        "job_id": job_id,
+        "operation_id": recovery_item.operation_id,
+        "item_id": recovery_item.item_id,
+        "status": _startup_recovery_status_value(),
+    }
+
+
+def _recovery_submission_matches(job, operation_id: str, item_id: str) -> bool:
+    control = _durable_recovery_control()
+    return bool(
+        type(job) is job_mgr.Job
+        and control is not None
+        and control["job_id"] == job.id
+        and control["operation_id"] == operation_id
+        and control["item_id"] == item_id
+    )
+
+
+def _staging_entry_allowed(job) -> bool:
+    """Refresh recovery under the staging mutex before any mutation begins."""
+    if not _run_lock_intact():
+        return False
+    try:
+        _record_startup_recovery(_RUN_LOCK_HANDLE)
+    except Exception as exc:
+        logging.getLogger("qobuz_librarian").warning(
+            "couldn't verify durable recovery at the staging boundary: %s",
+            exc,
+        )
+        return False
+    status = _startup_recovery_status_value()
+    return status == "clear" or (
+        status == "resume_required"
+        and _durable_recovery_matches_job(job)
+    )
+
+
+def _durable_completion_status(job) -> bool | None:
+    """Return the exact job/album acknowledgement state, or None on failure."""
+    from qobuz_librarian.completion import normalise_album_id
+    from qobuz_librarian.web import job_persistence
+
+    album_id = normalise_album_id(getattr(job, "album_id", None))
+    created_at = getattr(job, "created_at", None)
+    if album_id is None or type(created_at) not in (int, float):
+        return False
+    return job_persistence.durable_completion_acknowledged(
+        job.id,
+        job_created_at=created_at,
+        album_id=album_id,
+    )
+
+
+def _reconcile_acknowledged_job(job) -> bool:
+    """Make an externally completed exact job terminal and non-retryable."""
+    from qobuz_librarian.web import job_persistence
+
+    with job._lock:
+        job.status = job_mgr.JobStatus.DONE
+        job.phase = ""
+        job.error = None
+        job.summary = job.summary or "Download completed before the restart."
+        job.attention = ""
+        job.cancel_requested = False
+        job.finished_at = job.finished_at or time.time()
+    return job_persistence.persist(job)
+
+
+def _durable_recovery_response(request, message: str):
+    if _is_htmx(request):
+        return HTMLResponse(
+            _ql_notice_html("error", html.escape(message)),
+            status_code=200,
+        )
+    return _tr(request, "lock_busy.html", {"msg": message}, status_code=503)
 
 
 def _ql_notice_html(kind: str, body: str) -> str:
@@ -73,7 +561,21 @@ def _ql_notice_html(kind: str, body: str) -> str:
     )
 
 
-def _lock_busy_response(request):
+def _job_admission_response(request):
+    """Explain a refused jobs.db admission without claiming work was queued."""
+    message = job_mgr.JOB_ADMISSION_ERROR
+    if _is_htmx(request):
+        return HTMLResponse(
+            _ql_notice_html("error", html.escape(message)),
+            status_code=200,
+        )
+    return RedirectResponse(
+        url="/queue?error=" + urllib.parse.quote(message),
+        status_code=303,
+    )
+
+
+def _lock_busy_response(request, *, durable_resume_job_id: str | None = None):
     """Return a 503 response if the run-lock is busy OR a critical volume
     was unwritable at startup, else None."""
     if _CLI_MODE:
@@ -84,17 +586,43 @@ def _lock_busy_response(request):
                "paused so only one process writes to the library at a time. "
                "Stop the other run first, then restart Qobuz Librarian.")
     elif _UNWRITABLE_VOLUMES:
-        msg = (f"Required volume(s) not writable: "
+        msg = (f"Required {plural(len(_UNWRITABLE_VOLUMES), 'volume')} not "
+               "writable: "
                f"{', '.join(_UNWRITABLE_VOLUMES)}. On a NAS, set "
                "PUID/PGID to the share owner and confirm the host "
                "directories exist. Downloads can't run until fixed.")
-    elif _LOCK_UNENFORCEABLE and not _LOCK_OVERRIDE:
+    elif _LOCK_UNENFORCEABLE:
         msg = ("The data folder can't hold the single-writer safety lock "
                "(read-only, or a mount without file locking), so a second "
                "run writing the library at the same time would go unnoticed. "
-               "Downloads and scans are paused. If nothing else runs Qobuz "
-               "Librarian against this library, you can proceed anyway from "
-               "Settings → Mode.")
+               "Downloads and scans are paused. Move the data folder to a "
+               "writable filesystem that supports file locking, then restart.")
+    elif not _run_lock_intact():
+        msg = ("The single-writer safety lock was lost. Downloads and scans "
+               "are paused so another process cannot write to the library "
+               "at the same time. Restart Qobuz Librarian before continuing.")
+    elif (_startup_recovery_status_value() == "attention_required"):
+        msg = ("An interrupted download could not be verified safely. Downloads "
+               "and scans are paused, and its saved queue and staged files were "
+               "left unchanged. Check the application log for the blocked "
+               "recovery reason, correct it, then restart Qobuz Librarian.")
+    elif (
+        _startup_recovery_status_value() == "resume_required"
+        and not _durable_resume_allowed(durable_resume_job_id or "")
+    ):
+        origin = _startup_recovery_origin_value()
+        if origin == "cli":
+            msg = ("An interrupted terminal download has saved recovery state. "
+                   "Other library changes are paused. Switch to terminal mode "
+                   "in Settings, then resume that download there.")
+        elif origin == "web-job":
+            msg = ("An interrupted download has saved recovery state. Other "
+                   "library changes are paused until that exact download is "
+                   "retried from Queue or History.")
+        else:
+            msg = ("An interrupted download has saved recovery state. Other "
+                   "library changes are paused until that exact download is "
+                   "resumed from the interface where it started.")
     else:
         return None
     if _is_htmx(request):
@@ -110,14 +638,64 @@ def _web_writes_paused() -> bool:
     triggers (dashboard new-release check, library-scan resume) that have no
     request to bounce. Any trigger checking only part of this list quietly
     re-opens the hole the pause exists to close."""
-    return (_CLI_MODE or _LOCK_BUSY_PID is not None
-            or bool(_UNWRITABLE_VOLUMES)
-            or (_LOCK_UNENFORCEABLE and not _LOCK_OVERRIDE))
+    return (
+        _SHUTTING_DOWN
+        or _CLI_MODE
+        or _LOCK_BUSY_PID is not None
+        or bool(_UNWRITABLE_VOLUMES)
+        or _LOCK_UNENFORCEABLE
+        or not _run_lock_intact()
+        or _startup_recovery_status_value() in {
+            "attention_required",
+            "resume_required",
+        }
+    )
 
 
 # Populated at startup. Empty list means OK; non-empty means destructive
 # POSTs return 503 until the container restarts with the volumes mounted.
 _UNWRITABLE_VOLUMES: list[str] = []
+
+
+def _has_startup_write_authority() -> bool:
+    """Whether this Web process owns the real single-writer boundary."""
+    return _run_lock_intact() and not _web_writes_paused()
+
+
+def _shutdown_web_mutations() -> None:
+    """Quiesce every Web writer before releasing the process run lock."""
+    global _RUN_LOCK_HANDLE
+    job_mgr.stop_worker()
+    job_mgr.configure_staging_entry_guard(None)
+    if _RUN_LOCK_HANDLE is not None:
+        try:
+            _RUN_LOCK_HANDLE.close()
+        except OSError:
+            pass
+        _RUN_LOCK_HANDLE = None
+
+
+async def _finish_web_lifespan(ticker, lock_retry_task, maintenance_task) -> None:
+    """Stop background work, then release the run lock after all writers."""
+    global _SHUTTING_DOWN
+    with _auto_check_lock:
+        _SHUTTING_DOWN = True
+    for task in (ticker, lock_retry_task):
+        if task is not None:
+            task.cancel()
+    try:
+        for task in (ticker, lock_retry_task):
+            if task is None:
+                continue
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        if maintenance_task is not None:
+            await maintenance_task
+    finally:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _shutdown_web_mutations)
 
 
 def _resume_album_download(job, _args):
@@ -240,6 +818,23 @@ def _saved_review_key(surface, spec):
     )
 
 
+def _saved_review_claim_key(surface, spec):
+    """Return the stable identity of one executable saved-state action."""
+    row = _saved_review_row(surface, spec)
+    payload = row["payload"]
+    if surface == "upgrade":
+        album_id = payload.get("album_id")
+        if (isinstance(album_id, (str, int))
+                and not isinstance(album_id, bool)
+                and str(album_id).strip()):
+            return surface, "album_id", str(album_id).strip()
+    elif surface == "downsample":
+        album_dir = payload.get("album_dir")
+        if isinstance(album_dir, str) and album_dir:
+            return surface, "album_dir", album_dir
+    return surface, "row", _saved_review_key(surface, row)
+
+
 def _saved_review_signature(surface, state):
     rows = []
     for spec in state.get("candidates") or []:
@@ -277,8 +872,8 @@ def _saved_review_specs_from_job(surface, job):
 
 def _existing_saved_review_job(surface, signature):
     review_jobs = [
-        job for job in job_mgr.registry.awaiting_review()
-        if job.execute_kind == surface
+        job for job in job_mgr.registry.all()
+        if job.execute_kind == surface and job.status in job_mgr.ACTIVE
     ]
     for job in review_jobs:
         if (job.execute_kind == surface
@@ -296,11 +891,36 @@ def _existing_saved_review_job(surface, signature):
     return None
 
 
+def _active_saved_review_claim(surface, state):
+    """Find a running review that already owns any requested action."""
+    requested = {
+        _saved_review_claim_key(surface, spec)
+        for spec in state.get("candidates") or []
+    }
+    if not requested:
+        return None
+    executing = (job_mgr.JobStatus.PENDING, job_mgr.JobStatus.RUNNING)
+    for job in job_mgr.registry.all():
+        if job.execute_kind != surface:
+            continue
+        with job._lock:
+            if job.status not in executing:
+                continue
+            claimed = {
+                _saved_review_claim_key(surface, candidate)
+                for candidate in job.candidates
+                if candidate.get("selected")
+            }
+        if requested.intersection(claimed):
+            return job
+    return None
+
+
 _SAVED_REVIEW_TITLES = {
     "upgrade": "Upgrade candidates",
     "downsample": "Downsample candidates",
 }
-_SAVED_REVIEW_LOCK = threading.Lock()
+_SAVED_REVIEW_LOCK = threading.RLock()
 
 
 def _stale_saved_review_job(surface):
@@ -336,7 +956,12 @@ def _sync_saved_review_job(job, surface, state, signature):
     that still exist and add restored saved candidates unticked.
     """
     desired = list(state.get("candidates") or [])
-    with job._lock:
+    with job._review_action_lock, job._lock:
+        # Approval and saved-state refresh can arrive together. Once approval
+        # has claimed the review, its exact candidates belong to that run and
+        # must not be replaced underneath it.
+        if job.status != job_mgr.JobStatus.AWAITING_REVIEW:
+            return job
         existing_raw_by_key = {
             _saved_review_key(surface, c): c
             for c in job.candidates
@@ -388,16 +1013,16 @@ def _sync_saved_review_before_approve(job):
     if (getattr(job, "_saved_review_signature", None) is None
             and job.title != _SAVED_REVIEW_TITLES.get(surface)):
         return job
-    state = (
-        _upgrade_state_summary()
-        if surface == "upgrade"
-        else _downsample_state_summary()
-    )
-    current = {
-        "candidates": state["candidates"] if state.get("complete") else [],
-    }
-    signature = _saved_review_signature(surface, current)
     with _SAVED_REVIEW_LOCK:
+        state = (
+            _upgrade_state_summary()
+            if surface == "upgrade"
+            else _downsample_state_summary()
+        )
+        current = {
+            "candidates": state["candidates"] if state.get("complete") else [],
+        }
+        signature = _saved_review_signature(surface, current)
         if job.status != job_mgr.JobStatus.AWAITING_REVIEW:
             return job
         return _sync_saved_review_job(job, surface, current, signature)
@@ -407,6 +1032,9 @@ def _review_job_from_upgrade_state(state):
     from qobuz_librarian.web import flows
 
     with _SAVED_REVIEW_LOCK:
+        claimed = _active_saved_review_claim("upgrade", state)
+        if claimed is not None:
+            return claimed
         signature = _saved_review_signature("upgrade", state)
         existing = _existing_saved_review_job("upgrade", signature)
         if existing is not None:
@@ -440,6 +1068,9 @@ def _review_job_from_downsample_state(state):
     from qobuz_librarian.web import flows
 
     with _SAVED_REVIEW_LOCK:
+        claimed = _active_saved_review_claim("downsample", state)
+        if claimed is not None:
+            return claimed
         signature = _saved_review_signature("downsample", state)
         existing = _existing_saved_review_job("downsample", signature)
         if existing is not None:
@@ -471,6 +1102,27 @@ def _review_job_from_downsample_state(state):
         job.summary = f"{n} album{'s' if n != 1 else ''} can be downsampled."
         job_mgr.registry.add(job)
         return job
+
+
+def _review_job_from_current_saved_state(surface):
+    """Build or reuse one review from a state snapshot taken atomically.
+
+    Hide and approval use the same lock. A delayed request therefore cannot
+    reintroduce a candidate that was just hidden or create a second review for
+    work that an existing job has already claimed.
+    """
+    with _SAVED_REVIEW_LOCK:
+        if surface == "upgrade":
+            state = _upgrade_state_summary()
+            factory = _review_job_from_upgrade_state
+        elif surface == "downsample":
+            state = _downsample_state_summary()
+            factory = _review_job_from_downsample_state
+        else:
+            raise ValueError("unsupported saved review surface")
+        if not state["complete"] or not state["candidates"]:
+            return None
+        return factory(state)
 
 
 def _review_job_from_library_state():
@@ -557,12 +1209,44 @@ _RESUME_EXECUTE: dict = {
 }
 
 
+def _restore_jobs_once() -> None:
+    global _JOBS_RESTORED
+    with _JOBS_RESTORE_LOCK:
+        if _JOBS_RESTORED:
+            return
+        try:
+            job_mgr.restore_jobs(
+                _RESUME_EXECUTE,
+                durable_recovery_clear=(
+                    _startup_recovery_status_value() == "clear"
+                ),
+            )
+        except Exception as exc:
+            logging.getLogger("qobuz_librarian").warning(
+                "couldn't restore prior jobs: %s — starting fresh.",
+                exc,
+            )
+        finally:
+            # restore_jobs publishes into the registry only after it has built
+            # the full batch. Do not replay it if another authority transition
+            # reaches this helper later.
+            _JOBS_RESTORED = True
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     import logging
     import os
     import shutil
     global _RUN_LOCK_HANDLE, _LOCK_BUSY_PID, _CLI_MODE, _LOCK_UNENFORCEABLE
+    global _SHUTTING_DOWN, _STARTUP_RECOVERY_RESULT, _STARTUP_RECOVERY_UNKNOWN
+    global _JOBS_RESTORED
+    _SHUTTING_DOWN = False
+    with _JOBS_RESTORE_LOCK:
+        _JOBS_RESTORED = False
+    _STARTUP_RECOVERY_RESULT = None
+    _STARTUP_RECOVERY_UNKNOWN = False
+    job_mgr.set_durable_recovery_job_id(None)
     _log = logging.getLogger("qobuz_librarian")
     from qobuz_librarian.ui_cli.logging import attach_file_handler
     attach_file_handler(cfg.APP_LOG_FILE, cfg.LOG_LEVEL)
@@ -616,6 +1300,8 @@ async def _lifespan(_app: FastAPI):
         # resumes web mode (which lasts until the next restart).
         _CLI_MODE = True
         _LOCK_BUSY_PID = None
+        _STARTUP_RECOVERY_RESULT = None
+        _STARTUP_RECOVERY_UNKNOWN = False
         _log.info("QL_CLI_ONLY set — starting in terminal (CLI) mode; the web "
                   "app holds no lock and download/scan endpoints are paused.")
     else:
@@ -626,13 +1312,21 @@ async def _lifespan(_app: FastAPI):
             if _RUN_LOCK_HANDLE is None:
                 # None isn't success: the lock can't be ENFORCED here, and
                 # storing it as acquired would leave the corruption guard
-                # silently off. Pause destructive routes until the user
-                # explicitly accepts the risk (Settings → Mode).
+                # silently off. Destructive routes stay paused until the data
+                # path can enforce the lock and the app restarts.
                 _LOCK_UNENFORCEABLE = True
                 _log.error(
                     "STARTUP: the data dir can't hold the single-writer lock; "
-                    "download/scan endpoints paused until the user enables "
-                    "the no-lock override on Settings → Mode.")
+                    "download/scan endpoints paused. Move the data folder to "
+                    "a writable filesystem with file locking, then restart "
+                    "the app.")
+            else:
+                _LOCK_UNENFORCEABLE = False
+                result = _record_startup_recovery(_RUN_LOCK_HANDLE)
+                _log.info(
+                    "Durable queue startup state: %s.",
+                    result.status.value,
+                )
         except run_lock.LockBusy as busy:
             _LOCK_BUSY_PID = busy.pid
             _log.error(
@@ -653,149 +1347,170 @@ async def _lifespan(_app: FastAPI):
             if _LOCK_BUSY_PID is None or _CLI_MODE:
                 return
             try:
-                _RUN_LOCK_HANDLE = run_lock.acquire()
-                _LOCK_BUSY_PID = None
-                if _RUN_LOCK_HANDLE is None:
+                lease = run_lock.acquire()
+                if lease is None:
+                    _RUN_LOCK_HANDLE = None
+                    _LOCK_BUSY_PID = None
                     _LOCK_UNENFORCEABLE = True
                     _log.error(
                         "Run-lock became unenforceable; download/scan "
-                        "endpoints paused until the no-lock override is "
-                        "enabled on Settings → Mode.")
+                        "endpoints paused until a lock-capable data folder is "
+                        "available and the app is restarted.")
                 else:
-                    # A real handle means the guard is ON — clear any stale
-                    # unenforceable flag from an earlier attempt, or writes
-                    # stay falsely blocked until restart.
+                    _RUN_LOCK_HANDLE = lease
+                    result = _record_startup_recovery(lease)
+                    _restore_jobs_once()
                     _LOCK_UNENFORCEABLE = False
-                    _log.info("Lock acquired; web write endpoints now active.")
+                    _LOCK_BUSY_PID = None
+                    _log.info(
+                        "Lock acquired; durable queue startup state: %s.",
+                        result.status.value,
+                    )
                 return
             except run_lock.LockBusy as busy:
                 _LOCK_BUSY_PID = busy.pid
-    if _LOCK_BUSY_PID is not None:
-        asyncio.create_task(_retry_lock())
+    lock_retry_task = None
+    maintenance_task = None
+    ticker = None
+    try:
+        lock_retry_task = (
+            asyncio.create_task(_retry_lock())
+            if _LOCK_BUSY_PID is not None
+            else None
+        )
 
-    _UNWRITABLE_VOLUMES.clear()
-    # Opt-in via env so tests / dev runs that don't have /staging /music
-    # mounted don't trip on the gate. The bundled compose sets this to 1.
-    if os.environ.get("QL_CHECK_VOLUMES") == "1":
-        # The label (the container-internal mount name) is what the operator
-        # checks in their compose.yaml; the resolved cfg path is what's
-        # actually being tested. Showing both makes "/music" warnings useful
-        # even when MUSIC_ROOT is customised away from the bundled default,
-        # and is_dir() catches a /dev/null-shaped mistake the W_OK alone misses.
-        for label, path in (("STAGING_DIR", cfg.STAGING_DIR),
-                            ("MUSIC_ROOT", cfg.MUSIC_ROOT)):
-            p = Path(path)
-            unreachable = not p.exists()
-            not_a_dir = p.exists() and not p.is_dir()
-            unwritable = p.exists() and p.is_dir() and not os.access(str(p), os.W_OK)
-            if unreachable or not_a_dir or unwritable:
-                _UNWRITABLE_VOLUMES.append(
-                    f"{label}={path!s}"
-                    + (" (missing)" if unreachable
-                       else " (not a directory)" if not_a_dir
-                       else " (read-only)"))
-        if _UNWRITABLE_VOLUMES:
-            _log.error("STARTUP: critical volumes not usable: %s. Write "
-                       "endpoints will return 503 until container restarts "
-                       "with mounts fixed.", _UNWRITABLE_VOLUMES)
-    # Housekeeping the CLI also runs on each invocation — must be done
-    # here too, otherwise a web-only deployment never sweeps stale upgrade
-    # backups or orphan lyric-state entries.
-    try:
-        from qobuz_librarian.library.backup import cleanup_old_upgrade_backups
-        n = cleanup_old_upgrade_backups()
-        if n:
-            _log.info("Cleaned up %d stale upgrade backup(s) at startup.", n)
-    except Exception as e:
-        _log.debug("upgrade-backup cleanup error at startup: %s", e)
-    try:
-        from qobuz_librarian.integrations.lyrics import _prune_lyric_state_orphans
-        _prune_lyric_state_orphans()
-    except Exception as e:
-        _log.debug("lyric-state prune error at startup: %s", e)
-    # Heavy, throttled maintenance: prune_missing() stats every cached file
-    # (100k+ on a NAS library), so run it in the background instead of blocking
-    # the app from serving its first request.
-    async def _bg_prune_flac_cache():
-        try:
-            from qobuz_librarian.library import flac_cache
-            n_pruned = await asyncio.get_running_loop().run_in_executor(
-                None, flac_cache.prune_missing)
-            if n_pruned:
-                _log.info("Pruned %d stale tag-cache entries.", n_pruned)
-        except Exception as e:
-            _log.debug("flac-cache prune error: %s", e)
-        try:
-            from qobuz_librarian.library import repair_cache
-            repair_cache.prune_expired()
-        except Exception as e:
-            _log.debug("repair-cache prune error: %s", e)
-    asyncio.create_task(_bg_prune_flac_cache())
-    job_mgr.start_worker()
-    if not shutil.which("rip"):
-        _log.warning("`rip` (streamrip) not found in PATH — downloads will fail")
-    if not shutil.which("beet"):
-        _log.warning("`beet` (beets) not found in PATH — imports will fail")
-    if not shutil.which("flac"):
-        _log.warning("`flac` not found — FLAC integrity checks fall back to a size heuristic")
-    if not shutil.which("ffmpeg"):
-        _log.warning("`ffmpeg` not found — hi-res downsampling disabled")
-    # Reload jobs from the prior session so an AWAITING_REVIEW scan's
-    # candidates survive a container restart and queued/running downloads
-    # don't silently vanish (they're rebadged FAILED with a retry hint).
-    # Runs AFTER start_worker() above — benign because the work queues are empty
-    # until restore re-queues into them, and the registry is lock-guarded, so the
-    # worker only idle-ticks until restore hands it something.
-    try:
-        job_mgr.restore_jobs(_RESUME_EXECUTE)
-    except Exception as e:
-        _log.warning("couldn't restore prior jobs: %s — starting fresh.", e)
-    # Probe the saved token against Qobuz so a stale slot — non-empty but
-    # not actually authenticated — surfaces in the dashboard banner rather
-    # than failing the user's first search.
-    asyncio.create_task(_probe_token())
-    # Keep the dashboard banner honest after startup: any in-session 401 from
-    # the API client flips _TOKEN_VALID to False here, so a token that expires
-    # mid-session shows "saved token isn't authenticating" immediately instead
-    # of leaving stale green until the user happens to retry the failed action.
-    from qobuz_librarian.api.auth import register_auth_state_listener
-    register_auth_state_listener(_on_auth_state)
-
-    # The dashboard kicks off _maybe_auto_check_new_releases on load, but a
-    # headless box nobody opens would never check at all — making
-    # NEW_RELEASE_CHECK_INTERVAL a dead letter exactly where it matters most.
-    # Tick the same helper in the background so the documented interval holds
-    # without a visitor; every skip condition (interval off, no token, no
-    # baseline, CLI mode, active work, not yet due) lives in the helper itself,
-    # so this loop stays a dumb clock.
-    async def _auto_check_ticker():
-        loop = asyncio.get_running_loop()
-        while True:
-            await asyncio.sleep(900)
+        _UNWRITABLE_VOLUMES.clear()
+        # Opt-in via env so tests / dev runs that don't have /staging /music
+        # mounted don't trip on the gate. The bundled compose sets this to 1.
+        if os.environ.get("QL_CHECK_VOLUMES") == "1":
+            # The label (the container-internal mount name) is what the operator
+            # checks in their compose.yaml; the resolved cfg path is what's
+            # actually being tested. Showing both makes "/music" warnings useful
+            # even when MUSIC_ROOT is customised away from the bundled default,
+            # and is_dir() catches a /dev/null-shaped mistake the W_OK alone misses.
+            for label, path in (("STAGING_DIR", cfg.STAGING_DIR),
+                                ("MUSIC_ROOT", cfg.MUSIC_ROOT)):
+                p = Path(path)
+                unreachable = not p.exists()
+                not_a_dir = p.exists() and not p.is_dir()
+                unwritable = p.exists() and p.is_dir() and not os.access(str(p), os.W_OK)
+                if unreachable or not_a_dir or unwritable:
+                    _UNWRITABLE_VOLUMES.append(
+                        f"{label}={path!s}"
+                        + (" (missing)" if unreachable
+                           else " (not a directory)" if not_a_dir
+                           else " (read-only)"))
+            if _UNWRITABLE_VOLUMES:
+                _log.error("STARTUP: critical volumes not usable: %s. Write "
+                           "endpoints will return 503 until container restarts "
+                           "with mounts fixed.", _UNWRITABLE_VOLUMES)
+        # Heavy, throttled maintenance: prune_missing() stats every cached file
+        # (100k+ on a NAS library), so run it in the background instead of blocking
+        # the app from serving its first request.
+        async def _bg_prune_flac_cache():
             try:
-                await loop.run_in_executor(None, _maybe_auto_check_new_releases)
+                from qobuz_librarian.library import flac_cache
+                n_pruned = await asyncio.get_running_loop().run_in_executor(
+                    None, flac_cache.prune_missing)
+                if n_pruned:
+                    _log.info("Pruned %d stale tag-cache entries.", n_pruned)
             except Exception as e:
-                _log.warning("background new-release tick failed: %s", e)
+                _log.debug("flac-cache prune error: %s", e)
+            try:
+                from qobuz_librarian.library import repair_cache
+                repair_cache.prune_expired()
+            except Exception as e:
+                _log.debug("repair-cache prune error: %s", e)
+        maintenance_task = None
+        run_startup_maintenance = _has_startup_write_authority()
+        if run_startup_maintenance:
+            # The CLI runs these too. A browsing-only Web process must leave them
+            # alone because the CLI or another Web process can own the library.
+            try:
+                from qobuz_librarian.library.backup import cleanup_old_upgrade_backups
+                n = cleanup_old_upgrade_backups()
+                if n:
+                    _log.info(
+                        "Cleaned up %s at startup.",
+                        plural(n, "stale upgrade backup"),
+                    )
+            except Exception as e:
+                _log.debug("upgrade-backup cleanup error at startup: %s", e)
+            try:
+                from qobuz_librarian.integrations.lyrics import _prune_lyric_state_orphans
+                _prune_lyric_state_orphans()
+            except Exception as e:
+                _log.debug("lyric-state prune error at startup: %s", e)
+        job_mgr.configure_staging_entry_guard(_staging_entry_allowed)
+        job_mgr.start_worker()
+        if run_startup_maintenance:
+            maintenance_token = job_mgr.begin_library_operation(
+                "Startup maintenance")
+            if maintenance_token is None:
+                raise RuntimeError("Web workers stopped during startup")
 
-    # Always armed: the helper reads NEW_RELEASE_CHECK_INTERVAL live, so a
-    # Settings change (off to on, or a new interval) takes effect at the next
-    # tick without a restart.
-    ticker = asyncio.create_task(_auto_check_ticker())
-    if cfg.NEW_RELEASE_CHECK_INTERVAL > 0:
-        _log.info("New-release checks run in the background every "
-                  "%d hour(s); set NEW_RELEASE_CHECK_INTERVAL=0 to turn them off.",
-                  max(1, round(cfg.NEW_RELEASE_CHECK_INTERVAL / 3600)))
-    yield
-    ticker.cancel()
-    # Release the flock explicitly — assigning None alone relies on GC
-    # closing the file, which may not happen if any caller still holds
-    # a reference.
-    if _RUN_LOCK_HANDLE is not None:
-        try:
-            _RUN_LOCK_HANDLE.close()
-        except OSError:
-            pass
-        _RUN_LOCK_HANDLE = None
+            async def _registered_cache_prune():
+                try:
+                    await _bg_prune_flac_cache()
+                finally:
+                    job_mgr.end_library_operation(maintenance_token)
+
+            maintenance_task = asyncio.create_task(_registered_cache_prune())
+        if not shutil.which("rip"):
+            _log.warning("`rip` (streamrip) not found in PATH — downloads will fail")
+        _beets_python, beets_failure = _beets_runtime_diagnostic()
+        if _beets_python is None:
+            _log.warning("%s — imports will fail", beets_failure)
+        if not shutil.which("flac"):
+            _log.warning("`flac` not found — FLAC integrity checks fall back to a size heuristic")
+        if not shutil.which("ffmpeg"):
+            _log.warning("`ffmpeg` not found — hi-res downsampling disabled")
+        # A second Web process must not rebadge the first process's live jobs as
+        # failed merely because it cannot take the run lock.  Restore only
+        # after this process owns exact write authority; a later lock retry
+        # performs the same one-time restore before writes become available.
+        if _run_lock_intact():
+            _restore_jobs_once()
+        # Probe the saved token against Qobuz so a stale slot — non-empty but
+        # not actually authenticated — surfaces in the dashboard banner rather
+        # than failing the user's first search.
+        asyncio.create_task(_probe_token())
+        # Keep the dashboard banner honest after startup: any in-session 401 from
+        # the API client flips _TOKEN_VALID to False here, so a token that expires
+        # mid-session shows "saved token isn't authenticating" immediately instead
+        # of leaving stale green until the user happens to retry the failed action.
+        from qobuz_librarian.api.auth import register_auth_state_listener
+        register_auth_state_listener(_on_auth_state)
+
+        # The dashboard kicks off _maybe_auto_check_new_releases on load, but a
+        # headless box nobody opens would never check at all — making
+        # NEW_RELEASE_CHECK_INTERVAL a dead letter exactly where it matters most.
+        # Tick the same helper in the background so the documented interval holds
+        # without a visitor; every skip condition (interval off, no token, no
+        # baseline, CLI mode, active work, not yet due) lives in the helper itself,
+        # so this loop stays a dumb clock.
+        async def _auto_check_ticker():
+            loop = asyncio.get_running_loop()
+            while True:
+                await asyncio.sleep(900)
+                try:
+                    await loop.run_in_executor(None, _maybe_auto_check_new_releases)
+                except Exception as e:
+                    _log.warning("background new-release tick failed: %s", e)
+
+        # Always armed: the helper reads NEW_RELEASE_CHECK_INTERVAL live, so a
+        # Settings change (off to on, or a new interval) takes effect at the next
+        # tick without a restart.
+        ticker = asyncio.create_task(_auto_check_ticker())
+        if cfg.NEW_RELEASE_CHECK_INTERVAL > 0:
+            hours = max(1, round(cfg.NEW_RELEASE_CHECK_INTERVAL / 3600))
+            _log.info("New-release checks run in the background every "
+                      "%s; set NEW_RELEASE_CHECK_INTERVAL=0 to turn them off.",
+                      plural(hours, "hour"))
+        yield
+    finally:
+        await _finish_web_lifespan(
+            ticker, lock_retry_task, maintenance_task)
 
 
 def _classify_token(token):
@@ -1085,6 +1800,7 @@ async def login_submit(request: Request, username: str = Form(""),
 @app.post("/logout")
 async def logout(request: Request):
     resp = RedirectResponse(url="/login", status_code=303)
+    resp.headers["Cache-Control"] = "no-store"
     # Revoke the session server-side, not just the browser cookie — otherwise a
     # captured cookie value stays valid for its full 30-day lifetime.
     web_auth.revoke_session(request.cookies.get(web_auth.SESSION_COOKIE))
@@ -1166,7 +1882,6 @@ def _tr(request, name, context, *, status_code=200):
         )
     context.setdefault("cli_mode", _CLI_MODE)
     context.setdefault("lock_unenforceable", _LOCK_UNENFORCEABLE)
-    context.setdefault("lock_override", _LOCK_OVERRIDE)
     # Error/utility renders (e.g. the 404 page) don't name a nav section; an
     # explicit empty page just leaves every nav link inactive instead of
     # relying on Jinja's undefined-is-falsey behaviour.
@@ -1193,6 +1908,11 @@ def _tr(request, name, context, *, status_code=200):
     # warning dot on the Queue nav until each flagged job page is opened.
     from qobuz_librarian.web import job_persistence
     context.setdefault("history_attention", job_persistence.attention_count())
+    if name in {"job.html", "_job_body.html", "history.html"}:
+        context.setdefault(
+            "durable_recovery_control",
+            _durable_recovery_control(),
+        )
     return templates.TemplateResponse(request=request, name=name,
                                       context=context, status_code=status_code)
 
@@ -1422,6 +2142,8 @@ def _begin_direct_library_operation(label):
         if _web_writes_paused():
             return "paused", None, None
         token = job_mgr.begin_library_operation(label)
+        if token is None:
+            return "paused", None, None
         lock = job_mgr.staging_lock()
         if not lock.acquire(blocking=False):
             job_mgr.end_library_operation(token)
@@ -1447,7 +2169,7 @@ def _start_new_release_check():
         # run in an executor for POST /library). Re-check the whole pause
         # predicate under the lock so a scan can't start right after
         # set_mode('cli') released the lock — or while the lock is
-        # unenforceable and the user hasn't opted in.
+        # unenforceable.
         if _web_writes_paused():
             return None
         existing = _existing_new_release_check()
@@ -1456,12 +2178,11 @@ def _start_new_release_check():
         from qobuz_librarian.web import flows
         job = job_mgr.Job(title="New-release check")
         job.execute_kind = "new_releases"
-        job_mgr.submit_scan(
+        return job_mgr.submit_scan(
             job,
             lambda j: flows.scan_new_releases(j, _get_token()),
             lambda j, chosen: flows.execute_albums(j, chosen, _get_token()),
         )
-        return job
 
 
 def _new_release_review():
@@ -1602,7 +2323,7 @@ def _library_current_job():
     """The baseline scan that owns the /library surface right now (still
     pending / scanning / awaiting-review / running), or None when the surface
     is idle and shows the launcher. New-release checks never own it — their
-    results live on their own job page (operator ruling 2026-07-03), so the
+    results live on their own job page, so the
     Missing Albums / Gap Fill review can't be displaced by an overnight
     check. A parked review outranks running work: after a tab-scoped download
     splits the review, the user stays on the tab still waiting for them while
@@ -1659,11 +2380,34 @@ def _submit_scan_deduped(job, scan_fn, execute_fn, *kinds, statuses=("pending", 
         # pile up forever. Scoping to the same target is what stops one artist's
         # scan from throwing away a different artist's un-reviewed candidates.
         # A running download isn't touched (only pending/scanning gate above).
-        for old in job_mgr.registry.awaiting_review():
-            if getattr(old, "execute_kind", "") in kinds and _scan_target(old) == target:
-                job_mgr.cancel_review(old)
-        job_mgr.submit_scan(job, scan_fn, execute_fn)
-        return job
+        stale_reviews = [
+            old for old in job_mgr.registry.awaiting_review()
+            if (getattr(old, "execute_kind", "") in kinds
+                and _scan_target(old) == target)
+        ]
+        submitted = job_mgr.submit_scan(job, scan_fn, execute_fn)
+        if submitted is None:
+            return None
+        # Only discard the prior review after the replacement has a durable
+        # owner row. If jobs.db is unavailable, the user's old review remains
+        # intact and no scan enters memory or a worker lane.
+        for old in stale_reviews:
+            job_mgr.cancel_review(old)
+        return submitted
+
+
+def _scan_submission_failure_response(request, destination):
+    """Explain a refused durable admission unless the CLI owns the lock."""
+    busy = _lock_busy_response(request)
+    if busy is not None:
+        return busy
+    separator = "&" if "?" in destination else "?"
+    return RedirectResponse(
+        url=destination + separator + "error=" + urllib.parse.quote(
+            job_mgr.JOB_ADMISSION_ERROR
+        ),
+        status_code=303,
+    )
 
 
 def _active_library_scan():
@@ -1729,12 +2473,11 @@ def _start_library_scan(partial_only=False, force_full=False):
                                force_full=force_full)
             _fold_into_parked_library_review(j)
 
-        job_mgr.submit_scan(
+        return job_mgr.submit_scan(
             job,
             _scan,
             lambda j, chosen: flows.execute_albums(j, chosen, _get_token()),
         )
-        return job
 
 
 def _fold_into_parked_library_review(job):
@@ -1931,7 +2674,8 @@ async def lyric_retry(request: Request):
     from qobuz_librarian.web import flows
     job = job_mgr.Job(title="Lyric retry")
     job.execute_kind = "lyrics"
-    job_mgr.submit(job, lambda j: flows.run_lyric_retry(j))
+    if job_mgr.submit(job, lambda j: flows.run_lyric_retry(j)) is None:
+        return _job_admission_response(request)
     return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
 
 
@@ -2384,14 +3128,28 @@ def _summarize_download_result(r):
     return ", ".join(parts) + "."
 
 
-def _make_download_run(album, token, *, treat_as_new=False):
+def _make_download_run(
+    album,
+    token,
+    *,
+    treat_as_new=False,
+    durable_planned=None,
+):
     """Return the run(j) callable used by both queue_download and job_retry.
 
     treat_as_new downloads the album as a brand-new one even if a different
     edition is already owned — the "get this edition too" path.
     """
     def run(j):
+        from qobuz_librarian.library.catalog import (
+            compute_missing,
+            find_existing_tracks,
+            is_lossless_album,
+        )
         from qobuz_librarian.modes.process import process_album
+        from qobuz_librarian.queue.builder import _build_queue_item
+        from qobuz_librarian.queue.durable_album import plan_durable_new_album
+        from qobuz_librarian.queue.executor import _execute_download_queue
         from qobuz_librarian.ui_cli.errors import plural
         from qobuz_librarian.web.flows import (
             _note_staging_wait,
@@ -2400,14 +3158,145 @@ def _make_download_run(album, token, *, treat_as_new=False):
         )
         args = build_args()
         _note_staging_wait(j, "Downloading", 0, 1)
+        durable_failure = False
         with job_mgr.staging_lock():
-            r = process_album(album, args, allow_force=False,
-                              already_confirmed=True, token=token,
-                              treat_as_new=treat_as_new) or {}
+            durable_item = None
+            if durable_planned is not None:
+                from qobuz_librarian.queue import journal as queue_state
+
+                if treat_as_new:
+                    raise ValueError(
+                        "a saved durable retry cannot change edition intent"
+                    )
+                durable_item = queue_state._deserialize_queue_item(
+                    durable_planned
+                )
+                if durable_item["album"] != album:
+                    raise ValueError(
+                        "the saved durable retry album changed before execution"
+                    )
+            elif not treat_as_new and is_lossless_album(album):
+                qobuz_tracks = (album.get("tracks") or {}).get("items") or []
+                existing, album_dir = find_existing_tracks(album)
+                missing, present = compute_missing(qobuz_tracks, existing)
+                candidate = _build_queue_item(
+                    album=album,
+                    album_dir=album_dir,
+                    label=(
+                        f"{(album.get('artist') or {}).get('name') or '?'}"
+                        f" — {album.get('title') or '?'}"
+                    ),
+                    missing=missing,
+                    present=present,
+                    upgrade_only=False,
+                    auto_upgrade=False,
+                )
+                if plan_durable_new_album(candidate, args) is not None:
+                    durable_item = candidate
+            if durable_item is None:
+                r = process_album(album, args, allow_force=False,
+                                  already_confirmed=True, token=token,
+                                  treat_as_new=treat_as_new) or {}
+            else:
+                try:
+                    results, drained = _execute_download_queue(
+                        [durable_item],
+                        args,
+                        token,
+                        consolidate_duplicates=False,
+                    )
+                except BaseException:
+                    # The durable executor can change the saved queue before
+                    # raising. Refresh while the staging/run locks are still
+                    # held, but never replace the original failure with a
+                    # secondary inspection failure.
+                    try:
+                        if _run_lock_intact():
+                            _record_startup_recovery(_RUN_LOCK_HANDLE)
+                    except BaseException as refresh_exc:
+                        logging.getLogger("qobuz_librarian").warning(
+                            "couldn't refresh durable Web recovery after an "
+                            "executor failure: %s",
+                            refresh_exc,
+                        )
+                    raise
+
+                refresh_failed = False
+                recovery = None
+                try:
+                    if _run_lock_intact():
+                        recovery = _record_startup_recovery(
+                            _RUN_LOCK_HANDLE)
+                    else:
+                        refresh_failed = True
+                except Exception as exc:
+                    refresh_failed = True
+                    logging.getLogger("qobuz_librarian").warning(
+                        "couldn't refresh durable Web recovery after the "
+                        "executor returned: %s",
+                        exc,
+                    )
+                recovery_status = getattr(
+                    getattr(recovery, "status", None), "value", None)
+                result = (
+                    results[0]
+                    if type(results) is list
+                    and len(results) == 1
+                    and type(results[0]) is dict
+                    else None
+                )
+                accepted = (
+                    drained is True
+                    and result is not None
+                    and result.get("imported") is True
+                    and recovery_status == "clear"
+                    and not refresh_failed
+                )
+                if accepted:
+                    r = result
+                else:
+                    r = result or {}
+                    durable_failure = True
+                    completion_acknowledged = _durable_completion_status(j)
+                    if (
+                        completion_acknowledged is True
+                        and recovery_status == "clear"
+                        and _run_lock_intact()
+                        and _reconcile_acknowledged_job(j)
+                    ):
+                        # Completion crossed its durable Web acknowledgement
+                        # boundary even though the executor's return was not a
+                        # normal drained result. The exact job is now terminal;
+                        # never offer a duplicate download.
+                        return
+                    retryable = (
+                        completion_acknowledged is False
+                        and result is not None
+                        and result.get("result") == "retry"
+                        and recovery_status == "resume_required"
+                        and _durable_recovery_matches_job(j)
+                    )
+                    j.status = job_mgr.JobStatus.FAILED
+                    if retryable:
+                        j.attention = ""
+                        j.error = (
+                            "The download stopped before import completed. "
+                            "Its exact recovery state was saved; use Retry to "
+                            "continue it safely."
+                        )
+                    else:
+                        j.attention = "recovery"
+                        j.error = (
+                            "The download did not reach a safely settled "
+                            "completion. Its recovery state was retained; "
+                            "restart Qobuz Librarian after checking the log."
+                        )
         benign = {"already_complete", "skipped_already_higher_quality",
                   "skipped_has_extras", "dry_run", "user_skipped",
                   "lossy_only", "no_tracks", "cancelled"}
-        if r.get("result") not in benign and not r.get("imported"):
+        if durable_failure:
+            pass
+        elif r.get("result") not in benign and not r.get("imported"):
             j.status = job_mgr.JobStatus.FAILED
             if r.get("n_fail"):
                 j.error = f"{plural(r['n_fail'], 'track')} failed. See job log."
@@ -2474,6 +3363,42 @@ def _owned_file_identity(st) -> dict[str, int]:
     }
 
 
+def _owned_directory_cleanup_entry(st, *, created) -> dict[str, int | bool]:
+    return {
+        **_owned_file_identity(st),
+        "created": created is True,
+    }
+
+
+_OWNERSHIP_IDENTITY_FIELDS = (
+    "device",
+    "inode",
+    "size",
+    "modified_ns",
+    "changed_ns",
+)
+
+
+def _ownership_device_inode_matches(st, expected):
+    return (
+        isinstance(expected, dict)
+        and type(expected.get("device")) is int
+        and type(expected.get("inode")) is int
+        and [expected["device"], expected["inode"]] == _file_identity(st)
+    )
+
+
+def _ownership_identity_matches(st, expected):
+    actual = _owned_file_identity(st)
+    return (
+        isinstance(expected, dict)
+        and all(type(expected.get(field)) is int
+                for field in _OWNERSHIP_IDENTITY_FIELDS)
+        and all(actual[field] == expected[field]
+                for field in _OWNERSHIP_IDENTITY_FIELDS)
+    )
+
+
 def _open_directory_nofollow(path, *, dir_fd=None):
     """Open one real directory without following a symlink."""
     nofollow = getattr(os, "O_NOFOLLOW", None)
@@ -2496,27 +3421,104 @@ def _owned_relative(root: Path, path: Path):
     return root, rel
 
 
-def _bind_owned_path(root, path):
-    """Capture an exact file and every directory identity leading to it."""
+def _bind_owned_path(
+    root,
+    path,
+    *,
+    expected_file=None,
+    expected_root=None,
+    created_directories=None,
+):
+    """Bind one proven file and the positive directory-creation evidence."""
     root, rel = _owned_relative(Path(root), Path(path))
     if rel is None:
         return None
+    created_records = {}
+    for record in created_directories or ():
+        relative_value = (
+            record.get("relative") if isinstance(record, dict) else None)
+        if (
+            not isinstance(record, dict)
+            or not all(
+                type(record.get(field)) is int
+                for field in _OWNERSHIP_IDENTITY_FIELDS
+            )
+            or not isinstance(relative_value, str)
+            or "\x00" in relative_value
+            or os.path.isabs(relative_value)
+            or any(
+                part in ("", ".", "..")
+                for part in relative_value.split(os.sep)
+            )
+        ):
+            return None
+        _, created_relative = _owned_relative(
+            root, root / relative_value)
+        if created_relative is None:
+            return None
+        key = created_relative.as_posix()
+        if key in created_records:
+            return None
+        created_records[key] = record
     opened = []
+    seen_created_records = set()
     try:
         current = _open_directory_nofollow(root)
         opened.append(current)
-        directories = [_file_identity(os.fstat(current))]
-        for part in rel.parts[:-1]:
+        current_stat = os.fstat(current)
+        if expected_root is not None and not _ownership_device_inode_matches(
+            current_stat, expected_root
+        ):
+            return None
+        directories = [_file_identity(current_stat)]
+        cleanup_directories = [
+            _owned_directory_cleanup_entry(current_stat, created=False)
+        ]
+        for index, part in enumerate(rel.parts[:-1], start=1):
             current = _open_directory_nofollow(part, dir_fd=current)
             opened.append(current)
-            directories.append(_file_identity(os.fstat(current)))
+            current_stat = os.fstat(current)
+            directories.append(_file_identity(current_stat))
+            relative_key = Path(*rel.parts[:index]).as_posix()
+            created_record = created_records.get(relative_key)
+            created_identity = (
+                {
+                    field: created_record[field]
+                    for field in _OWNERSHIP_IDENTITY_FIELDS
+                }
+                if created_record is not None
+                else None
+            )
+            if (
+                created_record is not None
+                and not _ownership_identity_matches(
+                    current_stat, created_identity)
+            ):
+                return None
+            if created_record is not None:
+                seen_created_records.add(relative_key)
+            cleanup_directories.append(_owned_directory_cleanup_entry(
+                current_stat,
+                created=created_record is not None,
+            ))
         leaf = os.stat(rel.parts[-1], dir_fd=current, follow_symlinks=False)
         if not stat.S_ISREG(leaf.st_mode):
+            return None
+        if expected_file is not None and not _ownership_identity_matches(
+            leaf, expected_file
+        ):
+            return None
+        if seen_created_records != set(created_records):
             return None
         return {
             "relative": rel.as_posix(),
             "directories": directories,
             "file": _owned_file_identity(leaf),
+            "directory_cleanup": {
+                "version": 1,
+                "parent_count": 0,
+                "directories": cleanup_directories,
+            },
         }
     except (OSError, TypeError, ValueError):
         return None
@@ -2531,85 +3533,1628 @@ def _bind_owned_path(root, path):
 _OWNED_PATH_MISSING = object()
 
 
-def _unlink_owned_path(root, owned):
-    """Unlink a bound file only while its complete no-follow chain matches.
+def _directory_cleanup_records(owned, expected_count):
+    cleanup = owned.get("directory_cleanup")
+    if (not isinstance(cleanup, dict)
+            or type(cleanup.get("version")) is not int
+            or cleanup.get("version") != 1):
+        return None
+    parent_count = cleanup.get("parent_count")
+    if type(parent_count) is not int or parent_count < 0:
+        return None
+    records = cleanup.get("directories")
+    if (not isinstance(records, list)
+            or len(records) != parent_count + expected_count):
+        return None
+    for record in records:
+        if not isinstance(record, dict) or type(record.get("created")) is not bool:
+            return None
+        for key in ("device", "inode", "size", "modified_ns", "changed_ns"):
+            if type(record.get(key)) is not int:
+                return None
+    return parent_count, records
 
-    A missing path is distinct from a path whose ownership cannot be proved so
-    Undo can finish an already-completed deletion without weakening refusal of
-    replacements or changed files.
-    """
+
+def _directory_cleanup_entry_matches(st, record):
+    return all(
+        record[key] == value
+        for key, value in _owned_file_identity(st).items()
+    )
+
+
+def _close_owned_unlink_plan(plan):
+    if not isinstance(plan, dict):
+        return
+    for descriptor in reversed(plan.get("opened", ())):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _ownership_rename_noreplace(
+        first_parent_fd, first, second_parent_fd, second):
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError:
+        raise OSError(
+            errno.ENOTSUP, "atomic no-overwrite rename is unavailable") from None
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+            first_parent_fd,
+            os.fsencode(first),
+            second_parent_fd,
+            os.fsencode(second),
+            1,
+    ):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+_INVALID_OWNED_DELETION = object()
+_OWNED_QUARANTINE_NAME = re.compile(
+    r"^\.ql-undo-(?:file|dir)-[0-9a-f]{32}$")
+def _owned_deletion_record(value, kind):
+    deletion = value.get("deletion") if isinstance(value, dict) else None
+    if deletion is None:
+        # Missing paths require a durable record created before deletion.
+        if isinstance(value, dict) and "leaf_removed" in value:
+            return _INVALID_OWNED_DELETION
+        return None
+    if (
+        not isinstance(deletion, dict)
+        or type(deletion.get("version")) is not int
+        or deletion.get("version") != 1
+        or deletion.get("state") not in ("intent", "held", "removed")
+        or not isinstance(deletion.get("quarantine"), str)
+        or not _OWNED_QUARANTINE_NAME.fullmatch(deletion["quarantine"])
+        or not deletion["quarantine"].startswith(f".ql-undo-{kind}-")
+    ):
+        return _INVALID_OWNED_DELETION
+    return deletion
+
+
+def _record_owned_progress(progress):
+    if progress is None:
+        return True
+    try:
+        return progress() is not False
+    except Exception:
+        return False
+
+
+def _begin_owned_deletion(value, kind, progress):
+    deletion = _owned_deletion_record(value, kind)
+    if deletion is _INVALID_OWNED_DELETION:
+        return None
+    if deletion is None:
+        deletion = {
+            "version": 1,
+            "state": "intent",
+            "quarantine": f".ql-undo-{kind}-{secrets.token_hex(16)}",
+        }
+        value["deletion"] = deletion
+    # Confirm the complete current record before every retry. A failed prior
+    # persist must not leave a later call free to mutate from memory alone.
+    if not _record_owned_progress(progress):
+        return None
+    return deletion
+
+
+def _ownership_stable_matches(st, expected, *, directory=False):
+    wanted_mode = stat.S_ISDIR if directory else stat.S_ISREG
+    return (
+        wanted_mode(st.st_mode)
+        and isinstance(expected, dict)
+        and all(
+            type(expected.get(field)) is int
+            for field in ("device", "inode", "size", "modified_ns")
+        )
+        and all(
+            _owned_file_identity(st)[field] == expected[field]
+            for field in ("device", "inode", "size", "modified_ns")
+        )
+    )
+
+
+def _fsync_owned_directories(*descriptors):
+    synced = set()
+    for descriptor in descriptors:
+        if descriptor is None:
+            continue
+        current = os.fstat(descriptor)
+        if not stat.S_ISDIR(current.st_mode):
+            raise OSError(errno.ENOTDIR, "Undo anchor is not a directory")
+        identity = (int(current.st_dev), int(current.st_ino))
+        if identity in synced:
+            continue
+        os.fsync(descriptor)
+        synced.add(identity)
+
+
+def _owned_unlink_plan(root, owned):
+    """Open one leaf chain and accept only a proven resumable state."""
     if not isinstance(owned, dict):
         return None
     relative = owned.get("relative")
     directories = owned.get("directories")
     file_identity = owned.get("file")
-    if not isinstance(relative, str) or not isinstance(directories, list):
+    deletion = _owned_deletion_record(owned, "file")
+    if (
+        not isinstance(relative, str)
+        or not isinstance(directories, list)
+        or not _valid_ownership_identity(file_identity)
+        or deletion is _INVALID_OWNED_DELETION
+        or (isinstance(deletion, dict)
+            and deletion.get("state") == "removed")
+    ):
         return None
     root, rel = _owned_relative(Path(root), Path(root) / relative)
     if rel is None or len(directories) != len(rel.parts):
         return None
-    if not isinstance(file_identity, dict):
+    if not all(
+        isinstance(expected, list)
+        and len(expected) == 2
+        and all(type(value) is int for value in expected)
+        for expected in directories
+    ):
         return None
+
+    cleanup = _directory_cleanup_records(owned, len(directories))
+    if cleanup is not None:
+        parent_count, cleanup_records = cleanup
+        try:
+            cleanup_anchor = root.parents[parent_count]
+        except IndexError:
+            cleanup = None
+        else:
+            music_root = Path(os.path.abspath(os.fspath(cfg.MUSIC_ROOT)))
+            if parent_count > 0 and cleanup_anchor != music_root:
+                cleanup = None
+    if cleanup is None:
+        parent_count = 0
+        cleanup_records = None
 
     opened = []
     try:
-        current = _open_directory_nofollow(root)
-        opened.append(current)
-        if _file_identity(os.fstat(current)) != directories[0]:
-            return None
-        for index, part in enumerate(rel.parts[:-1], 1):
-            current = _open_directory_nofollow(part, dir_fd=current)
+        if root == root.parent:
+            current = _open_directory_nofollow(root)
             opened.append(current)
-            if _file_identity(os.fstat(current)) != directories[index]:
-                return None
-        leaf = os.stat(rel.parts[-1], dir_fd=current, follow_symlinks=False)
-        if (not stat.S_ISREG(leaf.st_mode)
-                or _owned_file_identity(leaf) != file_identity):
-            return None
-        os.unlink(rel.parts[-1], dir_fd=current)
-        return root / rel
-    except FileNotFoundError:
-        return _OWNED_PATH_MISSING
+            directory_fds = [current]
+            parent_fds = [None]
+            directory_names = [root.name]
+            cleanup_records = None
+        else:
+            anchor = root.parents[parent_count]
+            current = _open_directory_nofollow(anchor)
+            opened.append(current)
+            directory_fds = []
+            parent_fds = []
+            directory_names = []
+            chain_names = [*root.relative_to(anchor).parts, *rel.parts[:-1]]
+            for part in chain_names:
+                parent = current
+                current = _open_directory_nofollow(part, dir_fd=current)
+                opened.append(current)
+                parent_fds.append(parent)
+                directory_fds.append(current)
+                directory_names.append(part)
+
+        owned_directory_fds = directory_fds[parent_count:]
+        if len(owned_directory_fds) != len(directories):
+            raise ValueError("owned directory chain length changed")
+        for fd, expected in zip(owned_directory_fds, directories, strict=True):
+            if _file_identity(os.fstat(fd)) != expected:
+                raise ValueError("owned directory identity changed")
+        cleanup_matches = (
+            [
+                _directory_cleanup_entry_matches(os.fstat(fd), record)
+                for fd, record in zip(directory_fds, cleanup_records, strict=True)
+            ]
+            if parent_fds[0] is not None and cleanup_records is not None
+            else None
+        )
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            raise OSError("safe no-follow file access is unavailable")
+        leaf_fd = None
+        try:
+            leaf_fd = os.open(
+                rel.parts[-1],
+                os.O_RDONLY
+                | nofollow
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=current,
+            )
+        except FileNotFoundError:
+            if deletion is None:
+                raise ValueError("owned leaf disappeared without deletion intent")
+        if leaf_fd is not None:
+            opened.append(leaf_fd)
+            leaf = os.fstat(leaf_fd)
+            named_leaf = os.stat(
+                rel.parts[-1], dir_fd=current, follow_symlinks=False)
+            if _owned_file_identity(leaf) != _owned_file_identity(named_leaf):
+                raise ValueError("owned leaf name changed")
+            if _owned_file_identity(leaf) != file_identity:
+                raise ValueError("owned leaf identity changed")
+        return {
+            "root": root,
+            "relative": rel,
+            "path": root / rel,
+            "opened": opened,
+            "leaf_parent": current,
+            "leaf_name": rel.parts[-1],
+            "leaf_fd": leaf_fd,
+            "owned": owned,
+            "file": file_identity,
+            "deletion": deletion,
+            "directory_fds": directory_fds,
+            "parent_fds": parent_fds,
+            "directory_names": directory_names,
+            "cleanup_records": cleanup_records,
+            "cleanup_matches": cleanup_matches,
+        }
     except (OSError, TypeError, ValueError):
-        return None
-    finally:
-        for fd in reversed(opened):
+        for descriptor in reversed(opened):
             try:
-                os.close(fd)
+                os.close(descriptor)
+            except OSError:
+                pass
+        return None
+
+
+def _refresh_owned_cleanup_records(plan):
+    """Refresh exact directory proofs changed by this Undo operation."""
+    records = plan.get("cleanup_records") if isinstance(plan, dict) else None
+    matches = plan.get("cleanup_matches") if isinstance(plan, dict) else None
+    if records is None or matches is None:
+        return
+    for directory_fd, record, matched in zip(
+            plan["directory_fds"], records, matches, strict=True):
+        # Never turn a directory that was already changed before this Undo
+        # attempt into one of our own mutations.  Only records proved exact at
+        # plan creation may advance as our private rename/unlink work changes
+        # their timestamps.
+        if not matched:
+            continue
+        try:
+            current = os.fstat(directory_fd)
+        except OSError:
+            continue
+        if _file_identity(current) != [record["device"], record["inode"]]:
+            continue
+        record.update(_owned_file_identity(current))
+
+
+def _open_owned_leaf_quarantine(plan):
+    deletion = plan.get("deletion")
+    if not isinstance(deletion, dict):
+        return {
+            "missing": True,
+            "fd": None,
+            "held_fd": None,
+            "held_full_match": False,
+            "held_stable_match": False,
+        }
+    name = deletion["quarantine"]
+    try:
+        quarantine_fd = _open_directory_nofollow(
+            name, dir_fd=plan["leaf_parent"])
+    except FileNotFoundError:
+        return {
+            "missing": True,
+            "fd": None,
+            "held_fd": None,
+            "held_full_match": False,
+            "held_stable_match": False,
+        }
+    except OSError:
+        return None
+    held_fd = None
+    try:
+        current = os.fstat(quarantine_fd)
+        named = os.stat(
+            name, dir_fd=plan["leaf_parent"], follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or _owned_file_identity(current) != _owned_file_identity(named)
+        ):
+            raise ValueError("quarantine directory changed")
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            raise OSError("safe no-follow file access is unavailable")
+        try:
+            held_fd = os.open(
+                "held",
+                os.O_RDONLY
+                | nofollow
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=quarantine_fd,
+            )
+        except FileNotFoundError:
+            held_fd = None
+        held_identity = None
+        held_full_match = False
+        held_stable_match = False
+        if held_fd is not None:
+            held = os.fstat(held_fd)
+            named_held = os.stat(
+                "held", dir_fd=quarantine_fd, follow_symlinks=False)
+            if _owned_file_identity(held) != _owned_file_identity(named_held):
+                raise ValueError("quarantined leaf changed")
+            held_identity = _owned_file_identity(held)
+            held_full_match = _ownership_identity_matches(
+                held, plan["file"])
+            held_stable_match = _ownership_stable_matches(
+                held, plan["file"])
+        return {
+            "missing": False,
+            "fd": quarantine_fd,
+            "held_fd": held_fd,
+            "held_identity": held_identity,
+            "held_full_match": held_full_match,
+            "held_stable_match": held_stable_match,
+        }
+    except (OSError, TypeError, ValueError):
+        if held_fd is not None:
+            try:
+                os.close(held_fd)
+            except OSError:
+                pass
+        try:
+            os.close(quarantine_fd)
+        except OSError:
+            pass
+        return None
+    except BaseException:
+        if held_fd is not None:
+            try:
+                os.close(held_fd)
+            except OSError:
+                pass
+        try:
+            os.close(quarantine_fd)
+        except OSError:
+            pass
+        raise
+
+
+def _close_owned_quarantine(snapshot):
+    if not isinstance(snapshot, dict):
+        return
+    for key in ("held_fd", "fd"):
+        descriptor = snapshot.get(key)
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
             except OSError:
                 pass
 
 
-def _single_owned_path(album_dir, track):
-    """Bind the unique imported track that matches this single request."""
-    if not album_dir:
-        return None
-    from qobuz_librarian.library.scanner import read_album_dir
-
-    root = Path(album_dir)
+def _owned_unlink_leaf_matches(plan):
+    deletion = plan.get("deletion")
+    snapshot = _open_owned_leaf_quarantine(plan)
+    if snapshot is None:
+        return False
     try:
-        tracks = read_album_dir(root)
+        public_exists = plan.get("leaf_fd") is not None
+        held_exists = snapshot.get("held_fd") is not None
+        if public_exists and held_exists:
+            return False
+        if deletion is None:
+            return public_exists and not held_exists
+        if held_exists:
+            if public_exists:
+                return False
+            if deletion.get("state") == "intent":
+                return snapshot.get("held_stable_match") is True
+            if deletion.get("state") == "held":
+                return snapshot.get("held_full_match") is True
+            return False
+        return True
+    finally:
+        _close_owned_quarantine(snapshot)
+
+
+def _remove_owned_leaf_quarantine(plan, snapshot):
+    if snapshot.get("missing"):
+        return True
+    if snapshot.get("held_fd") is not None:
+        return False
+    try:
+        held = os.fstat(snapshot["fd"])
+        named = os.stat(
+            plan["deletion"]["quarantine"],
+            dir_fd=plan["leaf_parent"],
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(named.st_mode)
+            or _owned_file_identity(held) != _owned_file_identity(named)
+        ):
+            return False
+        os.rmdir(
+            plan["deletion"]["quarantine"],
+            dir_fd=plan["leaf_parent"],
+        )
+        _fsync_owned_directories(plan["leaf_parent"])
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _restore_owned_leaf_from_intent(
+        plan, snapshot, progress, cleanup_plan):
+    """Restore a rename-interrupted leaf without authorising its deletion."""
+    if (
+        snapshot.get("held_fd") is None
+        or snapshot.get("held_stable_match") is not True
+        or plan["deletion"].get("state") != "intent"
+    ):
+        return {"status": "held", "mutated": False}
+    previous_file = dict(plan["file"])
+    moved = False
+    try:
+        _ownership_rename_noreplace(
+            snapshot["fd"],
+            "held",
+            plan["leaf_parent"],
+            plan["leaf_name"],
+        )
+        moved = True
+        restored = os.fstat(snapshot["held_fd"])
+        named = os.stat(
+            plan["leaf_name"],
+            dir_fd=plan["leaf_parent"],
+            follow_symlinks=False,
+        )
+        if (
+            _owned_file_identity(restored) != _owned_file_identity(named)
+            or not _ownership_stable_matches(restored, plan["file"])
+        ):
+            raise OSError("restored Undo leaf changed")
+        _fsync_owned_directories(snapshot["fd"], plan["leaf_parent"])
+        plan["owned"]["file"] = _owned_file_identity(restored)
+        plan["file"] = plan["owned"]["file"]
+        plan["deletion"]["state"] = "intent"
+        _refresh_owned_cleanup_records(cleanup_plan)
+        if _record_owned_progress(progress):
+            return {"status": "restored", "mutated": True}
+        try:
+            _ownership_rename_noreplace(
+                plan["leaf_parent"],
+                plan["leaf_name"],
+                snapshot["fd"],
+                "held",
+            )
+            held_again = os.fstat(snapshot["held_fd"])
+            named_again = os.stat(
+                "held", dir_fd=snapshot["fd"], follow_symlinks=False)
+            if (
+                _owned_file_identity(held_again)
+                != _owned_file_identity(named_again)
+                or not _ownership_stable_matches(
+                    held_again, previous_file)
+            ):
+                raise OSError("rolled-back Undo leaf changed")
+            _fsync_owned_directories(
+                snapshot["fd"], plan["leaf_parent"])
+            plan["owned"]["file"] = previous_file
+            plan["file"] = previous_file
+            plan["deletion"]["state"] = "intent"
+            _refresh_owned_cleanup_records(cleanup_plan)
+            return {"status": "held", "mutated": True}
+        except (OSError, TypeError, ValueError):
+            return {"status": "restored", "mutated": True}
+    except (OSError, TypeError, ValueError):
+        if moved:
+            try:
+                _ownership_rename_noreplace(
+                    plan["leaf_parent"],
+                    plan["leaf_name"],
+                    snapshot["fd"],
+                    "held",
+                )
+                _fsync_owned_directories(
+                    snapshot["fd"], plan["leaf_parent"])
+            except OSError:
+                pass
+        _refresh_owned_cleanup_records(cleanup_plan)
+        _record_owned_progress(progress)
+        return {"status": "held", "mutated": moved}
+
+
+def _quarantine_owned_leaf(plan, *, progress=None, cleanup_plan=None):
+    """Durably remove one proved leaf through its persisted private name."""
+    cleanup_plan = cleanup_plan or plan
+    snapshot = None
+    lease_fd = plan.get("leaf_fd")
+    if lease_fd is None and isinstance(plan.get("deletion"), dict):
+        snapshot = _open_owned_leaf_quarantine(plan)
+        if snapshot is None:
+            return {"status": "refused", "mutated": False}
+        lease_fd = snapshot.get("held_fd")
+    exclusion = (
+        acquire_inode_write_exclusion(lease_fd)
+        if lease_fd is not None
+        else None
+    )
+    if lease_fd is not None and exclusion is None:
+        _close_owned_quarantine(snapshot)
+        return {"status": "refused", "mutated": False}
+
+    try:
+        deletion = _begin_owned_deletion(plan["owned"], "file", progress)
+    except BaseException:
+        if exclusion is not None:
+            exclusion.close()
+        _close_owned_quarantine(snapshot)
+        raise
+    if deletion is None:
+        if exclusion is not None:
+            exclusion.close()
+        _close_owned_quarantine(snapshot)
+        return {"status": "refused", "mutated": False}
+    plan["deletion"] = deletion
+
+    if snapshot is None:
+        try:
+            snapshot = _open_owned_leaf_quarantine(plan)
+        except BaseException:
+            if exclusion is not None:
+                exclusion.close()
+            raise
+    if snapshot is None:
+        if exclusion is not None:
+            exclusion.close()
+        return {"status": "refused", "mutated": False}
+    try:
+        if exclusion is not None and not exclusion.intact():
+            return {"status": "refused", "mutated": False}
+        public_exists = plan.get("leaf_fd") is not None
+        held_exists = snapshot.get("held_fd") is not None
+        if public_exists and held_exists:
+            return {"status": "refused", "mutated": False}
+
+        if not public_exists and held_exists:
+            if (
+                deletion.get("state") == "intent"
+                and snapshot.get("held_stable_match") is True
+            ):
+                return _restore_owned_leaf_from_intent(
+                    plan, snapshot, progress, cleanup_plan)
+            if (
+                deletion.get("state") != "held"
+                or snapshot.get("held_full_match") is not True
+            ):
+                return {"status": "held", "mutated": False}
+
+        if not public_exists and not held_exists:
+            if not snapshot.get("missing"):
+                if not _remove_owned_leaf_quarantine(plan, snapshot):
+                    return {"status": "held", "mutated": False}
+                _refresh_owned_cleanup_records(cleanup_plan)
+            else:
+                try:
+                    _fsync_owned_directories(plan["leaf_parent"])
+                except OSError:
+                    return {"status": "held", "mutated": False}
+            deletion["state"] = "removed"
+            _refresh_owned_cleanup_records(cleanup_plan)
+            if not _record_owned_progress(progress):
+                return {"status": "held", "mutated": True}
+            return {"status": "removed", "mutated": True}
+
+        if public_exists and snapshot.get("missing"):
+            try:
+                os.mkdir(
+                    deletion["quarantine"],
+                    0o700,
+                    dir_fd=plan["leaf_parent"],
+                )
+                _fsync_owned_directories(plan["leaf_parent"])
+            except OSError:
+                return {"status": "refused", "mutated": False}
+            _refresh_owned_cleanup_records(cleanup_plan)
+            if not _record_owned_progress(progress):
+                return {"status": "restored", "mutated": True}
+            _close_owned_quarantine(snapshot)
+            snapshot = _open_owned_leaf_quarantine(plan)
+            if snapshot is None or snapshot.get("missing"):
+                return {"status": "refused", "mutated": True}
+
+        if public_exists:
+            previous_file = dict(plan["file"])
+            moved_public = False
+            validated_moved = False
+            rolled_back = False
+            try:
+                current = os.fstat(plan["leaf_fd"])
+                named_current = os.stat(
+                    plan["leaf_name"],
+                    dir_fd=plan["leaf_parent"],
+                    follow_symlinks=False,
+                )
+                if (
+                    exclusion is None
+                    or not exclusion.intact()
+                    or _owned_file_identity(current)
+                    != _owned_file_identity(named_current)
+                    or not _ownership_identity_matches(
+                        current, plan["file"])
+                ):
+                    raise ValueError(
+                        "public leaf changed after deletion intent")
+                _ownership_rename_noreplace(
+                    plan["leaf_parent"],
+                    plan["leaf_name"],
+                    snapshot["fd"],
+                    "held",
+                )
+                moved_public = True
+                moved = os.fstat(plan["leaf_fd"])
+                named = os.stat(
+                    "held", dir_fd=snapshot["fd"], follow_symlinks=False)
+                if (
+                    _owned_file_identity(moved) != _owned_file_identity(named)
+                    or not _ownership_stable_matches(moved, plan["file"])
+                ):
+                    raise ValueError("public leaf changed at quarantine")
+                validated_moved = True
+                _fsync_owned_directories(
+                    snapshot["fd"], plan["leaf_parent"])
+            except (OSError, TypeError, ValueError):
+                if moved_public:
+                    try:
+                        _ownership_rename_noreplace(
+                            snapshot["fd"],
+                            "held",
+                            plan["leaf_parent"],
+                            plan["leaf_name"],
+                        )
+                        restored = os.fstat(plan["leaf_fd"])
+                        named_restored = os.stat(
+                            plan["leaf_name"],
+                            dir_fd=plan["leaf_parent"],
+                            follow_symlinks=False,
+                        )
+                        if (
+                            _owned_file_identity(restored)
+                            != _owned_file_identity(named_restored)
+                            or not _ownership_stable_matches(
+                                restored, plan["file"])
+                        ):
+                            raise OSError("restored Undo leaf changed")
+                        _fsync_owned_directories(
+                            snapshot["fd"], plan["leaf_parent"])
+                        rolled_back = True
+                    except (OSError, TypeError, ValueError):
+                        pass
+                if validated_moved and rolled_back:
+                    plan["owned"]["file"] = _owned_file_identity(restored)
+                    plan["file"] = plan["owned"]["file"]
+                    deletion["state"] = "intent"
+                _refresh_owned_cleanup_records(cleanup_plan)
+                persisted = _record_owned_progress(progress)
+                if validated_moved and rolled_back and not persisted:
+                    refreshed_file = dict(plan["file"])
+                    try:
+                        current = os.fstat(plan["leaf_fd"])
+                        named_current = os.stat(
+                            plan["leaf_name"],
+                            dir_fd=plan["leaf_parent"],
+                            follow_symlinks=False,
+                        )
+                        if (
+                            _owned_file_identity(current)
+                            != _owned_file_identity(named_current)
+                            or not _ownership_identity_matches(
+                                current, refreshed_file)
+                        ):
+                            raise OSError("restored Undo leaf changed")
+                        _ownership_rename_noreplace(
+                            plan["leaf_parent"],
+                            plan["leaf_name"],
+                            snapshot["fd"],
+                            "held",
+                        )
+                        held_again = os.fstat(plan["leaf_fd"])
+                        named_again = os.stat(
+                            "held",
+                            dir_fd=snapshot["fd"],
+                            follow_symlinks=False,
+                        )
+                        if (
+                            _owned_file_identity(held_again)
+                            != _owned_file_identity(named_again)
+                            or not _ownership_stable_matches(
+                                held_again, refreshed_file)
+                        ):
+                            raise OSError("re-quarantined Undo leaf changed")
+                        _fsync_owned_directories(
+                            snapshot["fd"], plan["leaf_parent"])
+                        plan["owned"]["file"] = previous_file
+                        plan["file"] = previous_file
+                        deletion["state"] = "intent"
+                        _refresh_owned_cleanup_records(cleanup_plan)
+                    except (OSError, TypeError, ValueError):
+                        pass
+                return {
+                    "status": "refused",
+                    "mutated": moved_public,
+                }
+            plan["owned"]["file"] = _owned_file_identity(moved)
+            plan["file"] = plan["owned"]["file"]
+            deletion["state"] = "held"
+            _refresh_owned_cleanup_records(cleanup_plan)
+            if not _record_owned_progress(progress):
+                return {"status": "held", "mutated": True}
+            _close_owned_quarantine(snapshot)
+            snapshot = _open_owned_leaf_quarantine(plan)
+            if snapshot is None or snapshot.get("held_fd") is None:
+                return {"status": "refused", "mutated": True}
+        elif deletion.get("state") != "held":
+            deletion["state"] = "held"
+            plan["owned"]["file"] = snapshot["held_identity"]
+            plan["file"] = plan["owned"]["file"]
+            _refresh_owned_cleanup_records(cleanup_plan)
+            if not _record_owned_progress(progress):
+                return {"status": "held", "mutated": False}
+
+        try:
+            held_now = os.fstat(snapshot["held_fd"])
+            named_held_now = os.stat(
+                "held", dir_fd=snapshot["fd"], follow_symlinks=False)
+            if (
+                exclusion is None
+                or not exclusion.intact()
+                or _owned_file_identity(held_now)
+                != _owned_file_identity(named_held_now)
+                or not _ownership_identity_matches(
+                    held_now, plan["file"])
+            ):
+                return {"status": "held", "mutated": False}
+            if exclusion is None or not exclusion.intact():
+                return {"status": "held", "mutated": False}
+            os.unlink("held", dir_fd=snapshot["fd"])
+            _fsync_owned_directories(snapshot["fd"])
+        except (OSError, TypeError, ValueError):
+            # Keep the exact leaf under its persisted private name. Restoring
+            # it changes ctime; a crash before the restored identity reaches
+            # disk would leave a later process unable to distinguish our file
+            # from an in-place public replacement with spoofed size/mtime.
+            return {"status": "held", "mutated": False}
+
+        _refresh_owned_cleanup_records(cleanup_plan)
+        if not _record_owned_progress(progress):
+            return {"status": "held", "mutated": True}
+        try:
+            os.close(snapshot["held_fd"])
+        except OSError:
+            pass
+        snapshot["held_fd"] = None
+        if not _remove_owned_leaf_quarantine(plan, snapshot):
+            return {"status": "held", "mutated": True}
+        deletion["state"] = "removed"
+        _refresh_owned_cleanup_records(cleanup_plan)
+        if not _record_owned_progress(progress):
+            return {"status": "held", "mutated": True}
+        return {"status": "removed", "mutated": True}
+    finally:
+        if exclusion is not None:
+            exclusion.close()
+        _close_owned_quarantine(snapshot)
+
+
+def _owned_directory_chain(root, owned):
+    relative = owned.get("relative") if isinstance(owned, dict) else None
+    directories = owned.get("directories") if isinstance(owned, dict) else None
+    if not isinstance(relative, str) or not isinstance(directories, list):
+        return None
+    root, rel = _owned_relative(Path(root), Path(root) / relative)
+    if rel is None or len(directories) != len(rel.parts) or root == root.parent:
+        return None
+    cleanup = _directory_cleanup_records(owned, len(directories))
+    if cleanup is None:
+        return None
+    parent_count, records = cleanup
+    try:
+        anchor = root.parents[parent_count]
+    except IndexError:
+        return None
+    music_root = Path(os.path.abspath(os.fspath(cfg.MUSIC_ROOT)))
+    if parent_count > 0 and anchor != music_root:
+        return None
+    names = [*root.relative_to(anchor).parts, *rel.parts[:-1]]
+    if len(names) != len(records):
+        return None
+    return {
+        "root": root,
+        "relative": rel,
+        "anchor": anchor,
+        "names": names,
+        "records": records,
+        "cleanup": owned["directory_cleanup"],
+    }
+
+
+def _refresh_open_directory_records(opened, *, include_last=True):
+    entries = opened if include_last else opened[:-1]
+    for descriptor, record, matched in entries:
+        if not matched:
+            continue
+        try:
+            current = os.fstat(descriptor)
+        except OSError:
+            continue
+        if _file_identity(current) == [record["device"], record["inode"]]:
+            record.update(_owned_file_identity(current))
+
+
+def _restore_owned_directory(
+        parent_fd, name, held_fd, record, deletion, opened, progress,
+        *, terminal_skip=False):
+    previous_identity = {
+        field: record[field] for field in _OWNERSHIP_IDENTITY_FIELDS
+    }
+    previous_state = deletion["state"]
+    try:
+        _ownership_rename_noreplace(
+            parent_fd, deletion["quarantine"], parent_fd, name)
     except OSError:
+        record.update(_owned_file_identity(os.fstat(held_fd)))
+        deletion["state"] = "held"
+        _refresh_open_directory_records(opened)
+        _record_owned_progress(progress)
+        return "retry"
+    try:
+        _fsync_owned_directories(parent_fd)
+    except OSError:
+        state = "intent"
+        try:
+            _ownership_rename_noreplace(
+                parent_fd, name, parent_fd, deletion["quarantine"])
+            _fsync_owned_directories(parent_fd)
+            state = "held"
+        except OSError:
+            pass
+        record.update(_owned_file_identity(os.fstat(held_fd)))
+        deletion["state"] = state
+        _refresh_open_directory_records(opened)
+        _record_owned_progress(progress)
+        return "retry"
+    try:
+        restored = os.fstat(held_fd)
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            _owned_file_identity(restored) != _owned_file_identity(named)
+            or not stat.S_ISDIR(restored.st_mode)
+            or (
+                not terminal_skip
+                and not _ownership_stable_matches(
+                    restored, record, directory=True)
+            )
+        ):
+            _refresh_open_directory_records(opened, include_last=False)
+            _record_owned_progress(progress)
+            return "retry"
+        record.update(_owned_file_identity(restored))
+        deletion["state"] = "intent"
+        _refresh_open_directory_records(opened)
+        persisted = _record_owned_progress(progress)
+        if persisted:
+            return "skipped" if terminal_skip else "retry"
+        try:
+            _ownership_rename_noreplace(
+                parent_fd, name, parent_fd, deletion["quarantine"])
+            held_again = os.fstat(held_fd)
+            named_again = os.stat(
+                deletion["quarantine"],
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if (
+                _owned_file_identity(held_again)
+                != _owned_file_identity(named_again)
+                or not _ownership_stable_matches(
+                    held_again, previous_identity, directory=True)
+            ):
+                raise OSError("rolled-back Undo directory changed")
+            _fsync_owned_directories(parent_fd)
+            record.update(previous_identity)
+            deletion["state"] = previous_state
+            _refresh_open_directory_records(opened, include_last=False)
+        except (OSError, TypeError, ValueError):
+            pass
+        return "retry"
+    except (OSError, TypeError, ValueError):
+        return "retry"
+
+
+def _cleanup_one_owned_directory(chain, index, progress):
+    records = chain["records"]
+    record = records[index]
+    deletion = _owned_deletion_record(record, "dir")
+    if deletion is _INVALID_OWNED_DELETION:
+        return "refused"
+    opened_fds = []
+    opened_records = []
+    restored_public_skip = False
+    try:
+        current = _open_directory_nofollow(chain["anchor"])
+        opened_fds.append(current)
+        parent_fd = current
+        held_fd = None
+        public_exists = False
+        for current_index, (name, current_record) in enumerate(zip(
+                chain["names"][:index + 1], records[:index + 1], strict=True)):
+            parent_fd = current
+            try:
+                current = _open_directory_nofollow(name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                if current_index != index:
+                    return "refused"
+                public_exists = False
+                held_fd = None
+                break
+            opened_fds.append(current)
+            current_stat = os.fstat(current)
+            full_match = _directory_cleanup_entry_matches(
+                current_stat, current_record)
+            opened_records.append((current, current_record, full_match))
+            if current_index < index:
+                # Ancestors can legitimately change when a sibling album or
+                # disc is added. Traverse only while the same directory inode
+                # remains, but reserve the full proof for the directory that
+                # would actually be removed.
+                if _file_identity(current_stat) != [
+                    current_record["device"], current_record["inode"]
+                ]:
+                    return "skipped"
+                continue
+            if not full_match:
+                # A public directory whose durable proof no longer matches is
+                # ambiguous after a rollback or restart. Never refresh it into
+                # ownership merely because the inode, size, and mtime happen
+                # to match.
+                if (
+                    isinstance(deletion, dict)
+                    and deletion.get("state") == "held"
+                    and _ownership_stable_matches(
+                        current_stat, current_record, directory=True)
+                ):
+                    # A crash after a no-overwrite private→public restore can
+                    # leave only ctime changed. Preserve that directory and
+                    # finish cleanup; never refresh it into deletion authority.
+                    restored_public_skip = True
+                else:
+                    return "refused" if deletion is not None else "skipped"
+            public_exists = True
+            held_fd = current
+
+        if deletion is None and not public_exists:
+            return "refused"
+        deletion = _begin_owned_deletion(record, "dir", progress)
+        if deletion is None:
+            return "retry"
+
+        quarantine_fd = None
+        try:
+            quarantine_fd = _open_directory_nofollow(
+                deletion["quarantine"], dir_fd=parent_fd)
+        except FileNotFoundError:
+            quarantine_fd = None
+        except OSError:
+            return "refused"
+        if quarantine_fd is not None:
+            opened_fds.append(quarantine_fd)
+            quarantined = os.fstat(quarantine_fd)
+            named_quarantine = os.stat(
+                deletion["quarantine"],
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if (
+                _owned_file_identity(quarantined)
+                != _owned_file_identity(named_quarantine)
+            ):
+                return "refused"
+            if public_exists:
+                return "refused"
+            if not _ownership_identity_matches(quarantined, record):
+                if (
+                    deletion.get("state") == "intent"
+                    and _ownership_stable_matches(
+                        quarantined, record, directory=True)
+                ):
+                    return _restore_owned_directory(
+                        parent_fd,
+                        chain["names"][index],
+                        quarantine_fd,
+                        record,
+                        deletion,
+                        opened_records,
+                        progress,
+                    )
+                return "refused"
+            held_fd = quarantine_fd
+
+        if restored_public_skip:
+            return "skipped" if quarantine_fd is None else "refused"
+
+        if not public_exists and quarantine_fd is None:
+            try:
+                _fsync_owned_directories(parent_fd)
+            except OSError:
+                return "retry"
+            deletion["state"] = "removed"
+            _refresh_open_directory_records(opened_records)
+            return "removed" if _record_owned_progress(progress) else "retry"
+
+        if public_exists and quarantine_fd is None:
+            previous_identity = {
+                field: record[field]
+                for field in _OWNERSHIP_IDENTITY_FIELDS
+            }
+            previous_state = deletion["state"]
+            moved_public = False
+            validated_moved = False
+            rolled_back = False
+            try:
+                current = os.fstat(held_fd)
+                named_current = os.stat(
+                    chain["names"][index],
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    _owned_file_identity(current)
+                    != _owned_file_identity(named_current)
+                    or not _directory_cleanup_entry_matches(
+                        current, record)
+                ):
+                    raise ValueError(
+                        "public directory changed after deletion intent")
+                _ownership_rename_noreplace(
+                    parent_fd,
+                    chain["names"][index],
+                    parent_fd,
+                    deletion["quarantine"],
+                )
+                moved_public = True
+                moved = os.fstat(held_fd)
+                named = os.stat(
+                    deletion["quarantine"],
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    _owned_file_identity(moved) != _owned_file_identity(named)
+                    or not _ownership_stable_matches(
+                        moved, record, directory=True)
+                ):
+                    raise ValueError("public directory changed at quarantine")
+                validated_moved = True
+                _fsync_owned_directories(parent_fd)
+            except (OSError, TypeError, ValueError):
+                if moved_public:
+                    try:
+                        _ownership_rename_noreplace(
+                            parent_fd,
+                            deletion["quarantine"],
+                            parent_fd,
+                            chain["names"][index],
+                        )
+                        restored = os.fstat(held_fd)
+                        named_restored = os.stat(
+                            chain["names"][index],
+                            dir_fd=parent_fd,
+                            follow_symlinks=False,
+                        )
+                        if (
+                            _owned_file_identity(restored)
+                            != _owned_file_identity(named_restored)
+                            or not _ownership_stable_matches(
+                                restored, record, directory=True)
+                        ):
+                            raise OSError("restored Undo directory changed")
+                        _fsync_owned_directories(parent_fd)
+                        rolled_back = True
+                    except (OSError, TypeError, ValueError):
+                        pass
+                if validated_moved and rolled_back:
+                    record.update(_owned_file_identity(restored))
+                    deletion["state"] = "intent"
+                    _refresh_open_directory_records(opened_records)
+                else:
+                    _refresh_open_directory_records(
+                        opened_records, include_last=False)
+                persisted = _record_owned_progress(progress)
+                if validated_moved and rolled_back and not persisted:
+                    refreshed_identity = {
+                        field: record[field]
+                        for field in _OWNERSHIP_IDENTITY_FIELDS
+                    }
+                    try:
+                        current = os.fstat(held_fd)
+                        named_current = os.stat(
+                            chain["names"][index],
+                            dir_fd=parent_fd,
+                            follow_symlinks=False,
+                        )
+                        if (
+                            _owned_file_identity(current)
+                            != _owned_file_identity(named_current)
+                            or not _ownership_identity_matches(
+                                current, refreshed_identity)
+                        ):
+                            raise OSError("restored Undo directory changed")
+                        _ownership_rename_noreplace(
+                            parent_fd,
+                            chain["names"][index],
+                            parent_fd,
+                            deletion["quarantine"],
+                        )
+                        held_again = os.fstat(held_fd)
+                        named_again = os.stat(
+                            deletion["quarantine"],
+                            dir_fd=parent_fd,
+                            follow_symlinks=False,
+                        )
+                        if (
+                            _owned_file_identity(held_again)
+                            != _owned_file_identity(named_again)
+                            or not _ownership_stable_matches(
+                                held_again,
+                                refreshed_identity,
+                                directory=True,
+                            )
+                        ):
+                            raise OSError(
+                                "re-quarantined Undo directory changed")
+                        _fsync_owned_directories(parent_fd)
+                        record.update(previous_identity)
+                        deletion["state"] = previous_state
+                        _refresh_open_directory_records(
+                            opened_records, include_last=False)
+                    except (OSError, TypeError, ValueError):
+                        pass
+                return "retry"
+            record.update(_owned_file_identity(moved))
+            deletion["state"] = "held"
+            _refresh_open_directory_records(opened_records)
+            if not _record_owned_progress(progress):
+                return "retry"
+        elif deletion["state"] != "held":
+            record.update(_owned_file_identity(os.fstat(held_fd)))
+            deletion["state"] = "held"
+            _refresh_open_directory_records(opened_records)
+            if not _record_owned_progress(progress):
+                return "retry"
+
+        try:
+            held_now = os.fstat(held_fd)
+            named_now = os.stat(
+                deletion["quarantine"],
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if (
+                _owned_file_identity(held_now)
+                != _owned_file_identity(named_now)
+                or not _ownership_identity_matches(held_now, record)
+            ):
+                return "refused"
+            os.rmdir(deletion["quarantine"], dir_fd=parent_fd)
+            _fsync_owned_directories(parent_fd)
+        except OSError as exc:
+            return _restore_owned_directory(
+                parent_fd,
+                chain["names"][index],
+                held_fd,
+                record,
+                deletion,
+                opened_records,
+                progress,
+                terminal_skip=exc.errno in (errno.ENOTEMPTY, errno.EEXIST),
+            )
+        deletion["state"] = "removed"
+        _refresh_open_directory_records(
+            opened_records, include_last=not public_exists)
+        return "removed" if _record_owned_progress(progress) else "retry"
+    except (OSError, TypeError, ValueError):
+        return "refused"
+    finally:
+        for descriptor in reversed(opened_fds):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _cleanup_owned_directories(root, owned, progress):
+    chain = _owned_directory_chain(root, owned)
+    if chain is None:
+        return True
+    complete = chain["cleanup"].get("complete", False)
+    if type(complete) is not bool:
+        return False
+    if complete:
+        return True
+    created_tail = []
+    for index in reversed(range(len(chain["records"]))):
+        if chain["records"][index]["created"] is not True:
+            break
+        created_tail.append(index)
+    if not created_tail:
+        chain["cleanup"]["complete"] = True
+        return _record_owned_progress(progress)
+
+    while True:
+        candidate = None
+        for index in created_tail:
+            deletion = _owned_deletion_record(chain["records"][index], "dir")
+            if deletion is _INVALID_OWNED_DELETION:
+                return False
+            if deletion is None or deletion["state"] != "removed":
+                candidate = index
+                break
+        if candidate is None:
+            chain["cleanup"]["complete"] = True
+            return _record_owned_progress(progress)
+        outcome = _cleanup_one_owned_directory(chain, candidate, progress)
+        if outcome == "removed":
+            continue
+        if outcome == "skipped":
+            chain["cleanup"]["complete"] = True
+            return _record_owned_progress(progress)
+        return False
+
+
+def _unlink_owned_path(root, owned, *, progress=None, outcome_out=None):
+    """Remove exact owned leaves, then retry exact created-folder cleanup."""
+    if not isinstance(owned, dict):
         return None
-    want = (track.get("isrc") or "").replace("-", "").upper().strip()
-    track_no = track.get("track_number")
-    disc_no = track.get("media_number") or 1
-    if want:
-        matches = [
-            item for item in tracks
-            if (item.get("isrc") or "").replace("-", "").upper().strip() == want
-        ]
-    elif track_no is not None:
-        matches = [
-            item for item in tracks
-            if item.get("tracknumber") == track_no
-            and (item.get("discnumber") or 1) == disc_no
-        ]
-    else:
-        matches = []
-    if len(matches) != 1 or not matches[0].get("path"):
+    companions = owned.get("companions", [])
+    if not isinstance(companions, list) or len(companions) > 2:
         return None
-    return _bind_owned_path(root, Path(matches[0]["path"]))
+    root, main_relative = _owned_relative(
+        Path(root), Path(root) / str(owned.get("relative", "")))
+    if main_relative is None:
+        return None
+    expected_companion = main_relative.with_suffix(".lrc").as_posix()
+    seen_kinds = set()
+    seen_relatives = {main_relative.as_posix()}
+    for companion in companions:
+        kind = companion.get("kind") if isinstance(companion, dict) else None
+        relative = companion.get("relative") if isinstance(companion, dict) else None
+        companion_relative = (
+            _strict_ownership_relative(root, relative)
+            if isinstance(relative, str) else None
+        )
+        if (
+            not isinstance(companion, dict)
+            or companion.get("companions")
+            or kind not in ("lyrics", "artwork")
+            or kind in seen_kinds
+            or companion_relative is None
+            or companion_relative.as_posix() in seen_relatives
+        ):
+            return None
+        if kind == "lyrics" and relative != expected_companion:
+            return None
+        if (
+            kind == "artwork"
+            and (
+                len(companion_relative.parent.parts)
+                >= len(main_relative.parts)
+                or main_relative.parts[:len(companion_relative.parent.parts)]
+                != companion_relative.parent.parts
+            )
+        ):
+            return None
+        seen_kinds.add(kind)
+        seen_relatives.add(companion_relative.as_posix())
+
+    entries = [owned, *companions]
+    deletion_records = [
+        _owned_deletion_record(entry, "file") for entry in entries]
+    if any(record is _INVALID_OWNED_DELETION for record in deletion_records):
+        return None
+
+    def _update_outcome(**extra):
+        current = [
+            _owned_deletion_record(entry, "file") for entry in entries]
+        removed_count = sum(
+            isinstance(record, dict) and record["state"] == "removed"
+            for record in current
+        )
+        held_count = sum(
+            isinstance(record, dict) and record["state"] == "held"
+            for record in current
+        )
+        if isinstance(outcome_out, dict):
+            outcome_out.update({
+                "files_complete": removed_count == len(entries),
+                "removed_files": removed_count,
+                "held_files": held_count,
+                "undo_started": any(
+                    isinstance(record, dict) for record in current),
+                **extra,
+            })
+
+    # A retry may begin after an earlier attempt durably removed a companion.
+    # Seed the result before every later preflight so refusal wording never
+    # claims that nothing was removed.
+    _update_outcome()
+    if (
+        deletion_records[0] is not None
+        and deletion_records[0]["state"] == "removed"
+        and any(record is None or record["state"] != "removed"
+                for record in deletion_records[1:])
+    ):
+        return None
+
+    plans = []
+    plan_by_entry = {}
+    try:
+        for entry, deletion in zip(entries, deletion_records, strict=True):
+            if deletion is not None and deletion["state"] == "removed":
+                continue
+            plan = _owned_unlink_plan(root, entry)
+            if plan is None:
+                return None
+            plans.append(plan)
+            plan_by_entry[id(entry)] = plan
+        if not all(_owned_unlink_leaf_matches(plan) for plan in plans):
+            return None
+        main_plan = plan_by_entry.get(id(owned))
+        for entry in [*companions, owned]:
+            deletion = _owned_deletion_record(entry, "file")
+            if isinstance(deletion, dict) and deletion["state"] == "removed":
+                continue
+            plan = plan_by_entry[id(entry)]
+            result = _quarantine_owned_leaf(
+                plan,
+                progress=progress,
+                cleanup_plan=main_plan or plan,
+            )
+            if result["status"] != "removed":
+                _update_outcome()
+                return None
+    except (OSError, TypeError, ValueError):
+        return None
+    finally:
+        for plan in reversed(plans):
+            _close_owned_unlink_plan(plan)
+
+    files_complete = all(
+        isinstance(_owned_deletion_record(entry, "file"), dict)
+        and _owned_deletion_record(entry, "file")["state"] == "removed"
+        for entry in entries
+    )
+    cleanup_complete = (
+        files_complete and _cleanup_owned_directories(root, owned, progress))
+    _update_outcome(
+        cleanup_pending=files_complete and not cleanup_complete)
+    if not files_complete or not cleanup_complete:
+        return None
+    return root / main_relative
+
+
+def _valid_ownership_identity(value):
+    return (
+        isinstance(value, dict)
+        and all(type(value.get(field)) is int
+                for field in _OWNERSHIP_IDENTITY_FIELDS)
+    )
+
+
+def _strict_ownership_relative(root, value):
+    if (
+        not isinstance(value, str)
+        or "\x00" in value
+        or os.path.isabs(value)
+    ):
+        return None
+    parts = value.split(os.sep)
+    if any(part in ("", ".", "..") for part in parts):
+        return None
+    _, relative = _owned_relative(root, root / value)
+    return relative
+
+
+def _single_ownership_item(payload):
+    """Validate the sealed one-item evidence before touching the library."""
+    root = Path(os.path.abspath(os.fspath(cfg.MUSIC_ROOT)))
+    if (
+        not isinstance(payload, dict)
+        or type(payload.get("version")) is not int
+        or payload.get("version") != 1
+        or payload.get("sealed") is not True
+        or payload.get("root") != str(root)
+        or not _valid_ownership_identity(payload.get("root_identity"))
+    ):
+        return None
+    items = payload.get("items")
+    if not isinstance(items, list) or len(items) != 1:
+        return None
+    item = items[0]
+    if not isinstance(item, dict) or not _valid_ownership_identity(item.get("file")):
+        return None
+    relative = item.get("relative")
+    if not isinstance(relative, str):
+        return None
+    file_relative = _strict_ownership_relative(root, relative)
+    if file_relative is None:
+        return None
+    created = item.get("created_directories")
+    if not isinstance(created, list):
+        return None
+    seen = set()
+    for record in created:
+        if not _valid_ownership_identity(record):
+            return None
+        directory_relative = record.get("relative")
+        if not isinstance(directory_relative, str):
+            return None
+        directory_relative = _strict_ownership_relative(
+            root, directory_relative)
+        if (
+            directory_relative is None
+            or len(directory_relative.parts) >= len(file_relative.parts)
+            or file_relative.parts[:len(directory_relative.parts)]
+            != directory_relative.parts
+        ):
+            return None
+        identity = (record["device"], record["inode"])
+        if identity in seen:
+            return None
+        seen.add(identity)
+    companions = item.get("companions")
+    if not isinstance(companions, list) or len(companions) > 1:
+        return None
+    artwork = None
+    if companions:
+        receipt = companions[0]
+        if (
+            not isinstance(receipt, dict)
+            or set(receipt) != {"kind", "relative", "file"}
+            or receipt.get("kind") != "artwork"
+            or not _valid_ownership_identity(receipt.get("file"))
+            or not isinstance(receipt.get("relative"), str)
+        ):
+            return None
+        artwork_relative = _strict_ownership_relative(
+            root, receipt["relative"])
+        if (
+            artwork_relative is None
+            or artwork_relative == file_relative
+            or len(artwork_relative.parent.parts) >= len(file_relative.parts)
+            or file_relative.parts[:len(artwork_relative.parent.parts)]
+            != artwork_relative.parent.parts
+        ):
+            return None
+        artwork = {
+            "path": root / artwork_relative,
+            "file_identity": receipt["file"],
+            "relative": artwork_relative,
+        }
+    return {
+        "root": root,
+        "path": root / file_relative,
+        "file_identity": item["file"],
+        "root_identity": payload["root_identity"],
+        "created_directories": created,
+        "artwork": artwork,
+    }
+
+
+def _single_owned_path(
+    payload,
+    landed_dir=None,
+    created_after_import=None,
+    created_files_after_import=None,
+):
+    """Bind only the exact destination reported by the one-run beets hook."""
+    item = _single_ownership_item(payload)
+    if item is None:
+        return None
+    created_directories = list(item["created_directories"])
+    for record in created_after_import or ():
+        if not _valid_ownership_identity(record):
+            return None
+        relative = record.get("relative")
+        if (not isinstance(relative, str)
+                or _strict_ownership_relative(item["root"], relative) is None):
+            return None
+        created_directories.append(record)
+    path = item["path"]
+    owned = _bind_owned_path(
+        item["root"],
+        path,
+        expected_file=item["file_identity"],
+        expected_root=item["root_identity"],
+        created_directories=created_directories,
+    )
+    if owned is None:
+        return None
+    companions = []
+    artwork = item.get("artwork")
+    if artwork is not None:
+        artwork_relative = artwork["relative"]
+        artwork_created = []
+        for record in created_directories:
+            directory_relative = _strict_ownership_relative(
+                item["root"], record["relative"])
+            if (
+                directory_relative is not None
+                and len(directory_relative.parts)
+                < len(artwork_relative.parts)
+                and artwork_relative.parts[:len(directory_relative.parts)]
+                == directory_relative.parts
+            ):
+                artwork_created.append(record)
+        companion = _bind_owned_path(
+            item["root"],
+            artwork["path"],
+            expected_file=artwork["file_identity"],
+            expected_root=item["root_identity"],
+            created_directories=artwork_created,
+        )
+        if companion is None:
+            return None
+        companion["kind"] = "artwork"
+        companions.append(companion)
+    for record in created_files_after_import or ():
+        if (
+            not isinstance(record, dict)
+            or not _valid_ownership_identity(record.get("file"))
+            or not isinstance(record.get("path"), str)
+        ):
+            return None
+        companion_path = Path(os.path.abspath(record["path"]))
+        if companion_path != Path(path).with_suffix(".lrc"):
+            return None
+        companion = _bind_owned_path(
+            item["root"],
+            companion_path,
+            expected_file=record["file"],
+            expected_root=item["root_identity"],
+            created_directories=created_directories,
+        )
+        if companion is None:
+            return None
+        companion["kind"] = "lyrics"
+        companions.append(companion)
+    if len(companions) > 2:
+        return None
+    if companions:
+        owned["companions"] = companions
+    return (owned, path) if owned is not None else None
+
+
+def _album_dir_for_owned_file(path, landed_dir):
+    """Accept only the album scope already verified by the import pipeline."""
+    if landed_dir is None:
+        return None
+    try:
+        path = Path(os.path.abspath(os.fspath(path)))
+        album_dir = Path(os.path.abspath(os.fspath(landed_dir)))
+        relative = path.relative_to(album_dir)
+    except (OSError, TypeError, ValueError):
+        return None
+    return album_dir if relative.parts else None
 
 
 def _make_single_track_run(album, track, token):
@@ -2625,6 +5170,7 @@ def _make_single_track_run(album, track, token):
         from qobuz_librarian.queue.builder import _build_queue_item
         from qobuz_librarian.queue.executor import _execute_download_queue
         from qobuz_librarian.ui_cli.errors import plural
+        from qobuz_librarian.web import job_persistence
         from qobuz_librarian.web.flows import (
             _note_staging_wait,
             _refresh_after_local_album_change,
@@ -2650,11 +5196,61 @@ def _make_single_track_run(album, track, token):
             upgrade_only=False, auto_upgrade=False,
             force_track_by_track=True,
         )
+        qi["_capture_import_ownership"] = True
         _note_staging_wait(j, "Downloading", 0, 1)
+        owned_path = None
+        owned_file_path = None
         with job_mgr.staging_lock():
             _execute_download_queue([qi], args, token)
-        if not (qi.get("n_ok", 0) > 0 and qi.get("imported", False)
-                and qi.get("n_fail", 0) == 0):
+            landed_dir = qi.get("_resolved_post_dir") or album_dir
+            download_succeeded = (
+                qi.get("n_ok", 0) > 0
+                and qi.get("imported", False)
+                and qi.get("n_fail", 0) == 0
+            )
+            if download_succeeded:
+                # The import hook reports beets' real destination. Bind it
+                # before another managed writer can be attributed to this job.
+                owned_binding = _single_owned_path(
+                    qi.get("_import_ownership"),
+                    landed_dir,
+                    qi.get("_import_ownership_created_directories"),
+                    qi.get("_import_ownership_created_files"),
+                )
+                if owned_binding is not None:
+                    owned_path, owned_file_path = owned_binding
+                    actual_album_dir = _album_dir_for_owned_file(
+                        owned_file_path, landed_dir)
+                    if actual_album_dir is None:
+                        # The sealed file proof and the already verified album
+                        # scope disagree. Keep the download, but do not invent
+                        # a folder boundary from a `Disc N`-looking name.
+                        owned_path = None
+                        owned_file_path = None
+                    else:
+                        landed_dir = actual_album_dir
+                # Persist the complete import result while the staging lock
+                # still protects its ownership evidence.  Marking, pruning,
+                # and the library refresh are all optional follow-up work and
+                # must not be able to strand a landed track without Undo proof.
+                single = {
+                    "album_id": str(album.get("id") or ""),
+                    "track_id": str(track.get("id") or ""),
+                    "dir": str(landed_dir) if landed_dir else "",
+                    "isrc": track.get("isrc") or "",
+                    "track_no": track.get("track_number"),
+                    "disc_no": track.get("media_number") or 1,
+                    "title": t_title, "artist": artist, "album": title,
+                    "marked": False,
+                }
+                if owned_path is not None:
+                    single["owned_path"] = owned_path
+                    single["owned_root"] = str(
+                        Path(os.path.abspath(os.fspath(cfg.MUSIC_ROOT)))
+                    )
+                j.single = single
+                job_persistence.persist(j)
+        if not download_succeeded:
             j.status = job_mgr.JobStatus.FAILED
             if qi.get("n_fail"):
                 j.error = f"{plural(qi.get('n_fail', 1), 'track')} failed"
@@ -2696,7 +5292,13 @@ def _make_single_track_run(album, track, token):
             # Complete means any parked Gap Fill candidate for it is stale.
             from qobuz_librarian.web.flows import prune_library_review_candidates
             prune_library_review_candidates(album)
-        landed_dir = qi.get("_resolved_post_dir") or album_dir
+        single["marked"] = marked
+        if owned_path is None:
+            j.summary += (
+                " Undo isn't available because the downloaded file "
+                "couldn't be verified."
+            )
+        job_persistence.persist(j)
         _refresh_after_local_album_change(
             album,
             {"dir": landed_dir},
@@ -2706,25 +5308,6 @@ def _make_single_track_run(album, track, token):
             upgrade=True,
             downsample=True,
         )
-        # Bind the imported audio to its exact file and directory identities.
-        # Undo is deliberately unavailable if that proof cannot be made: track
-        # tags and folder names can collide, and are not ownership evidence.
-        owned_path = _single_owned_path(landed_dir, track)
-        single = {
-            "album_id": str(album.get("id") or ""),
-            "track_id": str(track.get("id") or ""),
-            "dir": str(landed_dir) if landed_dir else "",
-            "isrc": track.get("isrc") or "",
-            "track_no": track.get("track_number"),
-            "disc_no": track.get("media_number") or 1,
-            "title": t_title, "artist": artist, "album": title,
-            "marked": marked, "new_folder": album_dir is None,
-        }
-        if owned_path is not None:
-            single["owned_path"] = owned_path
-        else:
-            j.summary += " Undo isn't available because the downloaded file couldn't be verified."
-        j.single = single
     return run
 
 
@@ -2892,7 +5475,8 @@ async def queue_download(request: Request, album_id: str = Form(""),
                       if single_track
                       else _make_download_run(
                           album, token, treat_as_new=download_as_new_edition))
-            job_mgr.submit(job, run_fn)
+            if job_mgr.submit(job, run_fn) is None:
+                return _job_admission_response(request)
         if _is_htmx(request):
             return _tr(request, "_job_queued.html", {"job": job})
         # Land on the new job's page so the user sees their download starting.
@@ -3121,9 +5705,8 @@ async def library_scan(
         # review screen badges the new releases (left un-ticked). Its results
         # live on their own job page, never over the Library tabs.
         job = await loop.run_in_executor(None, _start_new_release_check)
-        if job is None:    # lock handed to the terminal during the submit
-            return _lock_busy_response(request) or RedirectResponse(
-                url="/settings?mode=cli", status_code=303)
+        if job is None:
+            return _scan_submission_failure_response(request, "/library")
         return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
     scan_state = _library_scan_state()
     if not scan_state["ready"]:
@@ -3148,8 +5731,7 @@ async def library_scan(
         ),
     )
     if job is None:
-        return _lock_busy_response(request) or RedirectResponse(
-            url="/settings?mode=cli", status_code=303)
+        return _scan_submission_failure_response(request, "/library")
     # Land back on /library — the scan is watched and reviewed right here.
     return RedirectResponse(url="/library", status_code=303)
 
@@ -3312,11 +5894,11 @@ async def upgrade_review(request: Request):
         _get_token()
     except (SystemExit, NoCredsError):
         return _no_creds_response(request)
-    state = _upgrade_state_summary()
-    if not state["complete"] or not state["candidates"]:
-        return RedirectResponse(url="/upgrade", status_code=303)
     loop = asyncio.get_running_loop()
-    job = await loop.run_in_executor(None, lambda: _review_job_from_upgrade_state(state))
+    job = await loop.run_in_executor(
+        None, lambda: _review_job_from_current_saved_state("upgrade"))
+    if job is None:
+        return RedirectResponse(url="/upgrade", status_code=303)
     return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
 
 
@@ -3366,12 +5948,11 @@ async def downsample_review(request: Request):
     busy = _lock_busy_response(request)
     if busy is not None:
         return busy
-    state = _downsample_state_summary()
-    if not state["complete"] or not state["candidates"]:
-        return RedirectResponse(url="/downsample", status_code=303)
     loop = asyncio.get_running_loop()
     job = await loop.run_in_executor(
-        None, lambda: _review_job_from_downsample_state(state))
+        None, lambda: _review_job_from_current_saved_state("downsample"))
+    if job is None:
+        return RedirectResponse(url="/downsample", status_code=303)
     return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
 
 
@@ -3392,8 +5973,7 @@ async def downsample_scan(request: Request):
             j, chosen, token=_get_optional_token()),
         "downsample")
     if job is None:
-        return _lock_busy_response(request) or RedirectResponse(
-            url="/downsample", status_code=303)
+        return _scan_submission_failure_response(request, "/downsample")
     return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
 
 
@@ -3445,8 +6025,7 @@ async def repair_scan(request: Request):
         lambda j, chosen: flows.execute_repairs(j, chosen, _get_token()),
         "repair")
     if job is None:
-        return _lock_busy_response(request) or RedirectResponse(
-            url="/repair", status_code=303)
+        return _scan_submission_failure_response(request, "/repair")
     # Land back on /repair so the sweep is watched live right here — its card
     # streams each flagged album inline (and explains the wait if it's queued
     # behind another scan). When the scan finishes, the card's SSE done-handler
@@ -3516,11 +6095,13 @@ async def lyrics_scan(request: Request):
     from qobuz_librarian.web import flows
     job = job_mgr.Job(title="Lyrics scan")
     job.execute_kind = "lyrics"
-    job_mgr.submit(
+    submitted = job_mgr.submit(
         job,
         lambda j: flows.run_library_lyrics(j, rescan=rescan, synced_only=synced_only),
     )
-    return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
+    if submitted is None:
+        return _scan_submission_failure_response(request, "/lyrics")
+    return RedirectResponse(url=f"/jobs/{submitted.id}", status_code=303)
 
 
 def _migrate_checks(src, dest):
@@ -3609,8 +6190,7 @@ async def migrate_scan(request: Request):
                                                   allow_low_space=allow_low_space),
         "migration")
     if job is None:
-        return _lock_busy_response(request) or RedirectResponse(
-            url="/migrate", status_code=303)
+        return _scan_submission_failure_response(request, "/migrate")
     return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
 
 @app.get("/jobs/{job_id}", response_class=HTMLResponse)
@@ -3635,9 +6215,10 @@ async def job_page(request: Request, job_id: str, approved: bool = False,
                 if job.execute_kind in ("upgrade", "downsample") else "queue")
     if nav_page == "upgrade" and not _upgrade_available():
         nav_page = "queue"
-    if job.attention:
+    if job.attention and job.attention != "recovery":
         # Opening the page is the acknowledgement: the History chip and the
-        # nav's warning dot stand down once the user has seen the job.
+        # nav's warning dot stand down once the user has seen the job. Recovery
+        # attention is a safety state, not a dismissible notification.
         job.attention = ""
         from qobuz_librarian.web import job_persistence
         loop = asyncio.get_running_loop()
@@ -3731,27 +6312,31 @@ async def job_review_page(request: Request, job_id: str, page: int = 1,
     return _tr(request, "_review_page.html", ctx)
 
 
-def _split_off_unapproved(job, tab):
+def _build_unapproved_review(job, tab, *, admission_filter=None):
     """Before approving a library or new-release review: move every candidate
     that ISN'T being downloaded right now into its own parked review, so a
     partial download consumes ONLY the ticked picks. Everything else stays in
     the living review —
     the unticked candidates, plus (on a tab-scoped approve) the whole tab the
-    user isn't looking at, ticks and all. Without this the active tab's
-    unticked candidates rode into the DONE job and vanished, so ticking 10 of a
-    52k review and downloading wiped the other ~51,990. Returns the parked job,
-    or None when nothing is left to park (every candidate is being downloaded)."""
-    from qobuz_librarian.web import flows, job_persistence
+    user isn't looking at, ticks and all. A final admission filter may also
+    keep a selected candidate parked when another job claimed it just before
+    approval. The caller holds ``job._lock`` and durably admits both jobs
+    before publishing either transition. Returns the new unpublished parked
+    job, or None when every candidate is being used."""
+    from qobuz_librarian.web import flows
     tab_scoped = tab in ("missing", "gaps")
     gap_active = tab == "gaps"
-    with job._lock:
-        keep, split = [], []
-        for c in job.candidates:
-            in_scope = (not tab_scoped) or (flows.is_gap_candidate(c) == gap_active)
-            (keep if (in_scope and c.get("selected")) else split).append(c)
-        if not split:
-            return None
-        job.candidates = keep
+    keep, split = [], []
+    for c in job.candidates:
+        in_scope = (not tab_scoped) or (flows.is_gap_candidate(c) == gap_active)
+        selected = in_scope and c.get("selected")
+        admitted = selected and (
+            admission_filter is None or admission_filter(c)
+        )
+        (keep if admitted else split).append(c)
+    if not split:
+        return None
+    job.candidates = keep
     other = job_mgr.Job(title=job.title, kind=job.kind,
                         execute_kind=job.execute_kind,
                         execute_args=dict(job.execute_args or {}),
@@ -3762,10 +6347,6 @@ def _split_off_unapproved(job, tab):
     factory = _RESUME_EXECUTE.get(other.execute_kind)
     if factory is not None:
         other._execute_fn = factory(other, other.execute_args)
-    job_mgr.registry.add(other)
-    job_persistence.persist(other)
-    job_persistence.persist(job)
-    job.notify_review_changed()
     return other
 
 
@@ -3892,6 +6473,8 @@ async def job_approve(request: Request, job_id: str):
     # (freezing every SSE stream / other request) for a large parked review —
     # the same reason /select was offloaded.
     def _split_and_approve():
+        from qobuz_librarian.completion import normalise_album_id
+
         # Atomic recheck right before anything is consumed: the route's opening
         # gate ran before several awaits (form parsing, disk probes), and
         # set_mode('cli') can hand the run lock to the terminal inside that
@@ -3901,7 +6484,7 @@ async def job_approve(request: Request, job_id: str):
         # handoff also takes) this either sees the pause and bounces with the
         # review untouched, or flips the job active first so the handoff
         # refuses.
-        with _auto_check_lock:
+        with _SAVED_REVIEW_LOCK, _auto_check_lock, _DOWNLOAD_SUBMIT_LOCK:
             if _web_writes_paused():
                 return "paused"
             # A library or new-release download consumes only the ticked picks:
@@ -3914,18 +6497,55 @@ async def job_approve(request: Request, job_id: str):
             # selection, so the whole-review path is protected too. Other kinds
             # keep their own recovery (Upgrade/Downsample rebuild from saved
             # state).
+            split_review = None
+            admission_decisions = {}
+
+            def selection_filter(candidate):
+                key = candidate.get("cid")
+                if not isinstance(key, str) or not key:
+                    return False
+                if key in admission_decisions:
+                    return admission_decisions[key]
+                if tab:
+                    gap_active = tab == "gaps"
+                    if flows.is_gap_candidate(candidate) != gap_active:
+                        admission_decisions[key] = False
+                        return False
+                if job.execute_kind in ("library", "new_releases"):
+                    album_id = normalise_album_id(
+                        (candidate.get("payload") or {}).get("album_id")
+                    )
+                    if album_id is None:
+                        admission_decisions[key] = False
+                        return False
+                    admitted = _duplicate_download_job(album_id) is None
+                else:
+                    admitted = True
+                admission_decisions[key] = admitted
+                return admitted
+
+            if tab:
+                from qobuz_librarian.web import flows
             if (job.execute_kind in ("library", "new_releases")
                     and job.status == job_mgr.JobStatus.AWAITING_REVIEW):
-                remnant = _split_off_unapproved(job, tab)
-                # Whole review ticked → nothing was left to re-park. Remember it so
-                # the run, on success, retires the worked-through review instead of
-                # letting the saved-state rebuild resurrect the just-downloaded
-                # albums as "missing" on the next /library visit. Any that FAIL are
-                # re-parked to retry (flows.execute_albums). Library-only: new
-                # releases have no saved-state rebuild to retire.
-                if job.execute_kind == "library":
-                    job._consumed_whole_review = remnant is None
-            return job_mgr.approve(job, None)
+                def split_review(review_job):
+                    remnant = _build_unapproved_review(
+                        review_job,
+                        tab,
+                        admission_filter=selection_filter,
+                    )
+                    # Whole review ticked → retire the worked-through baseline
+                    # after success instead of rebuilding its old candidates.
+                    if review_job.execute_kind == "library":
+                        review_job._consumed_whole_review = remnant is None
+                    return remnant
+
+            return job_mgr.approve(
+                job,
+                None,
+                split_review=split_review,
+                selection_filter=selection_filter,
+            )
 
     approved = await loop.run_in_executor(None, _split_and_approve)
     if approved == "paused":
@@ -3933,6 +6553,16 @@ async def job_approve(request: Request, job_id: str):
         if busy is not None:
             return busy
         return RedirectResponse(url=dest, status_code=303)
+    if approved is None:
+        return RedirectResponse(
+            url=dest + "?error=" + urllib.parse.quote(
+                job_mgr.JOB_ADMISSION_ERROR
+            ) + _skip_q,
+            status_code=303,
+        )
+    if approved is job_mgr.APPROVAL_NO_SELECTION:
+        return RedirectResponse(url=f"{dest}?noselection=1{_skip_q}",
+                                status_code=303)
     flag = "approved=1" if approved else "stale=1"
     return RedirectResponse(url=f"{dest}?{flag}{_skip_q}", status_code=303)
 
@@ -4103,7 +6733,13 @@ async def job_select(request: Request, job_id: str):
     form = await request.form()
     cid = (form.get("cid") or "").strip()
     on = (form.get("checked") or "").strip().lower() in ("1", "true", "on", "yes")
-    if cid and job.set_selected(cid, on):
+    changed = job.set_selected(cid, on)
+    if changed is None:
+        return JSONResponse(
+            {"error": "review is no longer awaiting selection"},
+            status_code=409,
+        )
+    if changed:
         # Coalesced save: the candidate list is multi-MB on a big library, so
         # the tap must not wait for (or even schedule) a full serialize+write.
         job_mgr.persist_soon(job)
@@ -4146,7 +6782,13 @@ async def job_select_all(request: Request, job_id: str):
                          or flows.is_gap_candidate(c) == gap_active)
                     and (not q or flows.candidate_matches_query(c, q))]
     persist_failed = False
-    if job.set_all_selected(on, cids=cids):
+    changed = job.set_all_selected(on, cids=cids)
+    if changed is None:
+        return JSONResponse(
+            {"error": "review is no longer awaiting selection"},
+            status_code=409,
+        )
+    if changed:
         # Unlike a single tap, a bulk choice is one infrequent operation whose
         # success needs to mean its complete result is durable. Waiting for the
         # off-thread write lets this exact response warn if the data volume
@@ -4211,13 +6853,20 @@ async def job_hide(request: Request, job_id: str):
         # and drops the rest — no form keep-set, which under pagination would
         # only carry the visible page and clobber other pages' selections.
         try:
-            n = flows.dismiss_albums(job, artist,
-                                     scope=_hide_scope(job.execute_kind),
-                                     gap_only=gap_only)
+            with _SAVED_REVIEW_LOCK:
+                n = flows.dismiss_albums(job, artist,
+                                         scope=_hide_scope(job.execute_kind),
+                                         gap_only=gap_only)
         except OSError as e:
             # Nothing changed server-side; the non-2xx keeps htmx from
             # swapping the rows away and the error toast reads this body.
             return HTMLResponse(str(e), status_code=500)
+        if n is None:
+            return HTMLResponse(
+                "That review changed before the dismissal was saved. Reload "
+                "the page and try again.",
+                status_code=409,
+            )
         if n:
             # Keep other open tabs in sync; the originator already gets the
             # swapped group + fresh counts from this response.
@@ -4298,12 +6947,22 @@ async def job_dismiss_rest(request: Request, job_id: str):
     # plus a persist), which would block the event loop and stall every SSE
     # stream for a large scan.
     loop = asyncio.get_running_loop()
-    done = {"n": 0}
+    done = {"n": 0, "stale": False}
 
     def _dismiss_all():
-        for a in artists:
-            done["n"] += flows.dismiss_albums(job, a, scope=scope,
-                                              gap_only=gap_only, query=q)
+        with _SAVED_REVIEW_LOCK, job._review_action_lock:
+            for a in artists:
+                hidden = flows.dismiss_albums(
+                    job,
+                    a,
+                    scope=scope,
+                    gap_only=gap_only,
+                    query=q,
+                )
+                if hidden is None:
+                    done["stale"] = True
+                    break
+                done["n"] += hidden
 
     try:
         await loop.run_in_executor(None, _dismiss_all)
@@ -4318,6 +6977,16 @@ async def job_dismiss_rest(request: Request, job_id: str):
             job.notify_review_changed()
         return JSONResponse({"error": str(e), "hidden": done["n"]},
                             status_code=500)
+    if done["stale"]:
+        if done["n"]:
+            job.notify_review_changed()
+        return JSONResponse(
+            {
+                "error": "That review changed before dismissal completed.",
+                "hidden": done["n"],
+            },
+            status_code=409,
+        )
     if hidden_count:
         job.notify_review_changed(_review_origin(request))
     from qobuz_librarian.library import hidden as hidden_mod
@@ -4330,9 +6999,6 @@ async def job_dismiss_rest(request: Request, job_id: str):
 
 @app.post("/jobs/{job_id}/retry")
 async def job_retry(request: Request, job_id: str):
-    busy = _lock_busy_response(request)
-    if busy is not None:
-        return busy
     # Retry rebuilds the download from the persisted album_id, so it works as
     # well for a job evicted from the registry (restart, or 50 jobs later) as
     # for a live one — fall back to the archive instead of silently bouncing.
@@ -4347,27 +7013,190 @@ async def job_retry(request: Request, job_id: str):
             url="/queue?error=" + urllib.parse.quote(
                 "Nothing to retry for that job."),
             status_code=303)
+    form = await request.form()
+    raw_recovery_operation = form.get("recovery_operation_id")
+    raw_recovery_item = form.get("recovery_item_id")
+    recovery_submission = (
+        raw_recovery_operation is not None or raw_recovery_item is not None
+    )
+    recovery_operation_id = (
+        raw_recovery_operation.strip()
+        if isinstance(raw_recovery_operation, str)
+        else ""
+    )
+    recovery_item_id = (
+        raw_recovery_item.strip()
+        if isinstance(raw_recovery_item, str)
+        else ""
+    )
+    if recovery_submission and (
+        not recovery_operation_id
+        or not recovery_item_id
+        or len(recovery_operation_id) > 128
+        or len(recovery_item_id) > 128
+    ):
+        return _durable_recovery_response(
+            request,
+            "That recovery Retry is incomplete or stale. No download was "
+            "started. Reload this page and try again.",
+        )
+
+    # A Retry is also the only user-triggered lane for an interrupted durable
+    # Web download. Always inspect afresh while authority is intact: both a
+    # cached CLEAR and a cached RESUME can be stale after a worker attempt.
+    if not _run_lock_intact():
+        busy = _lock_busy_response(request)
+        if busy is not None:
+            return busy
+        return _durable_recovery_response(
+            request,
+            "The single-writer safety lock could not be verified. No download "
+            "was started. Restart Qobuz Librarian.",
+        )
+    try:
+        recovery = _record_startup_recovery(_RUN_LOCK_HANDLE)
+    except Exception:
+        return _durable_recovery_response(
+            request,
+            "The saved recovery state could not be checked safely. No "
+            "download was started. Restart Qobuz Librarian.",
+        )
+    recovery_status = _recovery_status_value(recovery)
+
+    completion_acknowledged = _durable_completion_status(job)
+    if completion_acknowledged is None:
+        return _durable_recovery_response(
+            request,
+            "The saved completion record could not be checked safely. No "
+            "download was started. Check the data-folder permissions, then "
+            "restart Qobuz Librarian.",
+        )
+    if completion_acknowledged:
+        if recovery_status != "clear":
+            return _durable_recovery_response(
+                request,
+                "This download is already recorded as complete, but its "
+                "interrupted recovery proof is not settled yet. No download "
+                "was started. Check the application log, then restart Qobuz "
+                "Librarian.",
+            )
+        busy = _lock_busy_response(request)
+        if busy is not None:
+            return busy
+        if not _reconcile_acknowledged_job(job):
+            return _durable_recovery_response(
+                request,
+                "The completed download could not be saved to History. No "
+                "download was started. Check the data-folder permissions, "
+                "then restart Qobuz Librarian.",
+            )
+        return RedirectResponse(url=f"/jobs/{job.id}", status_code=303)
+
+    if recovery_submission:
+        if not _recovery_submission_matches(
+            job,
+            recovery_operation_id,
+            recovery_item_id,
+        ):
+            return _durable_recovery_response(
+                request,
+                "That interrupted-download Retry is stale. No download was "
+                "started. Reload the job and use its current Retry button.",
+            )
+    elif recovery_status != "clear" or job.attention == "recovery":
+        return _durable_recovery_response(
+            request,
+            "This download needs its exact recovery Retry control. No "
+            "download was started. Reload the interrupted job and use Retry "
+            "there.",
+        )
+
+    if (
+        recovery_submission
+        and
+        recovery_status == "attention_required"
+        and _durable_recovery_matches_job(job)
+    ):
+        from qobuz_librarian.queue.startup_recovery import (
+            BlockedItemSettlementAction,
+        )
+
+        settled, reason = _settle_durable_web_recovery(
+            job,
+            BlockedItemSettlementAction.RETRY,
+        )
+        if not settled:
+            return _durable_recovery_response(
+                request,
+                reason or "The interrupted download remains blocked.",
+            )
+        recovery = _STARTUP_RECOVERY_RESULT
+        recovery_status = _recovery_status_value(recovery)
+    durable_resume = (
+        recovery_status == "resume_required"
+        and _durable_recovery_matches_job(job)
+    )
+    if job.attention == "recovery" and not (
+        recovery_status == "clear" or durable_resume
+    ):
+        return _durable_recovery_response(
+            request,
+            "This download needs recovery attention and cannot be retried "
+            "safely. No download was started. Check the application log, "
+            "then restart Qobuz Librarian.",
+        )
+    if recovery_status == "attention_required":
+        return _durable_recovery_response(
+            request,
+            "The saved interrupted download needs recovery attention. No "
+            "download was started. Check the application log, then restart "
+            "Qobuz Librarian.",
+        )
+    if recovery_status == "resume_required" and not durable_resume:
+        return _durable_recovery_response(
+            request,
+            "Saved recovery belongs to a different or changed download. No "
+            "download was started. Retry only the exact interrupted job.",
+        )
+    if recovery_status not in {"clear", "resume_required"}:
+        return _durable_recovery_response(
+            request,
+            "The saved recovery state could not be verified safely. No "
+            "download was started. Restart Qobuz Librarian.",
+        )
+    busy = _lock_busy_response(
+        request,
+        durable_resume_job_id=job.id if durable_resume else None,
+    )
+    if busy is not None:
+        return busy
     album_id = job.album_id
     duplicate = _find_job_touching_album(album_id)
     if duplicate:
         return RedirectResponse(url=f"/jobs/{duplicate.id}", status_code=303)
     try:
         token = _get_token()
-        from qobuz_librarian.api.client import call_within
-        from qobuz_librarian.api.search import get_album
-        loop = asyncio.get_running_loop()
-        album = await asyncio.wait_for(
-            loop.run_in_executor(
-                None,
-                lambda: call_within(cfg.WEB_FETCH_TIMEOUT, get_album, album_id, token)),
-            timeout=cfg.WEB_FETCH_TIMEOUT,
-        )
-        title = album.get("title") or job.title or "?"
-        artist = (album.get("artist") or {}).get("name") or job.artist or "?"
-        # Re-check for a duplicate under the submit lock: the await above yielded
-        # the event loop, so a second Retry for the same album could have raced
-        # in between the pre-check and here. Same guard queue_download uses, so
-        # two quick retries can't double-queue the same album.
+        album = None
+        if not durable_resume:
+            from qobuz_librarian.api.client import call_within
+            from qobuz_librarian.api.search import get_album
+
+            loop = asyncio.get_running_loop()
+            album = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: call_within(
+                        cfg.WEB_FETCH_TIMEOUT,
+                        get_album,
+                        album_id,
+                        token,
+                    ),
+                ),
+                timeout=cfg.WEB_FETCH_TIMEOUT,
+            )
+        # Re-check under the submit lock. A live album lookup may have yielded
+        # the event loop, and concurrent Retry requests must still fold onto
+        # the one exact durable owner.
         with _DOWNLOAD_SUBMIT_LOCK:
             duplicate = _find_job_touching_album(album_id)
             if duplicate:
@@ -4376,23 +7205,149 @@ async def job_retry(request: Request, job_id: str):
             # get_album await above; re-check inside the submit lock (as
             # queue_download does) so a retry can't start a job after the CLI
             # handoff.
-            busy = _lock_busy_response(request)
+            if not _run_lock_intact():
+                busy = _lock_busy_response(request)
+                if busy is not None:
+                    return busy
+                return _durable_recovery_response(
+                    request,
+                    "The single-writer safety lock was lost while Retry was "
+                    "preparing. No download was started. Restart Qobuz "
+                    "Librarian.",
+                )
+            try:
+                recovery_now = _record_startup_recovery(_RUN_LOCK_HANDLE)
+            except Exception:
+                return _durable_recovery_response(
+                    request,
+                    "The saved recovery state changed while Retry was "
+                    "preparing and could not be checked safely. No download "
+                    "was started. Restart Qobuz Librarian.",
+                )
+            recovery_status_now = _recovery_status_value(recovery_now)
+            durable_resume_now = (
+                recovery_status_now == "resume_required"
+                and _durable_recovery_matches_job(job)
+            )
+            if recovery_submission and not _recovery_submission_matches(
+                job,
+                recovery_operation_id,
+                recovery_item_id,
+            ):
+                return _durable_recovery_response(
+                    request,
+                    "The interrupted download changed while Retry was "
+                    "preparing. No download was started. Reload the job and "
+                    "try again.",
+                )
+            acknowledged_now = _durable_completion_status(job)
+            if acknowledged_now is None:
+                return _durable_recovery_response(
+                    request,
+                    "The saved completion record could not be checked safely. "
+                    "No download was started. Restart Qobuz Librarian.",
+                )
+            if acknowledged_now:
+                if recovery_status_now == "clear" and (
+                    _reconcile_acknowledged_job(job)
+                ):
+                    return RedirectResponse(
+                        url=f"/jobs/{job.id}", status_code=303)
+                return _durable_recovery_response(
+                    request,
+                    "This download is already recorded as complete, but its "
+                    "recovery could not be finalized safely. No download was "
+                    "started. Restart Qobuz Librarian.",
+                )
+            if job.attention == "recovery" and not (
+                recovery_status_now == "clear" or durable_resume_now
+            ):
+                return _durable_recovery_response(
+                    request,
+                    "This download needs recovery attention and cannot be "
+                    "retried safely. No download was started. Restart Qobuz "
+                    "Librarian.",
+                )
+            if recovery_status_now == "attention_required":
+                return _durable_recovery_response(
+                    request,
+                    "The saved interrupted download needs recovery attention. "
+                    "No download was started. Restart Qobuz Librarian.",
+                )
+            if (
+                recovery_status_now == "resume_required"
+                and not durable_resume_now
+            ):
+                return _durable_recovery_response(
+                    request,
+                    "The saved interrupted download no longer matches this "
+                    "job. No download was started. Restart Qobuz Librarian.",
+                )
+            if recovery_status_now not in {"clear", "resume_required"}:
+                return _durable_recovery_response(
+                    request,
+                    "The saved recovery state could not be verified safely. "
+                    "No download was started. Restart Qobuz Librarian.",
+                )
+            if durable_resume and recovery_status_now == "clear":
+                return _durable_recovery_response(
+                    request,
+                    "The saved interrupted download changed while Retry was "
+                    "preparing. No download was started. Restart Qobuz "
+                    "Librarian.",
+                )
+            durable_resume = durable_resume_now
+            busy = _lock_busy_response(
+                request,
+                durable_resume_job_id=job.id if durable_resume else None,
+            )
             if busy is not None:
                 return busy
+            durable_planned = None
+            if durable_resume:
+                durable_planned = _durable_recovery_planned(job)
+                if durable_planned is None:
+                    return _durable_recovery_response(
+                        request,
+                        "The exact saved download plan could not be loaded "
+                        "safely. No download was started. Restart Qobuz "
+                        "Librarian.",
+                    )
+                album = durable_planned.get("album")
+                if not isinstance(album, dict):
+                    return _durable_recovery_response(
+                        request,
+                        "The exact saved download plan is invalid. No "
+                        "download was started. Restart Qobuz Librarian.",
+                    )
+            elif album is None:
+                return _durable_recovery_response(
+                    request,
+                    "The album lookup changed while Retry was preparing. No "
+                    "download was started. Reload the job and try again.",
+                )
+            title = album.get("title") or job.title or "?"
+            artist = (album.get("artist") or {}).get("name") or job.artist or "?"
             # A failed single-track download carries job.album_id (so Retry shows up),
             # but _make_download_run would download the whole album. Rebuild it as
             # the same one-track run instead.
             single = getattr(job, "single", None)
             track = None
+            as_new = False
+            if durable_resume and single and single.get("track_id"):
+                return _durable_recovery_response(
+                    request,
+                    "The saved full-album recovery does not match this "
+                    "single-track job. No download was started. Restart "
+                    "Qobuz Librarian.",
+                )
             if single and single.get("track_id"):
                 tid = str(single.get("track_id"))
                 track = next(
                     (t for t in (album.get("tracks") or {}).get("items") or []
                      if str(t.get("id")) == tid), None)
-            new_job = job_mgr.Job(title=title, artist=artist, album_id=album_id)
             if track is not None:
-                new_job.single = dict(single)
-                job_mgr.submit(new_job, _make_single_track_run(album, track, token))
+                run = _make_single_track_run(album, track, token)
             elif single and single.get("track_id"):
                 # The original was a single-track download but that track is no
                 # longer on Qobuz — do NOT silently re-download the whole album.
@@ -4404,11 +7359,41 @@ async def job_retry(request: Request, job_id: str):
                 # Carry the "get this edition too" override across the retry —
                 # without it the rebuilt run sees the album as already owned
                 # and skips the download the user explicitly asked for.
-                as_new = bool((job.execute_args or {}).get("new_edition"))
+                if durable_planned is not None:
+                    run = _make_download_run(
+                        album,
+                        token,
+                        durable_planned=durable_planned,
+                    )
+                else:
+                    as_new = bool(
+                        (job.execute_args or {}).get("new_edition")
+                    )
+                    run = _make_download_run(
+                        album,
+                        token,
+                        treat_as_new=as_new,
+                    )
+            if durable_resume:
+                if not job_mgr.resubmit_failed(job, run):
+                    return _durable_recovery_response(
+                        request,
+                        "The exact interrupted job could not be queued safely. "
+                        "No download was started. Restart Qobuz Librarian.",
+                    )
+                new_job = job
+            else:
+                new_job = job_mgr.Job(
+                    title=title,
+                    artist=artist,
+                    album_id=album_id,
+                )
+                if track is not None:
+                    new_job.single = dict(single)
                 if as_new:
                     new_job.execute_args = {"new_edition": True}
-                job_mgr.submit(new_job, _make_download_run(album, token,
-                                                           treat_as_new=as_new))
+                if job_mgr.submit(new_job, run) is None:
+                    return _job_admission_response(request)
         return RedirectResponse(url=f"/jobs/{new_job.id}", status_code=303)
     except (SystemExit, NoCredsError):
         return RedirectResponse(url="/settings?error=creds", status_code=303)
@@ -4471,13 +7456,41 @@ async def job_undo(request: Request, job_id: str):
             logging.getLogger("qobuz_librarian").info(
                 "quality state refresh after undo skipped: %s", exc)
 
+    undo_outcome = {}
+
     def _reverse():
         from pathlib import Path
 
         from qobuz_librarian.integrations.beets import forget_beets_entries
         from qobuz_librarian.library import hidden as hidden_mod
-        d = Path(info["dir"])
-        removed = _unlink_owned_path(d, info.get("owned_path"))
+        from qobuz_librarian.web import job_persistence
+        owned_root = info.get("owned_root")
+        if owned_root is not None:
+            current_root = os.path.abspath(os.fspath(cfg.MUSIC_ROOT))
+            if (
+                not isinstance(owned_root, str)
+                or os.path.abspath(owned_root) != current_root
+            ):
+                return None
+            d = Path(current_root)
+        else:
+            d = Path(info["dir"])
+        # Every intent and state/identity refresh reaches the durable job row
+        # while the direct-operation lock still excludes another library
+        # writer. A restart can therefore resume a private held entry or an
+        # already-unlinked entry without treating an unrelated missing path as
+        # success.
+        job.single = info
+
+        def _persist_progress():
+            return job_persistence.persist(job)
+
+        removed = _unlink_owned_path(
+            d,
+            info.get("owned_path"),
+            progress=_persist_progress,
+            outcome_out=undo_outcome,
+        )
         if removed is not None and removed is not _OWNED_PATH_MISSING:
             forget_beets_entries([removed])
             if info.get("marked"):
@@ -4525,7 +7538,10 @@ async def job_undo(request: Request, job_id: str):
             # binding is left for the user rather than guessed from tags or
             # filenames.
             from pathlib import Path as _Path
-            dir_gone = not _Path(info["dir"]).exists()
+            dir_gone = (
+                info.get("owned_root") is None
+                and not _Path(info["dir"]).exists()
+            )
             if removed is _OWNED_PATH_MISSING or dir_gone:
                 if info.get("marked"):
                     from qobuz_librarian.library import hidden as hidden_mod
@@ -4536,9 +7552,28 @@ async def job_undo(request: Request, job_id: str):
                 job.summary = (f"“{info.get('title')}” was already gone; "
                                "cleared the single mark.")
             else:
-                job.summary = (f"Couldn't safely verify the downloaded copy of "
-                               f"“{info.get('title')}”. Nothing was removed; "
-                               "delete it manually if needed.")
+                if undo_outcome.get("files_complete"):
+                    job.summary = (
+                        f"Removed “{info.get('title')}”, but couldn't safely "
+                        "finish cleaning up its folders. Try Undo again.")
+                elif undo_outcome.get("removed_files"):
+                    job.summary = (
+                        "Part of Undo completed, but couldn't safely finish "
+                        f"removing “{info.get('title')}”. Try Undo again.")
+                elif undo_outcome.get("held_files"):
+                    job.summary = (
+                        "Undo safely set the downloaded copy of "
+                        f"“{info.get('title')}” aside, but couldn't finish "
+                        "removing it. Try Undo again.")
+                elif undo_outcome.get("undo_started"):
+                    job.summary = (
+                        "Undo started but couldn't safely finish removing "
+                        f"“{info.get('title')}”. Try Undo again.")
+                else:
+                    job.summary = (
+                        "Couldn't safely verify the downloaded copy of "
+                        f"“{info.get('title')}”. Nothing was removed; delete "
+                        "it manually if needed.")
         # Persist while the direct-operation registration still holds the web
         # run lock; a restart must not resurrect an Undo that already removed a
         # file or cleared its single mark.
@@ -4621,13 +7656,25 @@ async def queue_history(request: Request, p: int = 1):
 
     def _load_page(page):
         # Two layers: meaningful jobs as a scrollable card region, plain
-        # downloads as the paginated table underneath.
-        bulk = _stamp(job_persistence.history_page(_HISTORY_BULK_CAP, 0, bulk=True))
-        total = job_persistence.history_count(bulk=False)
+        # downloads as the paginated table underneath. Recovery obligations
+        # sit ahead of the bounded ordinary cards so age cannot hide them.
+        recoveries = _stamp(job_persistence.recovery_history())
+        bulk = recoveries + _stamp(job_persistence.history_page(
+            _HISTORY_BULK_CAP,
+            0,
+            bulk=True,
+            exclude_recoveries=True,
+        ))
+        total = job_persistence.history_count(
+            bulk=False, exclude_recoveries=True)
         pages = max(1, (total + _HISTORY_PER_PAGE - 1) // _HISTORY_PER_PAGE)
         page = min(max(1, page), pages)
         rows = _stamp(job_persistence.history_page(
-            _HISTORY_PER_PAGE, (page - 1) * _HISTORY_PER_PAGE, bulk=False))
+            _HISTORY_PER_PAGE,
+            (page - 1) * _HISTORY_PER_PAGE,
+            bulk=False,
+            exclude_recoveries=True,
+        ))
         return bulk, total, pages, page, rows
 
     loop = asyncio.get_running_loop()
@@ -4640,12 +7687,20 @@ async def queue_history(request: Request, p: int = 1):
 
 
 @app.post("/queue/clear")
-async def queue_clear():
+async def queue_clear(request: Request):
     """Clear the History: drop finished/canceled/failed jobs from the registry
     and the full on-disk archive. In-flight jobs are untouched."""
     from qobuz_librarian.web import job_persistence
-    job_mgr.registry.clear_finished()
-    job_persistence.clear_history()
+    with _STARTUP_RECOVERY_LOCK:
+        if _startup_recovery_status_value() != "clear":
+            return _durable_recovery_response(
+                request,
+                "History cannot be cleared while an interrupted download still "
+                "has saved recovery state. Retry or settle that download first.",
+            )
+        retained_job_id = job_mgr.durable_recovery_job_id()
+        job_mgr.registry.clear_finished()
+        job_persistence.clear_history(retain_job_id=retained_job_id)
     return RedirectResponse(url="/queue/history", status_code=303)
 
 
@@ -4708,12 +7763,18 @@ def _diagnostics():
         checks.append({"label": "beets DB (BEETS_DB_PATH)", "ok": False,
                        "detail": f"{beets_db.parent} does not exist"})
 
-    for binary in ("rip", "beet", "ffmpeg", "flac"):
+    for binary in ("rip", "ffmpeg", "flac"):
         found = _sh.which(binary)
         checks.append({"label": f"`{binary}` binary",
                        "ok": bool(found),
                        "detail": found or f"{binary} not on PATH. "
                        "Rebuild the image (docker compose build)"})
+    beets_python, beets_detail = _beets_runtime_diagnostic()
+    checks.append({
+        "label": "Beets 2.12.0 runtime",
+        "ok": beets_python is not None,
+        "detail": beets_detail,
+    })
 
     stranded = []
     if cfg.UPGRADE_BACKUP_DIR.exists():
@@ -4740,9 +7801,27 @@ def _diagnostics():
         orphans = find_only_copy_backups()
     except Exception:
         orphans = []
+    interrupted_disposals = [
+        item for item in orphans
+        if item[0].name.startswith(".ql-dispose-backup-")
+    ]
+    orphans = [
+        item for item in orphans
+        if not item[0].name.startswith(".ql-dispose-backup-")
+    ]
+    if interrupted_disposals:
+        checks.append({
+            "label": "Interrupted backup cleanup",
+            "ok": False,
+            "detail": f"{plural(len(interrupted_disposals), 'backup')} kept "
+                      "recovery data; review the location shown below before "
+                      "removing anything.",
+        })
     if orphans:
         checks.append({"label": "Orphaned backups (only copy)", "ok": False,
-                       "detail": f"{len(orphans)} backup(s) hold tracks missing "
+                       "detail": f"{plural(len(orphans), 'backup')} "
+                                 f"{'holds' if len(orphans) == 1 else 'hold'} "
+                                 "tracks missing "
                                  f"from their album folder — restore them below."})
     else:
         checks.append({"label": "Orphaned backups (only copy)", "ok": True,
@@ -5028,7 +8107,7 @@ async def set_mode(request: Request, target: str = Form("")):
     lock under a running job would let the CLI race the worker over /staging.
     """
     global _RUN_LOCK_HANDLE, _LOCK_BUSY_PID, _CLI_MODE, _creds_cache, \
-        _LOCK_UNENFORCEABLE, _LOCK_OVERRIDE
+        _LOCK_UNENFORCEABLE
     from qobuz_librarian import run_lock
     want = (target or "").strip().lower()
     if want == "cli":
@@ -5072,34 +8151,33 @@ async def set_mode(request: Request, target: str = Form("")):
                 "terminal."), status_code=303)
         return RedirectResponse(url="/settings?mode=cli", status_code=303)
     if want == "nolock":
-        # The user's explicit "proceed without the safety lock" consent —
-        # only meaningful while the lock is unenforceable, and it lasts until
-        # restart so a permanent footgun can't be flipped on by accident and
-        # forgotten. The Settings card that posts this spells out the risk.
-        if _LOCK_UNENFORCEABLE:
-            _LOCK_OVERRIDE = True
-            import logging
-            logging.getLogger("qobuz_librarian").warning(
-                "no-lock override enabled by the user; the single-writer "
-                "guard is OFF until restart — nothing prevents a concurrent "
-                "run from writing staging at the same time.")
-        return RedirectResponse(url="/settings", status_code=303)
+        # Durable recovery cannot inspect or reconcile saved work without exact
+        # single-writer authority. Older clients may still post this retired
+        # action; keep it fail-closed instead of silently accepting it.
+        return RedirectResponse(
+            url="/settings?error=" + urllib.parse.quote(
+                "The safety lock is required. Fix the data-folder filesystem "
+                "or permissions, then restart Qobuz Librarian."),
+            status_code=303,
+        )
     if want == "web":
         try:
-            _RUN_LOCK_HANDLE = run_lock.acquire()
-            _CLI_MODE = False
+            lease = run_lock.acquire()
+            _RUN_LOCK_HANDLE = lease
             _LOCK_BUSY_PID = None
-            if _RUN_LOCK_HANDLE is None:
+            if lease is None:
                 # Can't enforce the lock — same stance as startup: pause
-                # destructive routes until the user opts in to running
-                # without the guard.
+                # destructive routes until the filesystem can enforce it.
                 _LOCK_UNENFORCEABLE = True
+                _CLI_MODE = False
             else:
-                # The lock took hold this time (the data dir became writable,
-                # a different mount, …) — the guard is ON, so a stale
-                # unenforceable flag from startup must not keep blocking
-                # writes until restart.
+                _record_startup_recovery(lease)
+                # Terminal-first startup deliberately skipped persisted jobs.
+                # Rebind them while Web writes are still paused, then expose
+                # mutation routes only after the one-time restore completes.
+                _restore_jobs_once()
                 _LOCK_UNENFORCEABLE = False
+                _CLI_MODE = False
             # The CLI may have changed the saved token while it held the lock;
             # drop the cached creds so the banner reflects what's on disk now.
             _creds_cache = None
@@ -5152,6 +8230,34 @@ def _diagnostics_fragment(request: Request, checks: list | None = None) -> str:
     for path, origin in orphans:
         name = html.escape(path.name)
         dest = html.escape(str(origin)) if origin else "its album folder"
+        if path.name.startswith(".ql-dispose-backup-"):
+            held = path / "held"
+            try:
+                location = (
+                    held
+                    if stat.S_ISDIR(
+                        held.stat(follow_symlinks=False).st_mode)
+                    else path
+                )
+            except OSError:
+                location = path
+            display_location, _is_host_path = _resolve_host_path(location)
+            detail = (
+                f"Recovery files for {dest} were kept at "
+                f"{html.escape(display_location)}. Review them before removing "
+                "anything."
+            )
+            rows.append(
+                f'<div class="ql-diagnostic-row">'
+                f'<span class="ql-diagnostic-status '
+                f'ql-diagnostic-status-error" '
+                f'aria-label="Needs attention">!</span>'
+                f'<div class="min-w-0"><div '
+                f'class="ql-diagnostic-label">Interrupted backup cleanup'
+                f'</div><div class="ql-diagnostic-detail">{detail}</div>'
+                f'</div></div>'
+            )
+            continue
         rows.append(
             f'<div class="ql-diagnostic-row">'
             f'<span class="ql-diagnostic-status ql-diagnostic-status-error" aria-label="Needs attention">!</span>'
@@ -5179,7 +8285,7 @@ def _diagnostics_fragment(request: Request, checks: list | None = None) -> str:
             f'<div class="min-w-0"><div class="ql-diagnostic-label">Downsample originals: {name}</div>'
             f'<div class="ql-diagnostic-detail">Hi-res copies kept so the rewrite '
             f'can be undone; cleared automatically after '
-            f'{cfg.UPGRADE_BACKUP_RETENTION_DAYS} day(s).</div>'
+            f'{plural(cfg.UPGRADE_BACKUP_RETENTION_DAYS, "day")}.</div>'
             f'<form hx-post="/backups/restore" hx-target="#diagnostics-list" class="mt-2">'
             f'<input type="hidden" name="_csrf_token" value="{tok}">'
             f'<input type="hidden" name="backup" value="{name}">'
@@ -5202,7 +8308,7 @@ async def api_diagnostics(request: Request):
 
 def _restore_backup_sync(request: Request, backup: str) -> str:
     from qobuz_librarian.library.backup import (
-        _read_backup_origin,
+        load_backup_result,
         restore_gap_fill_backup,
         restore_upgrade_backup,
     )
@@ -5216,11 +8322,6 @@ def _restore_backup_sync(request: Request, backup: str) -> str:
         return (_ql_notice_html("error", "That backup isn't there anymore — "
                                 "it may already be restored or cleaned up.")
                 + _diagnostics_fragment(request))
-    origin = _read_backup_origin(target)
-    if origin is None:
-        return (_ql_notice_html("error", "This backup doesn't record where its "
-                                "files came from; move it back by hand.")
-                + _diagnostics_fragment(request))
     state, operation_token, lock = _begin_direct_library_operation(
         "Backup restore")
     if state == "paused":
@@ -5233,29 +8334,70 @@ def _restore_backup_sync(request: Request, backup: str) -> str:
                                 "right now — try again once it finishes.")
                 + _diagnostics_fragment(request))
     try:
-        if "_gapfill_" in name or "_downsample_" in name:
+        carried = load_backup_result(target)
+        receipt = carried.receipt if carried is not None else None
+        try:
+            origin = Path(receipt["origin"])
+            kind = receipt["kind"]
+        except (KeyError, TypeError, ValueError):
+            carried = None
+        if carried is None:
+            note = _ql_notice_html(
+                "error", "This backup changed or its recovery record is "
+                "invalid, so it was left untouched.")
+        elif (
+            resolution_plan := job_mgr.prepare_recovery_resolution(
+                str(carried.path), carried.receipt)
+        ) is None:
+            note = _ql_notice_html(
+                "error", "The saved recovery records could not be checked, "
+                "so this backup was left untouched. Check that the data "
+                "volume is writable, then try again.")
+        elif kind in {"gap-fill", "downsample"}:
             # These backups hold the good originals; the destination may hold a
             # partial or a rewritten copy, so the backup always wins the swap.
-            n = restore_gap_fill_backup(target, origin, keep_larger_dst=False)
-            if n and not target.exists():
-                note = _ql_notice_html(
-                    "success", f"Restored {n} file(s) to {html.escape(str(origin))}.")
+            n = restore_gap_fill_backup(
+                carried, origin, keep_larger_dst=False)
+            if n and not carried.exists():
+                if job_mgr.resolve_recovery_resolution(resolution_plan):
+                    note = _ql_notice_html(
+                        "success", f"Restored {plural(n, 'file')} to "
+                        f"{html.escape(str(origin))}.")
+                else:
+                    note = _ql_notice_html(
+                        "error", "The files were restored, but their saved "
+                        "recovery status could not be updated. History will "
+                        "continue to flag the recovery; do not run Restore "
+                        "again until the data volume has been checked.")
             elif n:
                 note = _ql_notice_html(
-                    "warning", f"Restored {n} file(s); the rest couldn't be "
+                    "warning", f"Restored {plural(n, 'file')}; the rest "
+                    "couldn't be "
                     "moved and stay in the backup.")
             else:
                 note = _ql_notice_html(
                     "error", "Nothing could be restored — the backup is "
                     "untouched; check the log.")
+        elif kind == "upgrade":
+            ok = restore_upgrade_backup(carried, origin)
+            if ok and job_mgr.resolve_recovery_resolution(resolution_plan):
+                note = _ql_notice_html(
+                    "success", f"Restored the album to "
+                    f"{html.escape(str(origin))}.")
+            elif ok:
+                note = _ql_notice_html(
+                    "error", "The album was restored, but its saved recovery "
+                    "status could not be updated. History will continue to "
+                    "flag the recovery; do not run Restore again until the "
+                    "data volume has been checked.")
+            else:
+                note = _ql_notice_html(
+                    "error", "Couldn't restore automatically — the backup "
+                    "is untouched; the log has the manual command.")
         else:
-            ok = restore_upgrade_backup(target, origin)
-            note = (_ql_notice_html(
-                        "success", f"Restored the album to {html.escape(str(origin))}.")
-                    if ok else
-                    _ql_notice_html(
-                        "error", "Couldn't restore automatically — the backup "
-                        "is untouched; the log has the manual command."))
+            note = _ql_notice_html(
+                "error", "This backup has an unsupported recovery record, so "
+                "it was left untouched.")
     finally:
         lock.release()
         job_mgr.end_library_operation(operation_token)

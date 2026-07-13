@@ -526,8 +526,8 @@ def print_consolidation_overview(summaries):
                 f"      ⚠  {qc['losing_hires']} track(s) here are HIGHER quality than primary."))
         if qc["unknown"]:
             log.info(fmt(C.RED + C.BOLD,
-                f"      ⚠  {qc['unknown']} track(s) here have unreadable quality — "
-                "can't confirm they're safe to delete."))
+                f"      ⚠  {qc['unknown']} track(s) here have uncertain quality "
+                "or channel layout — can't confirm they're safe to delete."))
 
 
 def print_per_track_consolidation(summary):
@@ -545,11 +545,12 @@ def print_per_track_consolidation(summary):
         sib_q = format_quality(st.get("bits", 0), st.get("sample_rate", 0))
         pri_q = format_quality(pt.get("bits", 0), pt.get("sample_rate", 0))
 
-        if (st.get("bits") or 0, st.get("sample_rate") or 0) == (0, 0):
-            badge = fmt(C.RED + C.BOLD, "delete (quality unreadable)")
-        elif _track_quality_cmp(st, pt) > 0:
+        comparison = _track_quality_cmp(st, pt)
+        if comparison is None:
+            badge = fmt(C.RED + C.BOLD, "delete (quality uncertain)")
+        elif comparison > 0:
             badge = fmt(C.RED + C.BOLD, "delete (HIGHER quality)")
-        elif _track_quality_cmp(st, pt) < 0:
+        elif comparison < 0:
             badge = fmt(C.GREEN, "delete (lower quality)")
         else:
             badge = fmt(C.GRAY, "delete (same quality)")
@@ -639,5 +640,3 @@ def print_album_summary(album, missing, present, album_dir, force, auto_upgrade=
             log.info(f"     {n:>2}.  {truncate(t.get('title') or '?', 60)}")
         if len(missing) > 25:
             log.info(fmt(C.GRAY, f"     … and {len(missing) - 25} more"))
-
-

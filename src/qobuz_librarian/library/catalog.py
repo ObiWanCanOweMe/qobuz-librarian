@@ -19,9 +19,14 @@ Behaviour you should not change without understanding the consequence:
 - predicted_album_paths uses a list, not a set, to preserve deterministic
   candidate order across runs (set hash iteration is non-deterministic).
 """
+import ctypes
+import errno
+import math
 import os
 import re
-import sys
+import secrets
+import sqlite3
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,15 +38,18 @@ from qobuz_librarian.library.scanner import (
     iter_tree_no_symlinks,
     read_album_dir,
 )
+from qobuz_librarian.library.sqlite_atomic import inspect_sqlite_source
 from qobuz_librarian.library.tags import (
     beets_sanitize,
+    canonical_recording_id,
+    canonical_track_slot,
+    canonical_track_title,
     differs_by_album_variant,
     normalize,
     similarity,
     strip_album_decorations,
     strip_edition_suffix,
     strip_leading_article,
-    strip_trailing_parens,
     strip_year_decoration,
 )
 from qobuz_librarian.ui_cli.colors import C, fmt
@@ -124,7 +132,7 @@ def _paths_equal(a: Path, b: Path) -> bool:
     forms, then to a plain string normalization."""
     try:
         return a.samefile(b)
-    except OSError:
+    except (OSError, TypeError, ValueError):
         pass
     try:
         return a.resolve() == b.resolve()
@@ -152,14 +160,14 @@ def _decoration_year(name):
 def _is_split_album_merge(album_dir, post_dir, qartist):
     """True when album_dir and post_dir are the SAME album split across two
     folders, safe to consolidate into post_dir (where beets just filed the new
-    tracks). Two shapes:
+    tracks).
 
-      - multi-artist: existing tracks under 'Primary, Other/Album', new ones
-        under 'Primary/Album'.
-      - year decoration: a hand-named/migrated folder lacks the '($year)' beets
-        writes ('Black Sands' vs 'Black Sands (2010)').
+    The safe automatic shape is multi-artist: existing tracks under
+    'Primary, Other/Album', with new ones under 'Primary/Album'. A bare album
+    folder and a same-parent year-decorated folder are ambiguous releases and
+    must remain separate.
 
-    Both require the two names to be the same album: equal once the year tag is
+    The names must describe the same album: equal once the year tag is
     stripped (so an edition/live folder isn't fused with the studio album), and
     not pinning two DIFFERENT years (different years are different releases — a
     reissue, an annual live album — never one split). Resolution can fuzzy-match
@@ -193,7 +201,7 @@ def _is_split_album_merge(album_dir, post_dir, qartist):
     if (_is_multi_artist_subset(album_dir.parent.name, qartist)
             and not _is_multi_artist_subset(post_dir.parent.name, qartist)):
         return True
-    return bool(_paths_equal(album_dir.parent, post_dir.parent))
+    return False
 
 
 # ── Album dir resolution ──────────────────────────────────────────────────────
@@ -278,9 +286,12 @@ def find_album_dir_filesystem(qobuz_album):
     for c in candidates:
         p_str = str(c.parent)
         if p_str not in _parent_kid_names:
-            _parent_kid_names[p_str] = {
-                k.name for k in _list_artist_subdirs_cached(c.parent)
-            }
+            try:
+                _parent_kid_names[p_str] = {
+                    k.name for k in _list_artist_subdirs_cached(c.parent)
+                }
+            except FileNotFoundError:
+                _parent_kid_names[p_str] = set()
         if c.name in _parent_kid_names[p_str]:
             vlog(f"exact match: {c}")
             return c
@@ -500,9 +511,7 @@ def _track_key(title_raw, disc, isrc, *, disc_scoped=True):
     scope = disc if disc_scoped else None
 
     def _scoped(text):
-        norm = normalize(text)
-        if not norm or not normalize(strip_trailing_parens(text)):
-            norm = text.strip().casefold()
+        norm = canonical_track_title(text)
         return (scope, norm) if norm else None
 
     title_raw = title_raw or ""
@@ -623,17 +632,104 @@ def compute_missing(qobuz_tracks, existing_tracks):
     return missing, present
 
 
-def folder_holds_all_tracks(folder, qobuz_tracks):
+def _strict_recording_id(track, field):
+    return canonical_recording_id(track.get(field), field)
+
+
+def _strict_track_slot(track, disc_field, number_field):
+    return canonical_track_slot(track, disc_field, number_field)
+
+
+def _strict_track_duration(track, field):
+    if isinstance(track.get(field), bool):
+        return None
+    try:
+        duration = float(track.get(field) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return duration if duration > 0 and math.isfinite(duration) else None
+
+
+def _strict_titles_match(qobuz_track, existing_track):
+    if (
+        not isinstance(qobuz_track.get("title"), str)
+        or not isinstance(existing_track.get("title"), str)
+    ):
+        return False
+    qobuz_key = _track_key(
+        qobuz_track.get("title"), 1, "", disc_scoped=False)
+    existing_key = _track_key(
+        existing_track.get("title"), 1, "", disc_scoped=False)
+    return _keys_match(qobuz_key, existing_key, "title")
+
+
+def _destructive_track_match(qobuz_track, existing_track):
+    qobuz_isrc = _strict_recording_id(qobuz_track, "isrc")
+    existing_isrc = _strict_recording_id(existing_track, "isrc")
+    qobuz_mbid = _strict_recording_id(qobuz_track, "mb_trackid")
+    existing_mbid = _strict_recording_id(existing_track, "mb_trackid")
+    if None in (qobuz_isrc, existing_isrc, qobuz_mbid, existing_mbid):
+        return False
+    if qobuz_isrc or existing_isrc:
+        return bool(
+            qobuz_isrc
+            and qobuz_isrc == existing_isrc
+            and not (
+                qobuz_mbid and existing_mbid
+                and qobuz_mbid != existing_mbid
+            )
+        )
+    if qobuz_mbid or existing_mbid:
+        return bool(qobuz_mbid and qobuz_mbid == existing_mbid)
+
+    qobuz_slot = _strict_track_slot(
+        qobuz_track, "media_number", "track_number")
+    qobuz_duration = _strict_track_duration(qobuz_track, "duration")
+    existing_duration = _strict_track_duration(existing_track, "length")
+    return bool(
+        qobuz_slot is not None
+        and qobuz_slot == _strict_track_slot(
+            existing_track, "discnumber", "tracknumber")
+        and qobuz_duration is not None
+        and existing_duration is not None
+        and abs(qobuz_duration - existing_duration) <= 2.0
+        and _strict_titles_match(qobuz_track, existing_track)
+    )
+
+
+def _destructive_track_coverage(qobuz_tracks, existing_tracks):
+    existing_slots = [
+        slot for track in existing_tracks
+        if (slot := _strict_track_slot(
+            track, "discnumber", "tracknumber")) is not None
+    ]
+    if len(existing_slots) != len(set(existing_slots)):
+        return False
+
+    claimed = set()
+    for qobuz_track in qobuz_tracks:
+        candidates = [
+            index for index, existing_track in enumerate(existing_tracks)
+            if _destructive_track_match(qobuz_track, existing_track)
+        ]
+        if len(candidates) != 1 or candidates[0] in claimed:
+            return False
+        claimed.add(candidates[0])
+    return True
+
+
+def folder_holds_all_tracks(folder, qobuz_tracks, destructive=False):
     """True only when every expected Qobuz track one-to-one matches an audio
-    file under ``folder`` — the same matcher the scan uses, so a duplicate
-    title needs two files and an extra can't stand in for an expected track.
+    file under ``folder``.
 
     This gates gap-fill backup deletion: a raw file count can be satisfied by
     extras, duplicate files, or pre-existing tracks while an expected track is
     absent, and the backup being deleted holds the only copy of the tracks
     moved aside. No expected list, an unreadable folder, or a walk that
     couldn't cover the whole tree reads as False — unverifiable means keep
-    the backup."""
+    the backup. Destructive callers opt into recording-authority, slot, title,
+    and duration checks; ordinary discovery keeps its intentionally permissive
+    edition matcher."""
     if not qobuz_tracks or folder is None or not folder.exists():
         return False
     walk_errors = []
@@ -644,6 +740,8 @@ def folder_holds_all_tracks(folder, qobuz_tracks):
         # can prove "complete" with the wrong file while the right one sits in
         # the unreadable subtree.
         return False
+    if destructive:
+        return _destructive_track_coverage(qobuz_tracks, tracks)
     still_missing, _ = compute_missing(qobuz_tracks, tracks)
     return not still_missing
 
@@ -652,10 +750,9 @@ def pair_existing_tracks(a_tracks, b_tracks):
     """One-to-one pair two ON-DISK track lists with the scan's matcher.
 
     Returns (pairs, unpaired_a): ``pairs`` as (a_track, b_track) tuples,
-    ``unpaired_a`` the a-side tracks that claimed nothing. Used to compare a
-    rebuilt album against its backup track-by-track (quality, length): rank
-    ordering can hide a swap where one track was upgraded and another
-    downgraded, so the comparison has to follow identity, not position."""
+    ``unpaired_a`` the a-side tracks that claimed nothing. This keeps discovery
+    semantics and must not authorize destructive cleanup; backup-disposal
+    callers use the strict matching path above."""
     disc_scoped = (_disc_count(a_tracks, "discnumber") > 1
                    and _disc_count(b_tracks, "discnumber") > 1)
     indices = _pair_indices(_existing_keys(a_tracks, disc_scoped),
@@ -1035,402 +1132,961 @@ def _count_audio_files_in(d):
     return n
 
 
-def cleanup_duplicate_art(album_dir: Path) -> int:
-    """Remove duplicate cover-art files that beets created via .N.jpg suffix.
+_RENAME_NOREPLACE = 1
 
-    When a partial album fill lands in a folder that already has cover art,
-    beets resolves the filename collision by renaming the incoming file to
-    cover.1.jpg, folder.2.png, etc. Net result: duplicate art files left
-    behind. We delete them post-import.
 
-    Pattern: <basename>.<digits>.<ext> where basename is in a known art-name
-    set and ext is a known image extension. The unnumbered base file
-    (<basename>.<ext>) MUST also exist — that's what makes it a beets
-    collision, not user-curated multi-art (booklet scans named
-    front.1/front.2 with no base front.<ext> are kept). Returns count of
-    files removed.
-    """
-    if not album_dir or not album_dir.exists():
-        return 0
-    art_names = {"cover", "folder", "album", "front", "art", "artwork", "albumart"}
-    art_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
-    pattern = re.compile(r"^(.+)\.\d+$")
-    removed = 0
+def _open_migration_directory(path, *, dir_fd=None):
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
+        raise OSError("safe directory access is unavailable")
+    flags = os.O_RDONLY | nofollow | directory | getattr(os, "O_CLOEXEC", 0)
+    return os.open(path, flags, dir_fd=dir_fd)
+
+
+def _renameat2_at(source_fd, source_name, destination_fd, destination_name,
+                  flags):
     try:
-        names_present = {f.name.lower() for f in album_dir.iterdir() if f.is_file()}
-    except OSError:
-        return 0
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as exc:
+        raise OSError(errno.ENOSYS, "renameat2 is unavailable") from exc
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = renameat2(
+        int(source_fd),
+        os.fsencode(source_name),
+        int(destination_fd),
+        os.fsencode(destination_name),
+        int(flags),
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), os.fspath(destination_name))
+
+
+def _rename_noreplace_at(source_fd, source_name, destination_fd,
+                         destination_name):
+    _renameat2_at(
+        source_fd,
+        source_name,
+        destination_fd,
+        destination_name,
+        _RENAME_NOREPLACE,
+    )
+
+
+
+def _migration_name_missing(parent_fd, name):
     try:
-        for f in album_dir.iterdir():
-            if not f.is_file():
-                continue
-            ext = f.suffix.lower()
-            if ext not in art_exts:
-                continue
-            m = pattern.match(f.stem)
-            if not m:
-                continue
-            base = m.group(1).lower()
-            if base not in art_names:
-                continue
-            # Only delete the numbered variant when the unnumbered base
-            # file exists too — that's the beets collision signature. If
-            # the user has cover.1.jpg / cover.2.jpg with no cover.jpg,
-            # those are their booklet scans; leave them.
-            if f"{base}{ext}" not in names_present:
-                continue
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+    return False
+
+
+class _MigrationEntryPreserved(OSError):
+    """Carry a concrete private recovery location without printing it."""
+
+    def __init__(self, location, message):
+        self.location = os.fspath(location)
+        super().__init__(errno.EBUSY, message)
+
+
+def _migration_descriptor_path(descriptor):
+    try:
+        value = os.readlink(f"/proc/self/fd/{int(descriptor)}")
+    except (OSError, TypeError, ValueError) as exc:
+        raise OSError(
+            "preserved migration entry has no stable recovery path"
+        ) from exc
+    if value.endswith(" (deleted)") or not Path(value).is_absolute():
+        raise OSError("preserved migration entry has no stable recovery path")
+    return Path(value)
+
+
+def _migration_entry_preserved(parent_fd, name, message):
+    return _MigrationEntryPreserved(
+        _migration_descriptor_path(parent_fd) / name,
+        message,
+    )
+
+
+def _migration_absolute_parts(value):
+    raw = os.fspath(value)
+    if isinstance(raw, bytes):
+        raw = os.fsdecode(raw)
+    if not isinstance(raw, str) or not raw or "\x00" in raw:
+        raise OSError("invalid absolute path")
+    absolute = Path(os.path.abspath(raw))
+    try:
+        relative = absolute.relative_to(Path(os.path.sep))
+    except ValueError:
+        raise OSError("path has no stable filesystem anchor") from None
+    return absolute, tuple(relative.parts)
+
+
+def _open_absolute_migration_chain(value):
+    """Hold every no-follow component from `/` through one directory."""
+    _absolute, names = _migration_absolute_parts(value)
+    chain = [_open_migration_directory(os.path.sep)]
+    try:
+        for name in names:
+            child = _open_migration_directory(name, dir_fd=chain[-1])
+            if not _migration_named_directory_matches(
+                    chain[-1], name, child):
+                os.close(child)
+                raise OSError("migration directory changed while it was opened")
+            chain.append(child)
+        return chain, names
+    except BaseException:
+        for descriptor in reversed(chain):
             try:
-                f.unlink()
-                removed += 1
-                vlog(f"removed duplicate art: {f.name}")
+                os.close(descriptor)
             except OSError:
                 pass
-    except OSError:
-        pass
-    return removed
+        raise
 
 
-def _prompt_migration_conflict(src_dir: Path, dest_dir: Path, auto_yes=False):
-    """Two albums for the same Qobuz release exist — one in the multi-artist
-    folder we just imported into, one in the primary-artist folder. Show
-    track count + quality side-by-side and ask whether to merge.
-
-    Returns True if the user wants to merge (file-by-file move with collision
-    prompts handled in `_merge_album_dirs`); False to leave both folders.
-    ``auto_yes`` (the CLI --yes flag) merges without prompting. Reachable from
-    the headless web executor, where there's no terminal to answer the prompt —
-    so a non-tty stdin leaves both folders for manual review rather than blocking
-    on input() (the merge's per-file prompts would block too)."""
-    from qobuz_librarian.library.scanner import read_album_dir as _read_album_dir
-    from qobuz_librarian.quality.tiers import format_quality
-    from qobuz_librarian.ui_cli.prompts import confirm
-
-    src_tracks = _read_album_dir(src_dir)
-    dst_tracks = _read_album_dir(dest_dir)
-
-    def _q(tracks):
-        if not tracks:
-            return "(empty)"
-        bits = max((t.get("bits") or 0) for t in tracks)
-        rate = max((t.get("sample_rate") or 0) for t in tracks)
-        return format_quality(bits, rate) if (bits or rate) else "?"
-
-    print()
-    log.info(fmt(C.YELLOW + C.BOLD,
-        "  ⚠  Multi-artist migration conflict"))
-    log.info(fmt(C.GRAY,
-        "     A folder for this album already exists at the primary-artist "
-        "location."))
-    log.info(fmt(C.WHITE,
-        f"     [src]  {src_dir}"))
-    log.info(fmt(C.GRAY,
-        f"            {len(src_tracks)} track(s) · {_q(src_tracks)}"))
-    log.info(fmt(C.WHITE,
-        f"     [dst]  {dest_dir}"))
-    log.info(fmt(C.GRAY,
-        f"            {len(dst_tracks)} track(s) · {_q(dst_tracks)}"))
-    log.info(fmt(C.GRAY,
-        "     Merge moves missing tracks from [src] → [dst]; on per-file "
-        "conflicts you'll be asked to keep src or dst."))
-    if not auto_yes and not sys.stdin.isatty():
-        # Headless (web executor / piped): can't safely prompt. Leave both
-        # folders for manual review instead of blocking on input().
-        log.info(fmt(C.GRAY,
-            "     No interactive terminal — leaving both folders for manual "
-            "review (re-run from a terminal or with --yes to merge)."))
+def _migration_chain_is_named(chain, names):
+    if len(chain) != len(names) + 1:
         return False
-    return confirm(
-        "  Merge [src] into [dst]?",
-        default_yes=True, auto_yes=auto_yes)
+    return all(
+        _migration_named_directory_matches(
+            chain[index], name, chain[index + 1])
+        for index, name in enumerate(names)
+    )
 
 
-# Beyond this many nested subdirs we stop merging. A real "Disc N" or
-# "CD N" structure is one level. Pathological inputs (symlink loop,
-# user-confused 20-level deep tree) would otherwise blow the stack or
-# spin forever.
-_MERGE_MAX_DEPTH = 8
-
-
-def _merge_album_dirs(src: Path, dst: Path, _depth: int = 0) -> bool:
-    """Move src/* into dst/. For each conflict, ask the user which to keep,
-    showing size + quality. Recurses into directory-vs-directory collisions
-    (multi-disc albums with Disc 1/, Disc 2/ subdirs). Returns True on
-    completion (even if some files were skipped); False on a hard I/O failure."""
-    from qobuz_librarian.library.migrate import move_path
-    from qobuz_librarian.ui_cli.colors import format_size
-    from qobuz_librarian.ui_cli.prompts import confirm
-
-    if _depth >= _MERGE_MAX_DEPTH:
-        log.info(fmt(C.YELLOW,
-            f"     skipped {src.name}/: nesting deeper than "
-            f"{_MERGE_MAX_DEPTH} levels (suspected loop or pathological tree)"))
-        return False
-
+def _open_migration_database_anchor():
+    configured = getattr(config, "BEETS_DB_PATH", None)
+    if not configured:
+        return None
+    database, parts = _migration_absolute_parts(configured)
+    if not parts:
+        raise OSError("invalid beets database path")
+    parent_chain, parent_names = _open_absolute_migration_chain(
+        database.parent)
+    descriptor = None
     try:
-        items = sorted(src.iterdir())
-    except OSError as e:
-        log.info(fmt(C.RED, f"  ✗  Couldn't list {src}: {e}."))
-        return False
-
-    for item in items:
-        target = dst / item.name
-        if not target.exists():
-            if not move_path(item, target):
-                log.info(fmt(C.YELLOW,
-                    f"     skipped {item.name}: couldn't move it (left in place)"))
-            continue
-
-        # Directory-vs-directory collision (typically multi-disc Disc N/):
-        # recurse so per-file conflict prompts still happen at leaf level.
-        if item.is_dir() and target.is_dir():
-            # Refuse to follow symlinked subdirs — they're how a single
-            # loop turns into infinite recursion. Real multi-disc albums
-            # don't use symlinks for disc folders.
-            if item.is_symlink() or target.is_symlink():
-                log.info(fmt(C.YELLOW,
-                    f"     skipped {item.name}/: symlinked subdir"))
-                continue
-            log.info(fmt(C.GRAY, f"     merging subdir: {item.name}/"))
-            _merge_album_dirs(item, target, _depth=_depth + 1)
-            # After recursion, src subdir should be empty (all files moved
-            # or dropped). Try to remove it; ignore failure (means user kept
-            # something there).
-            try:
-                item.rmdir()
-            except OSError:
-                pass
-            continue
-
-        # Mismatched type (file vs dir) — refuse rather than guess.
-        if item.is_dir() != target.is_dir():
-            log.info(fmt(C.YELLOW,
-                f"     skipped {item.name}: type mismatch (file vs dir)"))
-            continue
-
-        # File-vs-file collision. Compare and ask. Only prompt once per file.
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            raise OSError("safe beets database access is unavailable")
         try:
-            src_sz = item.stat().st_size
-            dst_sz = target.stat().st_size
+            descriptor = os.open(
+                database.name,
+                os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_chain[-1],
+            )
+        except FileNotFoundError:
+            descriptor = None
+        if descriptor is not None and not stat.S_ISREG(
+                os.fstat(descriptor).st_mode):
+            raise OSError("beets database is not a regular file")
+        anchor = {
+            "path": database,
+            "parent_chain": parent_chain,
+            "parent_names": parent_names,
+            "name": database.name,
+            "descriptor": descriptor,
+        }
+        if not _migration_database_anchor_matches(anchor):
+            raise OSError("configured beets database changed while it was opened")
+        return anchor
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        for directory_fd in reversed(parent_chain):
+            os.close(directory_fd)
+        raise
+
+
+def _migration_database_anchor_matches(anchor):
+    if anchor is None:
+        return True
+    try:
+        configured = getattr(config, "BEETS_DB_PATH", None)
+        if not configured:
+            return False
+        current, _parts = _migration_absolute_parts(configured)
+        if current != anchor["path"] or not _migration_chain_is_named(
+                anchor["parent_chain"], anchor["parent_names"]):
+            return False
+        descriptor = anchor["descriptor"]
+        if descriptor is None:
+            return _migration_name_missing(
+                anchor["parent_chain"][-1], anchor["name"])
+        return (
+            stat.S_ISREG(os.fstat(descriptor).st_mode)
+            and _migration_named_entry_matches(
+                anchor["parent_chain"][-1],
+                anchor["name"],
+                descriptor,
+            )
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _close_migration_database_anchor(anchor):
+    if anchor is None:
+        return
+    descriptor = anchor.get("descriptor")
+    if descriptor is not None:
+        try:
+            os.close(descriptor)
         except OSError:
-            src_sz = dst_sz = 0
-        log.info(fmt(C.WHITE, f"     conflict: {item.name}"))
-        log.info(fmt(C.GRAY,
-            f"       src: {format_size(src_sz)}   dst: {format_size(dst_sz)}"))
-        # Always keep-both unless a human at a terminal says otherwise: this
-        # collision can be two different masters, and --yes / the headless web
-        # executor must never silently replace one with the other. isatty gates
-        # the prompt so a non-tty worker takes the safe default without blocking
-        # on input().
-        if sys.stdin.isatty() and confirm(
-                "       Replace dst with src? (No keeps both)",
-                default_yes=False, auto_yes=False):
-            try:
-                item.replace(target)
-            except OSError as e:
-                log.info(fmt(C.YELLOW, f"       failed: {e}"))
-        else:
-            # Keep both — do NOT delete src. A same-named collision here can be
-            # two different masters, and the prompt never warned a file would be
-            # removed either way. Leaving src means its folder just isn't emptied
-            # (and so isn't auto-removed); the user can clean it up deliberately.
-            log.info(fmt(C.GRAY,
-                f"       kept both — left {item.name} in {item.parent.name}/"))
+            pass
+    for directory_fd in reversed(anchor.get("parent_chain", ())):
+        try:
+            os.close(directory_fd)
+        except OSError:
+            pass
+
+
+def _require_no_migration_items_triggers(connection):
+    trigger = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+        "AND tbl_name = 'items' COLLATE NOCASE LIMIT 1"
+    ).fetchone()
+    if trigger is not None:
+        raise sqlite3.DatabaseError(
+            "custom items triggers make path updates unverifiable")
+
+
+def _require_migration_delete_journal_mode(connection):
+    journal_mode = connection.execute("PRAGMA journal_mode").fetchone()
+    if journal_mode is None or str(journal_mode[0]).casefold() != "delete":
+        raise sqlite3.DatabaseError(
+            "safe path updates require SQLite delete-journal mode")
+
+
+def _prepare_migration_database_transaction_name(anchor):
+    """Compatibility gate; SQLite must never use a private database name."""
+    if (
+        anchor is not None
+        and anchor["descriptor"] is not None
+        and not _migration_database_anchor_matches(anchor)
+    ):
+        raise OSError("configured beets database changed before SQLite binding")
+
+
+
+def _preflight_migration_database_anchor(anchor, anchors_match=None):
+    """Reject an unsafe DB before its associated filesystem mutation."""
+    if anchor is None:
+        return
+    if not _migration_database_anchor_matches(anchor):
+        raise OSError("configured beets database changed before the move")
+    if anchor["descriptor"] is None:
+        return
+    try:
+        timeout = getattr(config, "BEETS_TIMEOUT", 5)
+        timeout = float(timeout) if timeout and timeout > 0 else 5.0
+        inspect_sqlite_source(
+            anchor,
+            _migration_database_anchor_matches,
+            lambda connection: (
+                _require_no_migration_items_triggers(connection),
+                _require_migration_delete_journal_mode(connection),
+            ),
+            connect=sqlite3.connect,
+            timeout=timeout,
+            anchors_match=anchors_match,
+        )
+    except sqlite3.Error as exc:
+        raise OSError(f"beets database preflight failed: {exc}") from exc
+
+
+def _migration_named_entry_matches(parent_fd, name, entry_fd):
+    try:
+        held = os.fstat(entry_fd)
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except (OSError, TypeError, ValueError):
+        return False
+    return (
+        stat.S_IFMT(held.st_mode) == stat.S_IFMT(named.st_mode)
+        and (int(held.st_dev), int(held.st_ino))
+        == (int(named.st_dev), int(named.st_ino))
+    )
+
+
+def _migration_named_directory_matches(parent_fd, name, directory_fd):
+    try:
+        if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
+            return False
+    except (OSError, TypeError, ValueError):
+        return False
+    return _migration_named_entry_matches(parent_fd, name, directory_fd)
+
+
+def _migration_rename_layout(source_fd, source_name, destination_fd,
+                             destination_name, entry_fd):
+    source_matches = _migration_named_entry_matches(
+        source_fd, source_name, entry_fd)
+    destination_matches = _migration_named_entry_matches(
+        destination_fd, destination_name, entry_fd)
+    if source_matches and _migration_name_missing(
+            destination_fd, destination_name):
+        return "source"
+    if destination_matches and _migration_name_missing(source_fd, source_name):
+        return "destination"
+    return "uncertain"
+
+
+def _migration_entry_is_unlinked(parent_fd, name, entry_fd):
+    try:
+        value = os.fstat(entry_fd)
+    except (OSError, TypeError, ValueError):
+        return False
+    return int(value.st_nlink) == 0 and _migration_name_missing(parent_fd, name)
+
+
+def _migration_entry_record(value):
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+        int(stat.S_IFMT(value.st_mode)),
+    )
+
+
+
+def _fsync_migration_directories(*descriptors):
+    synced = set()
+    for descriptor in descriptors:
+        value = os.fstat(descriptor)
+        if not stat.S_ISDIR(value.st_mode):
+            raise OSError(errno.ENOTDIR, "migration anchor is not a directory")
+        identity = (int(value.st_dev), int(value.st_ino))
+        if identity in synced:
+            continue
+        os.fsync(descriptor)
+        synced.add(identity)
+
+
+def _open_migration_handle(parent_fd, name):
+    path_only = getattr(os, "O_PATH", None)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if path_only is None or nofollow is None:
+        raise OSError("safe migration handles are unavailable")
+    descriptor = os.open(
+        name,
+        path_only | nofollow | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=parent_fd,
+    )
+    if not _migration_named_entry_matches(parent_fd, name, descriptor):
+        os.close(descriptor)
+        raise OSError("migration entry changed while it was opened")
+    return descriptor
+
+
+def _reserve_migration_directory_at(parent_fd, *, prefix, mode=0o700):
+    for _ in range(16):
+        name = f".{prefix}-{secrets.token_hex(12)}"
+        try:
+            os.mkdir(name, mode=mode, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        descriptor = None
+        try:
+            descriptor = _open_migration_directory(name, dir_fd=parent_fd)
+            if not _migration_named_directory_matches(
+                    parent_fd, name, descriptor):
+                raise OSError("reserved migration directory changed")
+            _fsync_migration_directories(parent_fd)
+            return name, descriptor
+        except BaseException:
+            if descriptor is None:
+                try:
+                    descriptor = _open_migration_directory(
+                        name, dir_fd=parent_fd)
+                except OSError:
+                    descriptor = None
+            if (
+                descriptor is not None
+                and _migration_named_directory_matches(
+                    parent_fd, name, descriptor)
+            ):
+                try:
+                    os.rmdir(name, dir_fd=parent_fd)
+                    _fsync_migration_directories(parent_fd)
+                except OSError:
+                    pass
+            if descriptor is not None:
+                os.close(descriptor)
+            raise
+    raise OSError("could not reserve a private migration directory")
+
+
+def _remove_reserved_migration_directory_at(parent_fd, name, directory_fd):
+    if not _migration_named_directory_matches(parent_fd, name, directory_fd):
+        return False
+    try:
+        os.rmdir(name, dir_fd=parent_fd)
+    except BaseException:
+        if not _migration_entry_is_unlinked(parent_fd, name, directory_fd):
+            return False
+    if not _migration_entry_is_unlinked(parent_fd, name, directory_fd):
+        return False
+    try:
+        _fsync_migration_directories(parent_fd)
+    except BaseException:
+        return False
     return True
 
 
-def _sync_beets_db_after_merge(old_dir: Path, new_dir: Path) -> None:
-    """Repoint each source row to its new path after a folder merge, except where a
-    row already exists at that path (a file collision the merge resolved), where
-    the source row is dropped instead. A blind prefix rewrite would otherwise
-    leave two items rows pointing at one file and break the next `beet update`.
+def _empty_migration_directory_state(
+        parent_fd, name, temporary_name, directory_fd):
+    if _migration_named_directory_matches(parent_fd, name, directory_fd):
+        return "public"
+    if _migration_named_directory_matches(
+            parent_fd, temporary_name, directory_fd):
+        return "quarantined"
+    try:
+        held = os.fstat(directory_fd)
+    except (OSError, TypeError, ValueError):
+        return "uncertain"
+    if (
+        stat.S_ISDIR(held.st_mode)
+        and int(held.st_nlink) == 0
+        and _migration_name_missing(parent_fd, name)
+        and _migration_name_missing(parent_fd, temporary_name)
+    ):
+        return "removed"
+    return "uncertain"
 
-    Reconciles only rows whose source file actually moved — i.e. is gone from
-    its old path on disk. A merge that hits a permission/space error (or a
-    collision the user declined to replace) leaves the file, and its correct
-    row, at the old path; repointing it blindly would point the DB at a file
-    that isn't there while orphaning the one that is.
+
+def _restore_empty_migration_directory_at(
+        parent_fd, name, temporary_name, directory_fd):
+    state = _empty_migration_directory_state(
+        parent_fd, name, temporary_name, directory_fd)
+    if state == "public":
+        return True
+    if state != "quarantined":
+        return False
+    try:
+        restored = _rollback_migration_rename(
+            parent_fd,
+            name,
+            parent_fd,
+            temporary_name,
+            directory_fd,
+        )
+    except _MigrationEntryPreserved:
+        raise
+    except BaseException:
+        restored = False
+    if restored:
+        return True
+    if _empty_migration_directory_state(
+            parent_fd, name, temporary_name, directory_fd) != "public":
+        return False
+    try:
+        _fsync_migration_directories(parent_fd)
+    except BaseException:
+        return False
+    return True
+
+
+def _restore_any_migration_entry_at(parent_fd, name, temporary_name):
+    """Put an unexpectedly quarantined entry back without overwriting."""
+    if (
+        not _migration_name_missing(parent_fd, name)
+        or _migration_name_missing(parent_fd, temporary_name)
+    ):
+        return False
+    moved_fd = None
+    try:
+        moved_fd = _open_migration_handle(parent_fd, temporary_name)
+        return _rollback_migration_rename(
+            parent_fd,
+            name,
+            parent_fd,
+            temporary_name,
+            moved_fd,
+        )
+    except _MigrationEntryPreserved:
+        raise
+    except BaseException:
+        return False
+    finally:
+        if moved_fd is not None:
+            os.close(moved_fd)
+
+
+def _rename_exact_migration_entry_at(
+        source_parent_fd, source_name,
+        destination_parent_fd, destination_name, expected_fd):
+    """Move one exact entry, restoring a replacement moved at the boundary."""
+    if _migration_rename_layout(
+            source_parent_fd,
+            source_name,
+            destination_parent_fd,
+            destination_name,
+            expected_fd) != "source":
+        raise OSError("exact migration rename precondition changed")
+    deferred = None
+    try:
+        _rename_noreplace_at(
+            source_parent_fd,
+            source_name,
+            destination_parent_fd,
+            destination_name,
+        )
+    except BaseException as exc:
+        deferred = exc
+    if _migration_rename_layout(
+            source_parent_fd,
+            source_name,
+            destination_parent_fd,
+            destination_name,
+            expected_fd) == "destination":
+        sync_error = None
+        try:
+            _fsync_migration_directories(
+                source_parent_fd, destination_parent_fd)
+        except BaseException as exc:
+            sync_error = exc
+        return deferred or sync_error
+
+    if _migration_name_missing(source_parent_fd, source_name):
+        unexpected_fd = None
+        try:
+            unexpected_fd = _open_migration_handle(
+                destination_parent_fd, destination_name)
+            if _rollback_migration_rename(
+                    source_parent_fd,
+                    source_name,
+                    destination_parent_fd,
+                    destination_name,
+                    unexpected_fd):
+                raise OSError(
+                    "migration entry changed during cleanup; the "
+                    "replacement was restored"
+                ) from deferred
+        except FileNotFoundError:
+            pass
+        finally:
+            if unexpected_fd is not None:
+                os.close(unexpected_fd)
+    if (
+        deferred is not None
+        and _migration_rename_layout(
+            source_parent_fd,
+            source_name,
+            destination_parent_fd,
+            destination_name,
+            expected_fd,
+        ) == "source"
+    ):
+        raise deferred
+    raise OSError("exact migration rename outcome is uncertain") from deferred
+
+
+def _remove_private_empty_migration_directory_at(
+        parent_fd, temporary_name, directory_fd):
+    """Remove an exact held directory behind a fresh private handoff."""
+    private_name = None
+    private_fd = None
+    moved = False
+
+    def restore_exact() -> bool:
+        nonlocal moved
+        if private_fd is None:
+            return False
+        restored = _rollback_migration_rename(
+            parent_fd,
+            temporary_name,
+            private_fd,
+            "candidate",
+            directory_fd,
+        )
+        if restored:
+            moved = False
+        return restored
+
+    try:
+        private_name, private_fd = _reserve_migration_directory_at(
+            parent_fd, prefix="qobuz-migrate-discard")
+        deferred = _rename_exact_migration_entry_at(
+            parent_fd,
+            temporary_name,
+            private_fd,
+            "candidate",
+            directory_fd,
+        )
+        moved = _migration_named_directory_matches(
+            private_fd, "candidate", directory_fd)
+        if not moved:
+            return False
+        if deferred is not None:
+            if not restore_exact():
+                raise _migration_entry_preserved(
+                    private_fd,
+                    "candidate",
+                    "Migration cleanup could not restore its held directory. "
+                    "The directory was kept for review.",
+                ) from deferred
+            if isinstance(deferred, OSError):
+                return False
+            raise deferred
+        try:
+            changed = bool(os.listdir(directory_fd))
+        except BaseException as exc:
+            if not restore_exact():
+                raise _migration_entry_preserved(
+                    private_fd,
+                    "candidate",
+                    "Migration cleanup could not restore its held directory. "
+                    "The directory was kept for review.",
+                ) from exc
+            if isinstance(exc, OSError):
+                return False
+            raise
+        if changed:
+            if not restore_exact():
+                raise _migration_entry_preserved(
+                    private_fd,
+                    "candidate",
+                    "A changed migration directory could not be restored. "
+                    "The directory was kept for review.",
+                )
+            return False
+        try:
+            _fsync_migration_directories(parent_fd, private_fd)
+            os.rmdir("candidate", dir_fd=private_fd)
+        except BaseException as exc:
+            if _migration_entry_is_unlinked(
+                    private_fd, "candidate", directory_fd):
+                _fsync_migration_directories(parent_fd, private_fd)
+                moved = False
+                if isinstance(exc, OSError):
+                    return True
+                raise
+            if _migration_named_directory_matches(
+                    private_fd, "candidate", directory_fd):
+                if not restore_exact():
+                    raise _migration_entry_preserved(
+                        private_fd,
+                        "candidate",
+                        "Migration cleanup could not restore its held "
+                        "directory. The directory was kept for review.",
+                    ) from exc
+                if isinstance(exc, OSError):
+                    return False
+                raise
+            raise OSError(
+                "private empty-directory cleanup outcome is uncertain"
+            ) from exc
+        if not _migration_entry_is_unlinked(
+                private_fd, "candidate", directory_fd):
+            raise OSError(
+                "private empty-directory removal outcome is uncertain")
+        moved = False
+        _fsync_migration_directories(parent_fd, private_fd)
+        return True
+    finally:
+        preserved = None
+        if moved and private_fd is not None:
+            try:
+                if not restore_exact():
+                    if _migration_named_directory_matches(
+                            private_fd, "candidate", directory_fd):
+                        preserved = _migration_entry_preserved(
+                            private_fd,
+                            "candidate",
+                            "Migration cleanup could not restore its held "
+                            "directory. The directory was kept for review.",
+                        )
+                    else:
+                        preserved = _MigrationEntryPreserved(
+                            _migration_descriptor_path(directory_fd),
+                            "Migration cleanup changed unexpectedly. The "
+                            "directory was kept for review.",
+                        )
+            except _MigrationEntryPreserved as exc:
+                preserved = exc
+        if private_fd is not None:
+            try:
+                if (
+                    private_name is not None
+                    and not os.listdir(private_fd)
+                ):
+                    _remove_reserved_migration_directory_at(
+                        parent_fd, private_name, private_fd)
+            except BaseException:
+                pass
+            os.close(private_fd)
+        if preserved is not None:
+            raise preserved
+
+
+def _remove_empty_migration_directory_at(parent_fd, name, directory_fd):
+    if not _migration_named_directory_matches(parent_fd, name, directory_fd):
+        return False
+    # Avoid a rename-and-rollback cycle for a directory that is already known
+    # to contain a conflict-kept entry. Besides needless churn, that cycle
+    # changes directory identities used by the sealed ownership receipt.
+    if os.listdir(directory_fd):
+        return False
+    for _ in range(16):
+        temporary_name = f".qobuz-migrate-empty-{secrets.token_hex(12)}"
+        try:
+            _rename_noreplace_at(
+                parent_fd, name, parent_fd, temporary_name)
+        except BaseException as exc:
+            state = _empty_migration_directory_state(
+                parent_fd, name, temporary_name, directory_fd)
+            if isinstance(exc, FileExistsError) and state == "public":
+                continue
+            if state == "quarantined":
+                if not _restore_empty_migration_directory_at(
+                        parent_fd, name, temporary_name, directory_fd):
+                    raise OSError(
+                        "empty-directory quarantine could not be rolled back"
+                    ) from exc
+            elif state != "public":
+                restored_unexpected = _restore_any_migration_entry_at(
+                    parent_fd, name, temporary_name)
+                if restored_unexpected:
+                    if isinstance(exc, OSError):
+                        return False
+                    raise
+                raise OSError(
+                    "empty-directory quarantine outcome is uncertain"
+                ) from exc
+            raise
+        moved_fd = None
+        try:
+            try:
+                moved_fd = _open_migration_handle(parent_fd, temporary_name)
+            except BaseException as exc:
+                if not _restore_empty_migration_directory_at(
+                        parent_fd, name, temporary_name, directory_fd):
+                    raise OSError(
+                        "empty-directory cleanup could not be rolled back"
+                    ) from exc
+                raise
+            if (
+                not _migration_name_missing(parent_fd, name)
+                or not _migration_named_entry_matches(
+                    parent_fd, temporary_name, directory_fd)
+                or not _migration_named_entry_matches(
+                    parent_fd, temporary_name, moved_fd)
+            ):
+                if (
+                    _migration_name_missing(parent_fd, name)
+                    and _migration_named_entry_matches(
+                        parent_fd, temporary_name, moved_fd)
+                    and not _migration_named_entry_matches(
+                        parent_fd, temporary_name, directory_fd)
+                ):
+                    if not _rollback_migration_rename(
+                            parent_fd,
+                            name,
+                            parent_fd,
+                            temporary_name,
+                            moved_fd):
+                        raise OSError(
+                            "late replacement directory could not be restored")
+                    return False
+                if not _restore_empty_migration_directory_at(
+                        parent_fd, name, temporary_name, directory_fd):
+                    raise OSError(
+                        "empty-directory cleanup could not be rolled back")
+                return False
+            try:
+                removed = _remove_private_empty_migration_directory_at(
+                    parent_fd, temporary_name, directory_fd)
+            except _MigrationEntryPreserved:
+                raise
+            except BaseException as exc:
+                state = _empty_migration_directory_state(
+                    parent_fd, name, temporary_name, directory_fd)
+                if state == "removed":
+                    _fsync_migration_directories(parent_fd)
+                    if isinstance(exc, OSError):
+                        return True
+                    raise
+                if not _restore_empty_migration_directory_at(
+                        parent_fd, name, temporary_name, directory_fd):
+                    raise OSError(
+                        "empty-directory cleanup outcome is uncertain"
+                    ) from exc
+                if isinstance(exc, OSError):
+                    return False
+                raise
+            if not removed:
+                if not _restore_empty_migration_directory_at(
+                        parent_fd, name, temporary_name, directory_fd):
+                    raise OSError(
+                        "empty-directory cleanup could not be rolled back")
+                return False
+            try:
+                _fsync_migration_directories(parent_fd)
+            except BaseException as exc:
+                raise OSError(
+                    "empty-directory removal could not be made durable"
+                ) from exc
+            return True
+        finally:
+            if moved_fd is not None:
+                os.close(moved_fd)
+    raise OSError("could not reserve an empty-directory cleanup name")
+
+
+def _open_or_publish_migration_directory_at(
+        parent_fd, name, *, created_out=None):
+    try:
+        return _open_migration_directory(name, dir_fd=parent_fd), False
+    except FileNotFoundError:
+        pass
+
+    reserved_name, directory_fd = _reserve_migration_directory_at(
+        parent_fd, prefix="qobuz-migrate-directory", mode=0o777)
+    try:
+        try:
+            _rename_noreplace_at(
+                parent_fd, reserved_name, parent_fd, name)
+        except FileExistsError:
+            if not _remove_reserved_migration_directory_at(
+                    parent_fd, reserved_name, directory_fd):
+                raise OSError(
+                    "temporary migration directory could not be reclaimed")
+            os.close(directory_fd)
+            return _open_migration_directory(name, dir_fd=parent_fd), False
+        if not _migration_named_directory_matches(
+                parent_fd, name, directory_fd):
+            raise OSError("published migration directory changed")
+        _fsync_migration_directories(parent_fd)
+        if created_out is not None:
+            record = {
+                "parent_fd": None,
+                "directory_fd": None,
+                "name": name,
+            }
+            try:
+                record["parent_fd"] = os.dup(parent_fd)
+                record["directory_fd"] = os.dup(directory_fd)
+                created_out.append(record)
+            except BaseException:
+                if record not in created_out:
+                    for key in ("directory_fd", "parent_fd"):
+                        descriptor = record[key]
+                        if descriptor is not None:
+                            try:
+                                os.close(descriptor)
+                            except OSError:
+                                pass
+                raise
+        return directory_fd, True
+    except BaseException:
+        if _migration_named_directory_matches(
+                parent_fd, name, directory_fd):
+            _remove_reserved_migration_directory_at(
+                parent_fd, name, directory_fd)
+        elif _migration_named_directory_matches(
+                parent_fd, reserved_name, directory_fd):
+            _remove_reserved_migration_directory_at(
+                parent_fd, reserved_name, directory_fd)
+        os.close(directory_fd)
+        raise
+
+def _open_migration_entry(parent_fd, name):
+    named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if stat.S_ISDIR(named.st_mode):
+        descriptor = _open_migration_directory(name, dir_fd=parent_fd)
+    elif stat.S_ISREG(named.st_mode):
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            raise OSError("safe file access is unavailable")
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+    else:
+        raise OSError(errno.EINVAL, "unsupported migration entry", name)
+    if not _migration_named_entry_matches(parent_fd, name, descriptor):
+        os.close(descriptor)
+        raise OSError("migration entry changed while it was opened")
+    return descriptor
+
+
+def _rollback_migration_rename(source_parent_fd, source_name,
+                               destination_parent_fd, destination_name,
+                               moved_fd):
+    if _migration_rename_layout(
+            source_parent_fd,
+            source_name,
+            destination_parent_fd,
+            destination_name,
+            moved_fd) != "destination":
+        return False
+    try:
+        _rename_noreplace_at(
+            destination_parent_fd,
+            destination_name,
+            source_parent_fd,
+            source_name,
+        )
+    except BaseException as exc:
+        if _migration_rename_layout(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+                moved_fd) != "source":
+            if _migration_named_entry_matches(
+                    destination_parent_fd, destination_name, moved_fd):
+                raise _migration_entry_preserved(
+                    destination_parent_fd,
+                    destination_name,
+                    "A second entry blocked safe migration restoration. "
+                    "Both entries were kept for review.",
+                ) from exc
+            return False
+    if _migration_rename_layout(
+            source_parent_fd,
+            source_name,
+            destination_parent_fd,
+            destination_name,
+            moved_fd) != "source":
+        return False
+    try:
+        _fsync_migration_directories(
+            source_parent_fd, destination_parent_fd)
+    except BaseException:
+        return False
+    return True
+
+
+def prompt_and_migrate_multi_artist_folder(
+    album,
+    args,
+    *,
+    ownership_move_out=None,
+):
+    """Leave imported multi-artist folders unchanged.
+
+    This compatibility boundary remains for older callers, but automatic
+    post-import folder moves are not offered because a filesystem rename and
+    the Beets path update cannot be committed as one restart-safe operation.
     """
-    db_path = getattr(config, "BEETS_DB_PATH", None)
-    if not db_path:
-        return
-    db_path = Path(str(db_path))
-    if not db_path.exists():
-        return
-    music_root = Path(str(config.MUSIC_ROOT))
-    try:
-        music_root_res = music_root.resolve()
-        old_rel = old_dir.resolve().relative_to(music_root_res)
-        new_rel = new_dir.resolve().relative_to(music_root_res)
-    except (ValueError, OSError):
-        return
-    # Match beets' own os.fsencode (filesystem encoding + surrogateescape) so
-    # non-UTF-8 filenames compare correctly rather than building a UTF-8 prefix
-    # that misses them.
-    old_prefix = os.fsencode(str(old_rel)) + b"/"
-    new_prefix = os.fsencode(str(new_rel)) + b"/"
-    import sqlite3
-    try:
-        with sqlite3.connect(str(db_path)) as conn:
-            rows = conn.execute(
-                "SELECT path FROM items WHERE SUBSTR(path, 1, ?) = ?",
-                (len(old_prefix), old_prefix)).fetchall()
-            for (path_b,) in rows:
-                # Skip rows whose file is still at the old path — that move
-                # didn't happen, so the row is already correct. If the path
-                # can't be stat'd (permission/stale mount), stay conservative
-                # and leave the row alone rather than repoint a file we can't
-                # confirm has moved.
-                old_abs = music_root / Path(os.fsdecode(path_b))
-                try:
-                    if old_abs.exists():
-                        continue
-                except OSError:
-                    continue
-                new_path_b = new_prefix + path_b[len(old_prefix):]
-                collides = conn.execute(
-                    "SELECT 1 FROM items WHERE path = ?",
-                    (new_path_b,)).fetchone()
-                if collides:
-                    conn.execute("DELETE FROM items WHERE path = ?", (path_b,))
-                else:
-                    conn.execute("UPDATE items SET path = ? WHERE path = ?",
-                                 (new_path_b, path_b))
-            conn.commit()
-    except (sqlite3.Error, OSError, ValueError) as e:
-        log.info(fmt(C.YELLOW,
-            f"  ⚠  beets DB merge sync failed ({e}). "
-            "Run `beet update` to re-scan."))
-
-
-def _sync_beets_db_after_file_move(old_file: Path, new_file: Path) -> None:
-    """Update beets' items.path for one file moved outside beets' control.
-
-    Matches a single exact path rather than a directory prefix; used when a repaired track beets
-    filed under its tag-derived album is relocated into the folder actually
-    being repaired.
-    """
-    db_path = getattr(config, "BEETS_DB_PATH", None)
-    if not db_path:
-        return
-    db_path = Path(str(db_path))
-    if not db_path.exists():
-        return
-    music_root = Path(str(config.MUSIC_ROOT))
-    try:
-        old_rel = old_file.resolve().relative_to(music_root.resolve())
-        new_rel = new_file.resolve().relative_to(music_root.resolve())
-    except (ValueError, OSError):
-        return
-    import sqlite3
-    try:
-        # os.fsencode (not UTF-8) to match how beets stores items.path, so a
-        # non-UTF-8 filename's row is actually matched. Same as the sibling
-        # merge sync.
-        with sqlite3.connect(str(db_path)) as conn:
-            conn.execute(
-                "UPDATE items SET path = ? WHERE path = ?",
-                (os.fsencode(str(new_rel)), os.fsencode(str(old_rel))),
-            )
-            conn.commit()
-    except (sqlite3.Error, OSError, ValueError) as e:
-        log.info(fmt(C.YELLOW,
-            f"  ⚠  beets DB path sync failed ({e}). "
-            "Run `beet update` to re-scan."))
-
-
-def prompt_and_migrate_multi_artist_folder(album, args):
-    """If `album` landed in a multi-artist folder ('Primary, Other'), move
-    it under 'Primary'. No-op when:
-      - Qobuz artist is a compilation alias ('Various Artists' etc.)
-      - The album is already directly under the primary
-      - The current folder isn't a recognised multi-artist form
-      - The destination album folder exists and the user declines to merge
-
-    Returns the resulting album dir Path (possibly unchanged) or None when
-    we can't locate the folder.
-    """
-    from qobuz_librarian.library import migrate
-    from qobuz_librarian.library.scanner import clear_scan_caches as _clear_caches
-    from qobuz_librarian.library.tags import beets_sanitize, normalize
-
-    qartist_raw = (album.get("artist") or {}).get("name") or ""
-    if not qartist_raw:
-        return None
-    if qartist_raw.lower().strip() in (
-            "various artists", "various", "va", "compilations", "soundtrack"):
-        return find_album_dir_filesystem(album)
-
-    cur = find_album_dir_filesystem(album)
-    if cur is None:
-        return None
-
-    # Use the primary (first) name from the Qobuz artist string. Qobuz
-    # returns "Jay Z and Kanye West" on some editions and "Jay Z" on
-    # others; the folder is always named from the comma-joined track-
-    # level form, so the migration target is the first name either way.
-    qartist = _primary_artist_of(qartist_raw)
-
-    cur_parent = cur.parent
-    primary = beets_sanitize(qartist)
-    if not primary:
-        return cur
-
-    # Already under the primary — nothing to do.
-    if normalize(cur_parent.name) == normalize(primary):
-        return cur
-
-    # Only migrate when the parent is 'qartist, other' (comma-space form).
-    # Other separators (' & ', ' and ') frequently appear inside real band
-    # names so we don't auto-migrate those. Match against the FULL Qobuz name
-    # (qartist_raw), not the primary: a single artist whose own name contains a
-    # comma ("Tyler, The Creator"; "Earth, Wind & Fire") would otherwise look
-    # like "<primary>, other" and get wrongly migrated into a lead-word folder.
-    if not _is_migration_candidate(cur_parent.name, qartist_raw):
-        return cur
-
-    new_parent = config.MUSIC_ROOT / primary
-    new_dir = new_parent / cur.name
-
-    if new_dir.exists():
-        if not _prompt_migration_conflict(
-                cur, new_dir, auto_yes=getattr(args, "yes", False)):
-            return cur
-        # User chose to merge: handle file-by-file, prompting on collisions.
-        ok = _merge_album_dirs(cur, new_dir)
-        if ok:
-            _sync_beets_db_after_merge(cur, new_dir)
-            maybe_remove_empty_dir(cur)
-            maybe_remove_empty_dir(cur_parent)
-            _clear_caches()
-            return new_dir
-        return cur
-
-    try:
-        # move_path renames within one filesystem and copy-verifies each file
-        # before deleting the source across filesystems, so a MUSIC_ROOT that
-        # spans two mounts can't strand a half-moved album. A partial move
-        # leaves files at cur; the merge-aware DB sync below reconciles only the
-        # rows whose file actually moved.
-        if not migrate.move_path(cur, new_dir) and cur.exists():
-            log.info(fmt(C.YELLOW,
-                f"  ⚠  Some files couldn't be moved out of {cur}; left in "
-                "place — reconcile by hand or re-run."))
-        # Sync beets DB BEFORE the cache clear so a concurrent scan can't see the
-        # new layout with the DB still pointing at the old path. Use the
-        # merge-aware sync (reconciles only rows whose file ACTUALLY moved), so a
-        # partial move that left some files at cur doesn't mis-repoint their
-        # rows to new_dir.
-        _sync_beets_db_after_merge(cur, new_dir)
-        log.info(fmt(C.GRAY,
-            f"  ⤷  Moved into primary-artist folder: {new_dir.name} "
-            f"(parent: {primary})"))
-        maybe_remove_empty_dir(cur_parent)
-        _clear_caches()
-        return new_dir
-    except OSError as e:
-        log.info(fmt(C.YELLOW,
-            f"  ⚠  Couldn't migrate to primary-artist folder: {e}."))
-        return cur
+    if isinstance(ownership_move_out, dict):
+        ownership_move_out.clear()
+    return find_album_dir_filesystem(album)
 
 
 # ── Qobuz catalog matching ────────────────────────────────────────────────────

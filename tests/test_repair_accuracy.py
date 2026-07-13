@@ -1,15 +1,3 @@
-"""Real-FLAC accuracy tests for the ISRC repair scan's integrity check.
-
-A repair scan must never call a file "ok" it never read: frame-CRC, middle-zero,
-or partial-tail corruption can leave the size and STREAMINFO intact, so only a
-real decode catches it. The shallow (deep=False) path is the strict case — it
-decode-probes every FLAC without a Qobuz call — and these build REAL corrupt
-FLACs to prove it flags them; the deep path adds the duration cross-check
-(last two tests). The decode probe is the ground truth.
-
-Network (Qobuz) is mocked; the FLAC decode path (`flac -t` via mutagen/flac) is
-real, so the real-FLAC tests are gated on ffmpeg + flac being present.
-"""
 import shutil
 import subprocess
 from pathlib import Path
@@ -29,8 +17,6 @@ def _need_tools():
         pytest.skip("flac not available")
 
 
-# ── real-FLAC builders (white noise = near-incompressible, like real music, so
-#    the file stays well above the cheap byte-size gate; decode is the signal) ──
 
 def _make_flac(path: Path, *, seconds=4, amp=0.5, isrc="USABC1234500"):
     subprocess.run(
@@ -48,8 +34,6 @@ def _make_flac(path: Path, *, seconds=4, amp=0.5, isrc="USABC1234500"):
 
 
 def _frame_corrupt(path: Path):
-    """Flip a run of bytes inside the audio frames → frame-CRC break. Size and
-    STREAMINFO stay intact, so only a real decode catches it."""
     off = flac_audio_offset(str(path)) or 8192
     size = path.stat().st_size
     start = off + (size - off) // 2
@@ -70,8 +54,6 @@ def _names(entries):
     return {Path(e["path"]).name for e in entries}
 
 
-# A Qobuz "match" for the corrupt files so the shallow sweep can build a
-# refillable verified_truncated entry once it decides to look one up.
 _QT = {"duration": 4.0, "title": "t", "track_number": 1, "isrc": "USABC1234500"}
 
 
@@ -124,12 +106,6 @@ def test_shallow_scan_does_not_false_flag_healthy(tmp_path, _need_tools):
 
 
 def test_byte_size_gate_does_not_flag_a_small_valid_flac_with_flac_absent(tmp_path, monkeypatch):
-    # The byte-size gate clears a suspiciously small file with a decode probe, but
-    # the probe needs the `flac` tool. With flac absent the gate must SKIP, not
-    # flag: quiet/ambient material compresses below the size gate yet decodes
-    # fine, and flagging it would trigger a false re-rip over a good original.
-    # Every other gate already degrades to "trust" when flac is absent; this one
-    # was the exception. Needs only ffmpeg (flac is simulated absent).
     if shutil.which("ffmpeg") is None:
         pytest.skip("ffmpeg not available")
 
@@ -159,44 +135,49 @@ def test_byte_size_gate_does_not_flag_a_small_valid_flac_with_flac_absent(tmp_pa
         f"a small but valid FLAC must not be flagged when flac is absent (got {r})")
 
 
-def test_duration_gate_abs_cap_flags_long_track_short_by_over_a_minute(monkeypatch):
-    # A 10-minute track missing 69 s is still 88% of its length, so the 85% ratio
-    # gate alone would wave it through; the absolute 60 s cap must flag it anyway.
-    # A 40 s trim (under the cap, above 85%) stays unflagged so a small edit on a
-    # long track isn't false-flagged into an overwrite. Driven through mocked
-    # lengths so it needs no 10-minute fixture.
+def test_duration_gate_abs_cap_flags_long_track_short_by_over_a_minute(
+        monkeypatch, tmp_path):
     import qobuz_librarian.repair_log as rl
 
-    def entries(flen):
-        return [{"path": "/nonexistent/01.flac", "title": "t",
-                 "isrc": "USABC1234500", "length": flen,
-                 "sample_rate": 44100, "bits": 16, "channels": 2}]
+    album = tmp_path / "album"
+    album.mkdir()
+    source = album / "01.flac"
+    source.write_bytes(b"held source")
+
+    def entry(flen):
+        return {"path": str(source), "title": "t",
+                "isrc": "USABC1234500", "length": flen,
+                "sample_rate": 44100, "bits": 16, "channels": 2}
 
     qt = {"duration": 600.0, "title": "t", "track_number": 1, "isrc": "USABC1234500"}
-    monkeypatch.setattr(rl, "find_qobuz_track_by_isrc", lambda i, t: qt)
+    monkeypatch.setattr(rl, "_qobuz_track_by_isrc", lambda i, t: qt)
+    monkeypatch.setattr(rl, "_flac_decode_ok", lambda *a, **k: True)
 
-    monkeypatch.setattr(rl, "read_album_dir", lambda d: entries(531.0))  # 69 s short
-    flagged = rl.scan_dir_for_isrc_repairs("/album", "tok", deep=True)["verified_truncated"]
+    monkeypatch.setattr(rl, "_read_held_audio_meta", lambda _s: entry(531.0))
+    flagged = rl.scan_dir_for_isrc_repairs(
+        album, "tok", deep=True)["verified_truncated"]
     assert len(flagged) == 1 and flagged[0].get("reason") is None
 
-    monkeypatch.setattr(rl, "read_album_dir", lambda d: entries(560.0))  # 40 s short
-    assert rl.scan_dir_for_isrc_repairs("/album", "tok", deep=True)["verified_truncated"] == []
+    monkeypatch.setattr(rl, "_read_held_audio_meta", lambda _s: entry(560.0))
+    assert rl.scan_dir_for_isrc_repairs(
+        album, "tok", deep=True)["verified_truncated"] == []
 
 
-def test_duration_gate_ignores_unreadable_length_tag(monkeypatch):
-    # A healthy track whose STREAMINFO length tag is unreadable (flen=0, with a
-    # positive Qobuz duration) must NOT be scored a 100%-truncation and then
-    # deleted+refilled. The `flen > 0` guard on the duration gate is the only
-    # thing preventing that; remove it and this flips to a false positive.
+def test_duration_gate_ignores_unreadable_length_tag(monkeypatch, tmp_path):
     import qobuz_librarian.repair_log as rl
 
-    entries = [{"path": "/nonexistent/01.flac", "title": "t",
-                "isrc": "USABC1234500", "length": 0.0,
-                "sample_rate": 44100, "bits": 16, "channels": 2}]
+    album = tmp_path / "album"
+    album.mkdir()
+    source = album / "01.flac"
+    source.write_bytes(b"held source")
+    entry = {"path": str(source), "title": "t",
+             "isrc": "USABC1234500", "length": 0.0,
+             "sample_rate": 44100, "bits": 16, "channels": 2}
     qt = {"duration": 200.0, "title": "t", "track_number": 1, "isrc": "USABC1234500"}
-    monkeypatch.setattr(rl, "find_qobuz_track_by_isrc", lambda i, t: qt)
-    monkeypatch.setattr(rl, "read_album_dir", lambda d: entries)
+    monkeypatch.setattr(rl, "_qobuz_track_by_isrc", lambda i, t: qt)
+    monkeypatch.setattr(rl, "_read_held_audio_meta", lambda _s: entry)
+    monkeypatch.setattr(rl, "_flac_decode_ok", lambda *a, **k: True)
 
-    r = rl.scan_dir_for_isrc_repairs("/album", "tok", deep=True)
+    r = rl.scan_dir_for_isrc_repairs(album, "tok", deep=True)
     assert r["verified_truncated"] == []
     assert r["verified_ok"] == 1

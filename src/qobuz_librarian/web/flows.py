@@ -60,7 +60,6 @@ def build_args():
         no_upgrade=False, no_downsample=False,
         prefer_hires=cfg.PREFER_HIRES,
         consolidate=False,
-        migrate_multi_artist=cfg.MIGRATE_MULTI_ARTIST,
         include_comps=False,
         include_singles=False,
         no_catalog=False,
@@ -417,16 +416,13 @@ def refold_restored_missing(artists, fingerprints):
 def refold_into_living_review(picks, execute_kind="library", ticked=True):
     """Fold a list of picks back into the newest parked review of
     ``execute_kind``, ticked by default — so they come back ready to retry
-    instead of stranding in a dead job. Callers: the picks a cancelled
-    download never reached (WebUIAudit #43), the albums that FAILED on a
-    partial-approve run, and (unticked) the instant Gap Fill candidate a
-    partial import leaves behind. The living review is the split-off parked
-    review #48 left behind at approve; when the WHOLE review was ticked there
-    is none, and those paths recover differently (a cancel lets the
-    saved-state rebuild bring the picks back unticked; a failure re-parks a
-    fresh review). Dedups by fold key, so re-adding a pick already in the
-    review is safe. Returns how many rejoined, or None when there's no review
-    to fold into."""
+    instead of stranding in a dead job. Callers include picks a cancelled
+    download never reached, albums that failed during a partial approval, and
+    the unticked Gap Fill candidate left by a partial import. The living review
+    is the split-off review left behind at approval; when the whole review was
+    selected, those paths rebuild or re-park their own review instead. Dedups by
+    fold key, so re-adding a pick already in the review is safe. Returns how
+    many rejoined, or None when there's no review to fold into."""
     from qobuz_librarian.web import job_persistence
     from qobuz_librarian.web import jobs as job_mgr
 
@@ -453,7 +449,7 @@ def _park_library_failures(failed_cands, execute_kind="library",
     empties the living review — so the albums that FAILED to download would
     vanish until the next scan. Re-park them as a fresh living review of
     ``execute_kind``, ticked, so they come back ready to retry (mirrors the
-    split-off review #48 leaves on a partial approve). Persisted so a restart
+    split-off review left by a partial approval). Persisted so a restart
     keeps them even though the retired baseline no longer rebuilds. Also the
     park half of the unticked instant Gap Fill fold, via ``ticked``/
     ``summary``. Returns the parked job, or None when nothing failed."""
@@ -663,6 +659,19 @@ def _flag_new_since_last_scan(job, mode):
 
 def dismiss_albums(job, artist, scope=hidden_mod.SCOPE_MISSING, gap_only=None,
                    query=""):
+    """Apply one hide action only while its review remains live."""
+    with job._review_action_lock:
+        return _dismiss_albums_locked(
+            job,
+            artist,
+            scope=scope,
+            gap_only=gap_only,
+            query=query,
+        )
+
+
+def _dismiss_albums_locked(job, artist, scope=hidden_mod.SCOPE_MISSING,
+                           gap_only=None, query=""):
     """Hide ``artist``'s albums that aren't currently selected, in ``scope``.
 
     Selection is server-backed (saved as the user ticks), so "hide the rest"
@@ -682,11 +691,17 @@ def dismiss_albums(job, artist, scope=hidden_mod.SCOPE_MISSING, gap_only=None,
     number hidden.
     """
     from qobuz_librarian.web import job_persistence
+    from qobuz_librarian.web import jobs as job_mgr
 
     # Snapshot + mutate under the lock in one go: a live scan appends candidates
     # from the worker thread, so reading job.candidates and replacing it in
     # separate steps could drop a concurrently-added album.
     with job._lock:
+        if job.status not in (
+            job_mgr.JobStatus.AWAITING_REVIEW,
+            job_mgr.JobStatus.SCANNING,
+        ):
+            return None
         to_hide = [c for c in job.candidates
                    if c.get("artist") == artist and not c.get("selected")
                    and (gap_only is None or is_gap_candidate(c) == gap_only)
@@ -894,7 +909,7 @@ def scan_library(job, token, partial_only=False, force_full=False):
                 "artist_id": saved.get("artist_id") or "",
                 "catalog_ids": list(catalog_ids or []),
             }
-        log.info(f"Resuming. {len(scanned)} artist(s) already scanned, "
+        log.info(f"Resuming. {plural(len(scanned), 'artist')} already scanned, "
                  f"{plural(total, 'album')} found so far.")
     todo = []
     n = len(artists)
@@ -1390,7 +1405,7 @@ def execute_albums(job, chosen, token):
         time.sleep(cfg.ARTIST_API_DELAY)
     job._progress_scope = None
     if job.cancel_requested:
-        # #43: the picks this run never started aren't lost — fold them back
+        # The picks this run never started aren't lost: fold them back
         # into the living review, ticked, so a cancel mid-batch doesn't strand
         # them in this dead job. The album that was mid-download when the cancel
         # landed sits just before `processed`, so it's outside chosen[processed:]
@@ -1416,8 +1431,8 @@ def execute_albums(job, chosen, token):
                  f"(some tracks failed); see the log.")
     if failed:
         job.error = f"{failed} of {plural(len(chosen), 'album')} didn't finish; see the log."
-    # #1: a whole-review download (every candidate ticked, nothing re-parked at
-    # approve) consumed the entire living review. Retire it so the saved-state
+    # A whole-review download (every candidate ticked, nothing re-parked at
+    # approval) consumed the entire living review. Retire it so the saved-state
     # rebuild doesn't resurrect the albums we just downloaded as "missing" on
     # the next /library visit. Albums that FAILED are re-parked, ticked, so they
     # come back to retry rather than silently vanishing until the next scan.
@@ -1428,7 +1443,7 @@ def execute_albums(job, chosen, token):
         library_scan_state.mark_review_retired(reason="worked_through")
     elif failed_cands and is_library_run:
         # Partial approve: the unticked picks stayed behind as a living split-off
-        # review (#48). Fold the albums that FAILED back into it, ticked, so they
+        # review. Fold the albums that failed back into it, ticked, so they
         # come back to retry — the same recovery the whole-review path gets, not
         # surviving only as this job's error line until a manual refresh.
         refold_into_living_review(failed_cands)
@@ -1604,8 +1619,10 @@ def execute_upgrades(job, chosen, token):
                     "n_at": 0,
                     "n_above": 0,
                 })
-                log.info(f"  upgrade incomplete: {verdict['n_below']} "
-                         f"track(s) still below target after retry. Marked capped.")
+                log.info(
+                    f"  upgrade incomplete: {plural(verdict['n_below'], 'track')} "
+                    "still below target after retry. Marked capped."
+                )
             _refresh_after_local_album_change(
                 album,
                 result,
@@ -1964,7 +1981,7 @@ def scan_repairs(job, token):
         for c in cp["candidates"]:
             _readd_candidate(job, c)
             total += 1
-        log.info(f"Resuming. {len(scanned)} artist(s) already checked, "
+        log.info(f"Resuming. {plural(len(scanned), 'artist')} already checked, "
                  f"{plural(total, 'album')} flagged so far.")
     log.info(f"Scanning {plural(len(artists), 'artist')} for damaged files. "
              "Only problems are listed below; expect long quiet stretches. "
@@ -2063,7 +2080,7 @@ def scan_repairs(job, token):
     log.info(job.summary)
 
 
-def _redownload_damaged_album(payload, token):
+def _redownload_damaged_album(payload, token, *, recovery_checkpoint=None):
     """Re-fetch a whole album whose damaged file couldn't be ID-verified.
 
     The folder is moved aside first so beets imports a clean copy instead of
@@ -2072,8 +2089,6 @@ def _redownload_damaged_album(payload, token):
     the re-download doesn't complete, the original folder is moved back so the
     user is never left worse off.
     """
-    import shutil as _shutil
-
     from qobuz_librarian.library.backup import (
         backup_album_dir,
         pin_unverified_upgrade_backup,
@@ -2082,8 +2097,13 @@ def _redownload_damaged_album(payload, token):
     )
     from qobuz_librarian.modes.process import (
         _carry_non_audio_from_backup,
+        _recover_incomplete_upgrade_backup,
         _upgrade_replacement_verified,
         process_album,
+    )
+    from qobuz_librarian.modes.repair import (
+        RepairRecovery,
+        RepairRecoveryRequired,
     )
     from qobuz_librarian.web.jobs import staging_lock
 
@@ -2092,38 +2112,131 @@ def _redownload_damaged_album(payload, token):
     full = get_album(payload["album_id"], token)
     album_dir = Path(payload["album_dir"])
     backup = backup_album_dir(album_dir) if album_dir.exists() else None
-    if album_dir.exists() and backup is None:
+    if backup is not None and not backup.complete:
+        _recover_incomplete_upgrade_backup(
+            backup, album_dir, operation="repair backup")
+        log.info("  The backup was interrupted, so the repair was stopped. "
+                 "See the recovery message above.")
+        return {"imported": False, "n_ok": 0, "result": "backup_failed"}
+    if (
+        album_dir.exists()
+        and backup is None
+    ):
         log.info("  Couldn't move the existing folder aside; left this album "
                  "alone. See the log above.")
         return {"imported": False, "n_ok": 0, "result": "backup_failed"}
+
+    def pin_repair_recovery(note):
+        if (backup is not None and backup.exists()
+                and not pin_unverified_upgrade_backup(backup, note)):
+            warn_pin_failed(backup)
+
+    def checkpoint_recovery(stage, reason, *, retained=True, required=False):
+        recovery = RepairRecovery(
+            backup=backup,
+            album_dir=album_dir,
+            stage=stage,
+            reason=reason,
+            retained=retained,
+        )
+        if recovery_checkpoint is None:
+            return recovery, True
+        try:
+            persisted = recovery_checkpoint(recovery) is True
+        except Exception as exc:
+            persisted = False
+            log.info(f"  Couldn't save the Repair recovery record: {exc}")
+        if required and not persisted:
+            log.info("  Repair stopped before downloading the replacement "
+                     "because its recovery record could not be saved.")
+        return recovery, persisted
+
+    if backup is not None:
+        _recovery, recovery_saved = checkpoint_recovery(
+            "backup",
+            "The original album is held while its replacement is downloaded.",
+            required=True,
+        )
+        if not recovery_saved:
+            if restore_upgrade_backup(backup, album_dir):
+                checkpoint_recovery(
+                    "resolved",
+                    "The original album was restored before Repair stopped.",
+                    retained=False,
+                )
+                return {
+                    "imported": False,
+                    "n_ok": 0,
+                    "result": "recovery_record_failed",
+                }
+            pin_repair_recovery(
+                "repair backup kept — recovery record and automatic restore "
+                "did not complete")
+            recovery, _ = checkpoint_recovery(
+                "restore",
+                "The recovery record could not be saved and automatic "
+                "restoration did not complete.",
+            )
+            cause = OSError("Repair recovery record could not be saved")
+            raise RepairRecoveryRequired(recovery, cause) from cause
+
     try:
         with staging_lock():
             result = process_album(full, build_args(), allow_force=False,
                                    already_confirmed=True, token=token) or {}
-    except Exception:
+    except Exception as exc:
         if backup:
-            restore_upgrade_backup(backup, album_dir)
+            if restore_upgrade_backup(backup, album_dir):
+                checkpoint_recovery(
+                    "resolved",
+                    "The original album was restored after the replacement "
+                    "download stopped.",
+                    retained=False,
+                )
+            else:
+                pin_repair_recovery(
+                    "repair backup kept — automatic restore after an error did "
+                    "not complete")
+                recovery, _ = checkpoint_recovery(
+                    "restore",
+                    "The replacement download stopped and automatic "
+                    "restoration did not complete.",
+                )
+                raise RepairRecoveryRequired(recovery, exc) from exc
         raise
     imported_ok = bool(result.get("imported")) and result.get("n_ok", 0) > 0
     if backup:
         if imported_ok and _upgrade_replacement_verified(full, album_dir, backup):
-            # The rebuild is verifiably at least as complete as the original
-            # and its final tree is durable — safe to drop the backup only
-            # after carrying the original's non-audio companions too.
-            if _carry_non_audio_from_backup(full, album_dir, backup):
-                try:
-                    _shutil.rmtree(backup)
-                except OSError as exc:
-                    log.info(f"  Re-download completed, but the redundant "
-                             f"backup couldn't be removed: {exc}")
+            # Carry useful companions, but keep the original until Repair has
+            # an exact final requested-track inventory rather than only the
+            # current album-level comparison.
+            carried = _carry_non_audio_from_backup(
+                full, album_dir, backup)
+            if carried is not None:
+                result["repair_unverified"] = True
+                pin_repair_recovery(
+                    "repair backup kept — exact requested-track result not "
+                    "yet proven")
+                log.info("  Re-download passed the current checks, but Repair "
+                         "cannot yet prove the exact final track set. Your "
+                         f"original album remains at {backup}.")
+                checkpoint_recovery(
+                    "verification",
+                    "The replacement passed the current checks, but the exact "
+                    "requested-track result could not be proven.",
+                )
             else:
                 result["repair_unverified"] = True
-                if not pin_unverified_upgrade_backup(
-                        backup, "repair backup kept — replacement not durable"):
-                    warn_pin_failed(backup)
+                pin_repair_recovery(
+                    "repair backup kept — replacement not durable")
                 log.info("  Re-download landed, but the rebuilt album or its "
                          "companions couldn't be flushed safely; keeping your "
                          f"backup at {backup}.")
+                checkpoint_recovery(
+                    "verification",
+                    "The replacement landed, but its album or companion files "
+                    "could not be flushed safely.",
+                )
         elif imported_ok:
             # Imported, but a decode pass alone doesn't prove the re-rip kept
             # every track — a truncated or short result could be WORSE than the
@@ -2132,19 +2245,110 @@ def _redownload_damaged_album(payload, token):
             # the result so the summary doesn't count it repaired: what's in
             # the library is an unverified, possibly incomplete replacement.
             result["repair_unverified"] = True
+            pin_repair_recovery(
+                "repair backup kept — replacement could not be verified "
+                "complete")
             log.info("  Re-download landed but couldn't be verified as complete "
                      f"as the original; keeping your backup at {backup}.")
+            checkpoint_recovery(
+                "verification",
+                "The replacement landed but could not be verified as complete "
+                "as the original album.",
+            )
         else:
             log.info("  Re-download didn't complete. Restoring the original "
                      "album folder.")
-            restore_upgrade_backup(backup, album_dir)
+            if restore_upgrade_backup(backup, album_dir):
+                checkpoint_recovery(
+                    "resolved",
+                    "The replacement did not complete, so the original album "
+                    "was restored.",
+                    retained=False,
+                )
+            else:
+                pin_repair_recovery(
+                    "repair backup kept — automatic restore did not complete")
+                checkpoint_recovery(
+                    "restore",
+                    "The replacement did not complete and automatic "
+                    "restoration was incomplete.",
+                )
     return result
+
+
+def _checkpoint_repair_recovery(job, recovery):
+    """Attach one exact Repair carrier to the durable job record."""
+    from qobuz_librarian.web import job_persistence
+
+    try:
+        record = recovery.as_record()
+        required = {
+            "version", "kind", "status", "location", "album_dir", "stage",
+            "reason", "complete", "requested", "backed_up", "receipt",
+        }
+        if (
+            not isinstance(record, dict)
+            or set(record) != required
+            or record.get("version") != 1
+            or record.get("kind") != "repair-backup"
+            or record.get("status") not in ("retained", "resolved")
+            or not isinstance(record.get("location"), str)
+            or not record["location"]
+            or not isinstance(record.get("album_dir"), str)
+            or not record["album_dir"]
+            or type(record.get("complete")) is not bool
+            or type(record.get("requested")) is not int
+            or type(record.get("backed_up")) is not int
+            or record["requested"] < 0
+            or record["backed_up"] < 0
+            or record["backed_up"] > record["requested"]
+            or (
+                record.get("receipt") is not None
+                and not isinstance(record.get("receipt"), dict)
+            )
+        ):
+            raise ValueError("Repair recovery record is malformed")
+    except (AttributeError, TypeError, ValueError) as exc:
+        log.info(f"  Couldn't prepare the Repair recovery record: {exc}")
+        return False
+
+    key = (record["kind"], record["location"])
+    with job._lock:
+        current = list(getattr(job, "recoveries", []) or [])
+        matching = lambda item: (
+            isinstance(item, dict)
+            and (item.get("kind"), item.get("location")) == key
+        )
+        if record["status"] == "resolved":
+            current = [item for item in current if not matching(item)]
+        else:
+            replaced = False
+            updated = []
+            for item in current:
+                if matching(item):
+                    if not replaced:
+                        updated.append(record)
+                        replaced = True
+                else:
+                    updated.append(item)
+            if not replaced:
+                updated.append(record)
+            current = updated
+        job.recoveries = current
+        if current:
+            job.attention = "recovery"
+        elif job.attention == "recovery":
+            job.attention = ""
+    return job_persistence.persist_recoveries(job)
 
 
 def execute_repairs(job, chosen, token):
     """Refill ISRC-verified truncated tracks, or re-download whole albums
     whose damage couldn't be ID-verified — depending on each candidate."""
-    from qobuz_librarian.modes.repair import repair_album_dir
+    from qobuz_librarian.modes.repair import (
+        RepairRecoveryRequired,
+        repair_album_dir,
+    )
     from qobuz_librarian.web.jobs import staging_lock
 
     clear_scan_caches()
@@ -2168,12 +2372,32 @@ def execute_repairs(job, chosen, token):
         try:
             if cand.get("kind") == "redownload":
                 # _redownload_damaged_album takes the staging lock itself.
-                result = _redownload_damaged_album(p, token)
+                result = _redownload_damaged_album(
+                    p,
+                    token,
+                    recovery_checkpoint=lambda recovery: (
+                        _checkpoint_repair_recovery(job, recovery)
+                    ),
+                )
             else:
                 with staging_lock():
                     result = repair_album_dir(Path(p["album_dir"]),
                                               p["verified_truncated"],
-                                              p["artist_name"], args, token)
+                                              p["artist_name"], args, token,
+                                              recovery_checkpoint=lambda recovery: (
+                                                  _checkpoint_repair_recovery(
+                                                      job, recovery)
+                                              ))
+        except RepairRecoveryRequired as exc:
+            # The callback normally saved this before the exceptional boundary.
+            # Repeat idempotently so a transient first write gets one final
+            # chance, while never reducing the carrier to an error string.
+            _checkpoint_repair_recovery(job, exc.recovery)
+            if job.cancel_requested:
+                break
+            if isinstance(exc.cause, (AuthLost, QobuzUnavailable, SystemExit)):
+                raise exc.cause
+            raise
         except (AuthLost, QobuzUnavailable):
             raise
         except Exception as e:
@@ -2187,7 +2411,13 @@ def execute_repairs(job, chosen, token):
         # counting it fixed would render a clean "Repaired n/n" over an album
         # that's still wrong — those count failed, and their kept backup is
         # named in the log.
-        if (result and result.get("n_ok", 0) > 0 and result.get("imported")
+        recovery_kept = any(
+            record.get("album_dir") == str(Path(p["album_dir"]))
+            for record in (getattr(job, "recoveries", []) or [])
+            if isinstance(record, dict)
+        )
+        if (not recovery_kept
+                and result and result.get("n_ok", 0) > 0 and result.get("imported")
                 and result.get("n_fail", 0) == 0
                 and not result.get("repair_unverified")):
             fixed += 1
@@ -2205,12 +2435,18 @@ def execute_repairs(job, chosen, token):
             failed += 1
         time.sleep(cfg.ARTIST_API_DELAY)
     job._progress_scope = None
+    recovery_count = len(getattr(job, "recoveries", []) or [])
     if job.cancel_requested:
-        job.summary = (f"Stopped early. {fixed} repaired, "
+        kept = (f", {recovery_count} kept for recovery"
+                if recovery_count else "")
+        job.summary = (f"Stopped early. {fixed} repaired{kept}, "
                        f"{len(chosen) - processed} not started.")
         log.info(job.summary)
         return
-    job.summary = f"Finished. Repaired {fixed}/{plural(len(chosen), 'album')}."
+    kept = (f" {plural(recovery_count, 'backup')} kept for recovery."
+            if recovery_count else "")
+    job.summary = (f"Finished. Repaired {fixed}/{plural(len(chosen), 'album')}."
+                   f"{kept}")
     log.info(job.summary)
     if failed:
         job.error = f"{failed} of {plural(len(chosen), 'album')} couldn't be repaired; see the log."
@@ -2240,7 +2476,7 @@ def run_lyric_retry(job):
     existing = [Path(p) for p in paths if Path(p).exists()]
     dropped = len(paths) - len(existing)
     if dropped:
-        log.info(f"{dropped} queued path(s) no longer on disk; skipping.")
+        log.info(f"{plural(dropped, 'queued path')} no longer on disk; skipping.")
     if not existing:
         save_lyric_retry([])
         job.summary = "All queued files are gone from disk; manifest cleared."
@@ -2257,7 +2493,7 @@ def run_lyric_retry(job):
             set_staging_holder("Lyrics retry")
             try:
                 lyric_fetch.fetch_for_paths(
-                    existing, log=log,
+                    existing, owned_root=cfg.MUSIC_ROOT, log=log,
                     providers=cfg.LYRICS_PROVIDERS or None,
                     lyrics_format=cfg.LYRICS_FORMAT,
                     state_path=cfg.LYRIC_FETCH_STATE_FILE,
@@ -2315,7 +2551,12 @@ def run_library_lyrics(job, *, rescan=False, synced_only=False):
         log.info(job.summary)
         return
     if res.get("stopped"):
-        job.summary = f"Stopped after scanning {plural(total, 'track')}."
+        stop_total = max(0, int(res.get("stop_total", total)))
+        processed = min(stop_total, max(0, int(res.get("processed", 0))))
+        job.summary = (
+            f"Stopped after processing {processed} of "
+            f"{plural(stop_total, 'track')}.")
+        log.info(job.summary)
         return
 
     wrote = (res.get("wrote-synced", 0) + res.get("wrote-plain", 0)
@@ -2332,6 +2573,7 @@ def run_library_lyrics(job, *, rescan=False, synced_only=False):
 
 
 # ── Library migration ──────────────────────────────────────────────────────────
+
 
 def scan_migration(job, src, dest, *, use_acoustid, in_place=False):
     """Analyze the source library and attach one candidate per placeable album.
@@ -2361,11 +2603,17 @@ def scan_migration(job, src, dest, *, use_acoustid, in_place=False):
         job.summary = "Stopped while checking existing copies. Nothing was copied."
         return
 
-    manifest = dest / "migration-manifest.csv"
     try:
-        engine.write_manifest(plan, manifest)
-    except OSError as exc:
-        log.info(f"Couldn't write the preview manifest: {exc}")
+        manifest_artifact = engine.write_manifest(plan)
+        manifest = Path(manifest_artifact["path"])
+    except (KeyError, OSError, TypeError, UnicodeError, ValueError) as exc:
+        job.error = (
+            "The migration preview could not be recorded safely, so nothing "
+            "can be approved. Fix the destination or filename issue and "
+            "scan again.")
+        job.summary = job.error
+        log.info(f"{job.error} Details: {exc}")
+        return
 
     groups: dict = {}
     for kind, plan_entries in (
@@ -2380,6 +2628,11 @@ def scan_migration(job, src, dest, *, use_acoustid, in_place=False):
     for (artist, album), group in sorted(groups.items()):
         entries = group["entries"]
         resumes = group["resume_entries"]
+        source_folders = {
+            tuple(entry.source_receipt.get("relative", ())[:-1])
+            for entry in entries + resumes
+            if entry.source_receipt is not None
+        }
         if entries and resumes:
             detail = (f"{plural(len(entries), 'track')} to "
                       f"{'move' if in_place else 'copy'} · "
@@ -2392,9 +2645,23 @@ def scan_migration(job, src, dest, *, use_acoustid, in_place=False):
                       "finish cover art and sidecars")
         payload = {
             "entries": [
-                (str(e.source), str(e.dest_rel)) for e in entries],
+                (str(e.source), str(e.dest_rel), e.source_receipt,
+                 e.destination_path_receipt)
+                for e in entries],
             "resume_entries": [
-                (str(e.source), str(e.dest_rel)) for e in resumes],
+                (str(e.source), str(e.dest_rel), e.source_receipt,
+                 e.destination_receipt)
+                for e in resumes],
+            "source_root": (str(plan.source_root)
+                            if plan.source_root is not None else None),
+            "source_root_receipt": plan.source_root_receipt,
+            "dest_root_receipt": plan.dest_root_receipt,
+            "destination_name_semantics": plan.destination_name_semantics,
+            "manifest_artifact": manifest_artifact,
+            "companion_receipts": [
+                receipt for receipt in plan.companion_receipts
+                if tuple(receipt.get("relative", ())[:-1]) in source_folders
+            ],
         }
         job.add_candidate(
             kind="migrate",
@@ -2442,42 +2709,111 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
 
     dest = Path(dest)
     entries = []
+    source_root = None
+    source_root_receipt = None
+    dest_root_receipt = None
+    destination_name_semantics = None
+    companion_receipts = []
+    companion_seen = set()
+    manifest_artifact = None
     for c in chosen:
-        for src_s, dest_s in c.get("payload", {}).get("entries", []):
+        payload = c.get("payload", {})
+        payload_manifest = payload.get("manifest_artifact")
+        if not isinstance(payload_manifest, dict):
+            job.error = (
+                "This migration review is missing the saved preview details "
+                "needed to verify its files. Nothing was changed; scan again "
+                "before moving or copying files.")
+            job.summary = job.error
+            return
+        if manifest_artifact is None:
+            manifest_artifact = payload_manifest
+        elif payload_manifest != manifest_artifact:
+            job.error = (
+                "The selected albums came from different migration previews. "
+                "Nothing was changed; scan again and select albums from one "
+                "preview.")
+            job.summary = job.error
+            return
+        payload_source_root = payload.get("source_root")
+        payload_source_receipt = payload.get("source_root_receipt")
+        payload_dest_receipt = payload.get("dest_root_receipt")
+        payload_name_semantics = payload.get("destination_name_semantics")
+        if source_root is None:
+            source_root = payload_source_root
+            source_root_receipt = payload_source_receipt
+            dest_root_receipt = payload_dest_receipt
+            destination_name_semantics = payload_name_semantics
+        elif (
+            payload_source_root != source_root
+            or payload_source_receipt != source_root_receipt
+            or payload_dest_receipt != dest_root_receipt
+            or payload_name_semantics != destination_name_semantics
+        ):
+            job.error = (
+                "The selected albums came from different migration previews. "
+                "Nothing was changed; scan again and select albums from one "
+                "preview.")
+            job.summary = job.error
+            return
+        for receipt in payload.get("companion_receipts", []):
+            relative = receipt.get("relative") if isinstance(receipt, dict) else None
+            if (
+                not isinstance(relative, (list, tuple))
+                or not relative
+                or any(
+                    not isinstance(part, str) or part in ("", ".", "..")
+                    for part in relative
+                )
+            ):
+                job.error = (
+                    "The saved migration preview is malformed. Nothing was "
+                    "changed; scan again.")
+                job.summary = job.error
+                return
+            key = tuple(relative)
+            if key not in companion_seen:
+                companion_seen.add(key)
+                companion_receipts.append(receipt)
+        for raw in payload.get("entries", []):
+            if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+                job.error = (
+                    "The saved migration preview is incomplete. Nothing was "
+                    "changed; scan again.")
+                job.summary = job.error
+                return
+            src_s, dest_s, sealed_source, sealed_destination_path = raw
             entries.append(engine.PlanEntry(
-                source=Path(src_s), status=engine.PLACE, dest_rel=Path(dest_s)))
-        for src_s, dest_s in c.get("payload", {}).get("resume_entries", []):
+                source=Path(src_s), status=engine.PLACE, dest_rel=Path(dest_s),
+                source_receipt=sealed_source,
+                destination_path_receipt=sealed_destination_path))
+        for raw in payload.get("resume_entries", []):
+            if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+                job.error = (
+                    "The saved migration preview is incomplete. Nothing was "
+                    "changed; scan again.")
+                job.summary = job.error
+                return
+            src_s, dest_s, sealed_source, sealed_destination = raw
             entries.append(engine.PlanEntry(
                 source=Path(src_s), status=engine.COLLISION,
-                dest_rel=Path(dest_s), reason="destination already exists"))
+                dest_rel=Path(dest_s), reason="destination already exists",
+                source_receipt=sealed_source,
+                destination_receipt=sealed_destination))
     if not entries:
         job.push_line("Nothing selected. Nothing to copy.")
         return
 
-    plan = engine.MigrationPlan(dest_root=dest, entries=entries)
-    # Re-check free space against the actually-selected files right before
-    # touching anything (the user may have deselected albums since the scan, and
-    # the disk may have changed). An in-place move that runs out mid-run leaves
-    # the library half-relocated, so block a known-short in-place migration here
-    # unless the user deliberately overrode the warning — the same gate the CLI
-    # enforces with a typed "yes". Copy mode leaves the originals intact, so a
-    # partial copy is recoverable and only warns.
-    # These mappings were approved from the scan. The estimate may count their
-    # companion files without rereading the audio; execute_plan performs the
-    # load-bearing identity check immediately before any companion copy.
+    plan = engine.MigrationPlan(
+        dest_root=dest,
+        entries=entries,
+        source_root=Path(source_root) if source_root else None,
+        source_root_receipt=source_root_receipt,
+        dest_root_receipt=dest_root_receipt,
+        companion_receipts=companion_receipts,
+        destination_name_semantics=destination_name_semantics,
+    )
     resume_entries = plan.collisions
-    need, free = engine.space_estimate(
-        plan, in_place=in_place, resume_entries=resume_entries)
-    if in_place and free is not None and need > free and not allow_low_space:
-        job.error = (
-            f"Not enough free space at {dest}: the move needs about "
-            f"{format_size(need)} but only {format_size(free)} is free. An "
-            "in-place move that runs out mid-run would leave your library "
-            "half-relocated. Free up space, choose another destination, or "
-            "re-run the migration with “proceed even if low on space” checked.")
-        job.summary = job.error
-        log.info(job.summary)
-        return
     # Serialize the file moves under the staging lock like every other execute
     # flow. Without it a migration writing into the library tree could interleave
     # with a concurrent download lane importing into the same <artist>/<album>
@@ -2487,27 +2823,102 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
     # A cross-filesystem move can run for hours; name the holder so a download
     # that blocks on the staging mutex shows what it's waiting behind instead of
     # sitting on RUNNING with no reason (the same treatment the lyrics scan gets).
+    result = None
+    results_artifact = None
+    results_manifest = None
+    results_error = None
+    execution_abort = None
     with staging_lock():
         set_staging_holder("Library migration")
         try:
-            result = engine.execute_plan(
-                plan, in_place=in_place,
-                cancel_check=lambda: job.cancel_requested,
-                progress=job.push_progress,
-                resume_entries=resume_entries)
-            # In-place leaves the emptied source folders behind; clear the husk.
-            pruned = engine.prune_empty_dirs(src) if (
-                in_place and src and not result.cancelled) else 0
+            if not engine.verify_audit_artifact(plan, manifest_artifact):
+                job.error = (
+                    "The saved migration preview no longer matches the files. "
+                    "Nothing was moved; scan again before approving it.")
+                job.summary = job.error
+                log.info(job.summary)
+                return
+            # This decisive estimate belongs inside the same mutation interval
+            # as execution. A download/import waiting on this lock cannot consume
+            # the checked space before the first migration write.
+            need, free = engine.space_estimate(
+                plan, in_place=in_place, resume_entries=resume_entries)
+            if (
+                in_place
+                and free is not None
+                and need > free
+                and not allow_low_space
+            ):
+                job.error = (
+                    f"Not enough free space at {dest}: the move needs about "
+                    f"{format_size(need)} but only {format_size(free)} is free. "
+                    "An in-place move that runs out mid-run would leave your "
+                    "library half-relocated. Free up space, choose another "
+                    "destination, or re-run the migration with “proceed even "
+                    "if low on space” checked.")
+                job.summary = job.error
+                log.info(job.summary)
+                return
+            try:
+                result = engine.execute_plan(
+                    plan, in_place=in_place,
+                    cancel_check=lambda: job.cancel_requested,
+                    progress=job.push_progress,
+                    resume_entries=resume_entries)
+            except engine.MigrationExecutionAbort as exc:
+                result = exc.result
+                execution_abort = exc
+            pruned = getattr(result, "pruned", 0)
+            try:
+                results_artifact = engine.write_results_manifest(
+                    result, plan=plan)
+                results_manifest = Path(results_artifact["path"])
+            except BaseException as exc:
+                results_error = exc
+                if execution_abort is not None:
+                    try:
+                        job.push_line(
+                            "partial migration report could not be saved: "
+                            f"{exc}"
+                        )
+                    finally:
+                        execution_abort.reraise(publication_error=exc)
+                if not isinstance(exc, Exception):
+                    try:
+                        job.push_line(
+                            "migration report could not be saved: "
+                            f"{exc}"
+                        )
+                    finally:
+                        raise exc.with_traceback(exc.__traceback__)
+            if execution_abort is not None:
+                try:
+                    job.push_line(
+                        f"partial migration report saved at {results_manifest}"
+                    )
+                finally:
+                    execution_abort.reraise()
         finally:
             set_staging_holder(None)
-    # Leave the preview manifest (the full plan, including what was left behind)
-    # alone; record what this run actually did in a sibling results file.
-    try:
-        engine.write_results_manifest(result, dest / "migration-results.csv")
-    except OSError:
-        pass
     for failed_src, reason in result.failures[:50]:
         job.push_line(f"failed: {failed_src} — {reason}")
+    companion_outcomes = getattr(result, "companion_outcomes", ())
+    companion_skipped = sum(
+        status == engine.SKIPPED
+        for _source, _destination, status, _reason in companion_outcomes
+    )
+    companion_failed = sum(
+        status == engine.FAILED
+        for _source, _destination, status, _reason in companion_outcomes
+    )
+    for source, _destination, status, reason in companion_outcomes:
+        if status == engine.FAILED:
+            job.push_line(f"sidecar failed: {source} — {reason}")
+    recoveries = tuple(getattr(result, "recoveries", ()))
+    for recovery in recoveries:
+        location = recovery.get("location", "unknown location")
+        restart = recovery.get("restart", "Inspect it before another migration.")
+        job.push_line(f"kept for recovery: {location} — {restart}")
 
     verb = "moved" if in_place else "copied"
     parts = [f"{plural(result.copied, 'file')} {verb} into {dest}"]
@@ -2515,6 +2926,12 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
         parts.append(f"{result.skipped} skipped (already present)")
     if result.companions:
         parts.append(f"carried {plural(result.companions, 'cover/sidecar file')}")
+    if companion_skipped:
+        parts.append(
+            f"{plural(companion_skipped, 'cover/sidecar file')} already existed"
+        )
+    if companion_failed:
+        parts.append(f"{plural(companion_failed, 'cover/sidecar file')} failed")
     if result.lingered:
         parts.append(f"{result.lingered} moved but the original couldn't be removed")
     if result.failed:
@@ -2527,5 +2944,34 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
         parts.append(f"cleared {plural(pruned, 'empty source folder')}")
     if result.cancelled:
         parts.append("stopped early")
+    if recoveries:
+        parts.append(
+            f"{plural(len(recoveries), 'file')} kept for recovery; see the details"
+        )
+    if results_error is not None:
+        parts.append("the migration report could not be saved")
+        job.error = (
+            "Migration finished, but its results report could not be saved: "
+            f"{results_error}. Check the migration details before running it "
+            "again.")
+    else:
+        parts.append(f"report saved at {results_manifest}")
+    if companion_failed or recoveries:
+        recovery_attention = (
+            f"{plural(len(recoveries), 'file')} kept for recovery"
+            if recoveries else ""
+        )
+        attention = (
+            f"{plural(companion_failed, 'sidecar failure') if companion_failed else ''}"
+            f"{' and ' if companion_failed and recoveries else ''}"
+            f"{recovery_attention}"
+        )
+        if job.error:
+            job.error = f"{job.error} Also: {attention}; see the migration details."
+        else:
+            job.error = (
+                f"Migration needs attention: {attention}. See the migration "
+                "details and saved report before running it again."
+            )
     job.summary = "; ".join(parts) + "."
     log.info(job.summary)

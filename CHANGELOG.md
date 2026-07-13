@@ -2,9 +2,18 @@
 
 All notable changes to Qobuz Librarian are recorded here, newest first. The project follows [semantic versioning](https://semver.org/); dates are when each version was tagged during local development.
 
+## [Unreleased]
+
+- Interrupted library changes are safer to recover. Downloads, imports, migrations, lyrics writes, backups, and database updates resume only from verified state and otherwise stop without guessing.
+- Single-track Undo removes only the exact track recorded by the job, then cleans up only empty folders created for that download. Changed files, reused folders, symlinks, and uncertain records are left alone.
+- Library writes stay paused when the shared run lock cannot be enforced. Web-to-terminal handoff waits for active work, and the retired no-lock option is rejected.
+- The Beets integration requires and verifies 2.12.0, honours configured paths, and confines cleanup to the staging folders it opened.
+- Review choices, queue recovery, and History counts remain consistent across concurrent updates, retries, restarts, and interrupted work.
+- Automatic post-import folder moves, including multi-artist split-folder merges, are no longer offered. The filesystem move and Beets path update cannot share one crash-safe commit, so albums keep their imported folders instead of risking an inconsistent library after a restart.
+
 ## [0.10.3] - 2026-07-10
 
-Hardening from repeated independent audits of the whole app — mostly review-lifecycle fixes, plus clearer waiting states.
+Reliability fixes across the app — mostly review-lifecycle fixes, plus clearer waiting states.
 
 - Downloading everything in the Library review no longer resurrects the same albums as "missing" on the next visit: a fully worked-through review retires, and anything that failed to download comes back ticked and ready to retry instead of vanishing until the next scan.
 - Failed downloads from a partial approve also fold back into the open review, ticked, rather than surviving only as an error line in a finished job.
@@ -28,7 +37,7 @@ Reliability and interface polish over 0.10.1.
 
 ## [0.10.1] - 2026-07-04
 
-Fixes and hardening from running 0.10.0 against a full-size library, plus a deep audit of the album-matching and downsample paths.
+Fixes from running 0.10.0 against a full-size library, including album-matching and downsample hardening.
 
 - The library review no longer counts an empty folder as an album you already own. A failed download, or a folder whose tracks were deleted, used to make a genuinely-missing album quietly disappear from the review; the same empty-folder check now also gates the Search "in library" tag.
 - Downsampling a loud master no longer clips it. The resampler can momentarily overshoot full scale on hot, brickwalled sources, and the rewrite used to hard-clip those peaks into distortion. Those files — and only those — are now eased down by the small amount needed first; quieter, more dynamic albums are untouched.
@@ -349,7 +358,7 @@ First packaged release during local development. Major additions included:
 ## [0.2.0] - 2026-03-26
 
 - A web UI (FastAPI) for searching, downloading and watching jobs stream their log live, alongside the existing CLI.
-- A crash-safe persistent download queue that resumes after a restart, with a per-run lock so two instances can't fight over the same library.
+- A crash-safe persistent download queue that resumes after a restart, with a shared-data run lock so the web app and CLI in one stack cannot write at the same time.
 - Whole-library and per-artist gap scans that list every missing album.
 - Ships as a multi-stage Docker image with a compose stack.
 

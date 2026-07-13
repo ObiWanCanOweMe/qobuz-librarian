@@ -1,30 +1,33 @@
 """Core album processing — detect gaps, prompt, download, import, consolidate."""
-import shutil
+import math
 from datetime import datetime, timezone
-from pathlib import Path
 
 from qobuz_librarian import config as cfg
-from qobuz_librarian.download import run_album_download
-from qobuz_librarian.integrations.beets import (
-    _merge_split_folder,
-    beets_import_paths,
-    staging_preflight,
+from qobuz_librarian.download import (
+    download_staged_files,
+    retain_download_staging,
+    retire_empty_download_staging,
+    run_album_download,
+    validated_staged_album_dirs,
 )
+from qobuz_librarian.integrations.beets import beets_import_paths, staging_preflight
 from qobuz_librarian.integrations.lyrics import (
     _record_post_import_lyric_retry,
     _resolve_signatures_to_paths,
     write_post_import_sidecars,
 )
 from qobuz_librarian.integrations.rip import (
-    files_added_since,
     is_cancel_requested,
     snapshot_staging,
 )
 from qobuz_librarian.library.backup import (
     backup_album_dir,
+    capture_album_source_receipt,
+    carry_backup_companions,
+    dispose_backup,
     pin_unverified_upgrade_backup,
-    replacement_tree_durable,
     restore_gap_fill_backup,
+    restore_incomplete_upgrade_backup,
     restore_upgrade_backup,
     warn_pin_failed,
 )
@@ -32,7 +35,6 @@ from qobuz_librarian.library.catalog import (
     _disc_scoped_match,
     _is_split_album_merge,
     album_quality_label,
-    cleanup_duplicate_art,
     compute_missing,
     find_album_dir_by_track_signatures,
     find_album_dir_filesystem,
@@ -41,8 +43,6 @@ from qobuz_librarian.library.catalog import (
     find_extras_in_existing,
     folder_holds_all_tracks,
     is_lossless_album,
-    pair_existing_tracks,
-    prompt_and_migrate_multi_artist_folder,
     track_signatures_for_album_dirs,
 )
 from qobuz_librarian.library.scanner import (
@@ -50,20 +50,27 @@ from qobuz_librarian.library.scanner import (
     drop_artist_subdirs_cache,
     read_album_dir,
 )
-from qobuz_librarian.library.tags import normalize, strip_edition_suffix
+from qobuz_librarian.library.tags import (
+    canonical_recording_id,
+    canonical_track_slot,
+    canonical_track_title,
+    normalize,
+    strip_edition_suffix,
+)
 from qobuz_librarian.modes.consolidate import consolidate_albums
 from qobuz_librarian.quality.decision import (
     compare_album_quality,
     existing_track_quality,
     mark_local_album_capped,
+    quality_relation,
 )
 from qobuz_librarian.quality.verify import (
     redownload_with_staged_fallback,
+    retry_preserves_track_coverage,
     verify_and_recover,
 )
 from qobuz_librarian.queue.executor import (
     _pre_import_staging_hooks,
-    staged_album_dirs_since,
 )
 from qobuz_librarian.repair_log import warn_if_download_truncated
 from qobuz_librarian.ui_cli.colors import C, fmt, format_size, section, truncate
@@ -77,15 +84,56 @@ from qobuz_librarian.ui_cli.prompts import (
 )
 
 
+def _recover_incomplete_upgrade_backup(backup, album_dir, *, operation):
+    """Best-effort recovery for a backup transaction that did not complete.
+
+    The caller must still abort the requested operation.  A complete recovery
+    only means the exact original was put back and the recovery copy was
+    retired; it does not turn the interrupted backup into permission to carry
+    on with a destructive replacement.
+    """
+    outcome = restore_incomplete_upgrade_backup(backup, album_dir)
+    recovered = bool(
+        outcome is not None
+        and outcome.unresolved == 0
+        and outcome.backup_disposed
+    )
+    if recovered:
+        log.info(fmt(
+            C.GREEN,
+            f"  ✓  Restored the original folder after the interrupted "
+            f"{operation}."))
+        return outcome
+
+    if not pin_unverified_upgrade_backup(
+            backup,
+            f"{operation} recovery kept — automatic reconciliation did not "
+            "complete"):
+        warn_pin_failed(backup)
+    unresolved = (
+        f" ({outcome.unresolved} original file(s) still unresolved)"
+        if outcome is not None else ""
+    )
+    log.info(fmt(
+        C.RED,
+        f"  ✗  The interrupted {operation} could not be fully restored"
+        f"{unresolved}."))
+    log.info(fmt(
+        C.WHITE,
+        f"     Recovery data remains at {backup}; leave it there until the "
+        "album is reconciled."))
+    return outcome
+
+
 def force_cleanup_preflight(album, args):
     """With --force, move an existing album dir aside to a backup before
     re-import — so beets doesn't make '<n>.1.flac' collisions against the old
     files, and a re-download that fails can be restored.
 
     Returns the backup Path when the folder was moved aside; True when there's
-    nothing to move; None for a symlinked dir (skip without further prompts);
-    False when the user declined or the backup couldn't be made. --yes does
-    NOT silence this prompt."""
+    nothing to move; None when the operation must stop without further prompts;
+    False when the user declined or no backup data was retained. --yes does NOT
+    silence this prompt."""
     if not args.force:
         return True
 
@@ -134,6 +182,13 @@ def force_cleanup_preflight(album, args):
         return False
 
     backup_path = backup_album_dir(album_dir)
+    if backup_path is not None and not backup_path.complete:
+        _recover_incomplete_upgrade_backup(
+            backup_path, album_dir, operation="forced re-download backup")
+        log.info(fmt(C.RED,
+            "  ✗  The backup was interrupted; refusing to continue with "
+            "--force."))
+        return None
     if backup_path is None:
         log.info(fmt(C.RED,
             "  ✗  Couldn't back up the folder; refusing to remove it. "
@@ -169,9 +224,7 @@ def _tracks_seconds(tracks):
 
 
 def _track_quality(t):
-    """(bit_depth, sample_rate) for one track, (0, 0) when unreadable.
-    Compared as tuples so 24-bit always beats 16-bit and, within a depth, the
-    higher sample rate wins — the same ordering the upgrade decision uses."""
+    """(bit_depth, sample_rate) for one track, (0, 0) when unreadable."""
     try:
         return (int(t.get("bits") or 0), int(t.get("sample_rate") or 0))
     except (TypeError, ValueError):
@@ -180,6 +233,108 @@ def _track_quality(t):
 
 def _fmt_quality(q):
     return f"{q[0]}-bit/{(q[1] or 0) / 1000:g}kHz"
+
+
+def _known_track_channels(track):
+    try:
+        channels = int(track.get("channels") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return channels if channels > 0 else None
+
+
+def _known_track_duration(track):
+    if isinstance(track.get("length"), bool):
+        return None
+    try:
+        duration = float(track.get("length") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return duration if duration > 0 and math.isfinite(duration) else None
+
+
+def _recording_identity(track, field):
+    return canonical_recording_id(track.get(field), field)
+
+
+def _known_track_slot(track):
+    return canonical_track_slot(track, "discnumber", "tracknumber")
+
+
+def _unidentified_track_match(original, replacement):
+    old_title = canonical_track_title(original.get("title"))
+    new_title = canonical_track_title(replacement.get("title"))
+    old_slot = _known_track_slot(original)
+    old_duration = _known_track_duration(original)
+    new_duration = _known_track_duration(replacement)
+    return bool(
+        old_title
+        and old_title == new_title
+        and old_slot is not None
+        and old_slot == _known_track_slot(replacement)
+        and old_duration is not None
+        and new_duration is not None
+        and abs(old_duration - new_duration) <= 2.0
+    )
+
+
+def _upgrade_track_identity_matches(original, replacement):
+    old_isrc = _recording_identity(original, "isrc")
+    new_isrc = _recording_identity(replacement, "isrc")
+    old_mbid = _recording_identity(original, "mb_trackid")
+    new_mbid = _recording_identity(replacement, "mb_trackid")
+    if None in (old_isrc, new_isrc, old_mbid, new_mbid):
+        return False
+    if old_isrc or new_isrc:
+        return bool(
+            old_isrc
+            and old_isrc == new_isrc
+            and not (old_mbid and new_mbid and old_mbid != new_mbid)
+        )
+    if old_mbid or new_mbid:
+        return bool(old_mbid and old_mbid == new_mbid)
+    return _unidentified_track_match(original, replacement)
+
+
+def _pair_upgrade_tracks_for_disposal(originals, replacements):
+    """Return unique, destruction-safe original/replacement pairs.
+
+    The normal library matcher deliberately tolerates missing identifiers and
+    fuzzy edition titles so scans can find music. Deleting the upgrade backup
+    needs stronger evidence: one-sided recording IDs cannot fall back to a
+    title, and unidentified tracks must agree on slot, title, and duration.
+    """
+    replacement_slots = [
+        slot for track in replacements
+        if (slot := _known_track_slot(track)) is not None
+    ]
+    if len(replacement_slots) != len(set(replacement_slots)):
+        return None
+
+    pairs = []
+    claimed = set()
+    for original in originals:
+        candidates = [
+            index for index, replacement in enumerate(replacements)
+            if _upgrade_track_identity_matches(original, replacement)
+        ]
+        if len(candidates) != 1 or candidates[0] in claimed:
+            return None
+        index = candidates[0]
+        claimed.add(index)
+        pairs.append((original, replacements[index]))
+    return pairs
+
+
+def _track_identity_conflicts(original, replacement):
+    for field in ("isrc", "mb_trackid"):
+        old_value = _recording_identity(original, field)
+        new_value = _recording_identity(replacement, field)
+        if old_value is None or new_value is None:
+            return True
+        if old_value and new_value and old_value != new_value:
+            return True
+    return False
 
 
 def _upgrade_replacement_verified(album, album_dir, backup_path):
@@ -203,6 +358,11 @@ def _upgrade_replacement_verified(album, album_dir, backup_path):
     post_dir = find_album_dir_filesystem(album)
     if not post_dir or not post_dir.exists():
         return False
+    return _upgrade_trees_verified(post_dir, backup_path)
+
+
+def _upgrade_trees_verified(post_dir, backup_path):
+    """Compare exact replacement/original tree views at the disposal gate."""
     new_tracks, new_degraded = _folder_tracks_checked(post_dir)
     old_tracks, old_degraded = _folder_tracks_checked(backup_path)
     # A degraded walk returns only the READABLE tracks: a transient error on
@@ -236,126 +396,91 @@ def _upgrade_replacement_verified(album, album_dir, backup_path):
             f"original {int(old_secs)}s (a track may be truncated) — "
             f"keeping the backup."))
         return False
-    # Quality gate: an auto-upgrade exists to RAISE quality, so refuse to delete
-    # the original when Qobuz under-delivered (advertised hi-res, served e.g.
-    # 16/44). Same track count + playtime would otherwise pass this vacuously
-    # and permanently replace the user's higher-res files with lower-res ones.
-    # Comparing only the endpoints of the quality range is not a proof:
-    # [16/44.1, 24/96, 24/192] against [16/44.1, 24/48, 24/192] passes both
-    # ends with the middle track downgraded. Two checks, both required:
-    #  - ranked multiset: quality-sorted new tracks must cover the sorted
-    #    originals slot for slot. An unreadable (0, 0) new track sorts last, so
-    #    it fails against any known original instead of being ignored;
-    #  - identity: a new track that IS one of the originals (same ISRC/title)
-    #    must not sit below it — rank dominance alone can hide a swap where one
-    #    track went up and another went down.
-    old_qs = sorted((_track_quality(t) for t in old_tracks), reverse=True)
-    new_qs = sorted((_track_quality(t) for t in new_tracks), reverse=True)
-    for oq, nq in zip(old_qs, new_qs):
-        if oq > (0, 0) and nq < oq:
-            log.info(fmt(C.YELLOW,
-                f"  ⚠  Upgrade delivered a {_fmt_quality(nq)} track where the "
-                f"original had {_fmt_quality(oq)} — keeping the backup "
-                f"(a track came back below the original)."))
-            return False
-    pairs, unpaired = pair_existing_tracks(old_tracks, new_tracks)
-    if unpaired:
+    # Every original must have one identity-paired replacement. Aggregate
+    # counts or playtime can hide one shortened/downgraded track behind a
+    # different track that grew, so the disposal decision is made per pair.
+    pairs = _pair_upgrade_tracks_for_disposal(old_tracks, new_tracks)
+    if pairs is None:
         log.info(fmt(C.YELLOW,
-            f"  ⚠  Upgrade replacement is missing {len(unpaired)} original "
-            "track identity match(es) — keeping the backup."))
+            "  ⚠  Couldn't prove one unique replacement for every original "
+            "track — keeping the backup."))
         return False
     for ot, nt in pairs:
         oq, nq = _track_quality(ot), _track_quality(nt)
-        if oq > (0, 0) and nq < oq:
+        title = truncate(str(ot.get("title") or ""), 40)
+        if _track_identity_conflicts(ot, nt):
             log.info(fmt(C.YELLOW,
-                f"  ⚠  Upgrade brought back "
-                f"{truncate(str(ot.get('title') or ''), 40)} at "
-                f"{_fmt_quality(nq)} where the original was {_fmt_quality(oq)} "
-                f"— keeping the backup."))
+                f"  ⚠  Upgrade matched {title} to a different recording "
+                "identity — keeping the backup."))
+            return False
+        relation = quality_relation(nq, oq)
+        if relation not in ("equal", "higher"):
+            detail = (
+                "trades bit depth for sample rate"
+                if relation == "incomparable"
+                else f"returned at {_fmt_quality(nq)} instead of {_fmt_quality(oq)}"
+            )
+            log.info(fmt(C.YELLOW,
+                f"  ⚠  Upgrade for {title} {detail} — keeping the backup."))
+            return False
+        old_channels = _known_track_channels(ot)
+        new_channels = _known_track_channels(nt)
+        if old_channels is None or new_channels is None:
+            log.info(fmt(C.YELLOW,
+                f"  ⚠  Couldn't verify the channel layout for {title} "
+                "— keeping the backup."))
+            return False
+        if new_channels != old_channels:
+            log.info(fmt(C.YELLOW,
+                f"  ⚠  Upgrade for {title} changed from {old_channels} to "
+                f"{new_channels} channels — keeping the backup."))
+            return False
+        old_duration = _known_track_duration(ot)
+        new_duration = _known_track_duration(nt)
+        if old_duration is None or new_duration is None:
+            log.info(fmt(C.YELLOW,
+                f"  ⚠  Couldn't verify the playtime for {title} "
+                "— keeping the backup."))
+            return False
+        if new_duration < old_duration * _UPGRADE_VERIFY_DURATION_RATIO:
+            log.info(fmt(C.YELLOW,
+                f"  ⚠  Upgrade for {title} is shorter than the original "
+                "— keeping the backup."))
             return False
     return True
 
 
+def _intentional_replacement_verified(replacement_path, _backup_path):
+    """Final exact-tree gate for a user-requested forced replacement."""
+    tracks, degraded = _folder_tracks_checked(replacement_path)
+    return bool(tracks) and not degraded
+
+
 def _carry_non_audio_from_backup(album, album_dir, backup_path,
                                  replacement_dir=None):
-    """Copy non-audio companions (booklets, scans, .cue/.log, hand-placed cover
-    art) from an upgrade backup into the rebuilt album before the backup is
-    deleted. The audio-only completeness check ignores these files, so without
-    this they'd be lost with the backup. Existing destination files are left
-    untouched. The completed replacement tree is then flushed in full. Returns
-    False when the destination can't be resolved, any copy failed, or the tree
-    could not be made durable, so the caller keeps the backup."""
-    from qobuz_librarian.library.backup import (
-        _SIDECARS,
-        _file_digest,
-        replacement_tree_durable,
-    )
-    from qobuz_librarian.library.scanner import iter_tree_no_symlinks
-    if not backup_path.exists():
-        return True
+    """Carry companions between exact held trees.
+
+    The returned pair is the exact replacement path and its updated receipt;
+    callers must use both for the final held-view disposal decision. Any
+    changed name, conflicting companion, symlink, active writer, or uncertain
+    durability keeps the backup and returns ``None``.
+    """
     dest = replacement_dir
     if not dest or not dest.exists():
         dest = find_album_dir_filesystem(album)
     if not dest or not dest.exists():
         dest = album_dir
     if not dest or not dest.exists():
-        return False
-    # Skip the backup bookkeeping sidecars (.ql_backup_origin etc.) — they
-    # are non-audio but must never be carried into the live library folder.
-    # Walked with an error channel, not rglob: rglob swallows a subtree
-    # listing failure, and if that subtree holds the only booklet/scan,
-    # "saw no companions" would authorize deleting the backup that still
-    # contains it.
-    walk_errors = []
-    companions = []
-    try:
-        for src in iter_tree_no_symlinks(backup_path, errors=walk_errors):
-            try:
-                if (src.is_file() and src.suffix.lower() not in cfg.AUDIO_EXTS
-                        and src.name not in _SIDECARS):
-                    companions.append(src)
-            except OSError as e:
-                walk_errors.append(e)
-    except OSError as e:
-        walk_errors.append(e)
-    if walk_errors:
-        return False
-    ok = True
-    for src in companions:
-        out = dest / src.relative_to(backup_path)
-        if out.exists():
-            # Same name is not the same file: a re-rip lands its own
-            # booklet.pdf/cover under the standard name, and skipping on the
-            # name alone would count the ORIGINAL companion as carried while
-            # its only copy sits in the backup about to be deleted. Only a
-            # byte-identical destination proves it's already across; anything
-            # else (different bytes, unreadable) keeps the backup. Digest
-            # compare, not filecmp — its stat-signature cache can return a
-            # stale verdict for a same-size file replaced within the same
-            # mtime tick.
-            try:
-                if _file_digest(src) == _file_digest(out):
-                    continue
-            except OSError:
-                pass
-            ok = False
-            continue
-        try:
-            out.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(src), str(out))
-        except OSError:
-            ok = False
-            continue
-        # The copy becomes the only copy when the backup is deleted. Verify its
-        # bytes now; the final whole-tree gate below flushes it together with
-        # the audio, nested directories, and any identical retained companion.
-        try:
-            copied_ok = _file_digest(src) == _file_digest(out)
-        except OSError:
-            copied_ok = False
-        if not copied_ok:
-            ok = False
-    return ok and replacement_tree_durable(dest)
+        return None
+    receipt = capture_album_source_receipt(dest)
+    if receipt is None:
+        return None
+    updated = carry_backup_companions(
+        backup_path,
+        dest,
+        expected_replacement_receipt=receipt,
+    )
+    return (dest, updated) if updated is not None else None
 
 
 def detect_sibling_album_groups(album_dirs):
@@ -372,42 +497,8 @@ def detect_sibling_album_groups(album_dirs):
 
 
 def sweep_staging_artwork():
-    """Remove streamrip's `__artwork/cover-*.jpg` orphan dirs from staging
-    after beets has moved the audio out. `beet import` ignores non-audio
-    files, so without this sweep every job leaves a cover-image dir behind
-    and the next preflight reports a dirty staging area."""
-    try:
-        roots = list(cfg.STAGING_DIR.rglob("__artwork"))
-    except OSError:
-        return
-    for d in roots:
-        if d.is_dir():
-            shutil.rmtree(d, ignore_errors=True)
-
-
-def _discard_staged_since(snapshot):
-    """Delete staging files added since `snapshot` (a cancelled job's partial
-    output) and prune the directories left empty, so a cancel leaves staging
-    as clean as it was before the rip started."""
-    try:
-        added = files_added_since(snapshot)
-    except OSError:
-        return
-    for f in added:
-        try:
-            Path(f).unlink()
-        except OSError:
-            pass
-    try:
-        descendants = sorted(cfg.STAGING_DIR.rglob("*"), key=lambda p: -len(p.parts))
-    except OSError:
-        return
-    for d in descendants:
-        if d.is_dir() and not any(d.iterdir()):
-            try:
-                d.rmdir()
-            except OSError:
-                pass
+    """Keep legacy artwork for preflight when no ownership receipt exists."""
+    return
 
 
 def pick_canonical_sibling(dirs):
@@ -773,6 +864,13 @@ def process_album(album, args, *, allow_force=True, label=None,
                 "     Falling back to gap-fill if applicable. "
                 "Use --force on this album manually if you want to replace."))
 
+        elif cls == "incomparable":
+            log.info(fmt(C.YELLOW,
+                "\n  ⚠  Not auto-upgrading: at least one local track would "
+                "gain one resolution dimension but lose the other."))
+            log.info(fmt(C.GRAY,
+                "     Keeping the existing files and filling gaps only."))
+
         elif cls == "unknown":
             log.info(fmt(C.GRAY,
                 "  · Couldn't read quality from existing tracks; using gap-fill."))
@@ -835,7 +933,26 @@ def process_album(album, args, *, allow_force=True, label=None,
     # is restored if anything fails before beets import succeeds.
     if auto_upgrade_active and album_dir and album_dir.exists():
         upgrade_backup_path = backup_album_dir(album_dir)
-        if upgrade_backup_path is None:
+        if (
+            upgrade_backup_path is not None
+            and not upgrade_backup_path.complete
+        ):
+            _recover_incomplete_upgrade_backup(
+                upgrade_backup_path,
+                album_dir,
+                operation="upgrade backup",
+            )
+            log_fetch({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "album_id": album.get("id"),
+                "artist": (album.get("artist") or {}).get("name"),
+                "title": album.get("title"),
+                "result": "upgrade_aborted_backup_failed",
+            })
+            return {"result": "upgrade_aborted_backup_failed"}
+        if (
+            upgrade_backup_path is None
+        ):
             log.info(fmt(C.RED,
                 "  ✗  Could not back up the existing folder; refusing to "
                 "wipe without a backup. Skipping this album."))
@@ -861,7 +978,10 @@ def process_album(album, args, *, allow_force=True, label=None,
                            default_yes=False, auto_yes=False):
                 log.info(fmt(C.GRAY, "  Skipping this album."))
                 return {"result": "cancelled"}
-        elif isinstance(force_outcome, Path) and upgrade_backup_path is None:
+        elif (
+            getattr(force_outcome, "complete", False) is True
+            and upgrade_backup_path is None
+        ):
             # The moved-aside folder is restored on failure / cleared on success
             # by the same finally block that handles the auto-upgrade backup.
             upgrade_backup_path = force_outcome
@@ -891,10 +1011,15 @@ def process_album(album, args, *, allow_force=True, label=None,
         snapshot = snapshot_staging()
         vlog(f"staging snapshot: {len(snapshot)} files before download")
 
-        run_album_download(
-            album=album, missing=missing, present=present, existing=existing,
-            album_dir=album_dir, snapshot=snapshot, quality=quality,
-            upgrade_only=upgrade_only, result=download_result)
+        try:
+            run_album_download(
+                album=album, missing=missing, present=present,
+                existing=existing, album_dir=album_dir, snapshot=snapshot,
+                quality=quality, upgrade_only=upgrade_only,
+                result=download_result)
+        except BaseException:
+            retain_download_staging(download_result)
+            raise
         n_ok = download_result["n_ok"]
         n_fail = download_result["n_fail"]
         n_lossy = download_result["n_lossy"]
@@ -908,8 +1033,9 @@ def process_album(album, args, *, allow_force=True, label=None,
         # pre-import hooks + beets ever run.
         if is_cancel_requested():
             log.info(fmt(C.YELLOW,
-                "\n  Cancelled — discarding the partial download; nothing imported."))
-            _discard_staged_since(snapshot)
+                "\n  Cancelled — retaining the partial download for review; "
+                "nothing imported."))
+            retain_download_staging(download_result)
             return {"result": "cancelled", "imported": False,
                     "n_ok": n_ok, "n_lossy": n_lossy, "n_fail": n_fail}
 
@@ -920,15 +1046,22 @@ def process_album(album, args, *, allow_force=True, label=None,
         # the finally restore the original, the same shape as the cancel path.
         if ((auto_upgrade_active or use_force) and n_ok > 0
                 and (n_fail > 0 or n_lossy > 0) and not args.no_import):
+            retained = retain_download_staging(
+                download_result, label="incomplete-replacement")
+            disposition = (
+                "retaining it in staging recovery"
+                if retained else
+                "leaving its isolated staging run untouched for review"
+            )
             log.info(fmt(C.YELLOW,
-                "\n  Re-download came back incomplete — discarding it and "
+                f"\n  Re-download came back incomplete — {disposition} and "
                 "keeping your original."))
-            _discard_staged_since(snapshot)
             return {"result": "partial", "imported": False,
                     "n_ok": n_ok, "n_fail": n_fail, "n_lossy": n_lossy}
 
         if n_ok > 0 and not args.no_import and not use_force:
-            staged_dirs_for_import = staged_album_dirs_since(snapshot)
+            staged_dirs_for_import = validated_staged_album_dirs(
+                download_result)
             staged_dirs = staged_dirs_for_import
             if staged_dirs:
                 effective_tier = (
@@ -949,19 +1082,25 @@ def process_album(album, args, *, allow_force=True, label=None,
                     try:
                         fresh_dirs, retry_kept = redownload_with_staged_fallback(
                             staged_dirs,
-                            discard_retry_output=lambda: _discard_staged_since(
-                                snapshot),
                             run_retry=_run_retry,
-                            collect_staged_dirs=lambda: staged_album_dirs_since(
-                                snapshot))
+                            collect_staged_dirs=lambda: (
+                                validated_staged_album_dirs(retry_result)
+                                if retry_result.get("n_ok", 0) > 0 else []),
+                            collect_retry_files=lambda: download_staged_files(
+                                retry_result),
+                            retry_preserves_original=lambda: (
+                                retry_preserves_track_coverage(
+                                    original_result, retry_result)))
                     except Exception:
                         download_result.clear()
                         download_result.update(original_result)
                         raise
                     if retry_kept:
+                        retire_empty_download_staging(original_result)
                         download_result.clear()
                         download_result.update(retry_result)
                     else:
+                        retire_empty_download_staging(retry_result)
                         download_result.clear()
                         download_result.update(original_result)
                     return fresh_dirs
@@ -987,10 +1126,16 @@ def process_album(album, args, *, allow_force=True, label=None,
                     elapsed = download_result.get("elapsed", elapsed)
                     if (auto_upgrade_active and n_ok > 0
                             and (n_fail > 0 or n_lossy > 0)):
+                        retained = retain_download_staging(
+                            download_result, label="incomplete-replacement")
+                        disposition = (
+                            "retaining it in staging recovery"
+                            if retained else
+                            "leaving its isolated staging run untouched for review"
+                        )
                         log.info(fmt(C.YELLOW,
                             "\n  Recovery re-download came back incomplete — "
-                            "discarding it and keeping your original."))
-                        _discard_staged_since(snapshot)
+                            f"{disposition} and keeping your original."))
                         return {"result": "partial", "imported": False,
                                 "n_ok": n_ok, "n_fail": n_fail,
                                 "n_lossy": n_lossy}
@@ -1010,9 +1155,11 @@ def process_album(album, args, *, allow_force=True, label=None,
         # metadata (wrong sample rate, missing lyrics) to its clients
         # between the move and the post-import hooks.
         if n_ok > 0 and not args.no_import:
-            transient_lyric_sigs, resampled_n = _pre_import_staging_hooks(args)
             if not staged_dirs_for_import:
-                staged_dirs_for_import = staged_album_dirs_since(snapshot)
+                staged_dirs_for_import = validated_staged_album_dirs(
+                    download_result)
+            transient_lyric_sigs, resampled_n = _pre_import_staging_hooks(
+                args, staged_dirs_for_import)
             post_import_signatures = track_signatures_for_album_dirs(
                 staged_dirs_for_import)
 
@@ -1027,7 +1174,30 @@ def process_album(album, args, *, allow_force=True, label=None,
             # A brand-new album (no folder found on disk) lands in a fresh
             # directory, so it can't split an existing beets album into
             # duplicate rows — skip the full-library de-dup scan for it.
-            imported = beets_import_paths(consolidate=album_dir is not None)
+            imported = beets_import_paths(
+                consolidate=album_dir is not None,
+                album_dirs=staged_dirs_for_import,
+            )
+            if (
+                imported
+                and "_staging_run" in download_result
+                and not retire_empty_download_staging(download_result)
+            ):
+                log.info(fmt(
+                    C.RED,
+                    "  ✗  The exact download run was not empty after beets; "
+                    "the import was not accepted.",
+                ))
+                imported = False
+            if not imported:
+                retained = retain_download_staging(
+                    download_result, label="beets-incomplete")
+                if retained:
+                    log.info(fmt(
+                        C.YELLOW,
+                        "  ⚠  Kept the exact residual download run in "
+                        "private staging recovery.",
+                    ))
 
         download_phase_completed = True
 
@@ -1060,19 +1230,37 @@ def process_album(album, args, *, allow_force=True, label=None,
                 # backup into the rebuilt album before deleting it — the
                 # audio-only verification ignores them, so they'd be lost. A
                 # failed carry keeps the backup: it holds the only copies.
-                if _carry_non_audio_from_backup(album, album_dir,
-                                                upgrade_backup_path):
-                    try:
-                        shutil.rmtree(upgrade_backup_path)
+                carried = _carry_non_audio_from_backup(
+                    album, album_dir, upgrade_backup_path)
+                if carried is not None:
+                    replacement_path, replacement_receipt = carried
+                    validator = (
+                        _upgrade_trees_verified
+                        if auto_upgrade_active
+                        else _intentional_replacement_verified
+                    )
+                    if dispose_backup(
+                        upgrade_backup_path,
+                        replacement_path=replacement_path,
+                        expected_replacement_receipt=replacement_receipt,
+                        replacement_validator=validator,
+                    ):
                         if auto_upgrade_active and not upgrade_only:
                             log.info(fmt(C.GRAY,
                                 "  ✓  Upgrade complete; backup cleared."))
-                    except OSError as e:
+                    else:
+                        upgrade_unverified = True
+                        if not pin_unverified_upgrade_backup(
+                                upgrade_backup_path,
+                                "upgrade kept — final exact replacement proof "
+                                "did not hold"):
+                            warn_pin_failed(upgrade_backup_path)
                         log.info(fmt(C.YELLOW,
-                            f"  ⚠  Upgrade succeeded but couldn't remove backup: {e}."))
+                            "  ⚠  Upgrade succeeded but the exact backup "
+                            "couldn't be safely removed."))
                         log.info(fmt(C.GRAY,
                             f"     Backup remains at {upgrade_backup_path} "
-                            f"(auto-cleaned after {cfg.UPGRADE_BACKUP_RETENTION_DAYS} days)."))
+                            "until you reconcile it."))
                 else:
                     upgrade_unverified = True
                     if not pin_unverified_upgrade_backup(upgrade_backup_path):
@@ -1100,6 +1288,11 @@ def process_album(album, args, *, allow_force=True, label=None,
                 log.info(fmt(C.WHITE,
                     f"     Restore: mv {upgrade_backup_path!s} {album_dir!s}"))
             elif download_phase_completed and args.no_import:
+                if not pin_unverified_upgrade_backup(
+                        upgrade_backup_path,
+                        "upgrade backup kept — --no-import leaves the "
+                        "replacement outside the verified library flow"):
+                    warn_pin_failed(upgrade_backup_path)
                 log.info(fmt(C.YELLOW,
                     f"\n  ⚠  --no-import set; cannot auto-verify upgrade. "
                     f"Backup kept at {upgrade_backup_path}."))
@@ -1117,6 +1310,11 @@ def process_album(album, args, *, allow_force=True, label=None,
                     log.info(fmt(C.GREEN,
                         f"  ✓  Restored original folder to {album_dir}."))
                 else:
+                    if not pin_unverified_upgrade_backup(
+                            upgrade_backup_path,
+                            "upgrade backup kept — automatic restore did not "
+                            "complete"):
+                        warn_pin_failed(upgrade_backup_path)
                     log.info(fmt(C.RED,
                         f"  ✗  Auto-restore failed. Original folder is at: "
                         f"{upgrade_backup_path}"))
@@ -1160,13 +1358,30 @@ def process_album(album, args, *, allow_force=True, label=None,
                 # expected track is absent. Require every expected track to
                 # match one-to-one; anything short means the present tracks
                 # aren't provably back, so keep the backup.
-                _filled_ok = folder_holds_all_tracks(_filled, qobuz_tracks)
-                if _filled_ok and replacement_tree_durable(_filled):
-                    try:
-                        shutil.rmtree(gap_fill_backup_path)
-                    except OSError as e:
+                _filled_ok = folder_holds_all_tracks(
+                    _filled, qobuz_tracks, destructive=True)
+                _filled_receipt = (
+                    capture_album_source_receipt(_filled)
+                    if _filled_ok else None
+                )
+                if _filled_ok and _filled_receipt is not None:
+                    if not dispose_backup(
+                        gap_fill_backup_path,
+                        replacement_path=_filled,
+                        expected_replacement_receipt=_filled_receipt,
+                        replacement_validator=lambda replacement, _backup: (
+                            folder_holds_all_tracks(
+                                replacement, qobuz_tracks, destructive=True)
+                        ),
+                    ):
+                        if not pin_unverified_upgrade_backup(
+                                gap_fill_backup_path,
+                                "gap-fill backup kept — final exact "
+                                "replacement proof did not hold"):
+                            warn_pin_failed(gap_fill_backup_path)
                         log.info(fmt(C.YELLOW,
-                            f"  ⚠  Gap-fill complete but couldn't remove backup: {e}."))
+                            "  ⚠  Gap-fill complete but the exact backup "
+                            "couldn't be safely removed."))
                 elif _filled_ok:
                     _gap_fill_not_located = True
                     if not pin_unverified_upgrade_backup(
@@ -1180,6 +1395,11 @@ def process_album(album, args, *, allow_force=True, label=None,
                         f"     Backup remains at {gap_fill_backup_path}."))
                 else:
                     _gap_fill_not_located = True
+                    if not pin_unverified_upgrade_backup(
+                            gap_fill_backup_path,
+                            "gap-fill backup kept — the complete replacement "
+                            "could not be located"):
+                        warn_pin_failed(gap_fill_backup_path)
                     log.info(fmt(C.YELLOW,
                         "  ⚠  Gap-fill imported but the filled album couldn't be "
                         f"located on disk — keeping backed-up tracks at "
@@ -1188,6 +1408,11 @@ def process_album(album, args, *, allow_force=True, label=None,
                 # Gate on download_phase_completed like the upgrade branch above:
                 # a crash MID-download (phase not completed) must fall through to
                 # the restore branch, not keep a backup while the album is short.
+                if not pin_unverified_upgrade_backup(
+                        gap_fill_backup_path,
+                        "gap-fill backup kept — --no-import leaves the "
+                        "replacement outside the verified library flow"):
+                    warn_pin_failed(gap_fill_backup_path)
                 log.info(fmt(C.YELLOW,
                     f"  ⚠  --no-import; gap-fill backup kept at "
                     f"{gap_fill_backup_path}."))
@@ -1205,6 +1430,11 @@ def process_album(album, args, *, allow_force=True, label=None,
                     log.info(fmt(C.GREEN,
                         f"  ✓  Restored {_n_back} track(s) to {album_dir}."))
                 else:
+                    if not pin_unverified_upgrade_backup(
+                            gap_fill_backup_path,
+                            "gap-fill backup kept — automatic restore was "
+                            "partial or failed"):
+                        warn_pin_failed(gap_fill_backup_path)
                     log.info(fmt(C.RED,
                         f"  ✗  Restored {_n_back} track(s); remaining originals "
                         f"preserved at {gap_fill_backup_path} — reconcile by hand."))
@@ -1233,53 +1463,26 @@ def process_album(album, args, *, allow_force=True, label=None,
 
     # ── Post-import cleanup: duplicate cover art ────────────────────────────
     if imported:
-        # Multi-artist folder migration is opt-in only (--migrate-multi-artist).
-        # Only migrate on strict success (no fails, no lossy).
-        _strict_success = (n_fail == 0 and n_lossy == 0)
-        if (getattr(args, "migrate_multi_artist", False)
-                and _strict_success):
-            post_dir = prompt_and_migrate_multi_artist_folder(album, args)
-            if post_dir is None:
-                post_dir = (
-                    find_album_dir_by_track_signatures(post_import_signatures)
-                    if post_import_signatures else None
-                )
-            if post_dir is None:
-                post_dir = find_album_dir_filesystem(album)
-        else:
-            post_dir = (
-                find_album_dir_by_track_signatures(post_import_signatures)
-                if post_import_signatures else None
-            )
-            if post_dir is None:
-                post_dir = find_album_dir_filesystem(album)
+        post_dir = (
+            find_album_dir_by_track_signatures(post_import_signatures)
+            if post_import_signatures else None
+        )
+        if post_dir is None:
+            post_dir = find_album_dir_filesystem(album)
         # A brand-new album can land in a folder the cached listing predates;
-        # clear the cache and look once more before giving up, or art cleanup,
-        # the split-merge, and the lyric-retry queue all silently no-op.
+        # clear the cache and look once more before giving up, or art cleanup
+        # and the lyric-retry queue silently no-op.
         if post_dir is None:
             clear_scan_caches()
             post_dir = find_album_dir_filesystem(album)
         if post_dir:
             if resampled_n > 0:
                 mark_local_album_capped(post_dir, qobuz_album=album)
-            n_art_removed = cleanup_duplicate_art(post_dir)
-            if n_art_removed:
-                vlog(f"removed {n_art_removed} duplicate art file(s)")
-            # Split-folder auto-merge.
-            try:
-                split_artist = (album.get("artist") or {}).get("name") or ""
-                if _is_split_album_merge(album_dir, post_dir, split_artist):
-                    n_merged = _merge_split_folder(post_dir, album_dir)
-                    if n_merged:
-                        log.info(fmt(C.GREEN,
-                            f"  ✓  Consolidated {n_merged} existing track(s) "
-                            f"into primary-artist folder: {post_dir.name}."))
-                    else:
-                        log.info(fmt(C.YELLOW,
-                            f"  ⚠  Split-folder detected but nothing merged "
-                            f"(check {album_dir} for overlap conflicts)."))
-            except Exception as _e_sf:
-                vlog(f"split-folder merge raised: {_e_sf}")
+            split_artist = (album.get("artist") or {}).get("name") or ""
+            if _is_split_album_merge(album_dir, post_dir, split_artist):
+                log.info(fmt(C.YELLOW,
+                    "  ⚠  Beets placed this album across two artist folders; "
+                    "both were left unchanged for manual review."))
             # Resolve transient-lyric signatures captured pre-beets
             if transient_lyric_sigs:
                 resolved = _resolve_signatures_to_paths(

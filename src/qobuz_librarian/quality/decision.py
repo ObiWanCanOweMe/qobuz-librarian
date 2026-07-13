@@ -49,6 +49,37 @@ def existing_track_quality(track):
     return (track.get("bits") or 0, track.get("sample_rate") or 0)
 
 
+def _known_positive_int(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def quality_relation(left, right):
+    """Return how ``left`` relates to ``right`` without ranking tradeoffs.
+
+    Bit depth and sample rate are independent quality dimensions.  A format is
+    higher only when neither dimension falls, lower only when neither rises,
+    and incomparable when one rises while the other falls.  Missing or partial
+    measurements cannot authorize an automatic replacement.
+    """
+    left_bits = _known_positive_int(left[0])
+    left_rate = _known_positive_int(left[1])
+    right_bits = _known_positive_int(right[0])
+    right_rate = _known_positive_int(right[1])
+    if None in (left_bits, left_rate, right_bits, right_rate):
+        return "unknown"
+    if left_bits == right_bits and left_rate == right_rate:
+        return "equal"
+    if left_bits >= right_bits and left_rate >= right_rate:
+        return "higher"
+    if left_bits <= right_bits and left_rate <= right_rate:
+        return "lower"
+    return "incomparable"
+
+
 def compare_album_quality(existing_tracks, qobuz_album):
     """Classify per-track quality of existing tracks vs the Qobuz album.
 
@@ -61,28 +92,35 @@ def compare_album_quality(existing_tracks, qobuz_album):
       'all_higher'  : every readable track is above Qobuz quality
       'mixed_above' : some above, some at; none below
       'mixed_both'  : some below AND some above (rare; treat conservatively)
+      'incomparable': at least one track trades bit depth for sample rate
 
-    Compares as tuples so (24, 96000) > (16, 44100) and (16, 96000) >
-    (16, 44100) etc — both bit depth and sample rate matter.
+    A result containing unknown or incomparable quality is never classified as
+    an automatic upgrade candidate.
     """
     qbits, qrate = album_max_quality(qobuz_album)
-    n_below = n_at = n_above = n_unknown = 0
+    n_below = n_at = n_above = n_unknown = n_incomparable = 0
 
     for t in existing_tracks:
         ebits, erate = existing_track_quality(t)
-        if not ebits or not erate:
+        relation = quality_relation((ebits, erate), (qbits, qrate))
+        if relation == "unknown":
             n_unknown += 1
-            continue
-        if (ebits, erate) < (qbits, qrate):
+        elif relation == "lower":
             n_below += 1
-        elif (ebits, erate) > (qbits, qrate):
+        elif relation == "higher":
             n_above += 1
-        else:
+        elif relation == "equal":
             n_at += 1
+        else:
+            n_incomparable += 1
 
     n_known = n_below + n_at + n_above
     if not existing_tracks:
         cls = "no_existing"
+    elif n_unknown:
+        cls = "unknown"
+    elif n_incomparable:
+        cls = "incomparable"
     elif n_known == 0:
         cls = "unknown"
     elif n_below > 0 and n_above > 0:
@@ -101,17 +139,26 @@ def compare_album_quality(existing_tracks, qobuz_album):
         "n_at": n_at,
         "n_above": n_above,
         "n_unknown": n_unknown,
+        "n_incomparable": n_incomparable,
     }
 
 
 def _track_quality_cmp(t1, t2):
     """Compare audio quality of two track dicts.
-    Returns 1 if t1 > t2, -1 if t1 < t2, 0 if equal.
-    Keyed on (bit_depth, sample_rate) matching --prefer-hires sort order.
+    Returns 1 if t1 > t2, -1 if t1 < t2, 0 if equal, and None when
+    incomplete/crossed measurements or a channel-count change make the
+    comparison unsafe.
     """
     q1 = (t1.get("bits") or 0, t1.get("sample_rate") or 0)
     q2 = (t2.get("bits") or 0, t2.get("sample_rate") or 0)
-    return (q1 > q2) - (q1 < q2)
+    relation = quality_relation(q1, q2)
+    c1 = _known_positive_int(t1.get("channels"))
+    c2 = _known_positive_int(t2.get("channels"))
+    if relation in ("unknown", "incomparable") or c1 is None or c2 is None:
+        return None
+    if c1 != c2:
+        return None
+    return {"higher": 1, "lower": -1, "equal": 0}[relation]
 
 
 def quality_change_summary(overlap):
@@ -122,10 +169,10 @@ def quality_change_summary(overlap):
     safe lower-quality drop."""
     losing_hires = same = upgrading = unknown = 0
     for st, pt in overlap:
-        if (st.get("bits") or 0, st.get("sample_rate") or 0) == (0, 0):
+        cmp = _track_quality_cmp(st, pt)
+        if cmp is None:
             unknown += 1
             continue
-        cmp = _track_quality_cmp(st, pt)
         if cmp > 0:
             losing_hires += 1
         elif cmp < 0:

@@ -1,9 +1,12 @@
 """Staged-rip quality checks before local rewrite hooks run."""
-import shutil
-import tempfile
 from pathlib import Path
 
-from qobuz_librarian import config as cfg
+from qobuz_librarian.integrations.staging import (
+    discard_group,
+    discard_received_audio_trees,
+    park_trees,
+    restore_group,
+)
 from qobuz_librarian.library.catalog import read_album_dir
 from qobuz_librarian.quality.decision import album_max_quality
 from qobuz_librarian.ui_cli.logging import log
@@ -26,9 +29,12 @@ def rip_shortfall(staged_dirs, qobuz_album, *, effective_tier=None):
     """Decide whether the staged rip came in below min(source, cap)."""
     target = album_max_quality(qobuz_album, tier=effective_tier)
     quals, n_unknown = staged_track_qualities(staged_dirs)
-    n_below = sum(1 for q in quals if q < target)
+    n_below = sum(
+        1 for bits, rate in quals
+        if bits < target[0] or rate < target[1]
+    )
     return {
-        "under": n_below > 0,
+        "under": n_below > 0 or n_unknown > 0,
         "n_below": n_below,
         "target": target,
         "worst": min(quals) if quals else None,
@@ -54,31 +60,37 @@ def verify_and_recover(qobuz_album, staged_dirs, *, redownload_at_max,
         "recovered": recovered,
         "retried": retried,
         "n_below": sf["n_below"],
+        "n_unknown": sf["n_unknown"],
         "served": sf["worst"],
         "target": sf["target"],
         "staged_dirs": staged_dirs,
     }
 
 
-def _staged_audio_count(dirs):
-    """Audio files across staged dirs — the completeness yardstick for
-    comparing the first rip against a retry."""
-    n = 0
-    for d in dirs:
-        p = Path(d)
-        try:
-            if p.is_dir():
-                n += sum(1 for f in p.rglob("*")
-                         if f.is_file() and f.suffix.lower() in cfg.AUDIO_EXTS)
-            elif p.is_file() and p.suffix.lower() in cfg.AUDIO_EXTS:
-                n += 1
-        except OSError:
-            continue
-    return n
+def retry_preserves_track_coverage(original, retry):
+    """True only when a retry preserves every known-good Qobuz track slot."""
+    original_expected = original.get("_expected_track_keys")
+    retry_expected = retry.get("_expected_track_keys")
+    original_clean = original.get("_clean_track_keys")
+    retry_clean = retry.get("_clean_track_keys")
+    if not all(isinstance(value, list) for value in (
+            original_expected, retry_expected, original_clean, retry_clean)):
+        return False
+    if (len(set(original_expected)) != len(original_expected)
+            or len(set(retry_expected)) != len(retry_expected)
+            or set(original_expected) != set(retry_expected)):
+        return False
+    return (
+        retry.get("_exact_track_coverage") is True
+        and not retry.get("_unmatched_audio")
+        and bool(original_clean)
+        and set(original_clean) <= set(retry_clean)
+    )
 
 
-def redownload_with_staged_fallback(staged_dirs, *, discard_retry_output,
-                                    run_retry, collect_staged_dirs):
+def redownload_with_staged_fallback(staged_dirs, *, run_retry,
+                                    collect_staged_dirs, collect_retry_files,
+                                    retry_preserves_original):
     """Retry without losing the first usable staged rip if retry lands nothing
     — or lands less of the album than the first rip did.
 
@@ -88,56 +100,47 @@ def redownload_with_staged_fallback(staged_dirs, *, discard_retry_output,
     if not originals:
         run_retry()
         return collect_staged_dirs(), True
-    first_rip_tracks = _staged_audio_count(originals)
+    parked = park_trees(originals, "quality-retry", kind="quality")
+    if parked is None:
+        raise OSError("couldn't safely park the first staged rip for retry")
 
-    def restore(moved):
-        restored = []
-        discard_retry_output()
-        for original, parked in moved:
-            if not parked.exists():
-                continue
-            if original.exists():
-                if original.is_dir():
-                    shutil.rmtree(original, ignore_errors=True)
-                else:
-                    try:
-                        original.unlink()
-                    except OSError:
-                        pass
-            original.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(parked), str(original))
-            restored.append(original)
+    def restore_first(fresh, retry_files):
+        if fresh and not discard_received_audio_trees(fresh, retry_files):
+            raise OSError(
+                "higher-quality retry output changed; both staged states were "
+                "kept for manual recovery")
+        restored = restore_group(parked)
+        if restored is None:
+            raise OSError(
+                "couldn't safely restore the first staged rip; both staged "
+                "states were kept for manual recovery")
         return restored
 
-    with tempfile.TemporaryDirectory(prefix="qobuz-quality-retry-") as tmp:
-        moved = []
+    try:
+        run_retry()
+        fresh = collect_staged_dirs()
+    except BaseException as exc:
         try:
-            for idx, original in enumerate(originals):
-                parked = Path(tmp) / str(idx)
-                shutil.move(str(original), str(parked))
-                moved.append((original, parked))
-        except BaseException:
-            # Parking itself failed (tmp full, permissions). Put back what was
-            # already parked — NOT via restore(): no retry ran, and its
-            # discard_retry_output diff would count the still-unparked
-            # originals as retry output and delete the only rip.
-            for original, parked in moved:
-                if parked.exists() and not original.exists():
-                    original.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(parked), str(original))
-            raise
-        try:
-            run_retry()
-            fresh = collect_staged_dirs()
-        except BaseException:
-            restore(moved)
-            raise
-        if fresh:
-            if _staged_audio_count(fresh) >= first_rip_tracks:
-                return fresh, True
-            # The max-tier retry landed fewer tracks than the first rip.
-            # Trading a complete album for a partial higher-quality one loses
-            # tracks the user already had — keep the first rip.
-            log.info("  Higher-quality retry came back with fewer tracks than "
-                     "the first rip; keeping the first rip.")
-        return restore(moved), False
+            try:
+                fresh = collect_staged_dirs()
+            except OSError:
+                # run_album_download retains its exact run before propagating
+                # an abrupt failure, so its former public dirs are absent.
+                fresh = []
+            retry_files = collect_retry_files()
+            restore_first(fresh, retry_files)
+        except Exception as recovery_error:
+            raise recovery_error from exc
+        raise
+
+    if fresh and retry_preserves_original():
+        if not discard_group(parked):
+            log.info(
+                "  Higher-quality retry succeeded; the first rip changed "
+                "while parked and was kept in the retry recovery folder.")
+        return fresh, True
+    if fresh:
+        log.info("  Higher-quality retry did not preserve the first rip's "
+                 "Qobuz track coverage; keeping the first rip.")
+    retry_files = collect_retry_files()
+    return restore_first(fresh, retry_files), False

@@ -1,24 +1,78 @@
-"""process_album integration behaviour: a web cancel must skip the import, a
-gap-fill that comes back lossy must restore the backed-up originals, and the
-staging sweep/preflight guards hold. The download-phase bookkeeping itself lives
-in test_download.py, against the shared run_album_download.
-"""
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 
+def _patch_download_receipts(monkeypatch, download, added):
+    from qobuz_librarian.integrations.staging import StagedFile
+
+    class _Run:
+        path = Path("/")
+
+        @staticmethod
+        def to_record():
+            return {"path": "/", "root_identity": [0, 0, 0, 0, 0, 0]}
+
+    def sealed_added(_snapshot):
+        receipts = []
+        for item in added:
+            value = item.stat()
+            receipts.append(StagedFile(item, (
+                value.st_dev, value.st_ino, value.st_mode, value.st_size,
+                value.st_mtime_ns, value.st_ctime_ns,
+            )))
+        return receipts
+
+    monkeypatch.setattr(download, "files_added_since", sealed_added)
+    monkeypatch.setattr(download, "create_staging_run", lambda: _Run())
+    monkeypatch.setattr(
+        download,
+        "capture_staging_run",
+        lambda _run: SimpleNamespace(files=(object(),)),
+    )
+
+
 def _args(**over):
     base = dict(force=False, yes=True, no_import=False, dry_run=False,
                 verbose=False, consolidate=False, no_upgrade=False,
-                no_downsample=True, migrate_multi_artist=False,
+                no_downsample=True,
                 auto_upgrade=False, prefer_hires=False)
     base.update(over)
     return SimpleNamespace(**base)
 
 
-def test_sweep_staging_artwork_removes_artwork_dirs(monkeypatch, tmp_path):
-    """`beet import` leaves streamrip's __artwork/ cover-image dirs behind."""
+def test_force_stops_after_an_interrupted_backup(monkeypatch, tmp_path):
+    from qobuz_librarian.modes import process as proc
+
+    album_dir = tmp_path / "music" / "Artist" / "Album"
+    album_dir.mkdir(parents=True)
+    (album_dir / "01.flac").write_bytes(b"original")
+    retained = SimpleNamespace(
+        complete=False,
+        path=tmp_path / "backups" / "Album",
+    )
+    recovered = []
+
+    monkeypatch.setattr(proc, "find_album_dir_filesystem", lambda _album: album_dir)
+    monkeypatch.setattr(proc, "confirm", lambda *args, **kwargs: True)
+    monkeypatch.setattr(proc, "backup_album_dir", lambda _path: retained)
+    monkeypatch.setattr(
+        proc,
+        "_recover_incomplete_upgrade_backup",
+        lambda backup, original, **kwargs: recovered.append(
+            (backup, original, kwargs["operation"])),
+    )
+
+    outcome = proc.force_cleanup_preflight({}, _args(force=True))
+
+    assert outcome is None
+    assert recovered == [
+        (retained, album_dir, "forced re-download backup"),
+    ]
+
+
+def test_sweep_staging_artwork_keeps_unproved_artwork_dirs(monkeypatch, tmp_path):
     from qobuz_librarian import config as cfg
     from qobuz_librarian.modes import process as proc
 
@@ -32,8 +86,52 @@ def test_sweep_staging_artwork_removes_artwork_dirs(monkeypatch, tmp_path):
     monkeypatch.setattr(cfg, "STAGING_DIR", staging)
     proc.sweep_staging_artwork()
 
-    assert not artwork.exists()
+    assert artwork.exists()
     assert keep.exists()
+
+
+def test_partial_retention_moves_only_the_recorded_download_run(
+        monkeypatch, tmp_path):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.download import retain_download_staging
+    from qobuz_librarian.integrations import staging as staging_tx
+
+    staging = tmp_path / "staging"
+    monkeypatch.setattr(cfg, "STAGING_DIR", staging)
+    owned = staging_tx.create_staging_run()
+    concurrent = staging_tx.create_staging_run()
+    owned_file = owned.path / "Artist" / "Album" / "01.flac"
+    concurrent_file = concurrent.path / "Other" / "Album" / "01.flac"
+    owned_file.parent.mkdir(parents=True)
+    concurrent_file.parent.mkdir(parents=True)
+    owned_file.write_bytes(b"owned partial")
+    concurrent_file.write_bytes(b"concurrent run")
+    result = {"_staging_run": owned.to_record()}
+
+    assert retain_download_staging(result, label="incomplete-replacement")
+    assert not owned.path.exists()
+    assert concurrent_file.read_bytes() == b"concurrent run"
+    groups = staging_tx.list_groups(kind="interrupted")
+    assert len(groups) == 1
+    assert list(groups[0].trees[0].path.rglob("*.flac"))[0].read_bytes() == (
+        b"owned partial"
+    )
+
+
+def test_completed_run_retirement_reclaims_nested_empty_directories(
+        monkeypatch, tmp_path):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.download import retire_empty_download_staging
+    from qobuz_librarian.integrations import staging as staging_tx
+
+    staging = tmp_path / "staging"
+    monkeypatch.setattr(cfg, "STAGING_DIR", staging)
+    run = staging_tx.create_staging_run()
+    (run.path / "Artist" / "Album" / "Disc 2").mkdir(parents=True)
+
+    assert retire_empty_download_staging({"_staging_run": run.to_record()})
+    assert not run.path.exists()
+    assert staging_tx.list_groups(kind="interrupted") == []
 
 
 def test_cancel_after_download_skips_beets_import(monkeypatch, tmp_path):
@@ -59,8 +157,6 @@ def test_cancel_after_download_skips_beets_import(monkeypatch, tmp_path):
     monkeypatch.setattr(proc, "snapshot_staging", lambda: set())
     monkeypatch.setattr(proc, "print_album_summary", lambda *a, **k: None)
     monkeypatch.setattr(proc, "log_fetch", lambda _e: None)
-    # The job was cancelled while the rip ran; process_album sees it after the
-    # download returns and must discard rather than import.
     monkeypatch.setattr(proc, "is_cancel_requested", lambda: True)
 
     def fake_download(**kw):
@@ -69,6 +165,7 @@ def test_cancel_after_download_skips_beets_import(monkeypatch, tmp_path):
                             gap_fill_backup_path=None)
         return kw["result"]
     monkeypatch.setattr(proc, "run_album_download", fake_download)
+    monkeypatch.setattr(proc, "validated_staged_album_dirs", lambda _result: [staging])
 
     beets_runs = []
     monkeypatch.setattr(proc, "beets_import_paths",
@@ -82,11 +179,6 @@ def test_cancel_after_download_skips_beets_import(monkeypatch, tmp_path):
 
 
 def test_treat_as_new_downloads_an_owned_album_as_a_separate_edition(monkeypatch, tmp_path):
-    """A normal download of an album the user already owns short-circuits as
-    'already complete'. With treat_as_new (the "get this edition too" path) the
-    ownership scan is bypassed, so it downloads in full and imports as a brand-new
-    album — album_dir stays None, so beets consolidation is off and the new
-    edition isn't folded into the owned one's folder."""
     from qobuz_librarian import config as cfg
     from qobuz_librarian.modes import process as proc
 
@@ -103,7 +195,6 @@ def test_treat_as_new_downloads_an_owned_album_as_a_separate_edition(monkeypatch
     owned_dir = tmp_path / "The Beatles" / "Abbey Road (1969)"
 
     monkeypatch.setattr(proc, "is_lossless_album", lambda _a: True)
-    # The album IS owned: the original edition resolves with all tracks present.
     monkeypatch.setattr(proc, "find_existing_tracks", lambda _a: (list(tracks), owned_dir))
     monkeypatch.setattr(proc, "find_album_dir_filesystem", lambda _a: owned_dir)
     monkeypatch.setattr(proc, "compute_missing",
@@ -111,8 +202,8 @@ def test_treat_as_new_downloads_an_owned_album_as_a_separate_edition(monkeypatch
     monkeypatch.setattr(proc, "staging_preflight", lambda _a: None)
     monkeypatch.setattr(proc, "snapshot_staging", lambda: set())
     monkeypatch.setattr(proc, "is_cancel_requested", lambda: False)
-    monkeypatch.setattr(proc, "_pre_import_staging_hooks", lambda _a: ([], 0))
-    monkeypatch.setattr(proc, "cleanup_duplicate_art", lambda _d: 0)
+    monkeypatch.setattr(
+        proc, "_pre_import_staging_hooks", lambda _a, _dirs=None: ([], 0))
     monkeypatch.setattr(proc, "write_post_import_sidecars", lambda _ds: None)
     monkeypatch.setattr(proc, "sweep_staging_artwork", lambda: None)
     monkeypatch.setattr(proc, "print_album_summary", lambda *a, **k: None)
@@ -125,15 +216,14 @@ def test_treat_as_new_downloads_an_owned_album_as_a_separate_edition(monkeypatch
     monkeypatch.setattr(proc, "run_album_download", fake_download)
 
     consolidate_seen = []
+    monkeypatch.setattr(proc, "validated_staged_album_dirs",
+                        lambda _result: [staging])
     monkeypatch.setattr(proc, "beets_import_paths",
                         lambda *a, **k: consolidate_seen.append(k.get("consolidate")) or True)
 
-    # Default: owned + complete → skipped, nothing downloaded or imported.
     assert proc.process_album(album, _args(), token="tok")["result"] == "already_complete"
     assert consolidate_seen == []
 
-    # treat_as_new: ownership bypassed → full download + import as a new album,
-    # consolidation off so it's never merged into the owned edition's folder.
     result = proc.process_album(album, _args(), token="tok", treat_as_new=True)
     assert result.get("imported") is True
     assert consolidate_seen == [False]
@@ -165,11 +255,12 @@ def test_auto_downsample_marks_imported_folder_when_album_resolver_misses(
     monkeypatch.setattr(proc, "find_album_dir_filesystem", lambda _a: None)
     monkeypatch.setattr(proc, "staging_preflight", lambda _a: None)
     monkeypatch.setattr(proc, "snapshot_staging", lambda: set())
-    monkeypatch.setattr(proc, "staged_album_dirs_since", lambda _s: [staged_album])
+    monkeypatch.setattr(proc, "validated_staged_album_dirs",
+                        lambda _result: [staged_album])
     monkeypatch.setattr(proc, "is_cancel_requested", lambda: False)
-    monkeypatch.setattr(proc, "_pre_import_staging_hooks", lambda _a: ([], 1))
+    monkeypatch.setattr(
+        proc, "_pre_import_staging_hooks", lambda _a, _dirs=None: ([], 1))
     monkeypatch.setattr(proc, "beets_import_paths", lambda *a, **k: True)
-    monkeypatch.setattr(proc, "cleanup_duplicate_art", lambda _d: 0)
     monkeypatch.setattr(proc, "write_post_import_sidecars", lambda _ds: None)
     monkeypatch.setattr(proc, "sweep_staging_artwork", lambda: None)
     monkeypatch.setattr(proc, "print_album_summary", lambda *a, **k: None)
@@ -227,11 +318,12 @@ def test_self_heal_retry_signatures_use_fresh_staged_dirs(monkeypatch, tmp_path)
     monkeypatch.setattr(proc, "find_album_dir_filesystem", lambda _a: old_dir)
     monkeypatch.setattr(proc, "staging_preflight", lambda _a: None)
     monkeypatch.setattr(proc, "snapshot_staging", lambda: set())
-    monkeypatch.setattr(proc, "staged_album_dirs_since", lambda _s: [first_staged])
+    monkeypatch.setattr(proc, "validated_staged_album_dirs",
+                        lambda _result: [first_staged])
     monkeypatch.setattr(proc, "is_cancel_requested", lambda: False)
-    monkeypatch.setattr(proc, "_pre_import_staging_hooks", lambda _a: ([], 1))
+    monkeypatch.setattr(
+        proc, "_pre_import_staging_hooks", lambda _a, _dirs=None: ([], 1))
     monkeypatch.setattr(proc, "beets_import_paths", lambda *a, **k: True)
-    monkeypatch.setattr(proc, "cleanup_duplicate_art", lambda _d: 0)
     monkeypatch.setattr(proc, "write_post_import_sidecars", lambda _ds: None)
     monkeypatch.setattr(proc, "sweep_staging_artwork", lambda: None)
     monkeypatch.setattr(proc, "print_album_summary", lambda *a, **k: None)
@@ -291,14 +383,18 @@ def test_self_heal_retry_no_files_imports_first_staged_rip(
     monkeypatch.setattr(proc, "staging_preflight", lambda _a: None)
     monkeypatch.setattr(proc, "snapshot_staging", lambda: set())
     monkeypatch.setattr(proc, "is_cancel_requested", lambda: False)
-    monkeypatch.setattr(proc, "_pre_import_staging_hooks", lambda _a: ([], 0))
-    monkeypatch.setattr(proc, "cleanup_duplicate_art", lambda _d: 0)
+    monkeypatch.setattr(
+        proc, "_pre_import_staging_hooks", lambda _a, _dirs=None: ([], 0))
     monkeypatch.setattr(proc, "write_post_import_sidecars", lambda _ds: None)
     monkeypatch.setattr(proc, "sweep_staging_artwork", lambda: None)
     monkeypatch.setattr(proc, "print_album_summary", lambda *a, **k: None)
     monkeypatch.setattr(proc, "log_fetch", lambda _e: None)
     monkeypatch.setattr(proc, "warn_if_download_truncated", lambda *a, **k: None)
     monkeypatch.setattr(proc, "track_signatures_for_album_dirs", lambda _d: [])
+    monkeypatch.setattr(
+        proc, "validated_staged_album_dirs",
+        lambda _result: [first_staged] if first_staged.exists() else [],
+    )
 
     imported = []
     monkeypatch.setattr(proc, "beets_import_paths",
@@ -336,8 +432,6 @@ def test_self_heal_retry_no_files_imports_first_staged_rip(
 
 
 def test_gap_fill_backup_restored_when_track_returns_lossy(monkeypatch, tmp_path):
-    """A full-album gap-fill stashes the owned tracks before re-ripping; if a
-    re-ripped track comes back lossy, process_album's finally restores them."""
     from qobuz_librarian import config as cfg
     from qobuz_librarian import download as dl
     from qobuz_librarian.modes import process as proc
@@ -350,6 +444,7 @@ def test_gap_fill_backup_restored_when_track_returns_lossy(monkeypatch, tmp_path
 
     staging = tmp_path / "staging"
     staging.mkdir()
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", tmp_path / "music")
     monkeypatch.setattr(cfg, "STAGING_DIR", staging)
     monkeypatch.setattr(cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
     monkeypatch.setattr(cfg, "AUTO_UPGRADE_ENABLED", False)
@@ -358,11 +453,12 @@ def test_gap_fill_backup_restored_when_track_returns_lossy(monkeypatch, tmp_path
     album = {"id": "ALB", "title": "Album", "artist": {"name": "Artist"},
              "maximum_bit_depth": 24, "maximum_sampling_rate": 96.0,
              "tracks": {"items": tracks}}
-    # 4 of 5 missing → full-album re-rip, the path that backs up present tracks.
     missing = tracks[1:]
     new_flacs = [staging / f"0{i} - T{i}.flac" for i in range(2, 6)]
     for f in new_flacs:
         f.write_bytes(b"\x00" * 1000)
+    lossy_rip = staging / "01 - T1.mp3"
+    lossy_rip.write_bytes(b"lossy")
 
     monkeypatch.setattr(proc, "is_lossless_album", lambda _a: True)
     monkeypatch.setattr(proc, "find_existing_tracks", lambda _a: (existing, album_dir))
@@ -371,20 +467,26 @@ def test_gap_fill_backup_restored_when_track_returns_lossy(monkeypatch, tmp_path
     monkeypatch.setattr(proc, "snapshot_staging", lambda: set())
     monkeypatch.setattr(proc, "staging_preflight", lambda _a: None)
     monkeypatch.setattr(proc, "is_cancel_requested", lambda: False)
-    monkeypatch.setattr(proc, "_pre_import_staging_hooks", lambda _a: ([], 0))
+    monkeypatch.setattr(
+        proc, "_pre_import_staging_hooks", lambda _a, _dirs=None: ([], 0))
     monkeypatch.setattr(proc, "beets_import_paths", lambda *a, **k: True)
-    monkeypatch.setattr(proc, "cleanup_duplicate_art", lambda _d: 0)
     monkeypatch.setattr(proc, "write_post_import_sidecars", lambda _ds: None)
     monkeypatch.setattr(proc, "sweep_staging_artwork", lambda: None)
     monkeypatch.setattr(proc, "log_fetch", lambda _e: None)
     monkeypatch.setattr(proc, "print_album_summary", lambda *a, **k: None)
+    monkeypatch.setattr(proc, "validated_staged_album_dirs",
+                        lambda _result: [staging])
 
-    # The download itself runs for real through run_album_download; only its
-    # primitives are stubbed. The re-ripped owned track comes back lossy.
     monkeypatch.setattr(dl, "rip_url", lambda *a, **k: (0, ""))
-    monkeypatch.setattr(dl, "files_added_since",
-                        lambda _s: new_flacs + [staging / "01 - T1.mp3"])
-    monkeypatch.setattr(dl, "cleanup_lossy", lambda _f: (new_flacs, ["01 - T1"], []))
+    _patch_download_receipts(monkeypatch, dl, [*new_flacs, lossy_rip])
+    monkeypatch.setattr(
+        dl, "cleanup_lossy",
+        lambda files: (
+            [file for file in files if file.suffix == ".flac"],
+            [file for file in files if file.suffix == ".mp3"],
+            [],
+        ),
+    )
     monkeypatch.setattr(dl, "snapshot_staging", lambda: set())
     monkeypatch.setattr(dl, "detect_auth_lost", lambda _o: False)
     monkeypatch.setattr(dl, "detect_disk_full", lambda _o: False)
@@ -424,30 +526,34 @@ def test_upgrade_verification_keeps_backup_when_replacement_is_short(monkeypatch
     backup.mkdir()
     post = tmp_path / "Album"
     post.mkdir()
-    original = [{"title": "T1", "length": 200.0},
-                {"title": "T2", "length": 180.0},
-                {"title": "T3", "length": 240.0}]
+    original = [
+        {"title": "T1", "length": 200.0, "bits": 16,
+         "sample_rate": 44100, "channels": 2,
+         "discnumber": 1, "tracknumber": 1},
+        {"title": "T2", "length": 180.0, "bits": 16,
+         "sample_rate": 44100, "channels": 2,
+         "discnumber": 1, "tracknumber": 2},
+        {"title": "T3", "length": 240.0, "bits": 16,
+         "sample_rate": 44100, "channels": 2,
+         "discnumber": 1, "tracknumber": 3},
+    ]
     monkeypatch.setattr(proc, "find_album_dir_filesystem", lambda _a: post)
 
-    # A track the matcher dropped: the rebuilt folder has fewer files.
     monkeypatch.setattr(proc, "read_album_dir",
                         lambda f, walk_errors=None: original if f == backup else original[:2])
     assert proc._upgrade_replacement_verified({"id": "x"}, post, backup) is False
-
-    # All tracks present but one re-ripped short (decodes, so flac -t passes):
-    # total playtime drops below the original.
-    truncated = [{"title": "T1", "length": 200.0},
-                 {"title": "T2", "length": 20.0},
-                 {"title": "T3", "length": 240.0}]
+    truncated = [
+        dict(original[0]),
+        {**original[1], "length": 20.0},
+        dict(original[2]),
+    ]
     monkeypatch.setattr(proc, "read_album_dir",
                         lambda f, walk_errors=None: original if f == backup else truncated)
     assert proc._upgrade_replacement_verified({"id": "x"}, post, backup) is False
 
-    # Can't even locate the import: keep the backup rather than guess.
     monkeypatch.setattr(proc, "find_album_dir_filesystem", lambda _a: None)
     assert proc._upgrade_replacement_verified({"id": "x"}, post, backup) is False
 
-    # A complete, full-length rebuild verifies → safe to drop the backup.
     complete = tmp_path / "Complete"
     complete.mkdir()
     monkeypatch.setattr(proc, "find_album_dir_filesystem", lambda _a: complete)
@@ -456,9 +562,6 @@ def test_upgrade_verification_keeps_backup_when_replacement_is_short(monkeypatch
 
 
 def test_upgrade_verification_rejects_a_masked_per_track_downgrade(monkeypatch, tmp_path):
-    """One replacement track came back 24/96 while another dropped to 16/44.
-    The album MAXIMUM rises, so a max-only quality gate would delete the
-    24/48 originals — the weakest track has to hold the line too."""
     from qobuz_librarian.modes import process as proc
 
     backup = tmp_path / "backup"
@@ -466,32 +569,167 @@ def test_upgrade_verification_rejects_a_masked_per_track_downgrade(monkeypatch, 
     post = tmp_path / "Album"
     post.mkdir()
     original = [{"title": "T1", "length": 200.0,
-                 "bits": 24, "sample_rate": 48000},
+                 "bits": 24, "sample_rate": 48000, "channels": 2,
+                 "discnumber": 1, "tracknumber": 1},
                 {"title": "T2", "length": 180.0,
-                 "bits": 24, "sample_rate": 48000}]
+                 "bits": 24, "sample_rate": 48000, "channels": 2,
+                 "discnumber": 1, "tracknumber": 2}]
     replacement = [{"title": "T1", "length": 200.0,
-                    "bits": 24, "sample_rate": 96000},
+                    "bits": 24, "sample_rate": 96000, "channels": 2,
+                    "discnumber": 1, "tracknumber": 1},
                    {"title": "T2", "length": 180.0,
-                    "bits": 16, "sample_rate": 44100}]
+                    "bits": 16, "sample_rate": 44100, "channels": 2,
+                    "discnumber": 1, "tracknumber": 2}]
     monkeypatch.setattr(proc, "find_album_dir_filesystem", lambda _a: post)
     monkeypatch.setattr(proc, "read_album_dir",
                         lambda f, walk_errors=None: original if f == backup else replacement)
     assert proc._upgrade_replacement_verified({"id": "x"}, post, backup) is False
 
-    # The same replacement with no downgraded track verifies.
     fixed = [{"title": "T1", "length": 200.0,
-              "bits": 24, "sample_rate": 96000},
+              "bits": 24, "sample_rate": 96000, "channels": 2,
+              "discnumber": 1, "tracknumber": 1},
              {"title": "T2", "length": 180.0,
-              "bits": 24, "sample_rate": 48000}]
+              "bits": 24, "sample_rate": 48000, "channels": 2,
+              "discnumber": 1, "tracknumber": 2}]
     monkeypatch.setattr(proc, "read_album_dir",
                         lambda f, walk_errors=None: original if f == backup else fixed)
     assert proc._upgrade_replacement_verified({"id": "x"}, post, backup) is True
 
+    def verifies(old_tracks, new_tracks):
+        old_tracks = [
+            {"discnumber": 1, "tracknumber": index, **track}
+            for index, track in enumerate(old_tracks, 1)
+        ]
+        new_tracks = [
+            {"discnumber": 1, "tracknumber": index, **track}
+            for index, track in enumerate(new_tracks, 1)
+        ]
+        monkeypatch.setattr(
+            proc,
+            "read_album_dir",
+            lambda f, walk_errors=None: (
+                old_tracks if f == backup else new_tracks
+            ),
+        )
+        return proc._upgrade_replacement_verified(
+            {"id": "x"}, post, backup)
+
+    stereo = {"channels": 2, "length": 100.0}
+    assert verifies(
+        [{"title": "T1", "bits": 16, "sample_rate": 192000, **stereo}],
+        [{"title": "T1", "bits": 24, "sample_rate": 96000, **stereo}],
+    ) is False
+    assert verifies(
+        [{"title": "T1", "bits": 24, "sample_rate": 96000,
+          "channels": 6, "length": 100.0}],
+        [{"title": "T1", "bits": 24, "sample_rate": 96000, **stereo}],
+    ) is False
+    assert verifies(
+        [
+            {"title": "T1", "bits": 16, "sample_rate": 44100, **stereo},
+            {"title": "T2", "bits": 16, "sample_rate": 44100, **stereo},
+        ],
+        [
+            {"title": "T1", "bits": 24, "sample_rate": 96000,
+             "channels": 2, "length": 50.0},
+            {"title": "T2", "bits": 24, "sample_rate": 96000,
+             "channels": 2, "length": 150.0},
+        ],
+    ) is False
+    assert verifies(
+        [{"title": "T1", "bits": 16, "sample_rate": 44100, **stereo}],
+        [{"title": "T1", "bits": 0, "sample_rate": 96000, **stereo}],
+    ) is False
+    assert verifies(
+        [{"title": "T1", "isrc": "USAAA1234567", "bits": 16,
+          "sample_rate": 44100, **stereo}],
+        [{"title": "T1", "isrc": "USBBB1234568", "bits": 24,
+          "sample_rate": 96000, **stereo}],
+    ) is False
+
+    identities = {
+        "isrc": "USAAA1234567",
+        "mb_trackid": "123456781234123412341234567890ab",
+    }
+    for identity_field, identity in identities.items():
+        assert verifies(
+            [{"title": "T1", identity_field: identity,
+              "bits": 16, "sample_rate": 44100, **stereo}],
+            [{"title": "T1", identity_field: "",
+              "bits": 24, "sample_rate": 96000, **stereo}],
+        ) is False
+        assert verifies(
+            [{"title": "T1", identity_field: "N/A",
+              "bits": 16, "sample_rate": 44100, **stereo}],
+            [{"title": "T1", identity_field: "N/A",
+              "bits": 24, "sample_rate": 96000, **stereo}],
+        ) is False
+
+    for identity_field, placeholder in (
+        ("isrc", "000000000000"),
+        ("mb_trackid", "00000000-0000-0000-0000-000000000000"),
+    ):
+        assert verifies(
+            [{"title": "Original", identity_field: placeholder,
+              "bits": 16, "sample_rate": 44100, **stereo}],
+            [{"title": "Different", identity_field: placeholder,
+              "bits": 24, "sample_rate": 96000, **stereo}],
+        ) is False
+
+    for old_title, new_title in (
+        ("東京 (Remaster)", "大阪 (Remaster)"),
+        ("東京 [Remaster]", "大阪 [Remaster]"),
+    ):
+        assert verifies(
+            [{"title": old_title, "bits": 16,
+              "sample_rate": 44100, **stereo}],
+            [{"title": new_title, "bits": 24,
+              "sample_rate": 96000, **stereo}],
+        ) is False
+
+    assert verifies(
+        [{"title": "T1", "bits": 16, "sample_rate": 44100,
+          "channels": 2, "length": True}],
+        [{"title": "T1", "bits": 24, "sample_rate": 96000,
+          "channels": 2, "length": 1.0}],
+    ) is False
+
+    assert verifies(
+        [{"title": "T1", "isrc": "US-AAA-12-34567",
+          "bits": 16, "sample_rate": 44100, **stereo}],
+        [{"title": "T1", "isrc": "USAAA1234567",
+          "bits": 24, "sample_rate": 96000, **stereo}],
+    ) is True
+    assert verifies(
+        [{"title": "T1",
+          "mb_trackid": "12345678-1234-1234-1234-1234567890ab",
+          "bits": 16, "sample_rate": 44100, **stereo}],
+        [{"title": "T1",
+          "mb_trackid": "123456781234123412341234567890ab",
+          "bits": 24, "sample_rate": 96000, **stereo}],
+    ) is True
+
+    assert verifies(
+        [{"title": "T1", "bits": 16, "sample_rate": 44100, **stereo}],
+        [{"title": "T1 (Remaster)", "bits": 24,
+          "sample_rate": 96000, **stereo}],
+    ) is False
+
+    assert verifies(
+        [
+            {"title": "Same", "bits": 16, "sample_rate": 44100, **stereo},
+            {"title": "Same", "bits": 16, "sample_rate": 44100, **stereo},
+        ],
+        [
+            {"title": "Same", "tracknumber": 1,
+             "bits": 24, "sample_rate": 96000, **stereo},
+            {"title": "Same", "tracknumber": 1,
+             "bits": 24, "sample_rate": 96000, **stereo},
+        ],
+    ) is False
+
 
 def test_upgrade_verification_keeps_backup_on_a_degraded_walk(monkeypatch, tmp_path):
-    """A transient read error on the backup returns only the READABLE tracks,
-    lowering the completeness baseline enough for an incomplete replacement
-    to pass every gate. Partially unreadable is unverifiable — keep it."""
     from qobuz_librarian.modes import process as proc
 
     backup = tmp_path / "backup"
@@ -512,10 +750,8 @@ def test_upgrade_verification_keeps_backup_on_a_degraded_walk(monkeypatch, tmp_p
     assert proc._upgrade_replacement_verified({"id": "x"}, post, backup) is False
 
 
-def test_gap_fill_backup_kept_when_extras_satisfy_the_count(monkeypatch, tmp_path):
-    """process_album's gap-fill resolution: enough audio files are in the
-    resolved folder, but one EXPECTED track is absent (a bonus file makes up
-    the number) — the backup holding the moved-aside track must survive."""
+def test_gap_fill_partial_import_restores_backup_despite_extra_track(
+        monkeypatch, tmp_path):
     from qobuz_librarian import config as cfg
     from qobuz_librarian import download as dl
     from qobuz_librarian.modes import process as proc
@@ -529,6 +765,7 @@ def test_gap_fill_backup_kept_when_extras_satisfy_the_count(monkeypatch, tmp_pat
 
     staging = tmp_path / "staging"
     staging.mkdir()
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", tmp_path / "music")
     monkeypatch.setattr(cfg, "STAGING_DIR", staging)
     monkeypatch.setattr(cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
     monkeypatch.setattr(cfg, "AUTO_UPGRADE_ENABLED", False)
@@ -549,18 +786,14 @@ def test_gap_fill_backup_kept_when_extras_satisfy_the_count(monkeypatch, tmp_pat
     monkeypatch.setattr(proc, "snapshot_staging", lambda: set())
     monkeypatch.setattr(proc, "staging_preflight", lambda _a: None)
     monkeypatch.setattr(proc, "is_cancel_requested", lambda: False)
-    monkeypatch.setattr(proc, "_pre_import_staging_hooks", lambda _a: ([], 0))
+    monkeypatch.setattr(
+        proc, "_pre_import_staging_hooks", lambda _a, _dirs=None: ([], 0))
     monkeypatch.setattr(proc, "beets_import_paths", lambda *a, **k: True)
-    monkeypatch.setattr(proc, "cleanup_duplicate_art", lambda _d: 0)
     monkeypatch.setattr(proc, "write_post_import_sidecars", lambda _ds: None)
     monkeypatch.setattr(proc, "sweep_staging_artwork", lambda: None)
     monkeypatch.setattr(proc, "log_fetch", lambda _e: None)
     monkeypatch.setattr(proc, "print_album_summary", lambda *a, **k: None)
 
-    # The full-album rip lands ALL five tracks clean (n_fail must be 0 for
-    # the success branch), but "beets" moves only T2–T5 into the album folder
-    # — the re-ripped T1 stays behind in staging. The folder still counts 5
-    # audio files thanks to the bonus one, so a raw count reads it as whole.
     t1_rip = staging / "01 - T1.flac"
     t1_rip.write_bytes(b"\x00" * 1000)
 
@@ -570,9 +803,11 @@ def test_gap_fill_backup_kept_when_extras_satisfy_the_count(monkeypatch, tmp_pat
             f.unlink()
         return True
     monkeypatch.setattr(proc, "beets_import_paths", fake_import)
+    monkeypatch.setattr(proc, "validated_staged_album_dirs",
+                        lambda _result: [staging])
 
     monkeypatch.setattr(dl, "rip_url", lambda *a, **k: (0, ""))
-    monkeypatch.setattr(dl, "files_added_since", lambda _s: [*new_flacs, t1_rip])
+    _patch_download_receipts(monkeypatch, dl, [*new_flacs, t1_rip])
     monkeypatch.setattr(dl, "cleanup_lossy", lambda f: (list(f), [], []))
     monkeypatch.setattr(dl, "snapshot_staging", lambda: set())
     monkeypatch.setattr(dl, "detect_auth_lost", lambda _o: False)
@@ -583,36 +818,10 @@ def test_gap_fill_backup_kept_when_extras_satisfy_the_count(monkeypatch, tmp_pat
 
     proc.process_album(album, _args(), token="tok")
 
-    kept = list((tmp_path / "backups").rglob("01 - T1.flac"))
-    assert kept and kept[0].read_bytes() == b"the-owned-original"
-
-
-def test_companion_carry_refuses_a_same_name_different_file(monkeypatch, tmp_path):
-    """A re-rip lands its own booklet.pdf under the standard name. Skipping
-    the carry on the NAME alone counts the original companion as across while
-    its only copy sits in the backup about to be deleted — only byte-identical
-    content proves it's already there."""
-    from qobuz_librarian.modes import process as proc
-
-    backup = tmp_path / "backup"
-    backup.mkdir()
-    (backup / "booklet.pdf").write_bytes(b"the-original-booklet")
-    dest = tmp_path / "Album"
-    dest.mkdir()
-    (dest / "booklet.pdf").write_bytes(b"a-different-booklet!")
-    monkeypatch.setattr(proc, "find_album_dir_filesystem", lambda _a: dest)
-
-    assert proc._carry_non_audio_from_backup({"id": "x"}, dest, backup) is False
-
-    # Byte-identical means already carried; the backup can go.
-    (dest / "booklet.pdf").write_bytes(b"the-original-booklet")
-    assert proc._carry_non_audio_from_backup({"id": "x"}, dest, backup) is True
+    assert owned.read_bytes() == b"the-owned-original"
 
 
 def test_upgrade_verification_rejects_a_rank_slot_downgrade(monkeypatch, tmp_path):
-    """[16/44.1, 24/96, 24/192] replaced by [16/44.1, 24/48, 24/192]: both
-    ENDPOINTS of the quality range match, so a min+max check passes while the
-    middle track was downgraded. Every ranked slot has to hold the line."""
     from qobuz_librarian.modes import process as proc
 
     backup = tmp_path / "backup"
@@ -636,9 +845,6 @@ def test_upgrade_verification_rejects_a_rank_slot_downgrade(monkeypatch, tmp_pat
 
 
 def test_upgrade_verification_rejects_a_swap_hidden_by_ranking(monkeypatch, tmp_path):
-    """Old: A=16/44.1, B=24/96. New: A=24/96, B=16/44.1. The ranked multisets
-    are identical, so only following track IDENTITY can see that B — a 24/96
-    master — came back below its original."""
     from qobuz_librarian.modes import process as proc
 
     backup = tmp_path / "backup"
@@ -660,7 +866,6 @@ def test_upgrade_verification_rejects_a_swap_hidden_by_ranking(monkeypatch, tmp_
 
 
 def test_upgrade_verification_requires_every_original_identity(monkeypatch, tmp_path):
-    """A duplicate replacement must not stand in for a missing original."""
     from qobuz_librarian.modes import process as proc
 
     backup = tmp_path / "backup"
@@ -685,8 +890,6 @@ def test_upgrade_verification_requires_every_original_identity(monkeypatch, tmp_
 
 
 def test_upgrade_verification_counts_an_unreadable_track_as_a_downgrade(monkeypatch, tmp_path):
-    """One replacement track reads (0, 0) — unknown quality. Ignoring unknowns
-    lets it vouch for a 24/96 original it can't be proven to match."""
     from qobuz_librarian.modes import process as proc
 
     backup = tmp_path / "backup"
@@ -705,53 +908,3 @@ def test_upgrade_verification_counts_an_unreadable_track_as_a_downgrade(monkeypa
     monkeypatch.setattr(proc, "read_album_dir",
                         lambda f, walk_errors=None: original if f == backup else replacement)
     assert proc._upgrade_replacement_verified({"id": "x"}, post, backup) is False
-
-
-def test_companion_carry_refuses_a_partial_backup_walk(monkeypatch, tmp_path):
-    """rglob swallows a subtree listing failure; if that subtree holds the only
-    booklet, "saw no companions" authorizes deleting the backup that still
-    contains it. A walk that couldn't cover the tree must fail the carry."""
-    from qobuz_librarian.library import scanner as scanner_mod
-    from qobuz_librarian.modes import process as proc
-
-    backup = tmp_path / "backup"
-    backup.mkdir()
-    (backup / "cover.jpg").write_bytes(b"art")
-    dest = tmp_path / "Album"
-    dest.mkdir()
-    monkeypatch.setattr(proc, "find_album_dir_filesystem", lambda _a: dest)
-
-    def partial(root, errors=None):
-        if errors is not None:
-            errors.append(OSError("scans/: EIO"))
-        return iter(())
-
-    monkeypatch.setattr(scanner_mod, "iter_tree_no_symlinks", partial)
-    assert proc._carry_non_audio_from_backup({"id": "x"}, dest, backup) is False
-
-
-def test_companion_carry_requires_a_durable_verified_copy(monkeypatch, tmp_path):
-    """The carried copy becomes the ONLY copy once the backup is deleted — a
-    copy that exists only in the page cache must keep the backup instead."""
-    from qobuz_librarian.library import backup as bk
-    from qobuz_librarian.modes import process as proc
-
-    backup = tmp_path / "backup"
-    backup.mkdir()
-    (backup / "cover.jpg").write_bytes(b"art")
-    dest = tmp_path / "Album"
-    dest.mkdir()
-    monkeypatch.setattr(proc, "find_album_dir_filesystem", lambda _a: dest)
-
-    monkeypatch.setattr(bk, "_fsync", lambda p: False)
-    assert proc._carry_non_audio_from_backup({"id": "x"}, dest, backup) is False
-
-    (dest / "cover.jpg").unlink(missing_ok=True)
-    monkeypatch.setattr(bk, "_fsync", lambda p: True)
-    assert proc._carry_non_audio_from_backup({"id": "x"}, dest, backup) is True
-    assert (dest / "cover.jpg").read_bytes() == b"art"
-
-    # An identical companion is already present now, but that shortcut must
-    # still flush the replacement audio tree before the backup can be removed.
-    monkeypatch.setattr(bk, "_fsync_tree", lambda _p: False)
-    assert proc._carry_non_audio_from_backup({"id": "x"}, dest, backup) is False

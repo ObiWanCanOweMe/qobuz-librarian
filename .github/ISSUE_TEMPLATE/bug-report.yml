@@ -15,7 +15,6 @@ body:
     attributes:
       label: Version
       description: Bottom of the sidebar in the web UI, or `qobuz-librarian --version`.
-      placeholder: v0.10.0
     validations:
       required: true
   - type: dropdown
