@@ -26,7 +26,7 @@ def run_library_lyrics_mode(args):
             "library isn't installed."))
         log.warning(fmt(C.GRAY,
             "     The bundled Docker image includes it; bare installs need "
-            "`pip install qobuz-librarian[lyrics]`."))
+            "the [lyrics] extra (`pip install 'syncedlyrics>=1.0'` also works)."))
         die("syncedlyrics not installed", EXIT_CONFIG)
 
     providers = ", ".join(cfg.LYRICS_PROVIDERS) or "Lrclib, NetEase, Musixmatch"

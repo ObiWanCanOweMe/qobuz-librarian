@@ -2,7 +2,7 @@
 
 [← README](../README.md)
 
-The CLI runs from the same image and Compose service as the web UI, with no separate install: `docker compose run` starts a one-off container from that service that shares the same volumes, config, and download lock. It uses the same matching engine as the web app, walking gaps album by album with yes/no prompts instead of parking a checklist. Run with no arguments for the menu, or flags for unattended runs. The examples below use Docker; from a `pip`/`pipx` or source install run the same commands as `qobuz-librarian …` (drop the `docker compose run --rm` prefix), and install the `[lyrics]` extra for the lyrics walk (`pip install qobuz-librarian[lyrics]`).
+The CLI runs from the same image and Compose service as the web UI, with no separate install: `docker compose run` starts a one-off container from that service that shares the same volumes, config, and download lock. It uses the same matching engine as the web app, walking gaps album by album with yes/no prompts instead of parking a checklist. Run with no arguments for the menu, or flags for unattended runs. The examples below use Docker; from a `pip`/`pipx` or source install run the same commands as `qobuz-librarian …` (drop the `docker compose run --rm` prefix). Install straight from the repo with the `[lyrics]` extra for the lyrics walk: `pipx install 'qobuz-librarian[lyrics] @ git+https://github.com/jarynclouatre/qobuz-librarian.git'`.
 
 ## The download lock
 
