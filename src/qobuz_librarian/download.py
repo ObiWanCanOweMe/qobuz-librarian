@@ -341,6 +341,39 @@ def retire_empty_download_staging(result, *, recovery_checkpoint=None):
     return retained is not None and discard_group(retained, expected_owner=run.owner)
 
 
+def retire_download_staging_after_import(result, *, recovery_checkpoint=None):
+    """Reclaim the run once beets has moved every audio track out.
+
+    A gap-fill or per-track rip stages the album cover next to the tracks;
+    merging into an album that already has its art leaves that cover in the
+    run, which is not an incomplete import. Accept when no audio remains and
+    dispose the run, art and all. Leftover audio means beets did not import
+    everything, so leave it for recovery.
+    """
+    if result.get("_staging_run_retained"):
+        return False
+    run = staging_run_from_record(result.get("_staging_run"))
+    if run is None:
+        return False
+    if (run.owner is None) != (recovery_checkpoint is None):
+        raise ValueError("owned download staging requires a recovery checkpoint")
+    if recovery_checkpoint is not None and not callable(recovery_checkpoint):
+        raise ValueError("recovery checkpoint must be callable")
+    current = capture_staging_run(run)
+    if current is None:
+        return False
+    if any(
+        (current.path / relative).suffix.lower() in cfg.AUDIO_EXTS
+        for relative, _identity in current.files
+    ):
+        return False
+    if run.owner is None:
+        retained = retain_staging_run(run, label="completed-import")
+        return retained is not None and discard_group(retained)
+    retained = retain_staging_run(run, label="completed-import", on_intent=recovery_checkpoint)
+    return retained is not None and discard_group(retained, expected_owner=run.owner)
+
+
 def _receipt_records(receipts):
     return [
         {"path": str(receipt.path), "identity": list(receipt.identity)}

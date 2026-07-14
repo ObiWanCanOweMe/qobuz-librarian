@@ -305,6 +305,29 @@ def test_same_title_twin_failure_stays_failed(monkeypatch, tmp_path):
     assert r["failed_tracks"] == ["Song"]
 
 
+def test_retire_download_staging_after_import_sweeps_leftover_art(monkeypatch, tmp_path):
+    # A gap-fill stages the album cover next to the track; merging into an
+    # album that already has art leaves the cover in the run. That is not an
+    # incomplete import: accept it and dispose the run. Leftover audio is.
+    from qobuz_librarian.integrations.staging import create_staging_run
+
+    monkeypatch.setattr(cfg, "STAGING_DIR", tmp_path)
+
+    run = create_staging_run()
+    album = run.path / "Artist" / "Album"
+    album.mkdir(parents=True)
+    (album / "cover.jpg").write_bytes(b"art")
+    assert dl.retire_download_staging_after_import({"_staging_run": run.to_record()}) is True
+    assert not run.path.exists()
+
+    run2 = create_staging_run()
+    album2 = run2.path / "Artist" / "Album"
+    album2.mkdir(parents=True)
+    (album2 / "01 - Song.flac").write_bytes(b"audio")
+    assert dl.retire_download_staging_after_import({"_staging_run": run2.to_record()}) is False
+    assert (album2 / "01 - Song.flac").exists()
+
+
 def test_snapshot_staging_skips_the_beets_retry_tree(monkeypatch, tmp_path):
     from qobuz_librarian import config as cfg
     from qobuz_librarian.integrations import rip

@@ -7,6 +7,7 @@ from qobuz_librarian import run_lock
 from qobuz_librarian.download import (
     download_staged_files,
     retain_download_staging,
+    retire_download_staging_after_import,
     retire_empty_download_staging,
     run_album_download,
     validated_staged_album_dirs,
@@ -1128,7 +1129,7 @@ def process_album(album, args, *, allow_force=True, label=None,
             if (
                 imported
                 and "_staging_run" in download_result
-                and not retire_empty_download_staging(download_result)
+                and not retire_download_staging_after_import(download_result)
             ):
                 log.info(fmt(
                     C.RED,

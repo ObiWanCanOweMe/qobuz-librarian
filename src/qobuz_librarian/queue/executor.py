@@ -21,6 +21,7 @@ from qobuz_librarian.completion import (
 from qobuz_librarian.download import (
     download_staged_files,
     retain_download_staging,
+    retire_download_staging_after_import,
     retire_empty_download_staging,
     run_album_download,
     validated_staged_album_dirs,
@@ -2783,7 +2784,7 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
 
                 if item_imported and (
                     "_staging_run" not in item
-                    or retire_empty_download_staging(item)
+                    or retire_download_staging_after_import(item)
                 ):
                     any_imported = True
                 else:
