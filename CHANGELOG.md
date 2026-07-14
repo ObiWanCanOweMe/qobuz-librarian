@@ -9,7 +9,7 @@ A long reliability pass over everything that moves or deletes files.
 - Interrupted downloads, imports, migrations, backups, and Undo now recover by re-checking what's actually on disk; anything that can't be verified is left in place instead of guessed at.
 - Undo on a single track removes exactly the file the job recorded, plus any folders it created that are now empty — replaced files, reused folders, and symlinks survive.
 - When the data folder can't enforce the single-writer lock, library writes stay paused instead of running unprotected.
-- beets 2.12.0 is now required and verified before imports run; cleanup stays inside the staging folders the import opened.
+- beets 2.12.0 is now required and verified before imports run — it's bundled in the Docker image, so this only affects bare CLI installs, which must provide that exact version. Cleanup stays inside the staging folders the import opened.
 - Albums credited to several artists can be re-filed under the primary artist again — the move now survives crashes and never overwrites an existing folder.
 - Smaller fixes from just after 0.10.3: review dismissal and mobile disclosure rendering, scans pick up changed candidate settings, cleaner web/terminal handoff coordination, and container user ids are normalised before the privilege drop.
 
