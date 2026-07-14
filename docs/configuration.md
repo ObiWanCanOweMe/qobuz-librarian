@@ -46,12 +46,7 @@ These settings apply to new jobs. A field you change on the Settings page keeps 
 | `MIGRATE_MULTI_ARTIST` | `false` | Re-file `A, B/Album` under `A/Album` after import |
 | `CONSOLIDATE` | `false` | Merge sibling/duplicate album folders (CLI-only) |
 
-`MIGRATE_MULTI_ARTIST` affects new imports only. It never replaces a name that
-already exists under the primary artist; conflicting files stay in their
-original folder for review. If Beets splits a gap-filled album between the
-combined and primary artist folders, Qobuz Librarian safely reunites only the
-non-conflicting files regardless of this preference. Both operations resume or
-roll back after a restart before other library work begins.
+`MIGRATE_MULTI_ARTIST` affects new imports only. It never replaces a name that already exists under the primary artist; conflicting files stay in their original folder for review. If Beets splits a gap-filled album between the combined and primary artist folders, Qobuz Librarian safely reunites only the non-conflicting files regardless of this preference. Both operations resume or roll back after a restart before other library work begins.
 
 `DOWNSAMPLE_HIRES_ENABLED` only touches new downloads (88.2 / 176.4 / 352.8 kHz → 44.1; 96 / 192 / 384 → 48; bit depth preserved, originals replaced atomically). To downsample hi-res already in your library, use the on-demand **Downsample** mode instead.
 
@@ -115,9 +110,7 @@ PGID=1000   # id -g
 
 On boot, the container chowns the app-managed volumes (`config`, `data`, `staging`, `upgrade_backups`) to that user and warns if a mounted path is not writable. `/music` is left alone because it is often a large NAS mount; the run user must be able to write to it.
 
-Operations that replace or remove an existing library file also require the
-share to flush file and directory changes reliably. If the mount cannot do
-that, Qobuz Librarian stops the destructive step and keeps the original.
+Operations that replace or remove an existing library file also require the share to flush file and directory changes reliably. If the mount cannot do that, Qobuz Librarian stops the destructive step and keeps the original.
 
 For a read-only music share, append `:ro` to the `/music` bind and set `QL_CHECK_VOLUMES=0` in `.env`; otherwise write endpoints, including scan starts, return 503 after the write check fails.
 
