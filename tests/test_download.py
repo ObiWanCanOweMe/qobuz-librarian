@@ -134,9 +134,12 @@ def test_lossy_track_retried_once_and_recovers(monkeypatch, tmp_path):
     assert (r["n_ok"], r["n_lossy"], r["n_fail"]) == (2, 0, 0)
 
     records = r["_staged_track_bindings"]
+    # track_b landed first, but bindings must come out in catalogue order —
+    # the durable runner compares them against the journal's lineages, which
+    # are always catalogue-ordered.
     assert [(record["slot"], record["path"]) for record in records] == [
-        ("qobuz:202", str(track_b)),
         ("qobuz:101", str(recovered)),
+        ("qobuz:202", str(track_b)),
     ]
 
     class _CapturedRun:

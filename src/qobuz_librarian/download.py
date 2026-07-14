@@ -349,7 +349,7 @@ def _receipt_records(receipts):
     ]
 
 
-def _staged_binding_records(pairs, keys_by_object):
+def _staged_binding_records(pairs, keys_by_object, slot_order):
     records = []
     seen_slots = set()
     seen_paths = set()
@@ -379,6 +379,12 @@ def _staged_binding_records(pairs, keys_by_object):
                 "identity": list(receipt.identity),
             }
         )
+    # Pairing follows the staging walk, which follows directory order — with
+    # parallel track downloads that rarely matches the catalogue. Everything
+    # downstream (journal lineages, the durable runner's binding compare)
+    # holds bindings in catalogue-slot order, so emit that order here.
+    position = {slot: index for index, slot in enumerate(slot_order)}
+    records.sort(key=lambda record: position[record["slot"]])
     return records
 
 
@@ -1257,7 +1263,9 @@ def run_album_download(
             "_retained_rejects": retained_rejects,
             "_clean_staged_files": _receipt_records([path for path, _ in clean_pairs]),
             "_all_staged_audio": _receipt_records(kept),
-            "_staged_track_bindings": _staged_binding_records(clean_pairs, keys_by_object),
+            "_staged_track_bindings": _staged_binding_records(
+                clean_pairs, keys_by_object, album_keys
+            ),
         }
     )
     return result
