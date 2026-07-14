@@ -328,6 +328,24 @@ def test_retire_download_staging_after_import_sweeps_leftover_art(monkeypatch, t
     assert (album2 / "01 - Song.flac").exists()
 
 
+def test_discard_download_staging_removes_partial_run(monkeypatch, tmp_path):
+    # A user cancel throws the partial rip away so the queue can move on —
+    # leftover audio must not hold the run for recovery like a crash does.
+    from qobuz_librarian.integrations.staging import create_staging_run
+
+    monkeypatch.setattr(cfg, "STAGING_DIR", tmp_path)
+
+    run = create_staging_run()
+    album = run.path / "Artist" / "Album"
+    album.mkdir(parents=True)
+    (album / "01 - Song.flac").write_bytes(b"partial audio")
+    (album / "cover.jpg").write_bytes(b"art")
+    assert dl.discard_download_staging({"_staging_run": run.to_record()}) is True
+    assert not run.path.exists()
+    retry_dir = tmp_path / cfg.BEETS_RETRY_DIR
+    assert not retry_dir.exists() or not any(retry_dir.iterdir())
+
+
 def test_snapshot_staging_skips_the_beets_retry_tree(monkeypatch, tmp_path):
     from qobuz_librarian import config as cfg
     from qobuz_librarian.integrations import rip

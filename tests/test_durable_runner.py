@@ -137,6 +137,93 @@ def test_download_quarantine_checkpoint_is_persisted_before_error_propagates(
     )
 
 
+def test_cancelled_download_discards_staging_and_clears_journal(
+    tmp_path, monkeypatch, authority
+):
+    # A user cancel is deliberate: the partial rip is thrown away — including
+    # a group parked for a rejected broken track — and the journal item is
+    # settled, so later downloads never wait on a restart.
+    staging = tmp_path / "staging"
+    monkeypatch.setattr(cfg, "STAGING_DIR", staging)
+    monkeypatch.setattr(cfg, "QUEUE_JOURNAL_DIR", tmp_path / "journals")
+    item = _single_track_item("Cancelled Album")
+    args = Namespace(no_import=False)
+    plan = plan_durable_new_album(item, args)
+    assert plan is not None
+
+    monkeypatch.setattr(durable_runner, "snapshot_staging", lambda: set())
+    rejected_path = str(staging / cfg.BEETS_RETRY_DIR / ".rejected-cafe")
+
+    def cancelled_download(**kwargs):
+        journal = queue_state.list_queue_journals()[0].journal
+        owner = journal.items[0].completion_input["owner"]
+        kwargs["result"]["_staging_run"] = {
+            "version": 2,
+            "path": str(staging / (".qobuz-run-" + "a" * 24)),
+            "root_identity": [1, 10, 0o40700, 0, 1, 2],
+            "owner": owner,
+        }
+        kwargs["recovery_checkpoint"](
+            {
+                "version": 1,
+                "kind": "staging-run",
+                "owner": owner,
+                "record": kwargs["result"]["_staging_run"],
+            }
+        )
+        kwargs["recovery_checkpoint"](
+            {
+                "version": 2,
+                "kind": "rejected",
+                "path": rejected_path,
+                "owner": owner,
+                "sealed_manifest": {
+                    "identity": [1, 12, 0o100600, 20, 21, 22],
+                    "sha256": "d" * 64,
+                },
+            }
+        )
+
+    run_discarded = []
+    group_discards = []
+    monkeypatch.setattr(durable_runner, "run_album_download", cancelled_download)
+    monkeypatch.setattr(durable_runner, "is_cancel_requested", lambda: True)
+    monkeypatch.setattr(
+        durable_runner,
+        "discard_download_staging",
+        lambda result, **kwargs: run_discarded.append(result) or True,
+    )
+    monkeypatch.setattr(durable_runner, "discard_group", lambda *a, **k: False)
+    monkeypatch.setattr(
+        durable_runner,
+        "discard_file_group",
+        lambda path, **kwargs: group_discards.append(str(path)) or True,
+    )
+    absent = StagingReferenceInspection(StagingReferenceStatus.ABSENT)
+    present = StagingReferenceInspection(StagingReferenceStatus.MATCH)
+    monkeypatch.setattr(durable_runner, "inspect_staging_run_reference", lambda *_: absent)
+    monkeypatch.setattr(
+        durable_runner,
+        "inspect_staging_group_reference",
+        lambda *_: absent if group_discards else present,
+    )
+
+    result = durable_runner.execute_durable_new_album(
+        [item],
+        item,
+        args,
+        plan=plan,
+        origin=CompletionOrigin(CompletionOriginKind.CLI, "album queue"),
+        mode="cli:album",
+        authority=authority,
+    )
+
+    assert result.status is durable_runner.DurableAlbumStatus.CANCELLED
+    assert run_discarded == [item]
+    assert group_discards == [rejected_path]
+    assert queue_state.list_queue_journals() == ()
+
+
 def test_durable_album_removes_queue_only_under_live_completion_proof(
     tmp_path, monkeypatch, authority
 ):

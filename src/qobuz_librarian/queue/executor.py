@@ -2554,6 +2554,15 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
             removed = all(queued is not item for queued in queue)
             if removed:
                 _persist()
+            if outcome.status is DurableAlbumStatus.CANCELLED:
+                item["result"] = "cancelled"
+                cancelled = True
+                log.info(fmt(C.YELLOW,
+                    "    Cancelled — discarded this album's partial "
+                    "download."))
+                results.append(_resolve_queue_item(
+                    item, args, False, authority=authority))
+                continue
             if outcome.status is not DurableAlbumStatus.COMPLETE:
                 results.append({
                     "dir": outcome.post_dir,

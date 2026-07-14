@@ -374,6 +374,24 @@ def retire_download_staging_after_import(result, *, recovery_checkpoint=None):
     return retained is not None and discard_group(retained, expected_owner=run.owner)
 
 
+def discard_download_staging(result, *, recovery_checkpoint=None):
+    """Throw away one exact run root after a deliberate cancel."""
+    if result.get("_staging_run_retained"):
+        return False
+    run = staging_run_from_record(result.get("_staging_run"))
+    if run is None:
+        return False
+    if (run.owner is None) != (recovery_checkpoint is None):
+        raise ValueError("owned download staging requires a recovery checkpoint")
+    if recovery_checkpoint is not None and not callable(recovery_checkpoint):
+        raise ValueError("recovery checkpoint must be callable")
+    if run.owner is None:
+        retained = retain_staging_run(run, label="cancelled")
+        return retained is not None and discard_group(retained)
+    retained = retain_staging_run(run, label="cancelled", on_intent=recovery_checkpoint)
+    return retained is not None and discard_group(retained, expected_owner=run.owner)
+
+
 def _receipt_records(receipts):
     return [
         {"path": str(receipt.path), "identity": list(receipt.identity)}

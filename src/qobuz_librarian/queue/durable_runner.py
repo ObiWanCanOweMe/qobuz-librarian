@@ -14,6 +14,7 @@ from qobuz_librarian.completion import (
 )
 from qobuz_librarian.completion_live import capture_new_album_completion
 from qobuz_librarian.download import (
+    discard_download_staging,
     exact_download_coverage,
     refresh_staged_track_bindings,
     retain_download_staging,
@@ -29,9 +30,11 @@ from qobuz_librarian.integrations.beets import (
     prepare_managed_staging_tags,
     reopen_managed_evidence,
 )
-from qobuz_librarian.integrations.rip import snapshot_staging
+from qobuz_librarian.integrations.rip import is_cancel_requested, snapshot_staging
 from qobuz_librarian.integrations.staging import (
     StagingReferenceStatus,
+    discard_file_group,
+    discard_group,
     inspect_staging_group_reference,
     inspect_staging_run_reference,
     isolated_staging_run_names,
@@ -82,6 +85,7 @@ class DurableAlbumStatus(str, Enum):
     COMPLETE = "complete"
     RETRY = "retry"
     ATTENTION = "attention"
+    CANCELLED = "cancelled"
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,6 +399,75 @@ def _retry_or_attention_after_download(
     return DurableAlbumResult(
         DurableAlbumStatus.RETRY,
         reason,
+        operation_id=operation_id,
+        item_id=item_id,
+    )
+
+
+def _cancel_after_download(
+    *,
+    operation_id: str,
+    item_id: str,
+    result: dict,
+    owner: RecoveryOwner,
+    checkpoint_group,
+    authority: RunLockLease,
+) -> DurableAlbumResult | None:
+    # A cancel is a deliberate stop, not a crash: throw the partial download
+    # away — the run root and any groups it parked, such as a rejected
+    # broken track — and settle the journal item so the queue never waits on
+    # recovery. Anything that cannot be proved settled falls back to the
+    # blocking path.
+    try:
+        _require_authority(authority)
+        discard_download_staging(result, recovery_checkpoint=checkpoint_group)
+        _require_authority(authority)
+    except (OSError, TypeError, ValueError, queue_state.QueueJournalError):
+        return None
+    journal = _load_exact(operation_id)
+    owner_data = _owner_record(owner)
+    for reference in _staging_references(journal, item_id):
+        if reference.kind != _STAGING_GROUP:
+            continue
+        _require_authority(authority)
+        inspected = inspect_staging_group_reference(reference.data, owner_data)
+        _require_authority(authority)
+        if inspected.status is StagingReferenceStatus.ABSENT:
+            continue
+        if inspected.status is not StagingReferenceStatus.MATCH:
+            return None
+        path = reference.data.get("path")
+        if not isinstance(path, str):
+            return None
+        _require_authority(authority)
+        discarded = discard_group(
+            Path(path), expected_owner=owner_data
+        ) or discard_file_group(Path(path), expected_owner=owner_data)
+        _require_authority(authority)
+        if not discarded:
+            return None
+    if _staging_references(journal, item_id):
+        journal = _reconcile_absent_staging(
+            journal,
+            item_id,
+            owner,
+            authority=authority,
+        )
+        if journal is None:
+            return None
+    if _journal_item(journal, item_id).recovery_references:
+        return None
+    try:
+        _require_authority(authority)
+        journal = queue_state.reset_unstarted_item_to_pending(journal, item_id)
+        _require_authority(authority)
+        queue_state.clear_queue_journal(operation_id, explicit_discard=True)
+        _require_authority(authority)
+    except (OSError, ValueError, queue_state.QueueJournalError):
+        return None
+    return DurableAlbumResult(
+        DurableAlbumStatus.CANCELLED,
+        "cancelled",
         operation_id=operation_id,
         item_id=item_id,
     )
@@ -733,6 +806,17 @@ def execute_durable_new_album(
         completion_input_from_download(initial, coverage) if coverage is not None else None
     )
     if ready_input is None:
+        if is_cancel_requested():
+            settled = _cancel_after_download(
+                operation_id=operation_id,
+                item_id=item_id,
+                result=item,
+                owner=owner,
+                checkpoint_group=checkpoint_group,
+                authority=authority,
+            )
+            if settled is not None:
+                return settled
         return _retry_or_attention_after_download(
             operation_id=operation_id,
             item_id=item_id,

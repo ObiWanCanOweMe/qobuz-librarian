@@ -3203,7 +3203,13 @@ def _make_download_run(
                     and recovery_status == "clear"
                     and not refresh_failed
                 )
-                if accepted:
+                cancelled_clean = (
+                    result is not None
+                    and result.get("result") == "cancelled"
+                    and recovery_status == "clear"
+                    and not refresh_failed
+                )
+                if accepted or cancelled_clean:
                     r = result
                 else:
                     r = result or {}
