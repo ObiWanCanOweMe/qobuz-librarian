@@ -62,9 +62,8 @@ def attach_file_handler(path, level_name: str = "INFO", role: str = ""):
         level = getattr(logging, level_name.upper(), logging.INFO)
         h.setLevel(level)
         # The logger itself gates at INFO (line 13), which would drop DEBUG
-        # records before any handler saw them — so LOG_LEVEL=DEBUG was a no-op.
-        # Lower the logger to this handler's level (the console handler keeps its
-        # own INFO/WARNING level), so LOG_LEVEL=DEBUG actually reaches the file.
+        # records before any handler saw them — so LOG_LEVEL=DEBUG was a no-
+        # op.
         log.setLevel(min(log.level, level))
         log.addHandler(h)
         _file_handler = h
@@ -73,10 +72,7 @@ def attach_file_handler(path, level_name: str = "INFO", role: str = ""):
         # isn't writable.
         pass
 
-# Progress-reporting hook. Like rip.py's cancel-check, the web layer injects a
-# reporter that routes structured progress (phase + counts) to the running
-# job's live header. Outside the web (CLI) it stays a no-op, so download/scan
-# code can call report_progress() unconditionally without knowing about jobs.
+# Progress-reporting hook.
 _progress_reporter = None
 
 
@@ -93,14 +89,7 @@ def report_progress(phase, current=0, total=0, item=""):
             pass
 
 
-# Optional thread-context wrapper, injected by the web JobManager. Helper threads
-# that subprocess-readers spawn (rip / beets output readers) log via the shared
-# "qobuz_librarian" logger, but the web job-log handler routes records by thread,
-# so a thread that doesn't carry the spawning job's context has its lines (the
-# live download / import output — the most user-visible part) dropped. The web
-# layer installs a wrapper that copies the spawning thread's job onto the helper
-# thread. No-op on the CLI (no per-thread job context). Shared here so both the
-# rip and beets readers use one injection point.
+# Optional thread-context wrapper, injected by the web JobManager.
 _thread_wrapper = None
 
 

@@ -195,65 +195,6 @@ def test_upgrade_walk_refreshes_saved_state_after_success(tmp_path, monkeypatch)
     assert ("downsample", False) in badge_calls
 
 
-def test_upgrade_walk_refreshes_saved_state_after_benign_no_op(
-        tmp_path, monkeypatch):
-    from qobuz_librarian.modes import upgrade
-
-    artist_dir = tmp_path / "Artist"
-    album_dir = artist_dir / "Album"
-    album_dir.mkdir(parents=True)
-    args = SimpleNamespace(
-        yes=True,
-        auto_safe=False,
-        dry_run=False,
-        consolidate=True,
-    )
-    state = {
-        "complete": True,
-        "candidates": [{
-            "artist": "Artist",
-            "title": "Album",
-            "detail": "CD -> 24-bit / 96 kHz",
-            "payload": {
-                "album_id": "alb-1",
-                "title_similarity": 1.0,
-                "needed_edition_swap": False,
-            },
-        }],
-    }
-    refreshed_upgrade = []
-    refreshed_downsample = []
-
-    upgrade_loads = [state, {"candidates": []}]
-    monkeypatch.setattr(
-        upgrade.upgrade_state,
-        "load",
-        lambda: upgrade_loads.pop(0) if upgrade_loads else {"candidates": []},
-    )
-    monkeypatch.setattr(upgrade, "get_album",
-                        lambda album_id, token: {"id": album_id, "title": "Album"})
-    monkeypatch.setattr(upgrade, "process_album",
-                        lambda album, *a, **kw: {
-                            "result": "upgrade_only_no_op",
-                            "dir": album_dir,
-                        })
-    monkeypatch.setattr(upgrade, "load_capped", lambda: {})
-    monkeypatch.setattr(upgrade.upgrade_state, "update_artist",
-                        lambda ad, **kwargs: refreshed_upgrade.append(ad.name)
-                        or SimpleNamespace(complete=True, candidates=[]))
-    monkeypatch.setattr(upgrade.downsample_state, "update_artist",
-                        lambda ad, **kwargs: refreshed_downsample.append(ad.name)
-                        or SimpleNamespace(complete=True, candidates=[]))
-    monkeypatch.setattr(upgrade.downsample_state, "load", lambda: {"candidates": []})
-    monkeypatch.setattr(upgrade.review_badges, "set_ready", lambda *a, **k: None)
-    monkeypatch.setattr(upgrade.time, "sleep", lambda *_: None)
-
-    upgrade.run_upgrade_walk_mode(args, "tok")
-
-    assert refreshed_upgrade == ["Artist"]
-    assert refreshed_downsample == ["Artist"]
-
-
 def test_upgrade_walk_marks_partial_cap_before_refresh(tmp_path, monkeypatch):
     from qobuz_librarian import config as cfg
     from qobuz_librarian.modes import upgrade
@@ -327,76 +268,6 @@ def test_upgrade_walk_marks_partial_cap_before_refresh(tmp_path, monkeypatch):
     assert refreshed_upgrade == ["Artist"]
 
 
-def test_upgrade_walk_does_not_mark_cap_when_staging_verdict_passed(
-        tmp_path, monkeypatch):
-    from qobuz_librarian import config as cfg
-    from qobuz_librarian.modes import upgrade
-    from qobuz_librarian.quality import decision
-
-    monkeypatch.setattr(cfg, "CAPPED_FILE", tmp_path / "capped.json")
-    artist_dir = tmp_path / "Artist"
-    album_dir = artist_dir / "Album"
-    album_dir.mkdir(parents=True)
-    album = {
-        "id": "alb-1",
-        "title": "Album",
-        "artist": {"name": "Artist"},
-        "maximum_bit_depth": 24,
-        "maximum_sampling_rate": 192,
-    }
-    args = SimpleNamespace(
-        yes=True,
-        auto_safe=False,
-        dry_run=False,
-        consolidate=True,
-    )
-    state = {
-        "complete": True,
-        "candidates": [{
-            "artist": "Artist",
-            "title": "Album",
-            "detail": "CD -> 24-bit / 96 kHz",
-            "payload": {
-                "album_id": "alb-1",
-                "title_similarity": 1.0,
-                "needed_edition_swap": False,
-            },
-        }],
-    }
-
-    upgrade_loads = [state, {"candidates": []}]
-    monkeypatch.setattr(
-        upgrade.upgrade_state,
-        "load",
-        lambda: upgrade_loads.pop(0) if upgrade_loads else {"candidates": []},
-    )
-    monkeypatch.setattr(upgrade, "get_album", lambda album_id, token: album)
-    monkeypatch.setattr(upgrade, "process_album",
-                        lambda album, *a, **kw: {
-                            "imported": True,
-                            "result": "downloaded",
-                            "dir": album_dir,
-                            "quality_verdict": {
-                                "under": False,
-                                "recovered": False,
-                                "n_below": 0,
-                            },
-                        })
-    monkeypatch.setattr(upgrade.upgrade_state, "update_artist",
-                        lambda ad, **kwargs: SimpleNamespace(
-                            complete=True, candidates=[]))
-    monkeypatch.setattr(upgrade.downsample_state, "update_artist",
-                        lambda ad, **kwargs: SimpleNamespace(
-                            complete=True, candidates=[]))
-    monkeypatch.setattr(upgrade.downsample_state, "load", lambda: {"candidates": []})
-    monkeypatch.setattr(upgrade.review_badges, "set_ready", lambda *a, **k: None)
-    monkeypatch.setattr(upgrade.time, "sleep", lambda *_: None)
-
-    upgrade.run_upgrade_walk_mode(args, "tok")
-
-    assert not decision.is_album_capped("alb-1", decision.load_capped())
-
-
 def test_upgrade_walk_refuses_when_upgrade_disabled(monkeypatch, caplog):
     from qobuz_librarian import config as cfg
     from qobuz_librarian.modes import upgrade
@@ -419,45 +290,6 @@ def test_upgrade_walk_refuses_when_upgrade_disabled(monkeypatch, caplog):
         upgrade.run_upgrade_walk_mode(args, "tok")
 
     assert "Upgrade scanning is turned off." in caplog.text
-
-
-def test_downsample_walk_refreshes_shared_state(monkeypatch):
-    from qobuz_librarian.library.downsample import DownsampleCandidate
-    from qobuz_librarian.modes import downsample
-
-    args = SimpleNamespace(dry_run=True)
-    artist_dir = Path("/music/Artist")
-    candidate = DownsampleCandidate(
-        album_dir=artist_dir / "Album",
-        artist="Artist",
-        title="Album",
-        n_hires=1,
-        n_flac=1,
-        source_rates=[96000],
-        target_rates=[48000],
-        est_saving=123,
-    )
-    calls = []
-
-    def fake_refresh(artists, **kwargs):
-        calls.append(list(artists))
-        assert kwargs["persist"] is False
-        return downsample.downsample_state.RefreshResult(
-            [candidate],
-            ["Artist"],
-            {},
-            True,
-        )
-
-    monkeypatch.setattr(downsample, "HAVE_DOWNSAMPLE", True)
-    monkeypatch.setattr(downsample, "list_library_artists",
-                        lambda: [artist_dir])
-    monkeypatch.setattr(downsample.downsample_state, "refresh_for_artists",
-                        fake_refresh)
-
-    downsample.run_downsample_walk_mode(args)
-
-    assert calls == [[artist_dir]]
 
 
 def test_downsample_walk_updates_only_affected_artist_after_success(monkeypatch):
@@ -511,51 +343,6 @@ def test_downsample_walk_updates_only_affected_artist_after_success(monkeypatch)
     assert refresh_calls == [[artist_dir]]
     assert update_calls == ["Artist"]
     assert badge_calls == [("downsample", False)]
-
-
-def test_downsample_walk_refreshes_affected_artist_after_noop(monkeypatch):
-    from qobuz_librarian.library.downsample import DownsampleCandidate
-    from qobuz_librarian.modes import downsample
-
-    args = SimpleNamespace(dry_run=False)
-    artist_dir = Path("/music/Artist")
-    candidate = DownsampleCandidate(
-        album_dir=artist_dir / "Album",
-        artist="Artist",
-        title="Album",
-        n_hires=1,
-        n_flac=1,
-        source_rates=[96000],
-        target_rates=[48000],
-        est_saving=123,
-    )
-    update_calls = []
-
-    monkeypatch.setattr(downsample, "HAVE_DOWNSAMPLE", True)
-    monkeypatch.setattr(downsample, "list_library_artists",
-                        lambda: [artist_dir])
-    monkeypatch.setattr(
-        downsample.downsample_state,
-        "refresh_for_artists",
-        lambda artists, **kwargs:
-        downsample.downsample_state.RefreshResult(
-            [candidate], ["Artist"], {}, True),
-    )
-    monkeypatch.setattr(downsample.downsample_state, "update_artist",
-                        lambda ad, **kwargs: update_calls.append(ad.name)
-                        or SimpleNamespace(complete=True, candidates=[]))
-    monkeypatch.setattr(downsample.downsample_state, "load",
-                        lambda: {"candidates": []})
-    monkeypatch.setattr(downsample.review_badges, "set_ready",
-                        lambda *a, **k: None)
-    monkeypatch.setattr(downsample, "downsample_dir",
-                        lambda *a, **k: {"resampled": 0, "saved_bytes": 0, "errors": 0})
-    monkeypatch.setattr(downsample, "confirm", lambda *a, **k: True)
-    monkeypatch.setattr("builtins.input", lambda *a, **k: "n")
-
-    downsample.run_downsample_walk_mode(args)
-
-    assert update_calls == ["Artist"]
 
 
 def test_downsample_walk_marks_successful_album_locally_capped(

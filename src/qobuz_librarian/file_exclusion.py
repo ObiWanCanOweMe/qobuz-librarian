@@ -256,9 +256,8 @@ class _LeaseSignalReference:
             return
         # Publish the closing state before the potentially interruptible join.
         # The target's own thread prunes closing references, so a retained
-        # traceback cannot keep the signal target alive after an
-        # interrupted explicit close.  The finalizer remains armed until the
-        # explicit release has actually completed, allowing a direct retry.
+        # traceback cannot keep the signal target alive after an interrupted
+        # explicit close.
         self._closing = True
         self._target.release(self._token)
         self._closed = True

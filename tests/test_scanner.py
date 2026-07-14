@@ -57,10 +57,7 @@ def test_read_album_dir_filename_fallback_and_mutagen_meta(tmp_path):
 
 
 def test_read_album_dir_strips_dot_and_space_track_prefixes(tmp_path):
-    # mutagen can't read these, so the filename is the only title source. Legacy
-    # "NN. Title" / "NN Title" rips must have the leading track number stripped
-    # like "NN - Title" does, or the digits stay in the title and the track reads
-    # as missing (spurious re-download) while the file reads as an extra.
+    # mutagen can't read these, so the filename is the only title source.
     (tmp_path / "03. Dotted Song.flac").write_bytes(b"")
     (tmp_path / "04 Spaced Song.flac").write_bytes(b"")
     (tmp_path / "05.Glued Song.flac").write_bytes(b"")

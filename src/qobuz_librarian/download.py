@@ -121,9 +121,7 @@ def _file_track_identity(path, context_tracks):
 
     context_discs = {_positive_int(track.get("media_number")) or 1 for track in context_tracks}
     meta_disc = _positive_int(meta.get("discnumber"))
-    # read_audio_meta defaults a missing DISCNUMBER to 1. On a multi-disc album
-    # that is not evidence of Disc 1, so use it only when it is non-default or
-    # the Qobuz album itself has one disc.
+    # read_audio_meta defaults a missing DISCNUMBER to 1.
     if meta_disc == 1 and len(context_discs) > 1:
         meta_disc = None
     explicit_disc = parent_disc or stem_disc
@@ -186,8 +184,7 @@ def _album_track_keys(tracks):
             keys.append(f"position:{position[0]}:{position[1]}")
             continue
         # The album response order is the last exact distinction available for
-        # malformed catalogue rows. It is deliberately not inferred from a
-        # downloaded filename or title.
+        # malformed catalogue rows.
         keys.append(f"album-slot:{index + 1}")
     return keys
 
@@ -595,8 +592,7 @@ def exact_download_coverage(result, album):
                 failed=raw_counts[0],
                 lossy=raw_counts[1],
                 # n_lossy is the final unique set of unresolved lossy *or*
-                # broken target slots.  broken_tracks is display history and
-                # deliberately still mentions rejects recovered by a retry.
+                # broken target slots.
                 broken=0,
                 unmatched=raw_counts[2],
                 extra=raw_counts[3],
@@ -765,9 +761,7 @@ def run_album_download(
     # Streamrip's track-URL path crashes with KeyError: 'body' on some tracks
     # (older catalog, edge metadata), so prefer the album URL when most of the
     # album is missing — beets merges any redundant duplicate of a present
-    # track on import. Small gap-fills stay track-by-track. Repair pins
-    # per-track no matter the ratio, so a tweak here can't turn a targeted
-    # truncation-repair into a wipe-and-replace.
+    # track on import.
     if force_track_by_track:
         download_full_album = False
     elif upgrade_only:
@@ -797,13 +791,7 @@ def run_album_download(
         )
         log.info(fmt(C.GRAY, f"  Strategy: per-track ({why})"))
 
-    # Free-space preflight. streamrip reports a full disk only via stderr text,
-    # which detect_disk_full() best-effort-greps — a real ENOSPC whose message
-    # lacks the errno string would otherwise read as an ordinary per-track
-    # failure and march the whole queue into the same wall, deleting each
-    # truncated partial as it goes. Abort early down the proper disk-full path
-    # (errno 28 → the caller restores backups and keeps items for a retry once
-    # space is freed) when staging is below the floor.
+    # Free-space preflight.
     if cfg.MIN_FREE_STAGING_MB > 0:
         try:
             free_mb = shutil.disk_usage(cfg.STAGING_DIR).free // (1024 * 1024)
@@ -827,8 +815,7 @@ def run_album_download(
         # Move the already-present tracks to a backup before the rip so beets
         # doesn't create 'Foo.1.flac' duplicates on import, and so a rip
         # failure (network drop, Ctrl+C, auth loss) can't leave the user with
-        # permanently lost tracks. The caller restores it if we don't fully
-        # succeed; recording it now keeps that recovery reachable on a raise.
+        # permanently lost tracks.
         if present and album_dir:
             ex = existing if existing is not None else read_album_dir(album_dir)
             extra_paths = {e["path"] for e in find_extras_in_existing(qobuz_tracks, ex)}
@@ -992,9 +979,8 @@ def run_album_download(
     retried_clean_targets = set()
 
     # Both reject kinds get one per-track retry: a broken FLAC is usually a
-    # transient glitch, and the album URL occasionally serves lossy for a track
-    # the track URL has lossless. One retry per track — no recursion, no loop.
-    # Skipped once a cancel is in flight so we don't fire rips the user stopped.
+    # transient glitch, and the album URL occasionally serves lossy for a
+    # track the track URL has lossless.
     discarded = lossy + broken
     resolved_rejects = []
     if discarded and attempted_tracks and not is_cancel_requested():
@@ -1057,13 +1043,11 @@ def run_album_download(
                 n_ok = len(kept)
                 log.info(fmt(C.GREEN, f"  ✓  Retry recovered {recovered} track(s)"))
 
-    # A HARD failure (rip errored with no file landing at all — distinct from a
-    # file that landed lossy/broken, retried above) gets one more per-track pull
-    # before it's given up on: a transient 5xx / momentary network blip usually
-    # clears on a second attempt, and otherwise the user has to re-run the whole
-    # repair or download just for that one track. One retry, no loop; the
-    # reconcile below un-fails anything this lands. Skipped on a cancel, and only
-    # for tracks that still have no clean file on disk.
+    # A HARD failure (rip errored with no file landing at all — distinct from
+    # a file that landed lossy/broken, retried above) gets one more per-track
+    # pull before it's given up on: a transient 5xx / momentary network blip
+    # usually clears on a second attempt, and otherwise the user has to re-run
+    # the whole repair or download just for that one track.
     if failed_track_objs and missing and not is_cancel_requested():
         clean_failed_ids = {
             id(track)
@@ -1140,8 +1124,7 @@ def run_album_download(
                 log.info(fmt(C.GREEN, f"  ✓  Retry recovered {recovered} failed download(s)"))
 
     # Reconcile completeness by unique Qobuz track identity, never by the raw
-    # number of audio names that appeared. Two files for one slot still prove
-    # only one track, and a clean but unrelated file proves none of them.
+    # number of audio names that appeared.
     lossy_tracks = lossy + broken
     clean_pairs = _pair_files_to_tracks(kept, attempted_tracks, file_identities, qobuz_tracks)
     clean_target_ids = {id(track) for _, track in clean_pairs}
@@ -1175,14 +1158,10 @@ def run_album_download(
             )
 
     if download_full_album and full_album_rc is not None:
-        # A full-album rip re-downloads the WHOLE album URL (all n_tracks_total
-        # tracks), including the already-present ones we moved to the gap-fill
-        # backup — so n_ok (every clean FLAC that landed) is counted against the
-        # total, NOT len(missing). Using len(missing) here let a present track's
-        # re-rip failure clamp n_fail to 0, which would (a) read an incomplete
-        # fill as clean and (b) let the executor drop the gap-fill backup or a
-        # sibling that still holds the missing track. A lossy fallback counts
-        # once in the lossy bucket, so n_ok + n_lossy + n_fail == tracks attempted.
+        # A full-album rip re-downloads the WHOLE album URL (all
+        # n_tracks_total tracks), including the already-present ones we moved
+        # to the gap-fill backup — so n_ok (every clean FLAC that landed) is
+        # counted against the total, NOT len(missing).
         if n_fail == 0 and full_album_rc != 0 and n_ok > 0:
             log.info(
                 fmt(
@@ -1218,9 +1197,7 @@ def run_album_download(
     lossy_track_labels = [_reject_label(path) for path in lossy_tracks]
     broken_track_labels = [_reject_label(path) for path in broken]
 
-    # Rejects remain durably manifested while their retry is unresolved. Once
-    # this run has classified/retried them, retire only the exact retained
-    # inode; a changed recovery entry is preserved and surfaced for review.
+    # Rejects remain durably manifested while their retry is unresolved.
     rejects_to_retire = list(resolved_rejects)
     if not is_cancel_requested():
         rejects_to_retire.extend(lossy_tracks)

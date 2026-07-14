@@ -35,10 +35,8 @@ def test_hide_is_scoped_durable_and_restorable(monkeypatch, tmp_path):
 
 
 def test_corrupt_store_is_preserved_not_silently_wiped(monkeypatch, tmp_path):
-    # A corrupt store must NOT be silently overwritten by the next save() — that
-    # would destroy a curated hide list. It's moved aside (.corrupt) and the new
-    # write goes to a fresh file, so the old data stays recoverable + the user is
-    # told, rather than the list vanishing on one bad read.
+    # A corrupt store must NOT be silently overwritten by the next save() —
+    # that would destroy a curated hide list.
     p = tmp_path / "h.json"
     p.write_text('{"missing": {"a|b": {"artist": "A"}}, THIS IS BROKEN',
                  encoding="utf-8")

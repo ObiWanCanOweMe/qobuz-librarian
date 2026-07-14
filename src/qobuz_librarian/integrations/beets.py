@@ -4132,10 +4132,7 @@ def _reclaim_ownership_directories(root_fd, records, nonce):
                 # The plug-in durably unlinks and fsyncs its marker before it
                 # can append the marker=None directory identity. A kill in
                 # that narrow window leaves the old marker receipt naming this
-                # exact dev/inode, but the directory is already empty. That is
-                # sufficient authority for the same empty-only quarantine
-                # cleanup below; any replacement identity or new entry still
-                # refuses.
+                # exact dev/inode, but the directory is already empty.
                 marker_present = False
             elif entries != [_OWNERSHIP_MARKER] or not _read_exact_marker(
                 directory_fd, marker, token
@@ -4484,23 +4481,10 @@ def _configured_beets_plugins(runtime=None):
 
 
 def _build_import_override_yaml(plugin_config=None, *, ownership_enabled=False):
-    """The beets config override the import runs with, as a YAML string.
-
-    Forces the keys the import contract depends on — library/directory,
-    non-interactive, non-incremental, autotag off, and move on — and lets
-    everything else fall through to the user's config.yaml. Autotag is forced
-    off because streamrip already wrote authoritative Qobuz tags; matching them
-    against MusicBrainz would, on anything but a confident match, skip the album
-    outright under quiet mode and leave the files stranded in staging. Move is
-    forced on because the rest of the pipeline is move-based — staging is scratch
-    space that gets pruned, and the import-success check infers success from the
-    tracks leaving it, so a copy-mode import (files left behind) would read as a
-    failure and park every album. `move: yes` relocates within a filesystem and
-    copies-then-deletes across one, so it covers a separate-filesystem /music too.
-    Optional path templates, the effective plugin list, and album-art handling
-    are derived from config. Emitting `plugins:` replaces the config.yaml list
-    (beets doesn't merge lists), so the effective list is preserved before the
-    bundled artwork guard is appended.
+    """The beets config override the import runs with, as a YAML string. Forces
+    the keys the import contract depends on — library/directory, non-
+    interactive, non-incremental, autotag off, and move on — and lets
+    everything else fall through to the user's config.yaml.
     """
     import re as _re
 
@@ -4514,16 +4498,10 @@ def _build_import_override_yaml(plugin_config=None, *, ownership_enabled=False):
         "  incremental: no\n"
         "  autotag: no\n"
         "  move: yes\n"
-        # Pin duplicate_action: merge for OUR importer (separate from the user's
-        # own `beet` usage, which still reads their config). Two reasons:
-        #  - Safety: `duplicate_action: remove` in config.yaml would have beets
-        #    util.remove() the pre-existing album's files off disk on a gap-fill /
-        #    re-download collision (irreversible, no backup). merge never deletes.
-        #  - Correctness: per-track gap-fill stages ONLY the missing tracks and
-        #    does NOT pre-clear the existing ones (download.py) — it depends on
-        #    beets MERGING the new tracks into the existing album folder. `skip`
-        #    (or a user-set skip) silently imports nothing; merge is also the
-        #    seeded default.
+        # Pin duplicate_action: merge for OUR importer (separate from the
+        # user's own `beet` usage, which still reads their config): a
+        # `duplicate_action: remove` in config.yaml would have beets delete
+        # the pre-existing album's files off disk on a gap-fill collision.
         "  duplicate_action: merge\n"
     )
     # Path templates are deployer-supplied and can contain single quotes
@@ -5762,19 +5740,9 @@ def _run_owned_beets_capture(args, *, env, timeout, database_exclusion, before_s
 
 
 def _wait_or_idle_kill(proc, last_output):
-    """Block until proc exits. Raise subprocess.TimeoutExpired ONLY if it
-    emits no output for cfg.BEETS_TIMEOUT seconds — a genuinely hung
-    import (DB lock, an unexpected prompt, a deadlocked plugin).
-
-    Crucially this is an *inactivity* timeout, not a wall-clock one: a
-    legitimately slow import (a large library over R2 / a slow NAS)
-    keeps printing beets progress lines, so its idle gap stays small and
-    it is never killed no matter how many hours it runs. Only true
-    silence trips it. cfg.BEETS_TIMEOUT <= 0 disables the guard entirely
-    (plain wait(), the original never-kill behaviour).
-
-    `last_output` is a 1-element list holding the monotonic timestamp of
-    the most recent output line, updated by the reader thread.
+    """Block until proc exits. Raise subprocess.TimeoutExpired ONLY if it emits
+    no output for cfg.BEETS_TIMEOUT seconds — a genuinely hung import (DB
+    lock, an unexpected prompt, a deadlocked plugin).
     """
     idle_limit = cfg.BEETS_TIMEOUT
     if isinstance(proc, _SYSTEM_POPEN):
@@ -6206,11 +6174,9 @@ def _beets_direct_guarded(
         if not stripped:
             return
         # Staging-path echoes are too noisy for the log, but they're the
-        # signal that tells us which album beets is on. Pull the first
-        # path segment after the staging root (the album folder) and use
-        # it as the live "Importing: …" subtitle. Same album seen twice
-        # in a row doesn't tick the counter — beets often prints the path
-        # several times for one album.
+        # signal that tells us which album beets is on. Pull the first path
+        # segment after the staging root (the album folder) and use it as the
+        # live "Importing: …" subtitle.
         idx = stripped.find(prefix)
         if idx >= 0:
             rest = stripped[idx + len(prefix) :]
@@ -6406,8 +6372,7 @@ def _beets_direct_guarded(
         # A successful explicit import consumes every exact source name. A
         # receipt still present at that name, a replacement at the same name,
         # or any audio left anywhere below the explicit roots makes the whole
-        # import fail closed. This prevents one moved track from completing a
-        # multi-track queue item while its siblings remain stranded.
+        # import fail closed.
         receipt_incomplete = audio_after != 0
         if not receipt_incomplete:
             for receipt in intended_audio:
@@ -7027,24 +6992,12 @@ def _consolidate_duplicate_albums(protected_paths=None):
 
 def forget_beets_entries(paths):
     """Drop beets DB entries for files that were deleted outside beets.
-
     Consolidation removes duplicate sibling tracks straight off disk; without
     this their rows linger in the beets library, so someone who also runs
     `beet` by hand sees ghost tracks until the next `beet update`. `beet
     remove` is used rather than a direct sqlite delete so beets cleans up the
     album row and any flexible-attribute rows along with the item — leaving
-    the database consistent. No `-d`: the files are already gone, so beets
-    only touches its database. `-l` pins the same database the import wrote to
-    (the import override forces `library:` to BEETS_DB_PATH), so this stays
-    correct even when a deployer points BEETS_DB_PATH somewhere other than the
-    `library:` line in config.yaml.
-
-    The paths are OR'd into one query — a bare comma separates beets
-    sub-queries — so a consolidation that deletes dozens of tracks costs two
-    `beet` runs, not one per file. A `list` pass first counts how many of the
-    paths beets actually tracks: that count is what's returned (0, with no
-    `remove`, when beets knows none of them). beets' path query is
-    directory-boundary aware, so each full file path matches exactly its track.
+    the database consistent.
     """
     paths = [str(p) for p in paths if str(p)]
     if not paths:

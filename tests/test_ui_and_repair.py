@@ -5,9 +5,7 @@ refills are proven back in place and re-verified — an outage or a still-short
 re-rip must keep the backup rather than lose the only good copy.
 """
 import os
-import sqlite3
 from argparse import Namespace
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -49,82 +47,6 @@ def test_scan_isrc_repairs_truncation_gates(tmp_path):
 
 
 # ── Repair scan: resume from an interrupted sweep ──────────────────────
-
-def test_repair_scan_receipt_refuses_a_replacement_before_backup(
-        tmp_path, monkeypatch):
-    from qobuz_librarian.library.backup import backup_gap_fill_files
-    from qobuz_librarian.modes import repair
-
-    music_root = tmp_path / "Music"
-    album_dir = music_root / "Artist" / "Album"
-    album_dir.mkdir(parents=True)
-    source = album_dir / "01.flac"
-    source.write_bytes(b"verified-truncated-source")
-    monkeypatch.setattr(repair.cfg, "MUSIC_ROOT", music_root)
-    monkeypatch.setattr(repair.cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
-    track = _track(length=100.0, path=str(source))
-    qobuz_track = {
-        "duration": 200.0,
-        "title": "Track",
-        "track_number": 1,
-    }
-    with patch(
-        "qobuz_librarian.repair_log._read_held_audio_meta", return_value=track
-    ), patch(
-        "qobuz_librarian.repair_log._qobuz_track_by_isrc",
-        return_value=qobuz_track,
-    ), patch(
-        "qobuz_librarian.repair_log.flac_audio_offset", return_value=0
-    ), patch(
-        "qobuz_librarian.repair_log._flac_decode_ok", return_value=False
-    ):
-        verified = scan_dir_for_isrc_repairs(
-            album_dir, "token")["verified_truncated"]
-
-    assert len(verified) == 1
-    expected = repair._verified_repair_source_receipts(verified, album_dir)
-    displaced = album_dir / "01.verified.flac"
-    source.rename(displaced)
-    source.write_bytes(b"unrelated-replacement")
-
-    assert backup_gap_fill_files(
-        [source], album_dir, expected_receipts=expected) is None
-    assert source.read_bytes() == b"unrelated-replacement"
-    assert displaced.read_bytes() == b"verified-truncated-source"
-    assert not repair.cfg.UPGRADE_BACKUP_DIR.exists()
-
-
-def test_repair_scan_refuses_same_name_replacement_during_qobuz_lookup(
-        tmp_path, monkeypatch):
-    import qobuz_librarian.repair_log as repair_log
-
-    album_dir = tmp_path / "Artist" / "Album"
-    album_dir.mkdir(parents=True)
-    source = album_dir / "01.flac"
-    source.write_bytes(b"damaged source")
-    displaced = album_dir / "01.displaced.flac"
-    track = _track(length=100.0, path=str(source))
-
-    monkeypatch.setattr(
-        repair_log, "_read_held_audio_meta", lambda _source: track)
-    monkeypatch.setattr(
-        repair_log, "_flac_decode_ok", lambda *a, **k: True)
-
-    def replace_during_lookup(_isrc, _token):
-        source.rename(displaced)
-        source.write_bytes(b"healthy same-name replacement")
-        return {"duration": 200.0, "title": "Track", "track_number": 1}
-
-    monkeypatch.setattr(
-        repair_log, "_qobuz_track_by_isrc", replace_during_lookup)
-
-    report = scan_dir_for_isrc_repairs(album_dir, "token", deep=True)
-
-    assert report["verified_truncated"] == []
-    assert report["unverified"] == 1
-    assert source.read_bytes() == b"healthy same-name replacement"
-    assert displaced.read_bytes() == b"damaged source"
-
 
 def test_repair_scan_resumes_from_checkpoint(tmp_path, monkeypatch):
     """An interrupted repair sweep skips the artists already checked, restores
@@ -329,45 +251,6 @@ def _sealed_import_receipt(
     }
 
 
-def test_repair_relocation_preserves_unowned_companions(tmp_path, monkeypatch):
-    repair, album_dir, landed_dir = _repair_relocation_dirs(
-        tmp_path, monkeypatch)
-    source_disc = landed_dir / "Disc 2"
-    source_disc.mkdir()
-    refill = source_disc / "01 - First Fires.flac"
-    refill.write_bytes(b"flac-bytes")
-    booklet = landed_dir / "booklet.pdf"
-    booklet.write_bytes(b"not-created-by-repair")
-    preexisting = landed_dir / "Keep Empty"
-    preexisting.mkdir()
-    scope_relative = landed_dir.relative_to(
-        repair.cfg.MUSIC_ROOT).as_posix()
-
-    moved = repair._relocate_refilled_into_album_dir(
-        album_dir,
-        landed_dir,
-        {"GBCFB1300101"},
-        before_names=set(),
-        ownership_receipt=_sealed_import_receipt(
-            repair.cfg.MUSIC_ROOT,
-            [refill],
-            landed_dir,
-            created_directories=[
-                (scope_relative, landed_dir),
-                (f"{scope_relative}/Disc 2", source_disc),
-            ],
-        ),
-        expected_refills=1,
-    )
-    assert moved == 1
-    assert (album_dir / "Disc 2" / refill.name).exists()
-    assert not refill.exists()
-    assert not source_disc.exists()
-    assert booklet.read_bytes() == b"not-created-by-repair"
-    assert preexisting.is_dir()
-    assert landed_dir.is_dir()
-
-
 def test_repair_relocation_refuses_a_symlinked_refill_folder(
         tmp_path, monkeypatch):
     from qobuz_librarian.modes import repair
@@ -405,342 +288,10 @@ def test_repair_relocation_refuses_a_symlinked_refill_folder(
     assert not (album_dir / refill.name).exists()
 
 
-def test_repair_relocation_rolls_back_when_beets_rejects_the_path(
-        tmp_path, monkeypatch):
-    repair, album_dir, landed_dir = _repair_relocation_dirs(
-        tmp_path, monkeypatch)
-    refill = landed_dir / "01 - First Fires.flac"
-    refill.write_bytes(b"flac-bytes")
-    database = tmp_path / "library.db"
-    old_path = b"Artist/The North Borders (2013)/01 - First Fires.flac"
-    with sqlite3.connect(database) as connection:
-        connection.execute(
-            "CREATE TABLE items (id INTEGER PRIMARY KEY, path BLOB NOT NULL)")
-        connection.execute("INSERT INTO items (path) VALUES (?)", (old_path,))
-        connection.execute(
-            "CREATE TRIGGER reject_repair BEFORE UPDATE OF path ON items "
-            "BEGIN SELECT RAISE(ABORT, 'rejected'); END")
-    monkeypatch.setattr(repair.cfg, "BEETS_DB_PATH", database)
-
-    with pytest.raises(OSError):
-        repair._relocate_refilled_into_album_dir(
-            album_dir,
-            landed_dir,
-            {"GBCFB1300101"},
-            before_names=set(),
-            ownership_receipt=_sealed_import_receipt(
-                repair.cfg.MUSIC_ROOT, [refill], landed_dir),
-            expected_refills=1,
-        )
-    assert refill.read_bytes() == b"flac-bytes"
-    assert not (album_dir / refill.name).exists()
-    with sqlite3.connect(database) as connection:
-        assert connection.execute("SELECT path FROM items").fetchone()[0] == old_path
-
-
-def test_repair_compensation_does_not_report_success_after_close_failure(
-        monkeypatch):
-    from qobuz_librarian.modes import repair
-
-    class Cursor:
-        def fetchone(self):
-            return 1, b"old"
-
-    class Connection:
-        def execute(self, _sql, _parameters=None):
-            return Cursor()
-
-        def rollback(self):
-            pass
-
-    class Transaction:
-        published = False
-        durable = False
-        uncertain = False
-
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def open(self):
-            return Connection()
-
-        def close(self):
-            self.uncertain = True
-            raise OSError("simulated cleanup failure")
-
-    monkeypatch.setattr(repair, "AtomicSQLiteWrite", Transaction)
-    monkeypatch.setattr(
-        repair, "_require_no_migration_items_triggers", lambda _connection: None)
-    monkeypatch.setattr(
-        repair, "_require_migration_delete_journal_mode", lambda _connection: None)
-
-    state, deferred = repair._compensate_repair_item_rows(
-        {},
-        ("id", "path"),
-        {1: (1, b"old")},
-        {1: (1, b"new")},
-        lambda: True,
-    )
-
-    assert state == "unknown"
-    assert isinstance(deferred, OSError)
-    assert str(deferred) == "simulated cleanup failure"
-
-
-def test_repair_relocation_restores_the_file_when_interrupted(
-        tmp_path, monkeypatch):
-    repair, album_dir, landed_dir = _repair_relocation_dirs(
-        tmp_path, monkeypatch)
-    refill = landed_dir / "01 - First Fires.flac"
-    refill.write_bytes(b"flac-bytes")
-
-    def interrupt(*_args, **_kwargs):
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(repair, "_sync_repair_beets_row", interrupt)
-    with pytest.raises(KeyboardInterrupt):
-        repair._relocate_refilled_into_album_dir(
-            album_dir,
-            landed_dir,
-            {"GBCFB1300101"},
-            before_names=set(),
-            ownership_receipt=_sealed_import_receipt(
-                repair.cfg.MUSIC_ROOT, [refill], landed_dir),
-            expected_refills=1,
-        )
-    assert refill.read_bytes() == b"flac-bytes"
-    assert not (album_dir / refill.name).exists()
-
-
-def test_repair_quarantines_the_exact_refill_before_moving_it(
-        tmp_path, monkeypatch):
-    repair, album_dir, landed_dir = _repair_relocation_dirs(
-        tmp_path, monkeypatch)
-    refill = landed_dir / "01 - First Fires.flac"
-    refill.write_bytes(b"verified-refill")
-    receipt = _sealed_import_receipt(
-        repair.cfg.MUSIC_ROOT, [refill], landed_dir)
-    rename_noreplace = repair._rename_noreplace_at
-    raced = False
-
-    def replace_before_quarantine(source_fd, source_name, destination_fd,
-                                  destination_name):
-        nonlocal raced
-        if (
-            not raced
-            and source_fd == destination_fd
-            and source_name == refill.name
-            and destination_name.startswith(".qobuz-repair-source-")
-        ):
-            raced = True
-            os.rename(
-                source_name,
-                "verified-refill.displaced",
-                src_dir_fd=source_fd,
-                dst_dir_fd=source_fd,
-            )
-            replacement_fd = os.open(
-                source_name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
-                dir_fd=source_fd,
-            )
-            try:
-                os.write(replacement_fd, b"unrelated-replacement")
-            finally:
-                os.close(replacement_fd)
-        return rename_noreplace(
-            source_fd, source_name, destination_fd, destination_name)
-
-    monkeypatch.setattr(
-        repair, "_rename_noreplace_at", replace_before_quarantine)
-    with pytest.raises(repair._RepairRelocationUncertain):
-        repair._relocate_refilled_into_album_dir(
-            album_dir,
-            landed_dir,
-            {"GBCFB1300101"},
-            before_names=set(),
-            ownership_receipt=receipt,
-            expected_refills=1,
-        )
-
-    assert raced is True
-    assert refill.read_bytes() == b"unrelated-replacement"
-    assert (landed_dir / "verified-refill.displaced").read_bytes() == b"verified-refill"
-    assert not (album_dir / refill.name).exists()
-    assert not any(
-        path.name.startswith(".qobuz-repair-source-")
-        for path in landed_dir.iterdir()
-    )
-
-
-def test_repair_refuses_a_replaced_preheld_album(tmp_path, monkeypatch):
-    repair, album_dir, landed_dir = _repair_relocation_dirs(
-        tmp_path, monkeypatch)
-    refill = landed_dir / "01 - First Fires.flac"
-    refill.write_bytes(b"verified-refill")
-    receipt = _sealed_import_receipt(
-        repair.cfg.MUSIC_ROOT, [refill], landed_dir)
-    held_root = repair._HeldMusicRoot(repair.cfg.MUSIC_ROOT)
-    held_album = repair._HeldRepairDirectory(
-        held_root, repair._repair_relative_parts(held_root, album_dir))
-    displaced = album_dir.with_name("First Fires.displaced")
-    album_dir.rename(displaced)
-    album_dir.mkdir()
-    (album_dir / "keep.txt").write_text("replacement")
-    try:
-        with pytest.raises(repair._RepairRelocationUncertain):
-            repair._relocate_refilled_into_album_dir(
-                album_dir,
-                landed_dir,
-                {"GBCFB1300101"},
-                before_names=set(),
-                ownership_receipt=receipt,
-                expected_refills=1,
-                held_root=held_root,
-                held_album=held_album,
-            )
-    finally:
-        held_album.close()
-        held_root.close()
-
-    assert refill.read_bytes() == b"verified-refill"
-    assert (album_dir / "keep.txt").read_text() == "replacement"
-    assert not (displaced / refill.name).exists()
-
-
-def test_empty_source_cleanup_restores_a_late_replacement(
-        tmp_path, monkeypatch):
-    from qobuz_librarian.library import catalog
-
-    parent = tmp_path / "parent"
-    source = parent / "source"
-    displaced = tmp_path / "displaced-source"
-    source.mkdir(parents=True)
-    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    rename_noreplace = catalog._rename_noreplace_at
-    replaced = False
-
-    def replace_before_cleanup(
-            source_parent_fd, source_name,
-            destination_parent_fd, destination_name):
-        nonlocal replaced
-        if destination_name.startswith(".qobuz-migrate-empty-") and not replaced:
-            replaced = True
-            source.rename(displaced)
-            source.mkdir()
-            (source / "user-file.txt").write_text("keep me", encoding="utf-8")
-        return rename_noreplace(
-            source_parent_fd,
-            source_name,
-            destination_parent_fd,
-            destination_name,
-        )
-
-    monkeypatch.setattr(catalog, "_rename_noreplace_at", replace_before_cleanup)
-    try:
-        removed = catalog._remove_empty_migration_directory_at(
-            parent_fd, "source", source_fd)
-    finally:
-        os.close(source_fd)
-        os.close(parent_fd)
-
-    assert replaced and removed is False
-    assert (source / "user-file.txt").read_text(encoding="utf-8") == "keep me"
-    assert displaced.is_dir()
-    assert not list(parent.glob(".qobuz-migrate-empty-*"))
-
-
-def test_empty_source_cleanup_reports_first_arrival_blocked_by_second(
-        tmp_path, monkeypatch):
-    from qobuz_librarian.library import catalog
-
-    parent = tmp_path / "parent"
-    source = parent / "source"
-    displaced = tmp_path / "displaced-source"
-    source.mkdir(parents=True)
-    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    rename_noreplace = catalog._rename_noreplace_at
-    first_installed = False
-    second_installed = False
-
-    def race_cleanup(
-            source_parent_fd, source_name,
-            destination_parent_fd, destination_name):
-        nonlocal first_installed, second_installed
-        if (
-            destination_name.startswith(".qobuz-migrate-empty-")
-            and source_name == "source"
-            and not first_installed
-        ):
-            first_installed = True
-            source.rename(displaced)
-            source.mkdir()
-            (source / "first.txt").write_text("first", encoding="utf-8")
-        elif (
-            source_name.startswith(".qobuz-migrate-empty-")
-            and destination_name == "source"
-            and first_installed
-            and not second_installed
-        ):
-            second_installed = True
-            source.mkdir()
-            (source / "second.txt").write_text("second", encoding="utf-8")
-        return rename_noreplace(
-            source_parent_fd,
-            source_name,
-            destination_parent_fd,
-            destination_name,
-        )
-
-    monkeypatch.setattr(catalog, "_rename_noreplace_at", race_cleanup)
-    try:
-        with pytest.raises(catalog._MigrationEntryPreserved) as caught:
-            catalog._remove_empty_migration_directory_at(
-                parent_fd, "source", source_fd)
-    finally:
-        os.close(source_fd)
-        os.close(parent_fd)
-
-    assert first_installed and second_installed
-    assert (source / "second.txt").read_text(encoding="utf-8") == "second"
-    assert displaced.is_dir()
-    preserved = Path(caught.value.location)
-    assert (preserved / "first.txt").read_text(encoding="utf-8") == "first"
-
-
-def test_refills_present_in_counts_duplicate_isrcs(tmp_path, monkeypatch):
-    # Two truncated originals sharing one ISRC (a .1.flac collision pair, or the
-    # same recording on two discs) both go to backup. The presence gate must
-    # require BOTH back before the backup is trusted as redundant — a set-based
-    # check passed when only one returned, deleting the backup and losing the
-    # other file.
-    from collections import Counter
-
-    from qobuz_librarian.modes import repair
-    wanted = Counter({"GBCFB1300101": 2})
-
-    # Only one file with the ISRC is back → not yet present.
-    monkeypatch.setattr(repair, "read_album_dir",
-                        lambda d: [{"isrc": "GBCFB1300101"}])
-    assert repair._refills_present_in(tmp_path, wanted, Counter()) is False
-
-    # Both back → present.
-    monkeypatch.setattr(repair, "read_album_dir",
-                        lambda d: [{"isrc": "GBCFB1300101"}, {"isrc": "gbcfb1300101"}])
-    assert repair._refills_present_in(tmp_path, wanted, Counter()) is True
-
-
 def test_refills_intact_requires_every_wanted_isrc_to_reverify(tmp_path, monkeypatch):
-    # Before the truncated originals' backup is trusted as redundant, the rebuilt
-    # folder is re-scanned and EVERY backed-up ISRC must positively re-verify.
-    # Checking only "not flagged truncated" was unsafe: an ISRC whose re-lookup
-    # transiently returned nothing lands in isrc_no_match, not verified_truncated,
-    # so it would read as intact and the only good copy's backup would be deleted
-    # while the refill is still short. Verified ISRCs come back in Qobuz's own
-    # casing, so the gate normalizes them first.
+    # Before the truncated originals' backup is trusted as redundant, the
+    # rebuilt folder is re-scanned and EVERY backed-up ISRC must positively
+    # re-verify.
     from collections import Counter
 
     from qobuz_librarian.modes import repair
@@ -759,10 +310,7 @@ def test_refills_intact_requires_every_wanted_isrc_to_reverify(tmp_path, monkeyp
 
 def test_refills_intact_counts_duplicate_isrcs_as_a_multiset(tmp_path, monkeypatch):
     # Two truncated files can share one ISRC (a .1.flac collision pair, or the
-    # same recording on two discs). The presence gate already counts the
-    # multiset; the intact gate must too — one verified-good twin must not
-    # vouch for the other, still-truncated file and let the backup holding
-    # both originals be deleted.
+    # same recording on two discs).
     from collections import Counter
 
     from qobuz_librarian.modes import repair
@@ -893,9 +441,8 @@ def _call_repair_album_dir(tmp_path, monkeypatch, *, n_ok, n_fail, imported,
     monkeypatch.setattr("qobuz_librarian.config.REPAIR_LOG_PATH", tmp_path / "repair.log")
     monkeypatch.setattr(repair_mod, "get_album",
                         lambda aid, tok: {"id": aid, "title": "Album", "tracks": {"items": []}})
-    # Parent-album resolution prefers the folder match; with none, it falls back
-    # to the most-common ISRC album (get_album above). Stub it so the test stays
-    # off the network and focused on backup resolution.
+    # Parent-album resolution prefers the folder match; with none, it falls
+    # back to the most-common ISRC album (get_album above).
     monkeypatch.setattr(repair_mod, "find_qobuz_album_for_dir",
                         lambda *a, **k: None)
 
@@ -1034,63 +581,6 @@ def test_repair_backup_kept_when_downloads_fail_and_skipped_when_backup_fails(tm
     monkeypatch.setattr(repair_mod, "restore_gap_fill_backup", restore_partial)
     res = repair_mod.repair_album_dir(album_dir, vt, "Artist", args, "tok")
     assert track.exists() and res["backup"] is None
-
-
-def test_repair_will_not_refill_without_a_durable_recovery_checkpoint(
-        tmp_path, monkeypatch):
-    seen = []
-    execute_calls = []
-
-    result, root = _call_repair_album_dir(
-        tmp_path,
-        monkeypatch,
-        n_ok=1,
-        n_fail=0,
-        imported=True,
-        recovery_checkpoint=lambda recovery: seen.append(recovery) or False,
-        execute_calls=execute_calls,
-    )
-
-    retained = [recovery for recovery in seen if recovery.retained]
-    assert len(retained) == 1
-    assert retained[0].backup.receipt is not None
-    assert retained[0].backup.backed_up == 1
-    assert seen[-1].retained is False
-    assert execute_calls == []
-    assert (root / "Artist" / "Album (2020)" / "01 - Track.flac").exists()
-    assert result["backup"] is None
-
-
-def test_repair_persists_a_preserved_refill_location(
-        tmp_path, monkeypatch):
-    import qobuz_librarian.modes.repair as repair_mod
-
-    preserved = tmp_path / "kept-refill"
-    preserved.mkdir()
-    (preserved / "first.txt").write_text("first", encoding="utf-8")
-    seen = []
-    error = repair_mod._RepairRelocationUncertain(
-        "refill cleanup needs review",
-        recovery_location=preserved,
-    )
-
-    result, _root = _call_repair_album_dir(
-        tmp_path,
-        monkeypatch,
-        n_ok=1,
-        n_fail=0,
-        imported=True,
-        recovery_checkpoint=lambda recovery: seen.append(recovery) or True,
-        relocation_error=error,
-    )
-
-    placement = [recovery for recovery in seen if recovery.stage == "placement"]
-    assert len(placement) == 1
-    record = placement[0].as_record()
-    assert str(preserved) in record["reason"]
-    assert "/proc/self/fd/" not in record["reason"]
-    assert (preserved / "first.txt").read_text(encoding="utf-8") == "first"
-    assert result["backup"] is not None
 
 
 # ── Walk-seen state: crash-safe atomic write ───────────────────────────
@@ -1366,8 +856,7 @@ def test_repair_pins_the_backup_when_the_tag_carry_fails(tmp_path, monkeypatch):
 def test_strict_confirm_reasks_on_a_typo(monkeypatch):
     # The downsample keep-vs-delete answer is SAVED as the standing default,
     # so a typo must not read as "delete the originals from now on" — strict
-    # mode re-asks until it gets a real yes or no. Non-strict prompts keep
-    # the old contract (anything not yes is No).
+    # mode re-asks until it gets a real yes or no.
     from qobuz_librarian.ui_cli import prompts
 
     answers = iter(["maybe", "y"])

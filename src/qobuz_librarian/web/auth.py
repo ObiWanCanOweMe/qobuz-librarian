@@ -60,17 +60,11 @@ def safe_next_path(raw) -> str:
         return ""
     return p
 
-# Credential file cache. Keyed to the file path so test fixtures that
-# redirect WEB_AUTH_FILE to a temp path don't serve stale data to the next
-# test. Invalidated explicitly in set_credentials() on any write.
+# Credential file cache.
 _cred_cache: dict | None = None
 _cred_cache_path: str | None = None
 
 # Login failure tracking: IP → list of failure timestamps.
-# After _LOGIN_MAX failures within _LOGIN_WINDOW seconds, return 429. The IP is
-# only as good as the proxy setup — set FORWARDED_ALLOW_IPS to your reverse
-# proxy so uvicorn fills request.client.host with the real client address;
-# otherwise every request shares the proxy's IP and one bad actor locks the box.
 _login_failures: dict[str, list[float]] = {}
 _login_lock = threading.Lock()
 _LOGIN_MAX = 5
@@ -88,11 +82,7 @@ _USER_LOGIN_MAX = 10
 _MAX_TRACKED_USERS = 1024
 
 # Active session tokens: a random per-login token (the cookie value) → expiry
-# epoch seconds. The cookie carries one of THESE, not the credential secret, so
-# logout and password changes can revoke sessions (one or all). The table is
-# mirrored to disk as SHA-256 digests — image updates and restarts are routine
-# for a self-hosted app, and re-typing the password after every one teaches
-# people to pick a weak one. A leaked file exposes digests, not cookie values.
+# epoch seconds.
 _SESSIONS_FILE = cfg.DATA_DIR / ".qobuz_web_sessions.json"
 _sessions_lock = threading.Lock()
 
@@ -211,8 +201,7 @@ def set_credentials(username: str, password: str) -> bool:
     every call, so resetting the password logs out any existing browser."""
     global _cred_cache, _cred_cache_path
     # Never overwrite an existing-but-unreadable creds file: a transient read
-    # error must not let the open /setup page clobber the admin account. A fresh
-    # install (no file) and a normal password change (file reads fine) both pass.
+    # error must not let the open /setup page clobber the admin account.
     if creds_file_present_but_unreadable():
         return False
     _cred_cache = None
@@ -494,9 +483,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if not configured:
             if creds_file_present_but_unreadable():
                 # The creds file is there but unreadable (transient I/O or a
-                # corrupt/half-written file). Falling back to the open /setup page
-                # would let anyone overwrite the admin account, so fail closed
-                # until the read recovers.
+                # corrupt/half-written file).
                 return Response(
                     "Login is configured but its credentials can't be read right "
                     "now. Try again shortly.", status_code=503)
@@ -515,18 +502,14 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
     @staticmethod
     def _reject(request, location):
-        # API/SSE callers get a machine-readable 401. htmx requests get a
-        # full-page redirect header (a 303 body would be swapped into a
-        # fragment). Everything else is an ordinary browser redirect.
+        # API/SSE callers get a machine-readable 401.
         if request.scope["path"].startswith("/api/"):
             return JSONResponse({"detail": "authentication required"},
                                 status_code=401)
         if request.headers.get("HX-Request") == "true":
             return Response(status_code=401, headers={"HX-Redirect": location})
         # Remember where a plain page GET was headed so login can land there
-        # instead of dumping every deep link on the dashboard. Only full-page
-        # GETs: a replayed POST target isn't a page, and htmx partials would
-        # render bare.
+        # instead of dumping every deep link on the dashboard.
         if location == LOGIN_PATH and request.method == "GET":
             import urllib.parse
             target = request.scope["path"]

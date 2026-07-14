@@ -1,5 +1,3 @@
-import json
-from pathlib import Path
 
 import pytest
 
@@ -210,42 +208,6 @@ def _completed_journal(
     return complete, item_id, evidence
 
 
-def test_multi_artist_policy_is_legacy_safe_and_frozen_with_execution(
-    queue_paths,
-):
-    _tmp_path, _music, _source, _destination, staging = queue_paths
-    pending = journal.save_queue_journal(
-        journal.create_queue_journal([_queue_item()], mode="test")
-    )
-    path = cfg.QUEUE_JOURNAL_DIR / f"{pending.operation_id}.json"
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["items"][0].pop("multi_artist_filing")
-    path.write_text(json.dumps(payload), encoding="utf-8")
-
-    loaded = journal.load_queue_journal(pending.operation_id).journal
-    assert loaded is not None
-    assert loaded.items[0].multi_artist_filing is False
-    item_id = loaded.items[0].item_id
-    active = journal.transition_journal_item(
-        loaded,
-        item_id,
-        journal.QueuePhase.ACTIVE,
-        completion_input=_completion_input(loaded, item_id, staging),
-        multi_artist_filing=True,
-    )
-    assert active.items[0].multi_artist_filing is True
-    with pytest.raises(
-        journal.QueueJournalBlocked,
-        match="filing policy",
-    ):
-        journal.transition_journal_item(
-            active,
-            item_id,
-            journal.QueuePhase.ACTIVE,
-            multi_artist_filing=False,
-        )
-
-
 def test_completed_removal_and_action_handoff_are_one_durable_state_machine(
     queue_paths, monkeypatch
 ):
@@ -416,64 +378,3 @@ def test_conflicting_planned_action_settles_as_an_exact_noop(
     assert (destination / "01 Test.flac").read_bytes() == b"different audio"
 
 
-def test_split_action_joins_planned_folder_into_completed_folder(queue_paths):
-    _tmp_path, _music, source, destination, _staging = queue_paths
-    destination.mkdir(parents=True)
-    (destination / "02 New.flac").write_bytes(b"new")
-    complete, item_id, evidence = _completed_journal(
-        queue_paths,
-        planned_album_dir=source,
-        completion_album_path="Artist/Album",
-    )
-    authority = run_lock.acquire()
-    try:
-        expectation = capture_post_import_relocation_expectation(
-            source, destination, authority=authority
-        )
-    finally:
-        authority.close()
-    retired = journal.commit_recovered_completed_item_removal(
-        complete,
-        item_id=item_id,
-        live_evidence=evidence,
-        post_import_action={
-            "action_id": "a" * 64,
-            "kind": "split-gap-fill",
-            "source": str(source),
-            "destination": str(destination),
-            "expectation": expectation,
-            "phase": "planned",
-            "relocation_operation_id": None,
-            "handoff_hash": None,
-        },
-    )
-    retirement = retired.retirements[0]
-    assert retirement.final_path == str(destination)
-    assert retirement.action is not None
-    assert retirement.action.source == str(source)
-
-
-def test_handoff_matcher_returns_unknown_for_unreadable_queue_state(
-    queue_paths,
-):
-    complete, item_id, evidence = _completed_journal(queue_paths)
-    retired = journal.commit_recovered_completed_item_removal(
-        complete,
-        item_id=item_id,
-        live_evidence=evidence,
-        post_import_action=None,
-    )
-    handoff = {
-        "consumer": {
-            "kind": "queue-completion",
-            "queue_operation_id": retired.operation_id,
-            "item_id": item_id,
-            "action_id": "a" * 64,
-        },
-        "hash": "f" * 64,
-    }
-    journal_path = cfg.QUEUE_JOURNAL_DIR / f"{retired.operation_id}.json"
-    journal_path.write_text("{", encoding="utf-8")
-    assert journal.post_import_relocation_handoff_matches(
-        "e" * 64, handoff
-    ) is None

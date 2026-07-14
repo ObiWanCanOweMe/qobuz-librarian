@@ -23,11 +23,9 @@ from qobuz_librarian.recovery import normalise_recovery_owner
 from qobuz_librarian.ui_cli.colors import C, fmt
 from qobuz_librarian.ui_cli.logging import log, vlog, wrap_thread_target
 
-# Optional cancel-check hook. The web JobManager installs a callable
-# here that returns True when the active job has been cancelled; rip_url
-# polls it between proc.wait iterations and kills the subprocess group
-# when it fires. None when running from the CLI (where Ctrl-C handles
-# the same job via KeyboardInterrupt).
+# Optional cancel-check hook. The web JobManager installs a callable here that
+# returns True when the active job has been cancelled; rip_url polls it
+# between proc.wait iterations and kills the subprocess group when it fires.
 _CANCEL_CHECK = None
 
 
@@ -59,20 +57,9 @@ _FLAC_TRUNCATION_FLOOR = 150_000
 # ── FLAC signature ────────────────────────────────────────────────────────────
 
 def _flac_signature(path: Path):
-    """Tag-tuple identifier for a FLAC, stable across beets's move.
-
-    Lyric_fetch's state file is keyed by absolute path.
-    Pre-import lyric runs leave state with
-    staging-path keys that vanish once beets moves files to MUSIC_ROOT.
-    Tag tuples survive that move because beets's `autotag: no` doesn't
-    rewrite tags. We use these to find where a transient-from-staging
-    file landed post-import, so the lyric retry manifest can hold the
-    real (post-import) paths instead of stale staging paths.
-
-    Returns None when mutagen is unavailable or the file can't be read
-    (caller treats that as "can't track for retry"). All string fields
-    are lowercased + stripped so trivial case differences don't break
-    matching across re-runs."""
+    """Tag-tuple identifier for a FLAC, stable across beets's move. Lyric_fetch's
+    state file is keyed by absolute path.
+    """
     if not HAVE_MUTAGEN:
         return None
     try:
@@ -318,11 +305,10 @@ def rip_url(url, timeout=None, live_output=False, quality=None,
     # collapse each multi-line ERROR block to one concise line.
     _ts_re   = re.compile(r"^\s*\[\d{2}:\d{2}:\d{2}\]\s*")
     _rule_re = re.compile(r"^\s*[─━]{3,}")
-    # Any line starting with a Unicode box-drawing char (U+2500–U+257F)
-    # is part of a Rich panel/traceback. Streamrip prints a multi-line
-    # traceback box on its `version_coro` post-processing bug; this filters
-    # the noise out of live output. The line is still captured in `lines`
-    # so error detection / auth-lost detection / rc-dump still work.
+    # Any line starting with a Unicode box-drawing char (U+2500–U+257F) is
+    # part of a Rich panel/traceback. Streamrip prints a multi-line traceback
+    # box on its `version_coro` post-processing bug; this filters the noise
+    # out of live output.
     _box_re  = re.compile(r"^[\u2500-\u257f]")
     # Rich's log handler appends "  module.py:LINE" columns at end of line —
     # anchor to EOL so a track title containing the literal "name.py:42"

@@ -80,9 +80,7 @@ def test_strip_album_decorations_handles_year_prefixed_folders():
 def test_differs_by_album_variant_rejects_coincidental_letter_overlap():
     # The bug this closed: a normalized title that coincidentally starts with
     # the SAME letters as a variant token isn't a variant — the token has to
-    # land at a real word boundary in the original. Without this guard, an
-    # owned 'Song' would NOT cover a catalog 'Song Liverpool' (a place name),
-    # nor 'Song Sessional' (an adjective), over-surfacing them as missing.
+    # land at a real word boundary in the original.
     assert not differs_by_album_variant("song", "songliverpool")
     assert not differs_by_album_variant("song", "songsessional")
     # The plain-prefix cases (no variant token at all) also stay False, so a

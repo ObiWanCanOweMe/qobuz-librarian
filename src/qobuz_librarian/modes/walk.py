@@ -183,10 +183,9 @@ def record_album_walk_seen(artist_name, album_name, seen=None):
 
 # ── Album fill walk ───────────────────────────────────────────────────
 
-# Outcomes that settle an album for the album-fill walk: it's done, or the user
-# said no, or Qobuz couldn't place the folder (recorded so it stops nagging on
-# every walk). 'user_stopped' is deliberately absent — pressing 's' bails out of
-# the walk, it isn't a decision about the album that happened to be on screen.
+# Outcomes that settle an album for the album-fill walk: it's done, or the
+# user said no, or Qobuz couldn't place the folder (recorded so it stops
+# nagging on every walk).
 _ALBUM_WALK_DECIDED = {
     "already_complete", "user_skipped",
     "no_qobuz_match", "no_tracks", "false_match", "predicted_path_mismatch",

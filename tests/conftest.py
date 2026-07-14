@@ -70,8 +70,7 @@ def _isolate_data_dir():
     cfg.NEW_RELEASE_CHECK_INTERVAL = 0
     cfg.AUTO_LIBRARY_SCAN = False
     # Keep the persistent caches out of the deterministic suite — tests that
-    # mock qobuz_get / build fixture FLACs expect a fresh read each time. Each
-    # cache's own test re-enables it.
+    # mock qobuz_get / build fixture FLACs expect a fresh read each time.
     cfg.ALBUM_CACHE_ENABLED  = False
     cfg.FLAC_CACHE_ENABLED   = False
     cfg.REPAIR_CACHE_ENABLED = False
@@ -79,8 +78,7 @@ def _isolate_data_dir():
     # the Qobuz lookup, so a real sleep between calls would only add dead time.
     cfg.REPAIR_LOOKUP_MIN_INTERVAL = 0.0
     # Suppress write-through job persistence for the deterministic suite — a
-    # shared jobs.db would otherwise leak historical rows between tests. The
-    # persistence-specific tests flip this off with monkeypatch and a reset.
+    # shared jobs.db would otherwise leak historical rows between tests.
     from qobuz_librarian.web import job_persistence
     job_persistence._disabled = True
 
@@ -112,9 +110,7 @@ def _isolate_data_dir():
     os.environ["BEETS_CONFIG_DIR"] = str(cfg.BEETS_CONFIG_DIR)
     os.environ["BEETS_DB_PATH"] = str(cfg.BEETS_DB_PATH)
     # Same reasoning: clear the Qobuz creds env so a reload(cfg) in a test
-    # doesn't pick a leftover dev-shell token back up. STREAMRIP_CONFIG is
-    # pointed at the tmp dir above; this complements that by making sure the
-    # env-var fast path can't bypass it.
+    # doesn't pick a leftover dev-shell token back up.
     os.environ["QOBUZ_USER_AUTH_TOKEN"] = ""
     os.environ["QOBUZ_USER_ID"] = ""
     os.environ["STREAMRIP_CONFIG"] = str(cfg.STREAMRIP_CONFIG)

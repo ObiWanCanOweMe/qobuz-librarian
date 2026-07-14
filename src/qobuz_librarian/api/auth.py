@@ -23,19 +23,13 @@ class QobuzError(Exception):  pass
 
 
 # Qobuz reached its retry ceiling without a usable answer — the network is
-# down, the request timed out, or the API is rate-limiting / 5xx-ing. Distinct
-# from QobuzError (a definitive answer like 404/bad-body) so callers can tell
-# "service is down, retry later" apart from "Qobuz says no such album". Like
-# AuthLost it's an abort signal: it propagates past the per-item handlers that
-# swallow QobuzError, so a blip mid-scan stops the scan cleanly instead of
-# being recorded as a genuine no-match.
+# down, the request timed out, or the API is rate-limiting / 5xx-ing.
 class QobuzUnavailable(Exception): pass
 
 
-# A hook the web layer registers in its lifespan so the dashboard's
-# "saved token isn't authenticating" banner reflects the most recent API call,
-# not just the startup probe. Lives here (not in client.py) so callers can
-# register without pulling the whole client module — and so tests can swap it.
+# A hook the web layer registers in its lifespan so the dashboard's "saved
+# token isn't authenticating" banner reflects the most recent API call, not
+# just the startup probe.
 _auth_state_listeners: list = []
 
 
@@ -142,11 +136,7 @@ def write_streamrip_creds(user_id, auth_token) -> bool:
         except Exception:
             doc = None
     if doc is None:
-        # Seed from the bundled streamrip-default.toml. Its schema +
-        # [misc].version match the bundled streamrip, so streamrip won't
-        # fire its interactive config-migration prompt (which aborts in
-        # our non-interactive subprocess). Look in the container path and
-        # the repo-relative path (editable/dev installs).
+        # Seed from the bundled streamrip-default.toml.
         _pkg_root = Path(__file__).resolve().parents[3]
         for cand in (Path("/app/docker/streamrip-default.toml"),
                      _pkg_root / "docker" / "streamrip-default.toml"):
@@ -157,10 +147,7 @@ def write_streamrip_creds(user_id, auth_token) -> bool:
                 except Exception:
                     doc = None
         if doc is None:
-            # No bundled default reachable (e.g. a pipx install). Build a
-            # minimal doc that still stamps [misc].version with the
-            # installed streamrip version so streamrip treats it as
-            # current and skips migration.
+            # No bundled default reachable (e.g. a pipx install).
             doc = tomlkit.document()
             import importlib.metadata as _im
             try:
@@ -172,8 +159,7 @@ def write_streamrip_creds(user_id, auth_token) -> bool:
                 doc["misc"]["version"] = _srv
             doc["database"] = tomlkit.table()
             # Keep streamrip's downloads db off — on it blocks re-downloading
-            # any track the user deleted by hand. The entrypoint enforces the
-            # same on the bundled config; mirror it on the bare-metal fallback.
+            # any track the user deleted by hand.
             doc["database"]["downloads_enabled"] = False
             doc["database"]["failed_downloads_enabled"] = True
             # downloads_path / failed_downloads_path are set below,
@@ -184,11 +170,7 @@ def write_streamrip_creds(user_id, auth_token) -> bool:
     doc["qobuz"]["password_or_token"] = auth_token
     doc["qobuz"]["use_auth_token"]    = True
     # streamrip 2.2.0 REQUIRES the `secrets` key to exist (it's a required
-    # field on QobuzConfig — deleting it makes the whole config fail to
-    # load). It needs a *matched* app_id+secret pair for a paid session;
-    # a pinned app_id with empty secrets yields a free-tier session
-    # ("IneligibleError"). Leave app_id+secrets empty so streamrip scrapes
-    # a matched pair itself on first auth.
+    # field on QobuzConfig — deleting it makes the whole config fail to load).
     doc["qobuz"]["app_id"] = ""
     if "secrets" not in doc["qobuz"]:
         doc["qobuz"]["secrets"] = tomlkit.array()
@@ -246,24 +228,12 @@ def write_streamrip_creds(user_id, auth_token) -> bool:
 
 
 def sync_streamrip_creds_from_env():
-    """If creds come from env vars, mirror them into the streamrip config.
-
-    The app authenticates its own Qobuz API calls straight from
-    QOBUZ_USER_AUTH_TOKEN, but downloads shell out to the bundled
-    `rip` CLI, which only reads its own config file. Without this, the
-    documented env-var setup path lets search/validation succeed while
-    every download fails on streamrip's interactive "Enter your Qobuz
-    email:" prompt. Idempotent: only rewrites when the config's token
-    doesn't already match the env token. Returns True if it wrote,
-    False on write failure, None if there was nothing to do.
-
-    A user id is required: the bundled streamrip raises
-    MissingCredentialsError on an empty email_or_userid even under
-    use_auth_token, so we never stamp a blank id — that would break every
-    download while the app's own API calls keep working (the exact
-    half-broken state this sync exists to prevent). The env id wins when set;
-    otherwise we preserve a user id already present in the config (e.g. one
-    saved via the Settings page) and only warn when none is available.
+    """If creds come from env vars, mirror them into the streamrip config. The
+    app authenticates its own Qobuz API calls straight from
+    QOBUZ_USER_AUTH_TOKEN, but downloads shell out to the bundled `rip` CLI,
+    which only reads its own config file. Without this, the documented env-var
+    setup path lets search/validation succeed while every download fails on
+    streamrip's interactive "Enter your Qobuz email:" prompt.
     """
     token = config.QOBUZ_USER_AUTH_TOKEN
     if not token:
@@ -339,9 +309,8 @@ def detect_auth_lost(rip_output):
             "invalid credentials")):
         return True
     # "unauthorized" is also a real word in album/track titles (e.g. "The
-    # Unauthorized Biography of Reinhold Messner"), and streamrip echoes titles
-    # in its progress output. Only treat it as auth loss on an error-shaped line
-    # so a successful download isn't torn down as a bogus auth failure.
+    # Unauthorized Biography of Reinhold Messner"), and streamrip echoes
+    # titles in its progress output.
     for line in o.splitlines():
         if "unauthor" in line and any(k in line for k in (
                 "error", "exception", "traceback", "401", "403",

@@ -221,10 +221,8 @@ def test_transient_api_error_aborts_the_scan_instead_of_burying_a_folder(
 # ── New-release quickscan ─────────────────────────────────────────────────────
 
 def test_resolve_artist_does_not_cache_an_id_less_match(monkeypatch):
-    # A partial/malformed Qobuz 200 — a name match carrying no id — must not be
-    # cached. The contract is "misses are NOT cached"; caching [None, name] would
-    # have every later scan return that poisoned hit and silently skip the artist
-    # forever (the gap and new-release paths early-return on a falsy id).
+    # A partial/malformed Qobuz 200 — a name match carrying no id — must not
+    # be cached.
     monkeypatch.setattr(discovery, "_resolve_cache", {})
     monkeypatch.setattr(discovery, "_resolve_cache_dirty", False)
 
@@ -295,10 +293,8 @@ def test_new_releases_surface_only_what_appeared_since_the_baseline(
         seen_by_id={str(first.artist_id): first.current_ids}, artist_dir=ad)
     assert caught_up.new_gaps == []
 
-    # Recency window: an OLD album that's new to the baseline (Qobuz back-filled
-    # it) is a back-catalogue gap, not a new release. With only the owned album
-    # in the baseline, both "Happier Than Ever" (2021) and the current-year album
-    # are new since — but only the recent one surfaces.
+    # Recency window: an OLD album that's new to the baseline (Qobuz back-
+    # filled it) is a back-catalogue gap, not a new release.
     recency = find_new_releases_for_artist(
         "Billie Eilish", token="tok", opts=opts,
         seen_by_id={str(first.artist_id): ["101"]}, artist_dir=ad)

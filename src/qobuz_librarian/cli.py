@@ -441,8 +441,7 @@ def check_rip():
         r = subprocess.run(["rip", "--version"], capture_output=True, text=True, timeout=10)
         if r.returncode != 0:
             # rip is on PATH (no FileNotFoundError) but exited nonzero — it's
-            # installed and broken, not missing. Saying "not in PATH" sends the
-            # user down the wrong path, so report the real exit + stderr.
+            # installed and broken, not missing.
             detail = (r.stderr or r.stdout or "").strip()
             die(fmt(C.RED,
                 f"\n✗  `rip --version` exited {r.returncode} — streamrip is "
@@ -463,9 +462,8 @@ def check_rip():
 
 
 def check_media_tools():
-    # flac verifies every downloaded track and metaflac reads its bit depth for
-    # the resample; ffmpeg does the hi-res downsample. Both ship together in the
-    # Docker image, so a miss means a broken setup rather than a config choice.
+    # flac verifies every downloaded track and metaflac reads its bit depth
+    # for the resample; ffmpeg does the hi-res downsample.
     for tool, hint in (
         ("flac", "Install the FLAC tools via your package manager "
                  "(e.g. `apt install flac`, `brew install flac`)."),
@@ -582,8 +580,7 @@ def parse_args():
                    default=cfg.CONSOLIDATE,
                    help="after import, scan sibling folders and offer to consolidate")
     # Passive auto-upgrade is OFF unless AUTO_UPGRADE_ENABLED is set or the
-    # explicit Upgrade walk is run. --no-upgrade force-disables it for a run
-    # even when the config flag is on. Backups are taken before any replace.
+    # explicit Upgrade walk is run.
     p.add_argument("--no-upgrade",   action="store_true",
                    help="force-disable quality upgrades for this run (plain gap-fill)")
     # Unattended upgrade-walk gate.
@@ -624,9 +621,7 @@ def parse_args():
                    help="migration: fingerprint files whose tags can't place them "
                         "(slower, needs network; no key required)")
     args = p.parse_args()
-    # Per-run override of cfg.AUTO_UPGRADE_ENABLED. Defaults to the global
-    # so plain gap-fills behave the same as before; the explicit upgrade
-    # walk flips this without mutating the shared cfg value.
+    # Per-run override of cfg.AUTO_UPGRADE_ENABLED.
     args.auto_upgrade = cfg.AUTO_UPGRADE_ENABLED
     # The walk / migrate / reset modes are whole-library or local-only runs that
     # read none of the album- or artist-scan flags below, so naming one of those
@@ -634,9 +629,8 @@ def parse_args():
     other_run_mode = (args.upgrade_walk or args.downsample_walk
                       or args.lyrics_walk or args.migrate or args.reset_walk_seen
                       or args.check_new_releases)
-    # Reject flag/mode combinations that would otherwise be silently dropped or
-    # accepted. --force re-downloads everything; it's an album-mode concept,
-    # ignored inside an artist scan or any walk/migrate mode.
+    # Reject flag/mode combinations that would otherwise be silently dropped
+    # or accepted.
     if args.force and (args.artist or other_run_mode):
         p.error("--force only applies to album mode (a query or Qobuz URL), "
                 "not --artist or a walk/migrate mode")
@@ -645,14 +639,10 @@ def parse_args():
             and not args.migrate:
         p.error("--in-place / --acoustid / --migrate-src / --migrate-dest only "
                 "apply with --migrate")
-    # --include-singles only affects artist mode's missing-albums step. Wrong in
-    # album mode (a query without --artist) or any walk/migrate mode. Allowed
-    # with --artist or the interactive menu.
+    # --include-singles only affects artist mode's missing-albums step.
     if args.include_singles and not args.artist and (args.query or other_run_mode):
         p.error("--include-singles only applies to artist mode")
-    # --no-catalog skips artist mode's missing-albums step. No other mode has
-    # one or reads the flag, so reject it there rather than accepting it
-    # silently. Bare --no-catalog stays valid for the menu.
+    # --no-catalog skips artist mode's missing-albums step.
     if args.no_catalog and not args.artist and (args.query or other_run_mode):
         p.error("--no-catalog only applies to artist mode")
     # The upgrade walk reviews saved Library candidates; a query would be
@@ -665,11 +655,8 @@ def parse_args():
     if args.artist and args.query:
         p.error("--artist NAME scans that one artist — drop the extra words, "
                 "or search them as an album without --artist")
-    # Exactly one whole-run mode executes per invocation — main() dispatches the
-    # first it finds and returns, so a second would be silently dropped. The two
-    # query pairings above get a tailored hint; this catches every other
-    # combination (--migrate with --downsample-walk, --reset-walk-seen with
-    # --artist, …) with one message instead of a rejection per pair.
+    # Exactly one whole-run mode executes per invocation — main() dispatches
+    # the first it finds and returns, so a second would be silently dropped.
     requested = [name for name, on in (
         ("a query (album mode)", bool(args.query)),
         ("--artist", args.artist is not None),
@@ -683,8 +670,7 @@ def parse_args():
     if len(requested) > 1:
         p.error("run one mode at a time — got " + ", ".join(requested))
     # With no mode, the run falls through to the interactive menu — whose
-    # prompts --quiet would silence, leaving a bare input cursor. --quiet is for
-    # unattended runs, so steer the user to name a mode.
+    # prompts --quiet would silence, leaving a bare input cursor.
     if args.quiet and not requested:
         p.error("--quiet is for unattended runs and silences the interactive "
                 "menu — name a mode (a query, --artist, --upgrade-walk, …) "
@@ -695,10 +681,7 @@ def parse_args():
     # --no-upgrade with --upgrade-walk is contradictory.
     if args.no_upgrade and args.upgrade_walk:
         p.error("--no-upgrade conflicts with --upgrade-walk")
-    # --auto-safe only gates the unattended upgrade walk. With a query
-    # (album mode) or --artist it does nothing — reject it instead of
-    # accepting it silently. Bare --auto-safe stays valid: the interactive
-    # menu's upgrade option reads it.
+    # --auto-safe only gates the unattended upgrade walk.
     if args.auto_safe and not args.upgrade_walk and (
             args.query or args.artist or other_run_mode):
         p.error("--auto-safe only applies to --upgrade-walk")
@@ -717,8 +700,7 @@ def parse_args():
 
 def main():
     # Apply the web Settings page's persisted overrides before parse_args
-    # reads cfg.* into the default flags. The web process applies these on
-    # startup, while CLI runs load them here.
+    # reads cfg.* into the default flags.
     try:
         from qobuz_librarian.web import settings_store
         settings_store.load()
@@ -796,17 +778,14 @@ def main():
         return
 
     # Library migration is local-only: it reorganises files on disk and never
-    # touches Qobuz. Handle it here, before the credential check and the
-    # download-oriented setup below, so it runs on a fresh box with no token.
+    # touches Qobuz.
     if args.migrate:
         from qobuz_librarian.modes.migrate import run_migrate_mode
         run_migrate_mode(args)
         return
 
     # Lyrics backfill reads/writes library files and fetches from lyric
-    # providers — no streamrip, ffmpeg or Qobuz token involved. Dispatch here,
-    # before the tool/credential checks, so it runs on a box that only has the
-    # library mounted.
+    # providers — no streamrip, ffmpeg or Qobuz token involved.
     if args.lyrics_walk:
         require_music_root()
         from qobuz_librarian.modes.lyrics import run_library_lyrics_mode
@@ -814,9 +793,8 @@ def main():
         return
 
     # The new-release check hits the Qobuz API but doesn't need streamrip,
-    # ffmpeg or the FLAC tools (one catalog call per artist, no track fetches),
-    # so dispatch here before the heavy tool checks. The mode loads its own
-    # token so failures there report cleanly without leaking the load.
+    # ffmpeg or the FLAC tools (one catalog call per artist, no track
+    # fetches), so dispatch here before the heavy tool checks.
     if args.check_new_releases:
         require_music_root()
         from qobuz_librarian.modes.new_releases import (
@@ -826,9 +804,7 @@ def main():
         return
 
     # Downsample walk is local-only — it reads hi-res files off disk and
-    # resamples them in place, never touching Qobuz. It needs ffmpeg and the
-    # FLAC tools but not streamrip, so dispatch it before check_rip() and the
-    # credential load: it runs on a box with no token and no downloader.
+    # resamples them in place, never touching Qobuz.
     if args.downsample_walk:
         check_media_tools()
         require_music_root()
@@ -836,9 +812,8 @@ def main():
         run_downsample_walk_mode(args)
         return
 
-    # Keep the interactive menu and saved-work choices available on a local-only
-    # box. Downloader, media-tool, library, and Qobuz checks run once, only when
-    # the user actually selects work that needs them.
+    # Keep the interactive menu and saved-work choices available on a local-
+    # only box.
     download_stack = {}
 
     def download_token():
@@ -895,9 +870,7 @@ def main():
         return token
 
     if resume_interrupted_queue:
-        # Keep this launch recovery-only. The queue executor independently
-        # proves the exact saved operation before it downloads or imports; no
-        # unrelated housekeeping or menu action can run first.
+        # Keep this launch recovery-only.
         try:
             offer_resume_startup_recovery(
                 args,
@@ -969,9 +942,7 @@ def main():
 
     if args.upgrade_walk:
         # AUTO_UPGRADE_ENABLED must stay False as the global default — it
-        # controls passive upgrades during ordinary gap-fill walks. Set the
-        # per-run flag so the replace path activates for this invocation
-        # without mutating the module global the web Settings page reads.
+        # controls passive upgrades during ordinary gap-fill walks.
         args.auto_upgrade = True
         from qobuz_librarian.modes.upgrade import run_upgrade_walk_mode
         run_upgrade_walk_mode(args, download_token())
@@ -982,17 +953,12 @@ def main():
         run_album_mode(args, download_token())
         return
 
-    # Crash-recovery: if a previous queueing run died with decisions still
-    # in memory, we'd have left .qobuz_pending_queue.json on disk. Offer
-    # to resume those before showing the menu so the user doesn't accidentally
-    # start a new walk on top of pending work. Keep/discard stays local; the
-    # download stack is loaded only if the user chooses Resume.
+    # Crash-recovery: if a previous queueing run died with decisions still in
+    # memory, we'd have left .qobuz_pending_queue.json on disk.
     offer_resume_pending_queue(args, download_token)
 
-    # Same idea, but for files where every lyric provider was unavailable
-    # last run. Surfaced separately because they're orthogonal: a flush
-    # can succeed (queue cleared) while individual files in it ended up
-    # shipped without lyrics.
+    # Same idea, but for files where every lyric provider was unavailable last
+    # run.
     from qobuz_librarian.integrations.lyrics import offer_resume_lyric_retry
     offer_resume_lyric_retry(args)
 
@@ -1007,8 +973,7 @@ def main():
             return
         if mode == Mode.ALBUM:
             # Loop inside album mode so the user can search album after album
-            # without bouncing back to the top menu each time. q/blank at the
-            # query prompt returns to the top menu.
+            # without bouncing back to the top menu each time.
             from qobuz_librarian.modes.album import run_album_mode
             run_album_mode(args, download_token(), query_args=[], loop=True)
         elif mode == Mode.ARTIST:
@@ -1071,17 +1036,8 @@ def _check_staging_occupied():
 
 
 def _maybe_drop_privileges():
-    """Re-exec under gosu to PUID/PGID when started as root.
-
-    The entrypoint drops PID 1 to PUID/PGID, but `docker exec ... qobuz-librarian`
-    bypasses the entrypoint and runs as root, so files the CLI downloads land
-    root-owned while web-created ones match PUID — and the web process (running
-    as PUID) then can't repair/upgrade a CLI-fetched album. Dropping here keeps
-    both writers consistent. No-op when not root, when PUID/PGID are
-    non-numeric, or when gosu isn't on PATH. Inside a container an unset
-    PUID/PGID means 1000:1000 — the entrypoint's default — so a bare
-    `docker run` with no `-e PUID` still lands CLI-fetched files under the
-    same owner the web process uses; outside one, unset means "leave me be".
+    """Re-exec under gosu to PUID/PGID when started as root. The entrypoint drops
+    PID 1 to PUID/PGID, but `docker exec ...
     """
     import os
     import shutil
@@ -1111,11 +1067,7 @@ def _maybe_drop_privileges():
     if not gosu:
         return
     home = os.environ.get("APP_HOME", "/tmp")
-    # Reconstruct the invocation. Under `python -m <pkg>`, sys.argv[0] is the
-    # module *file* path, which gosu would try to exec directly — it has no
-    # exec bit / shebang, so the re-exec dies and privilege-drop silently fails.
-    # Detect the -m case via __main__.__spec__ and route back through the
-    # interpreter; otherwise argv[0] is the console-script wrapper (executable).
+    # Reconstruct the invocation.
     import __main__
     spec = getattr(__main__, "__spec__", None)
     if spec is not None and getattr(spec, "name", None):

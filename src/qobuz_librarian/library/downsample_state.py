@@ -128,8 +128,7 @@ def _write_state(data):
                 os.unlink(tmp)
     except OSError as e:
         # The Downsample view reads this snapshot; a failed write means it
-        # shows stale candidates until the next scan. Surface it (verbose)
-        # instead of staying silent on a full/read-only volume.
+        # shows stale candidates until the next scan.
         from qobuz_librarian.ui_cli.logging import vlog
         vlog(f"downsample state write failed ({e}); saved downsample view may be stale")
 
@@ -370,8 +369,6 @@ def refresh_for_artists(
         candidates, artists_scanned, errors, complete, fingerprints, hidden_sig,
         refresh_started_at)
     # A cancelled refresh only contains the artists reached before the cancel.
-    # Keep the last complete snapshot instead of turning a partial crawl into a
-    # saved review list.
     if persist and result.complete:
         save(
             result,

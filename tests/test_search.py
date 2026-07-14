@@ -108,10 +108,8 @@ def test_get_artist_albums_paginates_and_stops_early():
 
 
 def test_get_artist_albums_advances_past_malformed_page_entries():
-    # A full raw page that mixes in a few malformed (non-dict) entries must NOT
-    # look like the end of the discography. Offset and short-page detection use
-    # the raw page length, so pagination keeps going and every real album is
-    # returned — a regression here silently hides albums during artist scans.
+    # A full raw page that mixes in a few malformed (non-dict) entries must
+    # NOT look like the end of the discography.
     page1 = {"albums": {"items": [{"id": i} for i in range(99)] + ["oops"],
                         "total": 101}}
     page2 = {"albums": {"items": [{"id": 99}, {"id": 100}]}}
@@ -136,9 +134,7 @@ def test_get_artist_albums_does_not_cache_a_short_fetch(tmp_path, monkeypatch):
     album_cache._reset_for_tests()
     try:
         # Qobuz says the artist has 105 albums but hands back 100 and then an
-        # empty page — a transient short read. The 100 we got are returned for
-        # this run, but caching them would hide the other 5 for the whole TTL,
-        # so the next call must re-fetch rather than trust the truncated list.
+        # empty page — a transient short read.
         page1 = {"albums": {"items": [{"id": i} for i in range(100)], "total": 105}}
         empty = {"albums": {"items": []}}
         with patch("qobuz_librarian.api.search.qobuz_get", side_effect=[page1, empty]):

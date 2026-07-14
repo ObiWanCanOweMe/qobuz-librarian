@@ -922,10 +922,8 @@ class _BeetsItemSeal:
             connection.execute("BEGIN IMMEDIATE")
             if not self._matches(connection, before_matches):
                 raise OSError("the reviewed files or beets rows changed")
-            # The recoverable copy must exist before database rows are removed.
-            # A later database error deliberately rolls the rows back and returns
-            # this exact backup for restoration; it must never convert an
-            # uncertain two-system commit into a reported success.
+            # The recoverable copy must exist before database rows are
+            # removed.
             result = mutate()
             if result is None or not result.complete:
                 connection.rollback()
@@ -1236,13 +1234,9 @@ def match_sibling_track(sibling_track, primary_tracks):
             for pt in primary_tracks
         ) != 1:
             return None
-        # Title + disc + position is NOT recording identity without an ISRC/MBID:
-        # a live setlist replayed on another date (or any two distinct
-        # same-titled recordings sharing a slot) matches all three. So the title
-        # fallback additionally requires the durations to agree before declaring
-        # an overlap the deleter will unlink — and where both sides carry a track
-        # number, those must match too. (find_sibling_album_dirs separately
-        # refuses to group folders that differ by year — the other half of this.)
+        # Title + disc + position is NOT recording identity without an
+        # ISRC/MBID: a live setlist replayed on another date (or any two
+        # distinct same-titled recordings sharing a slot) matches all three.
         matches = []
         for pt in primary_tracks:
             primary_isrc = canonical_recording_id(pt.get("isrc"), "isrc")
@@ -1271,9 +1265,7 @@ def consolidation_summary(siblings, primary_tracks):
         sib_tracks = read_album_dir(sib_dir)
         overlap, unique = [], []
         # Each primary track is one recording: at most one sibling track may
-        # claim it as a duplicate. Two distinct sibling files fuzzy-matching the
-        # same primary (two 'Intro's, suite parts) would otherwise BOTH be
-        # deleted, destroying the one that has no real copy in primary.
+        # claim it as a duplicate.
         claimed = set()
         for st in sib_tracks:
             match = match_sibling_track(st, primary_tracks)

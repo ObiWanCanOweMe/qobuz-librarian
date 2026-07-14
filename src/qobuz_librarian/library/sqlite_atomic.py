@@ -469,11 +469,10 @@ def _release_sqlite_database_exclusion_state(state):
             record["transition_pending"] = reference
             _retire_other_clean_sqlite_database_exclusions(record)
             # Keep the exact directory descriptor reusable after release.
-            # Making close(2) the release gate has an unprovable error boundary:
-            # it may consume the descriptor before reporting an interruption,
-            # so retrying its raw number could close an unrelated descriptor.
-            # LOCK_UN is idempotent on this still-owned open description and
-            # therefore gives a safe retry gate before the token is forgotten.
+            # Making close(2) the release gate has an unprovable error
+            # boundary: it may consume the descriptor before reporting an
+            # interruption, so retrying its raw number could close an
+            # unrelated descriptor.
             fcntl.flock(record["descriptor"], fcntl.LOCK_UN)
             tokens.discard(reference)
             record["owner"] = None

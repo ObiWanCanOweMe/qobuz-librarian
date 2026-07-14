@@ -39,8 +39,6 @@ from qobuz_librarian.ui_cli.logging import set_progress_reporter, set_thread_wra
 from qobuz_librarian.web import job_persistence, review_badges
 
 # Thread-local pointer to the job currently being run on this worker.
-# Lets rip_url's cancel-check hook (installed below) find the running
-# job's cancel_requested flag without threading job through every layer.
 _TLS = threading.local()
 _durable_recovery_state_lock = threading.Lock()
 _durable_recovery_job_id: str | None = None
@@ -168,8 +166,7 @@ def _propagate_job_to_thread(target):
 rip_module.set_cancel_check(_current_job_cancel_requested)
 # Carry the running job onto subprocess-reader helper threads (rip + beets) so
 # their live-output log lines reach the right job instead of being dropped by
-# JobLogHandler's per-thread routing. One hook at the shared logging module
-# covers both readers.
+# JobLogHandler's per-thread routing.
 set_thread_wrapper(_propagate_job_to_thread)
 
 
@@ -206,21 +203,14 @@ JOB_ADMISSION_ERROR = (
 APPROVAL_NO_SELECTION = object()
 
 # Sentinel sent to live SSE subscribers to close the current phase's stream.
-# It is intentionally NOT stored in log_lines: a scan/execute job streams in
-# two phases, and a replay for a late subscriber must not contain a stale
-# end-marker that would close the new phase's stream prematurely.
 STREAM_END = "__DONE__"
 
 # Sentinel prefix marking a fanned-out line as a structured progress update
-# (phase + counts) rather than log output. push_line() strips NUL bytes, so a
-# leading NUL can only come from push_progress — the SSE layer splits on it and
-# emits a separate `event: progress` the page renders as a live header.
+# (phase + counts) rather than log output.
 PROGRESS_PREFIX = "\x00PROGRESS\x00"
 
 # Sentinel fanned out when a review's selection or candidate set changes, so
-# other open tabs of the same review refresh live. Like PROGRESS_PREFIX it
-# starts with a NUL push_line() can't produce, so the SSE layer can tell it
-# apart from log output and emit a distinct `event: review`.
+# other open tabs of the same review refresh live.
 REVIEW_CHANGED = "\x00REVIEW\x00"
 _MISSING = object()
 
@@ -236,10 +226,9 @@ class Job:
     artist: str       = ""
     album_id: str     = ""
     # Single-track download undo info, set by the Get-track flow: the resolved
-    # album dir, the downloaded track's isrc/number, and its exact file/directory
-    # ownership record — enough for /undo to cleanly reverse it.
-    # Empty for every other job; its presence is also how the UI knows to hide
-    # Cancel (a one-track download finishes before you could catch it) and show Undo.
+    # album dir, the downloaded track's isrc/number, and its exact
+    # file/directory ownership record — enough for /undo to cleanly reverse
+    # it.
     single: dict      = field(default_factory=dict)
     kind: str         = "download"          # download | scan
     status: JobStatus = JobStatus.PENDING
@@ -251,13 +240,10 @@ class Job:
     progress_item: str    = ""
     progress_found: int   = 0   # running tally of results found so far
     # Artists with at least one find so far — the server-side count behind the
-    # scan page's "across N artists". Client-side counting lost the tally on an
-    # SSE reconnect (per-artist hits aren't replayed), so the cumulative number
-    # rides every progress payload and the reconnect snapshot instead.
+    # scan page's "across N artists".
     progress_found_artists: int = 0
     # What current/total are counting, so the UI can label a bare "12 / 350"
-    # ("artist", "album", "track"). Empty → no unit shown (e.g. downloads, where
-    # the album title + track item already make the count's meaning obvious).
+    # ("artist", "album", "track").
     progress_unit: str    = ""
     log_lines: list   = field(default_factory=list)
     # Review candidates: each is a dict
@@ -268,28 +254,19 @@ class Job:
     # e.g. why a scan found nothing — so it isn't buried in the log.
     summary: str = ""
     # Set when a finished job needs the user's eyes — e.g. a download that
-    # stayed under the quality target after the automatic retry. History marks
-    # the row and the nav carries a warning dot until the job page is opened.
+    # stayed under the quality target after the automatic retry.
     attention: str = ""
-    # Exact retained Repair backups. Unlike log_lines this is durable state:
-    # cancellation, a container restart, and History must all preserve the
-    # receipt-backed recovery location until Repair explicitly resolves it.
+    # Exact retained Repair backups.
     recoveries: list = field(default_factory=list)
     # The verb the review screen's submit button uses. Most jobs download what
     # you approve; the migration job copies (or moves), so it overrides this.
     review_verb: str = "Download"
-    # How to rebind execute_fn after a container restart. The closure passed
-    # into submit_scan can't be serialised; the kind names a flow in the
-    # resume registry (see web/app.py _RESUME_EXECUTE) and execute_args holds
-    # any extra inputs that flow needs (migration's dest path, in_place flag).
-    # Left as "" / {} for jobs that don't need to resume.
+    # How to rebind execute_fn after a container restart.
     execute_kind: str = ""
     execute_args: dict = field(default_factory=dict)
     cancel_requested: bool = False
     created_at: float = field(default_factory=time.time)
-    # When the job actually started working (left the queue). The elapsed clock
-    # counts from here so it shows scan/download time, not how long it sat
-    # pending; falls back to created_at while still queued or after a restart.
+    # When the job actually started working (left the queue).
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
     _execute_fn: Optional[Callable] = field(default=None, repr=False)
@@ -299,29 +276,20 @@ class Job:
         default_factory=threading.RLock,
         repr=False,
     )
-    # Monotonic candidate counter. cids are c{seq} and never reused, so a hide
-    # that drops candidates mid-scan can't collide with a candidate the scan
-    # appends afterwards (a length-based id would).
+    # Monotonic candidate counter.
     _cand_seq: int = field(default=0, repr=False)
     # Set once a scan hits JOB_CANDIDATE_CAP and stops listing further finds.
     _candidate_cap_noted: bool = field(default=False, repr=False)
     # Set by the execute flows the moment the first album/track lands on disk.
-    # An auth failure BEFORE this is set means nothing happened — the approve
-    # path re-parks the review instead of burying the user's picks in a failed
-    # job; after it, normal fail semantics apply (a re-park would re-download).
     _imported_any: bool = field(default=False, repr=False)
-    # How many artists a library scan couldn't check (per-artist errors). The
-    # fold reads it so a partial refresh can't masquerade as a complete one
-    # after the fold rewrites the scan's summary.
+    # How many artists a library scan couldn't check (per-artist errors).
     _unchecked_artists: int = field(default=0, repr=False)
     _preserve_persisted_single: bool = field(default=False, repr=False)
     _single_undo_unavailable: bool = field(default=False, repr=False)
-    # When set to (current, total, unit), push_progress reports THESE counts in
-    # place of the caller's — so a multi-item execute (repairing 16 albums) keeps
-    # the progress card on "album 3 / 16" even while each album's inner phases
-    # (download, import, downsample) report their own 1 / 1. Set/cleared by the
-    # execute loop; None = normal pass-through. The phase + item still come from
-    # the inner call, so the card reads e.g. "Importing… · 3/16 · <album>".
+    # When set to (current, total, unit), push_progress reports THESE counts
+    # in place of the caller's — so a multi-item execute (repairing 16 albums)
+    # keeps the progress card on "album 3 / 16" even while each album's inner
+    # phases (download, import, downsample) report their own 1 / 1.
     _progress_scope: Optional[tuple] = field(default=None, repr=False)
 
     def __post_init__(self):
@@ -359,21 +327,18 @@ class Job:
                     q.put_nowait(line)
                 except queue.Full:
                     # A consumer that fell behind (throttled tab, slow link):
-                    # drop its oldest buffered line to keep the live tail — and
-                    # the closing STREAM_END — flowing rather than freezing the
-                    # stream. The complete log is always on the job page. Only
-                    # _fan_out puts (under this lock) and only the reader gets,
-                    # so the slot we free can't be taken before we reuse it.
+                    # drop its oldest buffered line to keep the live tail —
+                    # and the closing STREAM_END — flowing rather than
+                    # freezing the stream.
                     try:
                         q.get_nowait()
                         q.put_nowait(line)
                     except (queue.Empty, queue.Full):
                         pass
 
-    # Read from config at class-definition time so env overrides on
-    # startup take effect (set JOB_LOG_CAP to lower for tight-memory NAS
-    # boxes, or higher for long artist walks). Stays a class attribute so
-    # tests that monkeypatch Job.LOG_CAP keep working unchanged.
+    # Read from config at class-definition time so env overrides on startup
+    # take effect (set JOB_LOG_CAP to lower for tight-memory NAS boxes, or
+    # higher for long artist walks).
     from qobuz_librarian import config as _cfg
     LOG_CAP = _cfg.JOB_LOG_CAP
     del _cfg
@@ -415,8 +380,7 @@ class Job:
         replay doesn't duplicate a preview row. ``unit`` names what current/total
         count ("artist"/"album"/"track") so the UI can label the bare numbers."""
         # An execute loop can pin the counts to an overall scope (e.g. album
-        # 3/16) so inner per-album phases don't reset the card to 1/1. The
-        # caller's phase, item, and found still pass through.
+        # 3/16) so inner per-album phases don't reset the card to 1/1.
         scope = self._progress_scope
         if scope is not None:
             current, total, unit = scope
@@ -469,9 +433,8 @@ class Job:
         return PROGRESS_PREFIX + json.dumps(snap)
 
     # Cap replay so a late subscriber doesn't get thousands of historical
-    # lines blasted at them (and so the bounded queue isn't filled by
-    # history alone — that would silently drop live lines). Default from
-    # config.JOB_LOG_REPLAY_TAIL (env-tunable).
+    # lines blasted at them (and so the bounded queue isn't filled by history
+    # alone — that would silently drop live lines).
     from qobuz_librarian import config as _cfg2
     REPLAY_TAIL = _cfg2.JOB_LOG_REPLAY_TAIL
     del _cfg2
@@ -488,10 +451,9 @@ class Job:
         """
         q: queue.Queue[str] = queue.Queue(maxsize=2000)
         with self._lock:
-            # Leave at least one slot for the progress snapshot below, so a large
-            # REPLAY_TAIL can't fill the queue with history alone and drop the
-            # reconnect header. REPLAY_TAIL == 0 means replay nothing, not the
-            # everything a bare log_lines[-0:] slice would hand back.
+            # Leave at least one slot for the progress snapshot below, so a
+            # large REPLAY_TAIL can't fill the queue with history alone and
+            # drop the reconnect header.
             tail = min(self.REPLAY_TAIL, q.maxsize - 1)
             for line in (self.log_lines[-tail:] if tail > 0 else []):
                 try:
@@ -528,8 +490,7 @@ class Job:
         cid = None
         with self._lock:
             # Bound the in-memory (and persisted) candidate list so a runaway
-            # whole-library scan can't exhaust memory. Past the cap, drop new
-            # finds and flag it once so the user knows to narrow the scan.
+            # whole-library scan can't exhaust memory.
             if len(self.candidates) >= self.CANDIDATE_CAP:
                 capped = not self._candidate_cap_noted
                 self._candidate_cap_noted = True
@@ -621,10 +582,8 @@ class JobRegistry:
     """In-memory store for all jobs, bounded to the last N finished jobs."""
 
     MAX_FINISHED = 50
-    # A finished job a client is still streaming is kept past MAX_FINISHED until
-    # the stream closes, so a slow viewer isn't 404'd. But a socket that wedged
-    # open without running its unsubscribe would pin it — and its log — in RAM
-    # forever, so force-evict one finished longer ago than this.
+    # A finished job a client is still streaming is kept past MAX_FINISHED
+    # until the stream closes, so a slow viewer isn't 404'd.
     _PINNED_MAX_AGE_SEC = 3600
 
     def __init__(self):
@@ -690,11 +649,9 @@ class JobRegistry:
         for job in finished:
             if excess <= 0:
                 break
-            # Don't evict a job a client is still streaming/viewing — that would
-            # 404 it out from under them; it's pruned once the stream closes. But
-            # a socket that wedged open (never ran its unsubscribe) would pin the
-            # job and its log in RAM forever, so force-evict one finished longer
-            # ago than any real post-finish stream would stay open.
+            # Don't evict a job a client is still streaming/viewing — that
+            # would 404 it out from under them; it's pruned once the stream
+            # closes.
             age = now - (job.finished_at or job.created_at)
             if job._subscribers and age < self._PINNED_MAX_AGE_SEC:
                 continue
@@ -732,12 +689,7 @@ class JobLogHandler(logging.Handler):
     def emit(self, record: logging.LogRecord):
         # Both worker lanes (download + scan) attach a handler to the SAME
         # process-global "qobuz_librarian" logger, and Python dispatches every
-        # record to EVERY handler regardless of the emitting thread. Without this
-        # filter a download's lines (incl. [ERROR]) bleed into a concurrent
-        # scan's log/SSE stream and vice versa. _TLS.current_job identifies the
-        # emitting thread's job (set in _run_task, and propagated into pool
-        # workers via pool_initializer_kwargs), so only push records that belong
-        # to THIS handler's job.
+        # record to EVERY handler regardless of the emitting thread.
         if getattr(_TLS, "current_job", None) is not self.job:
             return
         try:
@@ -770,9 +722,7 @@ def resolve_recovery_resolution(plan) -> bool:
     for job in live_jobs:
         job._lock.acquire()
     try:
-        # A full persist takes the same job lock before the database lock. Keep
-        # that order here and update memory before releasing it, so a delayed
-        # save cannot put a consumed recovery record back after this CAS.
+        # A full persist takes the same job lock before the database lock.
         updates = job_persistence.resolve_recovery_resolution(plan)
         if updates is None:
             return False
@@ -789,8 +739,7 @@ def resolve_recovery_resolution(plan) -> bool:
             job._lock.release()
 
 # Undo and backup Restore mutate the library directly from request workers
-# rather than through JobRegistry. Keep their short-lived registrations beside
-# the job registry so the web/CLI run-lock handoff sees every active writer.
+# rather than through JobRegistry.
 _library_operations: dict[str, str] = {}
 _library_operations_condition = threading.Condition()
 _library_operations_accepting = True
@@ -817,9 +766,7 @@ def active_library_operations() -> list[str]:
 
 # Review ticks save the whole candidate list, and on a big library that list
 # runs to tens of megabytes — written per checkbox, each tap waited on a
-# multi-hundred-ms serialize+write. Coalesce instead: at most one save per job
-# per delay window. Approve, discard, and status changes still persist
-# synchronously, so at worst a crash loses the last second and a half of ticks.
+# multi-hundred-ms serialize+write.
 _PERSIST_DELAY = 1.5
 _persist_timers: dict[str, threading.Timer] = {}
 _persist_timers_lock = threading.Lock()
@@ -842,11 +789,7 @@ def persist_soon(job) -> None:
         _persist_timers[job.id] = t
         t.start()
 # Two worker lanes so a quick single-album download isn't stuck behind a scan
-# whose execute phase is downloading 30 albums. Each lane keeps its own work
-# queue and worker thread; the shared `staging_lock` below serialises the
-# parts that actually touch /staging (rip + beets), so the two lanes safely
-# interleave per-album rather than per-job. Scans themselves don't take the
-# lock, so a download can run while a scan is mid-walk.
+# whose execute phase is downloading 30 albums.
 _download_worker_thread: Optional[threading.Thread] = None
 _scan_worker_thread: Optional[threading.Thread] = None
 _download_queue: "queue.Queue" = queue.Queue()
@@ -916,11 +859,7 @@ class _StagingMutex:
         self.release()
 
 
-# Mutual exclusion around the actual rip+import work. Acquired per album in
-# the execute loops (and once around each single-album download), released
-# between albums so the other lane gets a turn. Streamrip writes per-album
-# subfolders into /staging and beets has a process-wide SQLite lock — running
-# both lanes in parallel without this would race on both.
+# Mutual exclusion around the actual rip+import work.
 _staging_lock = _StagingMutex()
 
 
@@ -936,10 +875,7 @@ def staging_lock():
 
 
 # Human label for a long staging-lock hold — a library-wide Lyrics scan holds
-# the mutex for its whole (possibly hours-long) run, not per album. Set while
-# it owns the lock so a job blocked on it can tell the user what it's waiting
-# behind instead of sitting on RUNNING with no reason. Per-album holders leave
-# it None; they clear in well under a second.
+# the mutex for its whole (possibly hours-long) run, not per album.
 _staging_holder: Optional[str] = None
 _staging_holder_lock = threading.Lock()
 
@@ -1012,10 +948,7 @@ def _run_task(job: Job, fn):
         fn(job)
         if (job.cancel_requested and job.status not in TERMINAL
                 and job.status != JobStatus.AWAITING_REVIEW):
-            # A cooperative fn returned early on the cancel flag. A scan that
-            # reached AWAITING_REVIEW finished and parked results — a cancel
-            # landing just after that mustn't discard them; cancel_review is
-            # the explicit path for dismissing a parked review.
+            # A cooperative fn returned early on the cancel flag.
             job.status = JobStatus.CANCELED
         # fn may have parked the job in AWAITING_REVIEW (scan with results);
         # only auto-complete a job that's still RUNNING.
@@ -1024,9 +957,6 @@ def _run_task(job: Job, fn):
     except BaseException as e:  # noqa: BLE001 - the worker must stay durable
         # SystemExit and other fatal boundaries must surface as failed jobs,
         # not escape after the still-RUNNING state was persisted.
-        # Some exit messages embed ANSI escapes (fmt(C.RED, ...)) which
-        # would render as literal `\x1b[91m...` in the web UI — strip
-        # them so the error banner is readable.
         raw = str(e) or e.__class__.__name__
         cleaned = JobLogHandler._ANSI.sub("", raw).strip()
         job.status = JobStatus.FAILED
@@ -1038,10 +968,6 @@ def _run_task(job: Job, fn):
         # Persist BEFORE the hook fires: durability must never wait on a
         # webhook, and a stalled hook was able to leave a finished job saying
         # "running" on disk for its whole timeout.
-        # Skip if the job was evicted from the registry while we ran — a
-        # terminal transition above can race a concurrent Clear-History (which
-        # deletes the row), and a blind persist would re-insert the just-cleared
-        # job onto the History page.
         _finish_task_phase(job)
 
 
@@ -1133,21 +1059,15 @@ def _worker_loop(work_queue: "queue.Queue"):
                 # Only drain when nothing is active anywhere: the OTHER worker
                 # lane may be mid-job, and applying a deferred quality/config
                 # change on this idle tick is exactly the mid-job mutation
-                # save() deferred to prevent. (The pre-job drain below is the
-                # intended apply point once a lane picks up the next job.)
+                # save() deferred to prevent.
                 if not settings_store._any_active_job():
                     settings_store.drain_pending()
             except Exception:
                 pass
             continue
         # Settings changes deferred while we were busy are applied BEFORE the
-        # next job so "apply now" takes effect for it — but NOT while the OTHER
-        # lane is mid-execution. This lane's job is still PENDING here (it goes
-        # RUNNING below), so registry.executing() reflects only a concurrently
-        # RUNNING/SCANNING job in the other lane, which is reading cfg per-item
-        # right now; applying config under it is exactly the mid-job mutation
-        # save() deferred. When the other lane is busy, the change stays deferred
-        # and the idle tick (or the next pre-job point) applies it once idle.
+        # next job so "apply now" takes effect for it — but NOT while the
+        # OTHER lane is mid-execution.
         try:
             from qobuz_librarian.web import settings_store
             if not registry.executing():
@@ -1175,11 +1095,7 @@ def _worker_loop(work_queue: "queue.Queue"):
             if canceled_pending:
                 _finish_canceled(job)
             elif claimed:
-                # Recheck after the queue wait. A job may have been admitted
-                # while the data volume was healthy and then lost write access
-                # before its turn. In particular, a durable album completion
-                # needs this exact jobs.db row for its final acknowledgement;
-                # starting without it can leave recovery permanently blocked.
+                # Recheck after the queue wait.
                 if not job_persistence.admit(job):
                     with job._lock:
                         job.status = JobStatus.FAILED
@@ -1231,10 +1147,7 @@ def stop_worker():
     global _download_worker_thread, _scan_worker_thread
     global _library_operations_accepting
     with _worker_lifecycle_lock:
-        # Serialise the admission gate with start_worker(). Otherwise a start
-        # racing this stop could re-open direct operations just before we set
-        # the stop event, leaving a stopped Web process willing to admit new
-        # library writes.
+        # Serialise the admission gate with start_worker().
         with _library_operations_condition:
             _library_operations_accepting = False
         _stop_event.set()
@@ -1250,8 +1163,7 @@ def stop_worker():
         _download_worker_thread = None
         _scan_worker_thread = None
         # Keep start_worker() outside the lifecycle boundary until every
-        # already-admitted request write has drained as well. end_library_operation
-        # only needs the condition below, so waiting here cannot deadlock it.
+        # already-admitted request write has drained as well.
         with _library_operations_condition:
             _library_operations_condition.wait_for(
                 lambda: not _library_operations)
@@ -1260,9 +1172,7 @@ def stop_worker():
 def submit(job: Job, fn) -> Optional[Job]:
     """Queue a simple job. fn(job) runs to completion on the download worker."""
     # A fresh durable Web album binds its completion acknowledgement to this
-    # exact jobs.db row. Save it before publishing the job in memory or letting
-    # a worker observe it; otherwise a failed first save can allow the import to
-    # finish with no owner row capable of retiring the completion journal.
+    # exact jobs.db row.
     if not job_persistence.admit(job):
         return None
     registry.add(job)
@@ -1322,8 +1232,6 @@ def resubmit_failed(job: Job, fn) -> bool:
         if not job_persistence.persist(job):
             with job._lock:
                 # A queued cancel may have won after PENDING was published.
-                # Preserve that newer terminal transition instead of rolling it
-                # back to FAILED; no worker has been enqueued yet either way.
                 if job.status is JobStatus.PENDING:
                     for name, value in previous.items():
                         setattr(job, name, value)
@@ -1492,18 +1400,12 @@ def approve(
         job.notify_review_changed()
 
     def _execute(j: Job):
-        # Cancelled between approve and the worker picking this up: don't start
-        # the work. _run_task sees the flag on a still-RUNNING job and marks it
-        # CANCELED.
+        # Cancelled between approve and the worker picking this up: don't
+        # start the work.
         if j.cancel_requested:
             return
         j.phase = "execute"
-        # Read the selection at run time, not at approve time. A hide/dismiss
-        # can land in the window between approve flipping the status and the
-        # worker starting this (its own status guard and mutation straddle an
-        # await), and dismiss drops those candidates from j.candidates under the
-        # same lock. Reading here means an album hidden in that window isn't
-        # downloaded — a stale approve-time snapshot would queue it anyway.
+        # Read the selection at run time, not at approve time.
         with j._lock:
             chosen = j.selected_candidates()
         if not chosen:
@@ -1514,10 +1416,8 @@ def approve(
             j._execute_fn(j, chosen)
         except (Exception, SystemExit) as e:
             # Qobuz went away before ANYTHING landed: put the review back
-            # exactly as it was instead of burying the picks in a failed job
-            # — a months-old review's ticks would otherwise be gone for good.
-            # After the first import, normal fail semantics apply (a re-park
-            # would re-download what already landed).
+            # exactly as it was instead of burying the picks in a failed job —
+            # a months-old review's ticks would otherwise be gone for good.
             from qobuz_librarian.api.auth import AuthLost, QobuzUnavailable
             if (j._imported_any or j.cancel_requested or j.recoveries
                     or not isinstance(e, (AuthLost, QobuzUnavailable,
@@ -1546,8 +1446,7 @@ def cancel_review(job: Job) -> bool:
     # Flip under the job lock so this can't race approve() (which also flips
     # AWAITING_REVIEW under the lock); otherwise a cancel could land after an
     # approve already queued the execute phase, showing CANCELED while work
-    # runs. end_stream() is called outside the lock — it re-acquires the lock
-    # to fan out, so calling it inside would deadlock.
+    # runs.
     with job._review_action_lock, job._lock:
         if job.status != JobStatus.AWAITING_REVIEW:
             return False
@@ -1557,8 +1456,6 @@ def cancel_review(job: Job) -> bool:
     if job.execute_kind == "library":
         # Discarded — retire the baseline's review so the saved-state
         # reconstruction doesn't immediately rebuild what the user threw away.
-        # (A re-scan that supersedes a stale review advances the scan's
-        # updated_at past this, so its fresh review still shows.)
         from qobuz_librarian.library import library_scan_state
         library_scan_state.mark_review_retired(reason="discarded")
     job.end_stream()
@@ -1608,8 +1505,7 @@ def restore_jobs(
                 job_persistence.delete(row["id"])
                 continue
             # A recovery carrier is different: its exact backup record is a
-            # safety obligation. Retain it as failed instead of letting an
-            # unfamiliar future/corrupt status erase the only visible path.
+            # safety obligation.
             status = JobStatus.FAILED
             unknown_recovery_status = True
         job = Job(
@@ -1648,8 +1544,7 @@ def restore_jobs(
             )
         if completion_acknowledged and durable_recovery_clear is True:
             # Startup recovery proved and acknowledged this exact job
-            # incarnation before retiring the queue journal.  Restoring it as
-            # FAILED would offer a duplicate Retry for work already completed.
+            # incarnation before retiring the queue journal.
             job.status = JobStatus.DONE
             job.phase = ""
             job.error = None
@@ -1662,8 +1557,7 @@ def restore_jobs(
         elif completion_acknowledged:
             # The acknowledgement says the library mutation crossed its
             # durable boundary, but only a fresh CLEAR startup inspection may
-            # retire the Web job. Keep it visible and non-retryable so a stale
-            # acknowledgement can never offer a duplicate download.
+            # retire the Web job.
             job.status = JobStatus.FAILED
             job.phase = ""
             job.error = (
@@ -1686,11 +1580,9 @@ def restore_jobs(
             job_persistence.persist(job)
         elif status in (JobStatus.PENDING, JobStatus.RUNNING):
             job.status = JobStatus.FAILED
-            # Only an album download / single-track download carries an album_id, and
-            # only those get a Retry button on the job + history pages. Point every
-            # other kind at the page it re-runs from instead of telling the user to
-            # "submit it again" — there's no control on a failed lyrics/migration/
-            # library job to do that, so the generic message promised a dead end.
+            # Only an album download / single-track download carries an
+            # album_id, and only those get a Retry button on the job + history
+            # pages.
             restart = "Interrupted by a container restart. "
             if job.album_id:
                 job.error = restart + "Use Retry to download it again."
@@ -1710,8 +1602,7 @@ def restore_jobs(
             job_persistence.persist(job)
         elif status == JobStatus.SCANNING:
             # A scan caught mid-crawl isn't a failure — record it as cancelled
-            # (neutral) with a note in the summary, not a red error. A library
-            # scan keeps a checkpoint and continues from where it stopped.
+            # (neutral) with a note in the summary, not a red error.
             job.status = JobStatus.CANCELED
             # Library scans auto-resume from their checkpoint when the app next
             # opens; the whole-library repair sweep also checkpoints but only
@@ -1739,8 +1630,7 @@ def restore_jobs(
         elif status == JobStatus.AWAITING_REVIEW:
             if job.recoveries:
                 # Older builds could re-park a Repair after its originals had
-                # already been retained.  Never revive that unsafe state after
-                # a restart: the recovery must be handled before another run.
+                # already been retained.
                 job.status = JobStatus.FAILED
                 job.error = ("Original files remain at the recovery location "
                              "shown below. Check or restore them before "
@@ -1762,9 +1652,8 @@ def restore_jobs(
             historical += 1
         restored.append(job)
     # Insert once, then bound the in-memory finished set to MAX_FINISHED just
-    # like a live add() would — the archive on disk keeps up to PERSIST_KEEP so
-    # an evicted job still renders via /jobs/{id}. Without this a busy prior run
-    # would rehydrate hundreds of finished jobs straight onto /queue.
+    # like a live add() would — the archive on disk keeps up to PERSIST_KEEP
+    # so an evicted job still renders via /jobs/{id}.
     with registry._lock:
         for job in restored:
             registry._jobs[job.id] = job
@@ -1837,15 +1726,13 @@ def request_cancel(job: Job) -> bool:
     Returns False if the job is finished or owns unsettled durable recovery.
     """
     # A durable retry must keep its original job identity until the saved
-    # journal settles. Turning that exact PENDING job into CANCELED would leave
-    # recovery proof behind with no job that the Retry path can resume.
+    # journal settles.
     if _is_durable_recovery_job(job):
         return False
     if job.status == JobStatus.AWAITING_REVIEW and cancel_review(job):
         return True
-    # Either it wasn't in review, or an approve() flipped it to PENDING between
-    # the check and cancel_review's locked re-check. Fall through to the
-    # cooperative flag so that race doesn't swallow the user's cancel.
+    # Either it wasn't in review, or an approve() flipped it to PENDING
+    # between the check and cancel_review's locked re-check.
     with job._lock:
         if job.status in TERMINAL:
             return False
@@ -1853,8 +1740,7 @@ def request_cancel(job: Job) -> bool:
         canceled_pending = job.status == JobStatus.PENDING
         if canceled_pending:
             # Finalize immediately rather than leaving a queued cancel behind
-            # whatever is already using the lane. The worker claims PENDING
-            # under this same lock, so it cannot overwrite this transition.
+            # whatever is already using the lane.
             job.status = JobStatus.CANCELED
             job.finished_at = time.time()
     if canceled_pending:

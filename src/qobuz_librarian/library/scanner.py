@@ -39,10 +39,9 @@ def iter_tree_no_symlinks(root: Path, errors=None):
     like "contains no audio" must not be drawn (or cached) from it.
     """
     def _onerror(err):
-        # os.walk swallows scandir failures by default — a permission-denied or
-        # I/O-failed subdir would then silently drop its tracks from the scan
-        # with no signal at all. Surface it (verbose) so vanished files are at
-        # least diagnosable.
+        # os.walk swallows scandir failures by default — a permission-denied
+        # or I/O-failed subdir would then silently drop its tracks from the
+        # scan with no signal at all.
         vlog(f"scan: couldn't read {getattr(err, 'filename', root)}: {err}")
         if errors is None:
             raise err
@@ -108,11 +107,8 @@ def read_audio_meta(path: Path):
     try:
         f = mutagen.File(str(path), easy=True)
     except OSError:
-        # A read failure (EACCES/EIO/ESTALE) is not proof the file is untagged.
-        # Caching a negative here would blank its identity (ISRC, quality) for
-        # every scan until the file changes, and falling back to the filename
-        # would silently undercount the ISRC censuses that gate backup
-        # deletion. Let it propagate so the caller records a walk error.
+        # A read failure (EACCES/EIO/ESTALE) is not proof the file is
+        # untagged.
         raise
     except Exception:
         flac_cache.put(path, _NEG_META, sig=sig)
@@ -150,8 +146,7 @@ def read_audio_meta(path: Path):
         "path":        str(path),
         # Carry the size from the signature so read_album_dir doesn't have to
         # re-stat every audio file just for its size (a second stat per file
-        # adds up on a NAS-backed library). Cache HIT entries pre-dating this
-        # key fall back to the stat there.
+        # adds up on a NAS-backed library).
         "size":        sig[1] if sig else 0,
     }
     flac_cache.put(path, meta, sig=sig)
@@ -187,10 +182,8 @@ def read_album_dir(album_dir: Path, walk_errors=None):
     _exts = set(config.AUDIO_EXTS)
     try:
         for f in iter_tree_no_symlinks(album_dir, errors=walk_errors):
-            # is_file() re-raises EACCES/EIO/ESTALE (only ENOENT-class errors are
-            # swallowed by pathlib). Catch per entry so one unreadable file drops
-            # only itself, not every track after it — a truncated album list
-            # would mislead the backup/upgrade gates into deleting a good copy.
+            # is_file() re-raises EACCES/EIO/ESTALE (only ENOENT-class errors
+            # are swallowed by pathlib).
             try:
                 if f.suffix.lower() in _exts and f.is_file():
                     audio_files.append(f)
@@ -212,9 +205,7 @@ def read_album_dir(album_dir: Path, walk_errors=None):
             tags = read_audio_meta(f)
         except OSError as e:
             # The file is listed but can't be read: drop it AND mark the walk
-            # degraded. The filename fallback below is for files that parse as
-            # untagged, not for read failures — those must not enter counts
-            # with a blanked ISRC/quality.
+            # degraded.
             if walk_errors is None:
                 raise
             walk_errors.append(f"{f}: {e}")
@@ -223,9 +214,7 @@ def read_album_dir(album_dir: Path, walk_errors=None):
         if tags is None:
             stem = f.stem
             # Strip a leading track-number token in any common form — "NN - ",
-            # "NN. ", "NN ", "NN-" — so a dot/space-named untagged rip matches the
-            # Qobuz title instead of keeping the digits and reading as missing. A
-            # bare number with no separator ("1979") is left alone.
+            # "NN.
             m = re.match(r"^(\d+)[\s.\-]+(.+)$", stem)
             # Derive the disc from a "Disc N" / "CD N" parent so two same-titled
             # tracks on different discs don't collapse to one (disc, title) key.
@@ -276,10 +265,9 @@ def _has_audio_anywhere(d: Path, walk_errors=None):
     iter_tree per call is wasted iterdir+stat on every album subtree.
     """
     key = str(d)
-    # Atomic get: a concurrent download's clear_scan_caches() can empty the dict
-    # between an `in` check and the lookup, and that KeyError would escape the
-    # OSError guard below and drop the artist from the scan. Cached values are
-    # never None, so None unambiguously means "not cached".
+    # Atomic get: a concurrent download's clear_scan_caches() can empty the
+    # dict between an `in` check and the lookup, and that KeyError would
+    # escape the OSError guard below and drop the artist from the scan.
     cached = _HAS_AUDIO_CACHE.get(key)
     if cached is not None:
         return cached
@@ -301,8 +289,7 @@ def _has_audio_anywhere(d: Path, walk_errors=None):
         walk_errors.append(f"{d}: {e}")
     if walk_errors is not None and len(walk_errors) > error_count:
         # os.walk consumed a scandir failure via the error callback and walked
-        # on without that subtree — the audio may live exactly there. Do not
-        # poison the cache or report the directory as empty.
+        # on without that subtree — the audio may live exactly there.
         return None
     _HAS_AUDIO_CACHE[key] = False
     return False
@@ -413,9 +400,7 @@ def list_artist_album_dirs(artist_dir: Path, walk_errors=None):
 
 # ── Per-scan directory cache ──────────────────────────────────────────────────
 # Cleared via clear_scan_caches() at every top-level mode entry so memory
-# stays bounded. The fuzzy-match fallback in find_album_dir_filesystem hits
-# the same artist dir for every album; the cache turns N iterdir() calls
-# per artist into one.
+# stays bounded.
 _ARTIST_SUBDIRS_CACHE: dict = {}
 
 

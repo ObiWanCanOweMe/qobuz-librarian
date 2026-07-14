@@ -63,11 +63,8 @@ def canonical_track_slot(track, disc_field, number_field):
         return None
     return disc, number
 
-# beets' own default `replace` rules (its config_default.yaml), in the order it
-# applies them. Running a name through these gives the exact folder/file beets
-# would write — predicted_album_paths and the migrate placement both depend on
-# that equivalence, so a name like "...And Justice for All" resolves instead of
-# looking missing.
+# beets' own default `replace` rules (its config_default.yaml), in the order
+# it applies them.
 _BEETS_REPLACEMENTS = (
     (re.compile(r'[<>:?*|]'), "_"),
     (re.compile(r'"'),        "_"),
@@ -104,11 +101,8 @@ def clean_qobuz_string(s):
         return ""
     return _WHITESPACE_RUN_RE.sub(" ", s).strip()
 
-# Normalized forms of the "Various Artists" placeholder used by Qobuz and
-# many libraries. Matched after normalize() (lowercased, alphanum-only)
-# so "Various Artists", "various artists", "VA", "various", "V.A." all
-# fall into the same bucket. Used as a guard wherever Qobuz can't return
-# a meaningful artist catalog for a compilation alias.
+# Normalized forms of the "Various Artists" placeholder used by Qobuz and many
+# libraries.
 VA_NORMALIZED = frozenset({"variousartists", "various", "va"})
 
 
@@ -168,8 +162,7 @@ def strip_leading_article(name):
 
 # ── Track-title edition stripping ─────────────────────────────────────────────
 # Performance variants mark genuinely different recordings and must NOT be
-# stripped. If a parenthesized suffix contains one of these, we leave it
-# attached so the title remains distinct in compute_missing.
+# stripped.
 _PERFORMANCE_VARIANT_RE = re.compile(
     r"\b(?:"
     r"acoustic|live|demo|remix|instrumental|"
@@ -192,10 +185,7 @@ _PERFORMANCE_VARIANT_RE = re.compile(
 _TRAILING_PAREN_CAPTURE_RE = re.compile(r"\s*\(([^()]*)\)\s*$")
 
 # A parenthesized collaboration credit — "(with Beyoncé)" — names a distinct
-# recording and stays attached. Anchored to the start so a "with" buried in an
-# edition descriptor ("(Single Version with Intro)") doesn't keep that whole
-# edition tag; the common "(feat. X)" / "(featuring X)" forms are handled by
-# the performance-variant set above.
+# recording and stays attached.
 _LEADING_COLLAB_RE = re.compile(r"^\s*with\s+\w", re.IGNORECASE)
 
 
@@ -262,18 +252,13 @@ def canonical_track_title(value):
 
 # ── Album-name decoration stripping ──────────────────────────────────────────
 _YEAR_PAREN_RE = re.compile(r"\s*\([^)]*\d{4}[^)]*\)\s*$")
-# Leading-year forms from alternate beets path templates, e.g.
-# `[$year] $album/` produces "[1971] Hunky Dory"; `$year - $album/`
-# produces "1971 - Hunky Dory". A bare year requires a dash separator so a
-# title that simply IS a year ("1989", "2112 (Deluxe)") isn't mistaken for a
-# year prefix and eaten; the bracketed form is unambiguous.
+# Leading-year forms from alternate beets path templates, e.g. `[$year]
+# $album/` produces "[1971] Hunky Dory"; `$year - $album/` produces "1971 -
+# Hunky Dory".
 _LEADING_YEAR_RE   = re.compile(
     r"^\s*(?:\[\s*\d{4}\s*\]\s*[-–—]?|\d{4}\s*[-–—])\s+")
 
 # Edition keywords to strip from album title suffixes.
-# Deliberately excluded (different products, stay separate):
-#   companion / companion ep, live, demos, acoustic, instrumental,
-#   remix / remixed, b-sides / b sides / rarities
 _EDITION_TAIL_KEYWORDS = (
     r"(?:\d{4}\s+)?(?:re)?master(?:ed)?(?:\s+edition)?|"
     r"(?:\d{1,4}\w{0,2}\s+)?anniversary(?:\s+edition)?|"
@@ -294,8 +279,7 @@ _EDITION_TAIL_RE = re.compile(
 # The same distinct-release markers, applied to the parenthesized form: a
 # trailing '(Live)' / '(Acoustic)' / '(Demos)' is a different record, not an
 # edition, so it's never stripped — mirroring the colon/dash exclusions above
-# and strip_edition_suffix on track titles. Without this a live or acoustic
-# album collapses onto the studio one and gets hidden from the missing scan.
+# and strip_edition_suffix on track titles.
 _ALBUM_VARIANT_RE = re.compile(
     r"\b(?:live|unplugged|acoustic|demos?|instrumental|"
     r"remix(?:ed|es)?|b[\s-]?sides?|rarities|companion|sessions?)\b",
@@ -323,10 +307,8 @@ _ALBUM_VARIANT_TOKENS = (
 
 # Common words that legitimately follow a variant marker in real album titles
 # once spaces have been normalized out: "live AT Wembley", "live IN Tokyo",
-# "Live FROM the BBC", "demo TAPES", "Demo VERSION", "Live RECORDINGS",
-# "Live EP". Recognising these as a continuation lets a true variant title
-# pass the boundary check; arbitrary continuations like 'liver-pool' or
-# 'session-al' (the coincidental-substring false positives) don't.
+# "Live FROM the BBC", "demo TAPES", "Demo VERSION", "Live RECORDINGS", "Live
+# EP".
 _ALBUM_VARIANT_CONTINUATIONS = (
     "at", "in", "from", "of", "and", "with", "feat",
     "tapes", "tape", "version", "versions", "tracks", "track",
@@ -380,24 +362,16 @@ def differs_by_album_variant(shorter, longer):
 @lru_cache(maxsize=2048)
 def strip_album_decorations(name):
     """Strip trailing edition decorations iteratively from an album name.
-
-    Parenthesized decorations:
-      'Revolver (2009 Remaster)' → 'Revolver'
-      'Album (Deluxe) (2018)'    → 'Album'
-
-    Colon / dash suffixes:
-      'Cassadaga: Deluxe Edition' → 'Cassadaga'
-      'Revolver - 2022 Remaster'  → 'Revolver'
-      'Album: 50th Anniversary Edition' → 'Album'
-
-    Deliberately NOT stripped (these are distinct releases), in either the
-    parenthesized or colon/dash form:
-      'Cassadaga: A Companion'  (companion EP — different recordings)
-      'Album: Live in Tokyo' / 'Album (Live)'   (live album)
-      'Album: B-Sides' / 'Greatest Hits (Acoustic)'  (rarities / acoustic set)
-
-    Iterates up to 8 times so combined decorations like
-    'Foo: Deluxe Edition (2023)' fully strip in a single call.
+    Parenthesized decorations: 'Revolver (2009 Remaster)' → 'Revolver' 'Album
+    (Deluxe) (2018)' → 'Album' Colon / dash suffixes: 'Cassadaga: Deluxe
+    Edition' → 'Cassadaga' 'Revolver - 2022 Remaster' → 'Revolver' 'Album:
+    50th Anniversary Edition' → 'Album' Deliberately NOT stripped (these are
+    distinct releases), in either the parenthesized or colon/dash form:
+    'Cassadaga: A Companion' (companion EP — different recordings) 'Album:
+    Live in Tokyo' / 'Album (Live)' (live album) 'Album: B-Sides' / 'Greatest
+    Hits (Acoustic)' (rarities / acoustic set) Iterates up to 8 times so
+    combined decorations like 'Foo: Deluxe Edition (2023)' fully strip in a
+    single call.
     """
     s = name
     for _ in range(8):

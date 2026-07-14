@@ -1362,9 +1362,6 @@ def _resolve_queue_item(item, args, imported_globally, *, authority=None):
         post_dir = find_album_dir_filesystem(item["album"])
     # For brand-new albums (album_dir=None), find_album_dir_filesystem may
     # return None if the cache hasn't refreshed. Clear and retry once.
-    # Only bother when beets actually ran — if the import was never attempted
-    # the cache is already correct and clearing it for every short-circuited
-    # item in a large cancelled batch would thrash it O(n) times for nothing.
     if (
         post_dir is None
         and imported_globally
@@ -1651,19 +1648,13 @@ def _resolve_queue_item(item, args, imported_globally, *, authority=None):
     gfb = item.get("gap_fill_backup_path")
     if gfb is not None and gfb.exists():
         # Drop the moved-aside present tracks only when the re-rip imported
-        # cleanly — _item_strict_success requires n_fail == 0 AND n_lossy == 0,
-        # so a lossy/short re-rip of a present track can't clear the original
-        # (mirrors the full-album gap-fill gate in process.py). That signal is
-        # independent of whether we then *located* the filled folder, which
-        # matters: a clean import beets filed where the matcher can't find it
-        # must NOT be treated as a failure and restored over itself.
-        # NOT just "the folder has any audio": beets returns success when it
-        # moved anything, and it can leave tracks in staging on the success
-        # path — so a partial move would pass a >0 check while the present
-        # tracks' only copy is this backup. And not a raw file count either:
-        # extras, duplicate files, or pre-existing tracks reach the expected
-        # number while an expected track is absent. Require every expected
-        # track to match one-to-one, like process.py's gate.
+        # cleanly — _item_strict_success requires n_fail == 0 AND n_lossy ==
+        # 0, so a lossy/short re-rip of a present track can't clear the
+        # original (mirrors the full-album gap-fill gate in process.py). That
+        # signal is independent of whether we then *located* the filled
+        # folder, which matters: a clean import beets filed where the matcher
+        # can't find it must NOT be treated as a failure and restored over
+        # itself.
         _filled_whole = (
             not ownership_scope_used
             and album_has_content
@@ -2825,9 +2816,7 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
         # Drop a finished item from the persisted queue BEFORE resolving its
         # backup. If the process dies between the two, the worst case is an
         # orphaned backup the retention sweep clears — not a completed album
-        # left queued and needlessly re-downloaded on the next resume. The
-        # retry decision reads only download-phase state, so it's unaffected by
-        # the resolve that now follows it.
+        # left queued and needlessly re-downloaded on the next resume.
         if not _queue_item_needs_retry(item):
             _drop(item)
         results.append(_resolve_queue_item(

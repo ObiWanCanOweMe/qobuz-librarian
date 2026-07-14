@@ -40,34 +40,21 @@ SCOPE_MISSING = "missing"
 SCOPE_UPGRADE = "upgrade"
 SCOPE_DOWNSAMPLE = "downsample"
 # A deliberately downloaded single track: the album folder is left partial on
-# purpose. Unlike the dismissal scopes above this isn't "reviewed and declined"
-# but "I only wanted this track", so it has its own writers (mark/unmark) that
-# also store the Qobuz album id, and it drives the "collecting" signal — an
-# artist you own only singles by is not surfaced in the bulk walks.
+# purpose.
 SCOPE_SINGLE = "single"
 _SCOPES = (SCOPE_MISSING, SCOPE_UPGRADE, SCOPE_DOWNSAMPLE, SCOPE_SINGLE)
 
-# Serialises the load-modify-save in every mutator. mark_single fires on the
-# download executor thread while a scan or request may be hiding/restoring on
-# another; load()+save() is a read-modify-write that would otherwise drop one
-# side's update. In-process thread guard; _store_lock() adds the cross-process
-# half.
+# Serialises the load-modify-save in every mutator.
 _LOCK = threading.RLock()
 
 
 @contextmanager
 def _store_lock():
     """Serialise the hidden-store load-modify-save across BOTH threads and OS
-    processes.
-
-    The web hide/restore routes deliberately run without the global run-lock (so
-    a review row can still be dismissed while a scan holds it, or after the web
-    app hands the run-lock to the terminal). During that CLI handoff a separate
-    process can be marking single-track graduations at the same time — two OS
-    processes the in-process RLock can't serialise. An flock on a sidecar lock
-    file does. Best-effort on the file lock: if it can't be opened (read-only or
-    an odd mount) we proceed on the in-process lock alone rather than block a
-    dismissal."""
+    processes. The web hide/restore routes deliberately run without the global
+    run-lock (so a review row can still be dismissed while a scan holds it, or
+    after the web app hands the run-lock to the terminal).
+    """
     with _LOCK:
         lock_path = cfg.HIDDEN_FILE.parent / (cfg.HIDDEN_FILE.name + ".lock")
         fh = None
@@ -155,13 +142,8 @@ _SAVE_FAILED_MSG = ("Couldn't save that — the data folder looks full or "
 
 
 def save(store):
-    # Callers hold _store_lock() across load()+save(), so this writer never races
-    # a second writer of the same store. The temp file is still unique per write
-    # (mkstemp, not a fixed ".tmp" name): a shared temp name let two concurrent
-    # writers — a web hide racing a CLI single-marker during a run-lock handoff —
-    # clobber each other's partial write and leave an orphan beside the store.
-    # Returns True when the store hit disk; a mutator whose UI claims success
-    # checks this and raises instead of reporting a change that won't persist.
+    # Callers hold _store_lock() across load()+save(), so this writer never
+    # races a second writer of the same store.
     try:
         cfg.HIDDEN_FILE.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(cfg.HIDDEN_FILE.parent),

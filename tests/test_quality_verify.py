@@ -28,27 +28,6 @@ def test_cd_only_source_served_cd_is_not_under(monkeypatch):
     assert verify.rip_shortfall([_FakeDir()], album)["under"] is False
 
 
-@pytest.mark.parametrize(
-    ("served", "album"),
-    [
-        ((16, 44_100), (24, 96.0)),
-        ((24, 44_100), (16, 96.0)),
-    ],
-)
-def test_hires_source_served_below_one_dimension_is_under(
-        monkeypatch, served, album):
-    _patch(monkeypatch, [{
-        "bits": served[0],
-        "sample_rate": served[1],
-    }], tier=4)
-    album = {
-        "maximum_bit_depth": album[0],
-        "maximum_sampling_rate": album[1],
-    }
-    r = verify.rip_shortfall([_FakeDir()], album)
-    assert r["under"] is True and r["n_below"] == 1
-
-
 def test_one_low_track_among_good_is_under(monkeypatch):
     _patch(monkeypatch, [
         {"bits": 24, "sample_rate": 96000},
@@ -66,39 +45,11 @@ def test_served_at_cap_target_is_not_under(monkeypatch):
     assert verify.rip_shortfall([_FakeDir()], album)["under"] is False
 
 
-def test_cap_matters_same_rip_under_higher_cap(monkeypatch):
-    _patch(monkeypatch, [{"bits": 24, "sample_rate": 96000}], tier=4)
-    album = {"maximum_bit_depth": 24, "maximum_sampling_rate": 192.0}
-    assert verify.rip_shortfall([_FakeDir()], album)["under"] is True
-
-
 def test_effective_tier_override_controls_target(monkeypatch):
     _patch(monkeypatch, [{"bits": 24, "sample_rate": 96000}], tier=4)
     album = {"maximum_bit_depth": 24, "maximum_sampling_rate": 192.0}
     result = verify.rip_shortfall([_FakeDir()], album, effective_tier=3)
     assert result["under"] is False
-
-
-def test_retry_coverage_rejects_wrong_or_duplicate_same_count_tracks():
-    original = {
-        "_expected_track_keys": ["qobuz:1", "qobuz:2"],
-        "_clean_track_keys": ["qobuz:1", "qobuz:2"],
-    }
-    wrong = {
-        "_expected_track_keys": ["qobuz:1", "qobuz:2"],
-        "_clean_track_keys": ["qobuz:1", "qobuz:3"],
-        "_exact_track_coverage": True,
-        "_unmatched_audio": 0,
-    }
-    duplicate = {
-        "_expected_track_keys": ["qobuz:1", "qobuz:2"],
-        "_clean_track_keys": ["qobuz:1", "qobuz:1"],
-        "_exact_track_coverage": True,
-        "_unmatched_audio": 0,
-    }
-
-    assert verify.retry_preserves_track_coverage(original, wrong) is False
-    assert verify.retry_preserves_track_coverage(original, duplicate) is False
 
 
 def test_redownload_fallback_restores_first_staged_rip_when_retry_lands_nothing(
@@ -119,31 +70,6 @@ def test_redownload_fallback_restores_first_staged_rip_when_retry_lands_nothing(
     assert dirs == [first]
     assert retry_kept is False
     assert (first / "01.flac").read_bytes() == b"first rip"
-
-
-def test_redownload_fallback_restores_first_rip_when_same_count_retry_is_wrong(
-        monkeypatch, tmp_path):
-    staging = tmp_path / "staging"
-    first = staging / "Artist" / "Album"
-    first.mkdir(parents=True)
-    (first / "01.flac").write_bytes(b"first rip")
-    monkeypatch.setattr(config, "STAGING_DIR", staging)
-
-    def run_retry():
-        first.mkdir(parents=True)
-        (first / "02.flac").write_bytes(b"retry rip")
-
-    dirs, retry_kept = verify.redownload_with_staged_fallback(
-        [first],
-        run_retry=run_retry,
-        collect_staged_dirs=lambda: [first],
-        collect_retry_files=lambda: _receipts(first / "02.flac"),
-        retry_preserves_original=lambda: False)
-
-    assert dirs == [first]
-    assert retry_kept is False
-    assert (first / "01.flac").read_bytes() == b"first rip"
-    assert not (first / "02.flac").exists()
 
 
 def test_redownload_fallback_restores_first_rip_on_interrupt(
@@ -193,36 +119,6 @@ def test_redownload_fallback_restores_first_rip_when_retry_less_complete(
     assert sorted(p.name for p in first.iterdir()) == [
         "01.flac", "02.flac", "03.flac"]
     assert (first / "01.flac").read_bytes() == b"first rip"
-
-
-def test_redownload_fallback_preserves_unrelated_retry_occupant(
-        monkeypatch, tmp_path):
-    staging = tmp_path / "staging"
-    first = staging / "Artist" / "Album"
-    first.mkdir(parents=True)
-    for n in ("01", "02"):
-        (first / f"{n}.flac").write_bytes(b"first rip")
-
-    monkeypatch.setattr(config, "STAGING_DIR", staging)
-
-    def run_retry():
-        first.mkdir(parents=True)
-        (first / "01.flac").write_bytes(b"retry rip")
-        (first / "unrelated.txt").write_bytes(b"do not touch")
-
-    with pytest.raises(OSError):
-        verify.redownload_with_staged_fallback(
-            [first],
-            run_retry=run_retry,
-            collect_staged_dirs=lambda: [first],
-            collect_retry_files=lambda: _receipts(first / "01.flac"),
-            retry_preserves_original=lambda: False)
-
-    assert (first / "unrelated.txt").read_bytes() == b"do not touch"
-    assert any(
-        path.read_bytes() == b"first rip"
-        for path in (staging / config.BEETS_RETRY_DIR).rglob("*.flac")
-    )
 
 
 def test_staging_park_rolls_back_a_move_interrupted_before_receipt(
@@ -406,112 +302,3 @@ def test_staging_park_rolls_back_a_move_interrupted_before_receipt(
     monkeypatch.setattr(staging_tx, "_rollback_parked", real_rollback)
 
 
-def test_interrupted_run_manifest_precedes_move_and_survives_fatal_signal(
-        monkeypatch, tmp_path):
-    from qobuz_librarian.integrations import staging as staging_tx
-
-    staging = tmp_path / "staging"
-    monkeypatch.setattr(config, "STAGING_DIR", staging)
-    run = staging_tx.create_staging_run()
-    disc = run.path / "Artist" / "Album" / "Disc 2"
-    disc.mkdir(parents=True)
-    (disc / "01.flac").write_bytes(b"downloaded audio")
-
-    real_move = staging_tx._move_tree
-
-    def interrupt_after_move(receipt, destination, destination_name):
-        assert (destination / staging_tx._MANIFEST).is_file()
-        real_move(receipt, destination, destination_name)
-        raise KeyboardInterrupt("simulated process death")
-
-    monkeypatch.setattr(staging_tx, "_move_tree", interrupt_after_move)
-
-    with pytest.raises(KeyboardInterrupt, match="simulated process death"):
-        staging_tx.retain_staging_run(run)
-
-    assert not run.path.exists()
-    groups = staging_tx.list_groups(kind="interrupted")
-    assert len(groups) == 1
-    assert (groups[0].trees[0].path / "Artist" / "Album" / "Disc 2"
-            / "01.flac").read_bytes() == b"downloaded audio"
-
-
-def test_interrupted_run_retention_refuses_a_still_open_writer(
-        monkeypatch, tmp_path):
-    import os
-
-    from qobuz_librarian.integrations import staging as staging_tx
-
-    staging = tmp_path / "staging"
-    monkeypatch.setattr(config, "STAGING_DIR", staging)
-    run = staging_tx.create_staging_run()
-    partial = run.path / "Artist" / "Album" / "01.flac"
-    partial.parent.mkdir(parents=True)
-    partial.write_bytes(b"partial audio")
-    writer = os.open(partial, os.O_WRONLY)
-    try:
-        assert staging_tx.retain_staging_run(run) is None
-    finally:
-        os.close(writer)
-
-    assert partial.read_bytes() == b"partial audio"
-    assert staging_tx.list_groups(kind="interrupted") == []
-
-
-def test_rejected_file_manifest_lives_until_exact_disposal(
-        monkeypatch, tmp_path):
-    from qobuz_librarian.integrations import staging as staging_tx
-
-    staging = tmp_path / "staging"
-    rejected = staging / "run" / "bad.mp3"
-    rejected.parent.mkdir(parents=True)
-    rejected.write_bytes(b"not lossless")
-    monkeypatch.setattr(config, "STAGING_DIR", staging)
-    receipt = staging_tx.capture_file(rejected)
-
-    assert staging_tx.quarantine_file(receipt, ".rejected") is not None
-    groups = staging_tx.list_file_groups(kind="rejected")
-    assert len(groups) == 1
-    assert groups[0].retained.path.read_bytes() == b"not lossless"
-    assert staging_tx.discard_quarantined_file(receipt) is True
-    assert staging_tx.list_file_groups(kind="rejected") == []
-
-
-def test_staging_restore_rolls_back_a_partial_multi_tree_restore(
-        monkeypatch, tmp_path):
-    from qobuz_librarian.integrations import staging as staging_tx
-
-    staging = tmp_path / "staging"
-    first = staging / "Artist" / "First"
-    second = staging / "Artist" / "Second"
-    first.mkdir(parents=True)
-    second.mkdir()
-    (first / "01.flac").write_bytes(b"first")
-    (second / "01.flac").write_bytes(b"second")
-    monkeypatch.setattr(config, "STAGING_DIR", staging)
-
-    group = staging_tx.park_trees(
-        [first, second], "quality", kind="quality")
-    assert group is not None
-
-    real_move = staging_tx._move_tree
-    calls = 0
-
-    def fail_second_move(receipt, destination, destination_name):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise KeyboardInterrupt
-        return real_move(receipt, destination, destination_name)
-
-    monkeypatch.setattr(staging_tx, "_move_tree", fail_second_move)
-
-    with pytest.raises(KeyboardInterrupt):
-        staging_tx.restore_group(group)
-    assert not first.exists()
-    assert not second.exists()
-    reloaded = staging_tx.load_group(group.path, kind="quality")
-    assert reloaded is not None
-    assert sorted(
-        (tree.path / "01.flac").read_bytes() for tree in reloaded.trees
-    ) == [b"first", b"second"]

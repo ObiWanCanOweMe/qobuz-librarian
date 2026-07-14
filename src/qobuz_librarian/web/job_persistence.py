@@ -48,9 +48,7 @@ _log = logging.getLogger("qobuz_librarian")
 _lock = threading.Lock()
 _disabled = False
 _conn: Optional[sqlite3.Connection] = None
-# The db opened fine but a write later failed (typically a full disk). Surface
-# it once at INFO — durability is silently gone otherwise — then stay quiet so
-# a stuck volume doesn't flood the log on every status change.
+# The db opened fine but a write later failed (typically a full disk).
 _warned_write_failure = False
 
 
@@ -209,30 +207,21 @@ def init() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_durable_job_completion_album "
                 "ON durable_job_completions(job_id, job_created_at, album_id)"
             )
-            # Terminal-row index: history_count() / history_page() / prune_finished()
-            # all filter on status and order by finished_at. Without this they full-
-            # scan the table, touching every row's record header just to skip past
-            # the multi-MB ``candidates`` blob of parked reviews. COUNT(*) is served
-            # entirely from the index; the page query uses it to filter+sort before
-            # fetching only the LIMIT rows. created_at is the ORDER BY's COALESCE
-            # fallback, so it's carried in the index too. IF NOT EXISTS = idempotent.
+            # Terminal-row index: history_count() / history_page() /
+            # prune_finished() all filter on status and order by finished_at.
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jobs_terminal "
                 "ON jobs(status, finished_at, created_at)"
             )
-            # Schema versioning so a FUTURE column addition can ALTER TABLE instead
-            # of silently failing every persist() against an old jobs.db — that
-            # failure is swallowed by _note_write_failure, leaving the archive
-            # non-durable with no visible sign. To add a column later: bump
-            # _SCHEMA_VERSION and add an `if version < N: conn.execute("ALTER TABLE
-            # jobs ADD COLUMN ...")` block here (SQLite ADD COLUMN is online-safe).
+            # Schema versioning so a FUTURE column addition can ALTER TABLE
+            # instead of silently failing every persist() against an old
+            # jobs.db — that failure is swallowed by _note_write_failure,
+            # leaving the archive non-durable with no visible sign.
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             if version < _SCHEMA_VERSION:
-                # v2: persist Job.single (single-track download undo info) so a restart
-                # doesn't drop the Undo affordance on a completed one-track download.
-                # _SCHEMA already adds the column for a fresh db (CREATE TABLE), so
-                # only ALTER an existing table that predates it. ADD COLUMN is
-                # online-safe and the DEFAULT backfills old rows with '{}'.
+                # v2: persist Job.single (single-track download undo info) so
+                # a restart doesn't drop the Undo affordance on a completed
+                # one-track download.
                 cols = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
                 if "single" not in cols:
                     conn.execute(
@@ -243,9 +232,7 @@ def init() -> None:
                 if "attention" not in cols:
                     conn.execute(
                         "ALTER TABLE jobs ADD COLUMN attention TEXT NOT NULL DEFAULT ''")
-                # v4: exact retained Repair-backup state. This is deliberately
-                # separate from logs so cancellation/restart cannot discard the
-                # only recovery location and receipt.
+                # v4: exact retained Repair-backup state.
                 if "recoveries" not in cols:
                     conn.execute(
                         "ALTER TABLE jobs ADD COLUMN recoveries TEXT NOT NULL DEFAULT '[]'")
@@ -253,11 +240,10 @@ def init() -> None:
             conn.commit()
         except sqlite3.Error as e:
             # A transient/locked/full/corrupt jobs.db here would otherwise
-            # propagate out of restore_jobs() into the caller's broad "couldn't
-            # restore prior jobs — starting fresh" handler, masking a recoverable
-            # condition and then leaving every later persist() silently non-
-            # durable. Surface it distinctly and degrade to the in-memory
-            # registry; a restart once the volume recovers re-runs this.
+            # propagate out of restore_jobs() into the caller's broad
+            # "couldn't restore prior jobs — starting fresh" handler, masking
+            # a recoverable condition and then leaving every later persist()
+            # silently non- durable.
             _log.warning("job persistence schema/migration failed; running "
                          "without crash durability until the volume recovers "
                          "and the app restarts: %s", e)
@@ -280,9 +266,7 @@ def _job_values(job, *, single=_CURRENT_JOB_SINGLE):
         execute_args_json = json.dumps(job.execute_args or {}, default=str)
         single_value = job.single if single is _CURRENT_JOB_SINGLE else single
         single_json = json.dumps(single_value or {}, default=str)
-        # Recovery receipts are a safety boundary. Never stringify an unknown
-        # value into a plausible-looking record: either the exact JSON carrier
-        # is saved or this persist reports failure.
+        # Recovery receipts are a safety boundary.
         recoveries_json = json.dumps(
             getattr(job, "recoveries", []) or [],
             ensure_ascii=False,
@@ -332,9 +316,8 @@ def _persist_locked(job) -> bool:
 
 def persist(job) -> bool:
     """Write the job's current state to disk. Return whether it reached disk."""
-    # Keep the job lock through both the preservation decision and the database
-    # commit. A save already waiting on this lock must honour a relocation gate
-    # that was engaged while it waited.
+    # Keep the job lock through both the preservation decision and the
+    # database commit.
     with job._lock:
         if getattr(job, "_preserve_persisted_single", False) is True:
             return _persist_preserving_single_locked(job)
@@ -1297,9 +1280,7 @@ def load_all() -> list[dict]:
                 raise ValueError("recovery payload is invalid")
             # Only AWAITING_REVIEW jobs need their candidates on restore; all
             # other statuses are either rehydrated as live state (RUNNING →
-            # FAILED) or displayed as history without candidates. Skipping the
-            # json.loads for the rest avoids deserialising ~950 multi-MB blobs
-            # on startup when only a handful of parked reviews exist.
+            # FAILED) or displayed as history without candidates.
             candidates = json.loads(r[7] or "[]") if r[5] == "awaiting_review" else []
             out.append({
                 "id": r[0], "title": r[1], "artist": r[2], "album_id": r[3],

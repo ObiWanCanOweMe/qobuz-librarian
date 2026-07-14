@@ -53,10 +53,9 @@ def _fsync_quiet(path):
         pass
 
 # Downsampling needs ffmpeg to resample AND flac to verify the result. The
-# overwrite is in-place and irreversible, so without the verifier there's no way
-# to confirm a good encode replaced the only hi-res copy — treat the feature as
-# unavailable rather than overwrite unverified. Both are pinned in the image, so
-# this is always True there; a bare checkout missing either skips the step.
+# overwrite is in-place and irreversible, so without the verifier there's no
+# way to confirm a good encode replaced the only hi-res copy — treat the
+# feature as unavailable rather than overwrite unverified.
 HAVE_DOWNSAMPLE = (shutil.which("ffmpeg") is not None
                    and shutil.which("flac") is not None)
 
@@ -326,15 +325,10 @@ _TARGET_PEAK_DBFS = -1.0
 
 
 def _resampled_peak_dbfs(src, af_filter, rate, *, pass_fds=()):
-    """Peak level (dBFS) the resampled signal reaches, on a float render.
-
-    soxr's reconstruction can push a hot (loud) source past full scale; the
-    integer FLAC written below would hard-clip that overshoot into audible
-    distortion. Measured on the base resample filter with a float output codec —
-    before the s32 format step, which would itself clip the overshoot away and
-    hide it (volumedetect and an integer render both read 0.0 there). Returns
-    None when it can't be read, so the caller encodes without attenuation rather
-    than guess."""
+    """Peak level (dBFS) the resampled signal reaches, on a float render. soxr's
+    reconstruction can push a hot (loud) source past full scale; the integer
+    FLAC written below would hard-clip that overshoot into audible distortion.
+    """
     try:
         r = subprocess.run(
             ["ffmpeg", "-hide_banner", "-nostdin", "-i", str(src),
@@ -592,15 +586,8 @@ def _receipt_matches_source(binding, receipt, exclusion) -> bool:
 
 
 def _encode_opts_for_bps(bps, af_filter):
-    """ffmpeg options that keep the output FLAC at the source bit depth.
-
-    Returns (af, sample_fmt, depth_args). The encoder, not the s16/s32 sample
-    format alone, sets the FLAC bit depth: a 24-bit source fed as s32 is written
-    as a 32-bit stream unless -bits_per_raw_sample 24 says otherwise, which would
-    inflate the master (larger file, wrong reported depth). 16-bit uses s16; any
-    other known depth (8/24/32) is pinned via -bits_per_raw_sample so the output
-    keeps the source depth instead of being silently padded. An unknown depth
-    (0, unreadable) keeps the conservative s32 default with no pin.
+    """ffmpeg options that keep the output FLAC at the source bit depth. Returns
+    (af, sample_fmt, depth_args).
     """
     if bps == 16:
         return af_filter, "s16", []
@@ -654,23 +641,21 @@ def resample_one(rel, sr, rate, af_filter, *, base_dir=None,
                     "left the original untouched")
 
         bps = read_local_bit_depth(source_path, pass_fds=source_fds)
-        # An unreadable source bit depth (bps == 0) can't be pinned — the encode
-        # would default to 32-bit and inflate a 24-bit master — and can't be
-        # re-verified afterward, so refuse rather than overwrite the master in
-        # place. A downsample has no re-download to fall back on; an un-shrunk
-        # file is far cheaper than a silently altered master. Same stance as the
-        # unknown-length guard below.
+        # An unreadable source bit depth (bps == 0) can't be pinned — the
+        # encode would default to 32-bit and inflate a 24-bit master — and
+        # can't be re-verified afterward, so refuse rather than overwrite the
+        # master in place. A downsample has no re-download to fall back on; an
+        # un-shrunk file is far cheaper than a silently altered master.
         if not bps:
             return (rel, sr, rate, None,
                     "couldn't read the source bit depth; left the original untouched")
         af, sample_fmt, depth_args = _encode_opts_for_bps(bps, af_filter)
-        # Keep the resample from clipping a hot master: soxr can overshoot full
-        # scale on loud/brickwalled sources, which the integer encode would
-        # hard-clip into audible distortion. Measure the resampled peak; if it
-        # would exceed full scale, attenuate the source by just enough to land it
-        # at _TARGET_PEAK_DBFS (inaudible, and only on files that would clip —
-        # everything else stays bit-untouched). A failed measurement falls back
-        # to no attenuation, no worse than before.
+        # Keep the resample from clipping a hot master: soxr can overshoot
+        # full scale on loud/brickwalled sources, which the integer encode
+        # would hard-clip into audible distortion. Measure the resampled peak;
+        # if it would exceed full scale, attenuate the source by just enough
+        # to land it at _TARGET_PEAK_DBFS (inaudible, and only on files that
+        # would clip — everything else stays bit-untouched).
         enc_af = af
         _peak = _resampled_peak_dbfs(
             source_path, af_filter, rate, pass_fds=source_fds)
@@ -752,8 +737,7 @@ def resample_one(rel, sr, rate, af_filter, *, base_dir=None,
         # prefix, and flac -t then passes on that short output — so a damaged
         # hi-res master (the exact file class the repair feature exists to
         # catch) could be silently replaced by a shortened encode, laundering
-        # the damage out of every later integrity probe. Compare the output's
-        # sample count to the source scaled by the rate ratio.
+        # the damage out of every later integrity probe.
         in_samples = read_total_samples(source_path, pass_fds=source_fds)
         out_samples = read_total_samples(temp_path, pass_fds=(temp_fd,))
         if not (in_samples and out_samples):
@@ -905,26 +889,11 @@ def sweep_stale_encodes(directory):
 
 def downsample_dir(directory, *, verbose=True, base_dir=None, log=print,
                    keep_originals=False, cancel_check=None):
-    """Resample any high-sample-rate FLACs inside `directory` (recursive).
-
-    Probes each file's sample rate, resamples the ones above CD rate, and
-    leaves the rest untouched. `base_dir` is the root paths are taken relative
-    to (defaults to MUSIC_ROOT); pass the album/staging dir when the files
-    aren't on the canonical music tree yet.
-
-    keep_originals: park a verified copy of each original in the backup area
-    before its rewrite, so the run can be undone until the retention sweep. A
-    file whose copy can't be made is left untouched (counted as an error) —
-    the mode's promise is that nothing is rewritten without its safety copy.
-
-    cancel_check: optional callable polled as each encode finishes. Once it
-    returns True, not-yet-started encodes are discarded and the run returns
-    after the in-flight ones complete — each finished encode's swap is atomic,
-    so stopping between tracks is always safe, and a Stop pressed mid-album
-    no longer waits for every remaining track.
-
-    Returns dict: {"resampled": int, "errors": int, "saved_bytes": int}.
-    Never raises; on bad input returns zero counts.
+    """Resample any high-sample-rate FLACs inside `directory` (recursive). Probes
+    each file's sample rate, resamples the ones above CD rate, and leaves the
+    rest untouched. `base_dir` is the root paths are taken relative to
+    (defaults to MUSIC_ROOT); pass the album/staging dir when the files aren't
+    on the canonical music tree yet.
     """
     directory = Path(directory)
     if not directory.exists() or not directory.is_dir():

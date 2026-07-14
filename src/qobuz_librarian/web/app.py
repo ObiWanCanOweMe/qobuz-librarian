@@ -50,42 +50,29 @@ from qobuz_librarian.web.csrf import (
 # garbage-collect it (which would silently release the flock).
 _RUN_LOCK_HANDLE = None
 # Set when run_lock.acquire() fails at startup — the holder's PID, used by
-# every destructive route to refuse new work. Read-only routes (dashboard,
-# search, settings view) stay open so the user can still figure out what's
-# going on.
+# every destructive route to refuse new work.
 _LOCK_BUSY_PID = None
 # True when the web app has deliberately released the run-lock so the terminal
 # (CLI) can use it — set by the Settings "Mode" toggle, or at startup when
-# QL_CLI_ONLY is set. Distinct from _LOCK_BUSY_PID (another process holds the
-# lock unexpectedly): in CLI mode the web holds no lock on purpose and pauses
-# its own download/scan endpoints so the two can't race over /staging.
+# QL_CLI_ONLY is set.
 _CLI_MODE = False
-# run_lock.acquire() returned None: the data dir can't ENFORCE the
-# single-writer lock (unwritable path, or a mount without file locking).
-# Silently running would leave the corruption guard quietly off, so
-# destructive routes stay paused until the filesystem is fixed and the app
-# restarts.
+# run_lock.acquire() returned None: the data dir can't ENFORCE the single-
+# writer lock (unwritable path, or a mount without file locking).
 _LOCK_UNENFORCEABLE = False
 # Exact result from the most recent run-lock acquisition. Startup recovery is
 # inspection/reconciliation only; it never starts a download or import.
 _STARTUP_RECOVERY_RESULT = None
-# True while an authoritative refresh is running or after it raised. Treat it
-# as ATTENTION even if the last cached result was CLEAR: the journal may have
-# changed before inspection failed.
+# True while an authoritative refresh is running or after it raised.
 _STARTUP_RECOVERY_UNKNOWN = False
 _STARTUP_RECOVERY_LOCK = threading.RLock()
 # Set before lifespan shutdown starts so no new mutating request can register
 # while the workers and request-owned library operations are draining.
 _SHUTTING_DOWN = False
 # Persisted Web jobs are restored only after this process holds exact write
-# authority. The lock also makes startup retry and a Settings mode change
-# converge on the same one-time restore.
+# authority.
 _JOBS_RESTORED = False
 _JOBS_RESTORE_LOCK = threading.Lock()
-# Tri-state result of the startup token probe. None until the probe runs
-# (or if the network glitched); True if Qobuz accepted the saved token;
-# False if Qobuz returned AuthLost. The dashboard banner only fires on the
-# explicit False so a transient network blip doesn't nag the user.
+# Tri-state result of the startup token probe.
 _TOKEN_VALID: bool | None = None
 
 
@@ -141,8 +128,7 @@ def _recover_startup_queue(authority):
     from qobuz_librarian.web import job_persistence
 
     # COMPLETE/RESOLVING recovery retires its queue proof only after the exact
-    # original Web job has durably acknowledged it.  Initialise that store
-    # before inspection; restore_jobs() runs later in the lifespan.
+    # original Web job has durably acknowledged it.
     job_persistence.init()
 
     def _acknowledge(
@@ -400,9 +386,8 @@ def _durable_recovery_planned(job):
         try:
             from qobuz_librarian.queue import journal as queue_state
 
-            # Loading the journal already validates its schema. Round-trip the
-            # one planned item once more so the worker receives its own
-            # canonical copy, never a mutable reference into cached recovery.
+            # Round-trip for a canonical copy, never a mutable reference
+            # into cached recovery state.
             planned = queue_state._serialize_queue_item(
                 queue_state._deserialize_queue_item(queued_item.planned)
             )
@@ -985,9 +970,8 @@ def _sync_saved_review_job(job, surface, state, signature):
     """
     desired = list(state.get("candidates") or [])
     with job._review_action_lock, job._lock:
-        # Approval and saved-state refresh can arrive together. Once approval
-        # has claimed the review, its exact candidates belong to that run and
-        # must not be replaced underneath it.
+        # A review that already left AWAITING_REVIEW must not be replaced
+        # underneath its approval.
         if job.status != job_mgr.JobStatus.AWAITING_REVIEW:
             return job
         existing_raw_by_key = {
@@ -1155,17 +1139,12 @@ def _review_job_from_current_saved_state(surface):
 
 def _review_job_from_library_state():
     """Rebuild the parked Library review from the saved baseline scan when no
-    live job holds the /library surface — so a review lost to a swept cancel, a
-    discarded scan job, or a corrupt persisted row on restart comes back
-    instead of stranding the user on 'Baseline ready' with no tabs. Mirrors the
-    Upgrade/Downsample saved-state reconstruction; the live job stays primary
-    (callers only reach here when _library_current_job() is None).
-
-    Returns the job, or None when there's nothing un-consumed to show — the
-    review was retired (worked through or discarded; see
-    library_scan_state.mark_review_retired) with no newer scan since, or every
-    saved candidate is now dismissed. Candidates already on disk are left in;
-    the approve path's drop_owned_missing_candidates skips them at download."""
+    live job holds the /library surface — so a review lost to a swept cancel,
+    a discarded scan job, or a corrupt persisted row on restart comes back
+    instead of stranding the user on 'Baseline ready' with no tabs. Mirrors
+    the Upgrade/Downsample saved-state reconstruction; the live job stays
+    primary (callers only reach here when _library_current_job() is None).
+    """
     from qobuz_librarian.library import hidden as hidden_mod
     from qobuz_librarian.library import library_scan_state
     from qobuz_librarian.web import flows
@@ -1177,8 +1156,7 @@ def _review_job_from_library_state():
     # Compare the retire marker against the MISSING kind's OWN last-save time,
     # not the global stamp: save_kind() bumps the global updated_at for every
     # kind it writes (a gap-fill / partial scan included), so a global compare
-    # let any unrelated save resurrect a review the user discarded. Only a
-    # fresh missing scan (newer mstate updated_at) should bring one back.
+    # let any unrelated save resurrect a review the user discarded.
     missing_updated = float(mstate.get("updated_at") or 0.0)
     retired_at = float(full.get("review_retired_at") or 0.0)
     if retired_at and retired_at >= missing_updated:
@@ -1222,11 +1200,8 @@ def _review_job_from_library_state():
         return job
 
 
-# Names the persisted ``execute_kind`` strings so jobs survive a restart
-# even though their original execute closure is gone. Each factory is
-# called lazily, when the user actually approves the reloaded job, so
-# the rebound function reads the current token rather than baking in the
-# (possibly-rotated) one from the prior session.
+# Names the persisted ``execute_kind`` strings so jobs survive a restart even
+# though their original execute closure is gone.
 _RESUME_EXECUTE: dict = {
     "library":      _resume_album_download,
     "new_releases": _resume_album_download,
@@ -1256,8 +1231,7 @@ def _restore_jobs_once() -> None:
             )
         finally:
             # restore_jobs publishes into the registry only after it has built
-            # the full batch. Do not replay it if another authority transition
-            # reaches this helper later.
+            # the full batch.
             _JOBS_RESTORED = True
 
 
@@ -1317,15 +1291,8 @@ async def _lifespan(_app: FastAPI):
                      "config; web downloads may fail until creds are set "
                      "via the Settings page.")
     # Acquire the same run lock the CLI uses, so a `docker compose run ...
-    # cli` invocation while the web is up can't corrupt /staging. If we
-    # CAN'T acquire it, _LOCK_BUSY_PID is set and every destructive route
-    # refuses with 503 — silently continuing without the lock would let
-    # two writers race in /staging and corrupt both their downloads.
     if os.environ.get("QL_CLI_ONLY", "").strip().lower() in ("1", "true", "yes", "on"):
         # Terminal-first deployment: don't take the lock, so `docker exec ...
-        # qobuz-librarian` always works. The web UI still serves for browsing
-        # and Settings; its download/scan endpoints stay paused until the user
-        # resumes web mode (which lasts until the next restart).
         _CLI_MODE = True
         _LOCK_BUSY_PID = None
         _STARTUP_RECOVERY_RESULT = None
@@ -1340,8 +1307,7 @@ async def _lifespan(_app: FastAPI):
             if _RUN_LOCK_HANDLE is None:
                 # None isn't success: the lock can't be ENFORCED here, and
                 # storing it as acquired would leave the corruption guard
-                # silently off. Destructive routes stay paused until the data
-                # path can enforce the lock and the app restarts.
+                # silently off.
                 _LOCK_UNENFORCEABLE = True
                 _log.error(
                     "STARTUP: the data dir can't hold the single-writer lock; "
@@ -1368,10 +1334,9 @@ async def _lifespan(_app: FastAPI):
         global _RUN_LOCK_HANDLE, _LOCK_BUSY_PID, _LOCK_UNENFORCEABLE
         while _LOCK_BUSY_PID is not None:
             await asyncio.sleep(30)
-            # The lock state can change during the sleep: set_mode('cli') hands
-            # the lock to the terminal (sets _CLI_MODE, clears _LOCK_BUSY_PID).
-            # Re-check before acquiring, or we'd take the lock back in CLI mode
-            # and wedge both the web app and the CLI until restart.
+            # The lock state can change during the sleep: set_mode('cli')
+            # hands the lock to the terminal (sets _CLI_MODE, clears
+            # _LOCK_BUSY_PID).
             if _LOCK_BUSY_PID is None or _CLI_MODE:
                 return
             try:
@@ -1411,11 +1376,9 @@ async def _lifespan(_app: FastAPI):
         # Opt-in via env so tests / dev runs that don't have /staging /music
         # mounted don't trip on the gate. The bundled compose sets this to 1.
         if os.environ.get("QL_CHECK_VOLUMES") == "1":
-            # The label (the container-internal mount name) is what the operator
-            # checks in their compose.yaml; the resolved cfg path is what's
-            # actually being tested. Showing both makes "/music" warnings useful
-            # even when MUSIC_ROOT is customised away from the bundled default,
-            # and is_dir() catches a /dev/null-shaped mistake the W_OK alone misses.
+            # The label (the container-internal mount name) is what the
+            # operator checks in their compose.yaml; the resolved cfg path is
+            # what's actually being tested.
             for label, path in (("STAGING_DIR", cfg.STAGING_DIR),
                                 ("MUSIC_ROOT", cfg.MUSIC_ROOT)):
                 p = Path(path)
@@ -1493,10 +1456,8 @@ async def _lifespan(_app: FastAPI):
             _log.warning("`flac` not found — FLAC integrity checks fall back to a size heuristic")
         if not shutil.which("ffmpeg"):
             _log.warning("`ffmpeg` not found — hi-res downsampling disabled")
-        # A second Web process must not rebadge the first process's live jobs as
-        # failed merely because it cannot take the run lock.  Restore only
-        # after this process owns exact write authority; a later lock retry
-        # performs the same one-time restore before writes become available.
+        # A second Web process must not rebadge the first process's live jobs
+        # as failed merely because it cannot take the run lock.
         if _run_lock_intact():
             _restore_jobs_once()
         # Probe the saved token against Qobuz so a stale slot — non-empty but
@@ -1510,13 +1471,10 @@ async def _lifespan(_app: FastAPI):
         from qobuz_librarian.api.auth import register_auth_state_listener
         register_auth_state_listener(_on_auth_state)
 
-        # The dashboard kicks off _maybe_auto_check_new_releases on load, but a
-        # headless box nobody opens would never check at all — making
-        # NEW_RELEASE_CHECK_INTERVAL a dead letter exactly where it matters most.
-        # Tick the same helper in the background so the documented interval holds
-        # without a visitor; every skip condition (interval off, no token, no
-        # baseline, CLI mode, active work, not yet due) lives in the helper itself,
-        # so this loop stays a dumb clock.
+        # The dashboard kicks off _maybe_auto_check_new_releases on load, but
+        # a headless box nobody opens would never check at all — making
+        # NEW_RELEASE_CHECK_INTERVAL a dead letter exactly where it matters
+        # most.
         async def _auto_check_ticker():
             loop = asyncio.get_running_loop()
             while True:
@@ -1572,9 +1530,7 @@ def _on_auth_state(valid: bool) -> None:
     _TOKEN_VALID = bool(valid)
     # A working (or not-yet-probed) token turning rejected is the one event
     # worth pushing through the notification hook — an unattended box
-    # otherwise fails jobs quietly until somebody opens the UI. Only the
-    # transition fires: the 401s that follow are False→False, and a recovery
-    # re-arms it, so a flapping token can't spam.
+    # otherwise fails jobs quietly until somebody opens the UI.
     if was is not False and not valid:
         job_mgr.fire_auth_lost_hook()
 
@@ -1623,9 +1579,7 @@ app = FastAPI(title="Qobuz Librarian", docs_url=None, redoc_url=None,
 
 # AuthMiddleware is added first so it ends up innermost — it runs after the
 # CSRF middleware, which keeps CSRF validation on the login/setup POSTs and
-# lets the redirects it returns pick up the security headers. (The CSRF cookie
-# rides only HTML responses, so it's seeded by the login/setup page GET the
-# redirect bounces to, not by the redirect itself.)
+# lets the redirects it returns pick up the security headers.
 app.add_middleware(web_auth.AuthMiddleware)
 app.add_middleware(CSRFMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
@@ -1727,10 +1681,8 @@ _ASSET_VERSION = _asset_version()
 templates.env.globals["asset_version"] = _ASSET_VERSION
 
 
-# Bake the asset version into the worker so its cache name changes whenever the
-# served assets change. The script bytes then differ, which is what makes the
-# browser pick up the new worker and purge stale caches — a fixed cache name
-# left returning visitors on old assets.
+# Bake the asset version into the worker so its cache name changes whenever
+# the served assets change.
 _SW_JS = (static_dir / "sw.js").read_text(encoding="utf-8").replace(
     "__APP_VERSION__", _ASSET_VERSION)
 
@@ -1867,9 +1819,7 @@ async def setup_submit(request: Request, username: str = Form(""),
             request=request, name="setup.html",
             context={"error": err, "username": user}, status_code=400)
     # First-run setup is unauthenticated by necessity (no creds exist yet), so
-    # whoever reaches the open port first claims admin. Log the client IP so the
-    # takeover window is at least auditable; the prevention is seeding
-    # WEB_AUTH_USER/WEB_AUTH_PASSWORD (now plumbed through compose).
+    # whoever reaches the open port first claims admin.
     _ip = (request.client.host if request.client else "") or "unknown"
     import logging as _logging
     _logging.getLogger("qobuz_librarian").warning(
@@ -2158,9 +2108,7 @@ async def dashboard_head():
 
 
 # Reentrant so the auto-triggers (which hold it) can call the _start_* helpers
-# below (which re-acquire it). It makes every "is one already queued? → submit"
-# check-and-submit atomic across both the manual POST and the dashboard auto
-# path, so a manual click landing alongside an auto-trigger can't stack two.
+# below (which re-acquire it).
 _auto_check_lock = threading.RLock()
 
 
@@ -2193,11 +2141,8 @@ def _start_new_release_check():
     already queued). Shared by the manual Library-page option and the automatic
     dashboard trigger."""
     with _auto_check_lock:
-        # The run-lock may have been handed to the terminal mid-submit (this can
-        # run in an executor for POST /library). Re-check the whole pause
-        # predicate under the lock so a scan can't start right after
-        # set_mode('cli') released the lock — or while the lock is
-        # unenforceable.
+        # The run-lock may have been handed to the terminal mid-submit (this
+        # can run in an executor for POST /library).
         if _web_writes_paused():
             return None
         existing = _existing_new_release_check()
@@ -2402,12 +2347,10 @@ def _submit_scan_deduped(job, scan_fn, execute_fn, *kinds, statuses=("pending", 
         if existing is not None:
             return existing
         # A re-scan supersedes the same artist's stale parked review (or the
-        # whole-library pass's) instead of stacking a second one: the fresh scan
-        # re-derives that target's candidates, so the old awaiting-review result
-        # is obsolete, and parked reviews never self-clear so without this they
-        # pile up forever. Scoping to the same target is what stops one artist's
-        # scan from throwing away a different artist's un-reviewed candidates.
-        # A running download isn't touched (only pending/scanning gate above).
+        # whole-library pass's) instead of stacking a second one: the fresh
+        # scan re-derives that target's candidates, so the old awaiting-review
+        # result is obsolete, and parked reviews never self-clear so without
+        # this they pile up forever.
         stale_reviews = [
             old for old in job_mgr.registry.awaiting_review()
             if (getattr(old, "execute_kind", "") in kinds
@@ -2417,8 +2360,7 @@ def _submit_scan_deduped(job, scan_fn, execute_fn, *kinds, statuses=("pending", 
         if submitted is None:
             return None
         # Only discard the prior review after the replacement has a durable
-        # owner row. If jobs.db is unavailable, the user's old review remains
-        # intact and no scan enters memory or a worker lane.
+        # owner row.
         for old in stale_reviews:
             job_mgr.cancel_review(old)
         return submitted
@@ -2619,14 +2561,12 @@ async def dashboard(request: Request, q: str = "", kind: str = "artist"):
 
     # These all read the (often NAS / network-mounted) data + music volumes —
     # the fetch log, the creds file, the lyric-retry file, and a staging
-    # iterdir(). Run them off the event loop so a sleepy/flaky mount can't stall
-    # every other request (health checks, SSE setup, search) while it blocks.
+    # iterdir().
     def _gather_disk_state():
         from qobuz_librarian.integrations.lyrics import load_lyric_retry
         from qobuz_librarian.library import new_releases, scan_checkpoint
         # These read state files and may submit a background job, so they run
-        # here (off the event loop) alongside the other disk work. Resume an
-        # interrupted scan first (the new-release check is gated on the baseline).
+        # here (off the event loop) alongside the other disk work.
         _maybe_resume_library_scan()
         _maybe_auto_check_new_releases()
         library_scan_state = _library_scan_state()
@@ -2637,17 +2577,13 @@ async def dashboard(request: Request, q: str = "", kind: str = "artist"):
             # dismiss marker) or turns it off via AUTO_LIBRARY_SCAN.
             "offer_baseline": (cfg.AUTO_LIBRARY_SCAN
                                and not new_releases.auto_scan_attempted()),
-            # First-run setup banner: shown until a full library scan has seeded
-            # the new-release baseline. setup_scanning = a library scan is now
-            # pending/running — re-queried here (not from the pre-trigger
-            # active_jobs) so the scan the auto-trigger just submitted shows.
+            # First-run setup banner: shown until a full library scan has
+            # seeded the new-release baseline.
             "baseline_complete": new_releases.is_baseline_complete(),
             "setup_scanning": _active_library_scan() is not None,
             "library_scan_state": library_scan_state,
-            # An interrupted gap-scan, surfaced on the dashboard the way /library
-            # already does — gated on no scan running. The setup banner above
-            # covers the not-yet-baselined case, so index.html shows THIS only
-            # once a baseline exists; otherwise the two would double up.
+            # An interrupted gap-scan, surfaced on the dashboard the way
+            # /library already does — gated on no scan running.
             "library_resume": (lambda cp: cp if cp is not None
                                and _active_library_scan() is None else None)(
                                    scan_checkpoint.pending()),
@@ -2847,9 +2783,8 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
                     error = ("Only Qobuz album and track URLs are supported. "
                              "Search for an artist by name instead.")
             elif is_qobuz_url:
-                # URL looks like qobuz.com but isn't a recognised format
-                # (e.g. artist/interpreter or playlist page). Text-searching
-                # the URL string returns nothing and confuses the user.
+                # URL looks like qobuz.com but isn't a recognised format (e.g.
+                # artist/interpreter or playlist page).
                 if kind == "artist":
                     error = "Search artists by name. Paste album or track URLs only."
                 else:
@@ -2977,22 +2912,14 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
                 })
                 _album_raws.append(a)
 
-            # Flag results already in the library so search never offers a plain
-            # Download on an album you own — the app is gap-fill, so that would
-            # contradict its own purpose. Reuse the scans' owned-title match,
-            # resolving each artist's folder once, off the event loop.
+            # Flag results already in the library so search never offers a
+            # plain Download on an album you own — the app is gap-fill, so
+            # that would contradict its own purpose.
             if _album_raws:
                 def _annotate_owned():
-                    # Mark owned with the SAME filesystem resolver the download
-                    # and scan paths use, so the badge agrees with them.
-                    # find_album_dir_filesystem expands artist variants — incl.
-                    # the comma-split for collaboration folders ("John Lennon,
-                    # Yoko Ono") and diacritic folds — so an album filed under a
-                    # collab or otherwise-named folder is still recognised.
-                    # For an owned album also note the on-disk year:
-                    # the year picks the user's pressing as the row (so the rest
-                    # show as "other versions") while Search stays out of
-                    # upgrade decisions.
+                    # Mark owned with the SAME filesystem resolver the
+                    # download and scan paths use, so the badge agrees with
+                    # them.
                     from qobuz_librarian.library.catalog import _count_audio_files_in, _dir_year
                     for res, alb in zip(results, _album_raws):
                         try:
@@ -3026,11 +2953,10 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
                     logging.getLogger("qobuz_librarian").exception(
                         "ownership annotation failed for %r", query)
 
-            # Collapse the flat result list into one row per album: a remaster,
-            # deluxe, and box set of the same record group together with the
-            # alternates tucked under the main row, instead of the same album
-            # scattering down the page. The edition Qobuz ranked first is the
-            # row; the rest become its "other versions".
+            # Collapse the flat result list into one row per album: a
+            # remaster, deluxe, and box set of the same record group together
+            # with the alternates tucked under the main row, instead of the
+            # same album scattering down the page.
             if _album_raws:
                 from qobuz_librarian.library.discovery import _is_live_release
                 from qobuz_librarian.library.tags import (
@@ -3041,11 +2967,10 @@ async def do_search(request: Request, q: str = Form("", max_length=500),
                 by_key = {}
                 for res, alb in zip(results, _album_raws):
                     ver = alb.get("version") or ""
-                    # A live/session take is a different recording, not an edition
-                    # of the studio album — key it on its own so it stays its own
-                    # row instead of hiding under the studio album's "other
-                    # versions". (A remaster/deluxe shares the base title and does
-                    # group, which is what we want.)
+                    # A live/session take is a different recording, not an
+                    # edition of the studio album — key it on its own so it
+                    # stays its own row instead of hiding under the studio
+                    # album's "other versions".
                     if _is_live_release(res["title"]) or _is_live_release(ver):
                         base = normalize(res["title"] + " " + ver)
                     else:
@@ -3235,9 +3160,7 @@ def _make_download_run(
                     )
                 except BaseException:
                     # The durable executor can change the saved queue before
-                    # raising. Refresh while the staging/run locks are still
-                    # held, but never replace the original failure with a
-                    # secondary inspection failure.
+                    # raising.
                     try:
                         if _run_lock_intact():
                             _record_startup_recovery(_RUN_LOCK_HANDLE)
@@ -3294,8 +3217,7 @@ def _make_download_run(
                     ):
                         # Completion crossed its durable Web acknowledgement
                         # boundary even though the executor's return was not a
-                        # normal drained result. The exact job is now terminal;
-                        # never offer a duplicate download.
+                        # normal drained result.
                         return
                     retryable = (
                         completion_acknowledged is False
@@ -3360,10 +3282,7 @@ def _make_download_run(
             )
             prune_library_review_candidates(album)
             if r.get("n_fail", 0) > 0:
-                # Partial landing: the album is on disk with gaps. Same rule
-                # as the batch executor — surface the remainder as Gap Fill
-                # NOW (after the prune, which would otherwise drop the fresh
-                # candidate as a same-id stale one), not on the next refresh.
+                # Partial landing: the album is on disk with gaps.
                 _fold_partial_gap_fill(
                     album, (album.get("artist") or {}).get("name") or "",
                     r.get("n_fail", 0))
@@ -3379,9 +3298,7 @@ def _file_identity(st) -> list[int]:
 
 
 def _owned_file_identity(st) -> dict[str, int]:
-    # Inodes can be recycled after a file is replaced. Keep enough of the
-    # original stat record to distinguish that replacement without rereading a
-    # potentially large audio file merely to offer Undo.
+    # Inodes can be recycled after a file is replaced.
     return {
         "device": int(st.st_dev),
         "inode": int(st.st_ino),
@@ -3849,9 +3766,7 @@ def _refresh_owned_cleanup_records(plan):
     for directory_fd, record, matched in zip(
             plan["directory_fds"], records, matches, strict=True):
         # Never turn a directory that was already changed before this Undo
-        # attempt into one of our own mutations.  Only records proved exact at
-        # plan creation may advance as our private rename/unlink work changes
-        # their timestamps.
+        # attempt into one of our own mutations.
         if not matched:
             continue
         try:
@@ -4357,10 +4272,7 @@ def _quarantine_owned_leaf(plan, *, progress=None, cleanup_plan=None):
             os.unlink("held", dir_fd=snapshot["fd"])
             _fsync_owned_directories(snapshot["fd"])
         except (OSError, TypeError, ValueError):
-            # Keep the exact leaf under its persisted private name. Restoring
-            # it changes ctime; a crash before the restored identity reaches
-            # disk would leave a later process unable to distinguish our file
-            # from an in-place public replacement with spoofed size/mtime.
+            # Keep the exact leaf under its persisted private name.
             return {"status": "held", "mutated": False}
 
         _refresh_owned_cleanup_records(cleanup_plan)
@@ -4542,9 +4454,7 @@ def _cleanup_one_owned_directory(chain, index, progress):
             opened_records.append((current, current_record, full_match))
             if current_index < index:
                 # Ancestors can legitimately change when a sibling album or
-                # disc is added. Traverse only while the same directory inode
-                # remains, but reserve the full proof for the directory that
-                # would actually be removed.
+                # disc is added.
                 if _file_identity(current_stat) != [
                     current_record["device"], current_record["inode"]
                 ]:
@@ -4552,9 +4462,7 @@ def _cleanup_one_owned_directory(chain, index, progress):
                 continue
             if not full_match:
                 # A public directory whose durable proof no longer matches is
-                # ambiguous after a rollback or restart. Never refresh it into
-                # ownership merely because the inode, size, and mtime happen
-                # to match.
+                # ambiguous after a rollback or restart.
                 if (
                     isinstance(deletion, dict)
                     and deletion.get("state") == "held"
@@ -4562,8 +4470,7 @@ def _cleanup_one_owned_directory(chain, index, progress):
                         current_stat, current_record, directory=True)
                 ):
                     # A crash after a no-overwrite private→public restore can
-                    # leave only ctime changed. Preserve that directory and
-                    # finish cleanup; never refresh it into deletion authority.
+                    # leave only ctime changed.
                     restored_public_skip = True
                 else:
                     return "refused" if deletion is not None else "skipped"
@@ -4922,8 +4829,6 @@ def _unlink_owned_path(root, owned, *, progress=None, outcome_out=None):
             })
 
     # A retry may begin after an earlier attempt durably removed a companion.
-    # Seed the result before every later preflight so refusal wording never
-    # claims that nothing was removed.
     _update_outcome()
     if (
         deletion_records[0] is not None
@@ -5360,9 +5265,7 @@ def _persist_single_download_undo(
         persistence_error = exc
     if persisted is not True:
         # A failed return can still mean SQLite committed before reporting an
-        # I/O error. The preservation gate was engaged before the attempt, so
-        # no ordinary save can expose the stale source snapshot while the
-        # destination commit is still uncertain.
+        # I/O error.
         queue_item["_post_import_relocation_handoff_unknown"] = True
         try:
             proof_before = (
@@ -5619,9 +5522,7 @@ def _make_single_track_run(album, track, token):
                 j.error = ("Couldn't retrieve the track. Qobuz may be rate-limiting "
                            "you, or it's unavailable. Try again shortly.")
             return
-        # Only mark it a single when explicitly configured. By default, a track
-        # grab is just a track grab; future library scans should still offer the
-        # rest of the album if it remains incomplete.
+        # Only mark it a single when explicitly configured.
         marked = bool(cfg.SUPPRESS_SINGLE_TRACK_GAPS and len(missing) > 1)
         if marked:
             try:
@@ -5641,10 +5542,9 @@ def _make_single_track_run(album, track, token):
             j.summary = (f"Got “{t_title}”, filed under {artist} / {title}. "
                          "Future scans can still offer the rest of the album.")
         else:
-            # This download completed the album — it's a normal full album now, so
-            # clear any single mark an earlier partial download left behind.
-            # Without this the stale mark keeps the artist out of bulk scans and
-            # the new-release check even though nothing is partial any more.
+            # This download completed the album — it's a normal full album
+            # now, so clear any single mark an earlier partial download left
+            # behind.
             hidden_mod.unmark_single(artist, title)
             j.summary = (f"Got “{t_title}”; that completed {title}, so it's "
                          "filed as a full album.")
@@ -5683,23 +5583,17 @@ async def queue_download(request: Request, album_id: str = Form(""),
     if not album_id:
         msg = "Missing album id."
         if _is_htmx(request):
-            # 200, not 400: htmx only swaps 2xx/3xx responses, so a 400 fragment
-            # is silently dropped and the user sees no feedback. The notice
-            # styling carries the "this failed" meaning instead of the status.
+            # 200, not 400: htmx only swaps 2xx/3xx responses, so a 400
+            # fragment is silently dropped and the user sees no feedback.
             return HTMLResponse(_ql_notice_html("error", html.escape(msg)))
         return RedirectResponse(url="/queue?error=" + urllib.parse.quote(msg),
                                 status_code=303)
-    # "Get this edition too" — download a different edition of an album the user
-    # already owns, as a separate album. Bypasses the owned-check and treats it
-    # as brand-new so it lands in its own (year) folder beside the existing copy
-    # rather than being skipped or replacing it.
+    # "Get this edition too" — download a different edition of an album the
+    # user already owns, as a separate album.
     download_as_new_edition = str(as_new_edition).strip().lower() in (
         "1", "true", "yes", "on")
     # Refuse true duplicates — same album already active or pending — but only
-    # of the SAME intent (see _duplicate_download_job). A parked review naming
-    # the album doesn't count (nothing is queued there), and a deliberate
-    # new-edition copy or a single-track download is its own request and isn't
-    # swallowed by an unrelated job for the same album.
+    # of the SAME intent (see _duplicate_download_job).
     existing = _duplicate_download_job(album_id, track_id, download_as_new_edition)
     if existing:
         if _is_htmx(request):
@@ -5742,9 +5636,7 @@ async def queue_download(request: Request, album_id: str = Form(""),
                 except Exception:
                     existing_tracks = []
                 qobuz_tracks = (album.get("tracks") or {}).get("items") or []
-                # Only count it complete when nothing's missing. A partial album
-                # (some present, some missing) returns False so process_album can
-                # gap-fill the missing tracks instead of forcing a full re-rip.
+                # Only count it complete when nothing's missing.
                 return bool(existing_tracks and qobuz_tracks) and not (
                     compute_missing(qobuz_tracks, existing_tracks)[0])
 
@@ -5754,12 +5646,10 @@ async def queue_download(request: Request, album_id: str = Form(""),
             if await loop.run_in_executor(None, _already_complete):
                 msg = "This album is already in your library."
                 if _is_htmx(request):
-                    # Offer the deliberate second-edition path instead of a dead
-                    # end: a remaster or a different mix can be kept alongside the
-                    # owned copy (it imports into its own (year) folder). The form
-                    # re-posts with as_new_edition so the owned-check is skipped.
-                    # A quiet card with the action stacked below the text, so the
-                    # button never gets squeezed into a wrapped column on a phone.
+                    # Offer the deliberate second-edition path instead of a
+                    # dead end: a remaster or a different mix can be kept
+                    # alongside the owned copy (it imports into its own (year)
+                    # folder).
                     aid = html.escape(album_id)
                     return HTMLResponse(
                         f'<div class="ql-download-choice">'
@@ -5821,13 +5711,7 @@ async def queue_download(request: Request, album_id: str = Form(""),
                         )
                     )
                 return RedirectResponse(url=f"/jobs/{dup.id}", status_code=303)
-            # Re-check the run-lock right before submitting. The album fetch
-            # above awaited, and set_mode could have handed the lock to the
-            # terminal in that window — while this not-yet-registered job was
-            # invisible to set_mode's active-job check, so it wouldn't have
-            # refused the handoff. There's no await between here and submit, so
-            # this read and the registry add are atomic on the event loop: once
-            # the job is registered the handoff sees it and is refused instead.
+            # Re-check the run-lock right before submitting.
             busy = _lock_busy_response(request)
             if busy is not None:
                 return busy
@@ -5959,8 +5843,7 @@ async def library_page(request: Request, page: int = 1):
         "baseline_complete": new_releases.is_baseline_complete(),
         "hidden_count": hidden_mod.count(hidden_mod.SCOPE_MISSING),
         # Why a finished review retired ("discarded" / "worked_through" / ""),
-        # so the finished-state card reads right. Filled in below only when the
-        # page is actually calm post-baseline with no live review.
+        # so the finished-state card reads right.
         "library_review_retired_reason": "",
         "JobStatus": job_mgr.JobStatus,
         # Drives the header's quiet refresh: hidden while a crawl is already
@@ -5991,9 +5874,8 @@ async def library_page(request: Request, page: int = 1):
         # nothing is running above.
         cp = scan_checkpoint.pending()
         ctx["library_resume"] = cp if cp is not None else None
-        # Finished-state copy: the "Review complete" vs "Review discarded" card
-        # keys off why the review retired. Only read post-baseline with no live
-        # review — the one place the finished state renders.
+        # Finished-state copy: the "Review complete" vs "Review discarded"
+        # card keys off why the review retired.
         if ctx["baseline_complete"]:
             from qobuz_librarian.library import library_scan_state
             ctx["library_review_retired_reason"] = (
@@ -6061,9 +5943,8 @@ async def library_scan(
                     status_code=200)
             return RedirectResponse(
                 url="/library?error=" + urllib.parse.quote(msg), status_code=303)
-        # Same job the dashboard auto-check submits; its own execute_kind so the
-        # review screen badges the new releases (left un-ticked). Its results
-        # live on their own job page, never over the Library tabs.
+        # Same job the dashboard auto-check submits; its own execute_kind so
+        # the review screen badges the new releases (left un-ticked).
         job = await loop.run_in_executor(None, _start_new_release_check)
         if job is None:
             return _scan_submission_failure_response(request, "/library")
@@ -6138,18 +6019,14 @@ async def _restore_hidden(request, scope, redirect):
             status_code=303)
     if scope == hidden_mod.SCOPE_MISSING and (artists or fingerprints):
         # Upgrade/Downsample re-derive their reviews from saved state at read
-        # time, so restore takes effect there on its own. The Library review
-        # is a parked job — fold the restored candidates back in, or the
-        # restore looks like a no-op until some future scan.
+        # time, so restore takes effect there on its own.
         from qobuz_librarian.library import library_scan_state
         from qobuz_librarian.web import flows
         loop = asyncio.get_running_loop()
         rejoined = await loop.run_in_executor(
             None, lambda: flows.refold_restored_missing(artists, fingerprints))
         if rejoined is None:
-            # No live parked review to fold into. If one was retired, lift it so
-            # the restored items rebuild a usable review on the next /library
-            # load; otherwise they return on the next scan.
+            # No live parked review to fold into.
             lifted = await loop.run_in_executor(
                 None, library_scan_state.clear_review_retired)
             msg = ("Restored — back in the Library review." if lifted
@@ -6214,8 +6091,7 @@ async def upgrade_page(request: Request):
     from qobuz_librarian.library import hidden as hidden_mod
     creds_ok = bool(_read_creds().get("auth_token"))
     # Without credentials the page still renders, showing the connect card —
-    # bouncing to Search reads as a broken button. Only the env kill-switch
-    # hides the surface entirely.
+    # bouncing to Search reads as a broken button.
     if not getattr(cfg, "UPGRADE_SCAN_ENABLED", True):
         return _upgrade_unavailable_response()
     state = _upgrade_state_summary()
@@ -6341,12 +6217,7 @@ async def downsample_scan(request: Request):
 async def repair_page(request: Request, page: int = 1):
     from qobuz_librarian.library import scan_checkpoint
     creds_ok = bool(_read_creds().get("auth_token"))
-    # /repair is the SINGLE authoritative repair surface. When a repair job is in
-    # flight or has results parked for review, render its live body inline here
-    # (scanning → review → repairing → done) instead of bouncing to /jobs/{id}.
-    # Only a genuinely idle surface shows the start/resume form — so a parked
-    # review is never hidden behind a "Start scan" button (clicking which would
-    # silently discard those results via the rescan dedup).
+    # /repair is the SINGLE authoritative repair surface.
     rjob = _repair_current_job()
     ctx = {"creds_ok": creds_ok, "qobuz_ready": _qobuz_ready(),
            "page": "repair", "repair_job": rjob,
@@ -6388,8 +6259,7 @@ async def repair_scan(request: Request):
         return _scan_submission_failure_response(request, "/repair")
     # Land back on /repair so the sweep is watched live right here — its card
     # streams each flagged album inline (and explains the wait if it's queued
-    # behind another scan). When the scan finishes, the card's SSE done-handler
-    # forwards to the job page's flagged-album review.
+    # behind another scan).
     return RedirectResponse(url="/repair", status_code=303)
 
 
@@ -6568,17 +6438,15 @@ async def job_page(request: Request, job_id: str, approved: bool = False,
                 status_code=303)
         historical = True
     # An upgrade/downsample job page is that tool's surface, so its nav item
-    # lights up (and its review dot counts as seen — the user is looking at it).
-    # Unless the tool is unavailable: then the nav hides Upgrade, and lighting a
-    # hidden item points at nothing — fall back to Queue.
+    # lights up (and its review dot counts as seen — the user is looking at
+    # it).
     nav_page = (job.execute_kind
                 if job.execute_kind in ("upgrade", "downsample") else "queue")
     if nav_page == "upgrade" and not _upgrade_available():
         nav_page = "queue"
     if job.attention and job.attention != "recovery":
         # Opening the page is the acknowledgement: the History chip and the
-        # nav's warning dot stand down once the user has seen the job. Recovery
-        # attention is a safety state, not a dismissible notification.
+        # nav's warning dot stand down once the user has seen the job.
         job.attention = ""
         from qobuz_librarian.web import job_persistence
         loop = asyncio.get_running_loop()
@@ -6723,9 +6591,7 @@ async def job_approve(request: Request, job_id: str):
             status_code=303)
     # A parked review can outlive its feature: credentials can be pulled after
     # an upgrade review parks, and the downsample engine can vanish across a
-    # restart. The tool's own routes refuse in that state, so the approve door
-    # refuses the same way — otherwise the run launches straight into a doomed
-    # token or engine lookup.
+    # restart.
     if job.execute_kind == "upgrade" and not _upgrade_available():
         return _upgrade_unavailable_response()
     if job.execute_kind == "downsample":
@@ -6743,8 +6609,7 @@ async def job_approve(request: Request, job_id: str):
         dest = f"/jobs/{job_id}"
     # Library, new-release, and repair downloads need Qobuz just as much as
     # upgrades do — refuse up front rather than consuming the review with a
-    # run that dies on the first token lookup. (A token that expires mid-run
-    # is caught by the execute path, which re-parks the review.)
+    # run that dies on the first token lookup.
     if (job.execute_kind in ("library", "new_releases", "repair")
             and job.status == job_mgr.JobStatus.AWAITING_REVIEW
             and not _qobuz_ready()):
@@ -6753,28 +6618,20 @@ async def job_approve(request: Request, job_id: str):
                 "Reconnect Qobuz before downloading — your review is "
                 "untouched."),
             status_code=303)
-    # Guard a zero-selection approve: with nothing ticked, approving would flip
-    # the job to done over an empty set and flash success while quietly
-    # discarding the whole review. The submit button is disabled client-side, but
-    # a direct POST or a stale page can still reach here — keep it in review and
-    # say so instead.
+    # Guard a zero-selection approve: with nothing ticked, approving would
+    # flip the job to done over an empty set and flash success while quietly
+    # discarding the whole review.
     if job.status == job_mgr.JobStatus.AWAITING_REVIEW:
         job = _sync_saved_review_before_approve(job)
-    # A library review approves per tab: the button acts on the tab the user is
-    # looking at, and only that tab. Zero-selection is judged within the tab,
-    # and the other tab's candidates split into their own parked review before
-    # the download consumes this job. No tab posted (older page, direct POST)
-    # keeps the whole-review behavior.
+    # A library review approves per tab: the button acts on the tab the user
+    # is looking at, and only that tab.
     form = await request.form()
     tab = (form.get("tab") or "").strip()
     if job.execute_kind != "library" or tab not in ("missing", "gaps"):
         tab = ""
     loop = asyncio.get_running_loop()
-    # First downsample while the keep-vs-delete choice is unmade: force it here,
-    # before anything is rewritten. The prompt re-posts to this route carrying
-    # keep_choice — that saves the real setting (changeable later in Settings)
-    # and the run proceeds. An env-set or already-saved choice skips straight
-    # through, so nobody who has decided is asked again.
+    # First downsample while the keep-vs-delete choice is unmade: force it
+    # here, before anything is rewritten.
     if (job.execute_kind == "downsample"
             and job.status == job_mgr.JobStatus.AWAITING_REVIEW
             and cfg.DOWNSAMPLE_KEEP_ORIGINALS not in ("keep", "delete")):
@@ -6784,12 +6641,6 @@ async def job_approve(request: Request, job_id: str):
 
             def _save_keep_choice():
                 # Persist as the standing default AND apply in-memory now.
-                # settings_store.save() defers the apply while another job is
-                # running, but the downsample run this approve is about to
-                # launch reads the value at once and nothing else reads it —
-                # so it must not wait for the worker to idle, or the originals
-                # get deleted despite a "keep" choice. Mirrors the CLI path
-                # (modes/downsample).
                 settings_store.save({"DOWNSAMPLE_KEEP_ORIGINALS": choice})
                 cfg.DOWNSAMPLE_KEEP_ORIGINALS = choice
 
@@ -6803,8 +6654,7 @@ async def job_approve(request: Request, job_id: str):
             and job.execute_kind in _LIBRARY_SURFACE_KINDS):
         # The review may have gone stale while parked: an album grabbed from
         # Search (or added by hand) can still sit here as a missing-album
-        # candidate. Re-check against the disk and drop what's already owned,
-        # instead of downloading it again. Disk probes — off the event loop.
+        # candidate.
         from qobuz_librarian.web import flows
         skipped = await loop.run_in_executor(
             None, lambda: flows.drop_owned_missing_candidates(job))
@@ -6825,38 +6675,26 @@ async def job_approve(request: Request, job_id: str):
         if not has_pick:
             return RedirectResponse(url=f"{dest}?noselection=1{_skip_q}",
                                     status_code=303)
-    # Selection is saved server-side as the user ticks (the paginated review no
-    # longer carries every checkbox in the form), so approve runs against the
-    # saved flags — passing None keeps them as-is rather than reading the form.
-    # Offload to a thread: approve() does a json.dumps of up to JOB_CANDIDATE_CAP
-    # candidate dicts + a SQLite commit, which would block the single event loop
-    # (freezing every SSE stream / other request) for a large parked review —
-    # the same reason /select was offloaded.
+    # Selection is saved server-side as the user ticks (the paginated review
+    # no longer carries every checkbox in the form), so approve runs against
+    # the saved flags — passing None keeps them as-is rather than reading the
+    # form.
     def _split_and_approve():
         from qobuz_librarian.completion import normalise_album_id
 
-        # Atomic recheck right before anything is consumed: the route's opening
-        # gate ran before several awaits (form parsing, disk probes), and
-        # set_mode('cli') can hand the run lock to the terminal inside that
-        # window — this not-yet-approved review is invisible to its active-job
-        # check, so approving after the handoff would start destructive work
-        # with the single-writer guard off. Under _auto_check_lock (which the
-        # handoff also takes) this either sees the pause and bounces with the
-        # review untouched, or flips the job active first so the handoff
-        # refuses.
+        # Atomic recheck right before anything is consumed: the route's
+        # opening gate ran before several awaits (form parsing, disk probes),
+        # and set_mode('cli') can hand the run lock to the terminal inside
+        # that window — this not-yet-approved review is invisible to its
+        # active-job check, so approving after the handoff would start
+        # destructive work with the single-writer guard off.
         with _SAVED_REVIEW_LOCK, _auto_check_lock, _DOWNLOAD_SUBMIT_LOCK:
             if _web_writes_paused():
                 return "paused"
-            # A library or new-release download consumes only the ticked picks:
-            # park everything else (unticked, plus the inactive tab on a
-            # tab-scoped approve) as its own living review first, so the download
-            # can't eat un-reviewed candidates. For new releases this is also the
-            # standing rule that a release stays in the New Releases review until
-            # it's downloaded or dismissed — approving one of ten must not consume
-            # the other nine. tab="" (older page / direct POST) still splits by
-            # selection, so the whole-review path is protected too. Other kinds
-            # keep their own recovery (Upgrade/Downsample rebuild from saved
-            # state).
+            # A library or new-release download consumes only the ticked
+            # picks: park everything else (unticked, plus the inactive tab on
+            # a tab-scoped approve) as its own living review first, so the
+            # download can't eat un-reviewed candidates.
             split_review = None
             admission_decisions = {}
 
@@ -6944,9 +6782,7 @@ def _hide_scope(execute_kind):
     return hidden_mod.SCOPE_MISSING
 
 
-# Artist groups per review page. A huge gap scan can surface thousands of
-# albums; rendering them all is what made the review page tank, so the server
-# pages by whole artist groups (an album never splits across a page).
+# Artist groups per review page.
 REVIEW_PAGE_ARTISTS = 40
 # Whole-group candidate budget per page — see _paginate_groups.
 REVIEW_PAGE_CANDIDATES = 1500
@@ -7120,9 +6956,7 @@ async def job_select_all(request: Request, job_id: str):
         return JSONResponse({"error": "invalid scope"}, status_code=400)
     cids = form.getlist("cid")[:100000] if scope == "page" else None
     # Tab and filter scoping: on a library review, select-all flips only the
-    # active tab's candidates — never the tab the user can't see. And with a
-    # filter typed, only the candidates it shows — flipping the other
-    # thousand rows invisibly would overwrite every saved tick on the tab.
+    # active tab's candidates — never the tab the user can't see.
     tab = (form.get("tab") or "").strip()
     q = (form.get("q") or "").strip().lower()
     artist = (form.get("artist") or "").strip()
@@ -7150,10 +6984,7 @@ async def job_select_all(request: Request, job_id: str):
         )
     if changed:
         # Unlike a single tap, a bulk choice is one infrequent operation whose
-        # success needs to mean its complete result is durable. Waiting for the
-        # off-thread write lets this exact response warn if the data volume
-        # rejected it; a delayed coalesced write could only fail after the page
-        # had already claimed success.
+        # success needs to mean its complete result is durable.
         from qobuz_librarian.web import job_persistence
         loop = asyncio.get_running_loop()
         saved = await loop.run_in_executor(
@@ -7249,8 +7080,6 @@ async def job_hide(request: Request, job_id: str):
         if n:
             # Carry the fresh authoritative counts so the page updates the
             # summary/selected/reclaimable without recounting a partial DOM.
-            # hidden_total keeps the toolbar's "Dismissed (N)" link current —
-            # it's rendered once with the page and has no other refresh path.
             import json as _json
 
             from qobuz_librarian.library import hidden as hidden_mod
@@ -7286,9 +7115,7 @@ async def job_dismiss_rest(request: Request, job_id: str):
     # An active filter narrows the dismissal to the rows it shows — same
     # what-you-see-is-what-you-act-on rule as select-all.
     q = (form.get("q") or "").strip().lower()
-    # Snapshot the artists that still have an unticked album. dismiss_albums
-    # re-reads each artist's saved ticks, so a tick that lands after this
-    # snapshot is still honoured and its album isn't dropped.
+    # Snapshot the artists that still have an unticked album.
     with job._lock:
         artists, seen = [], set()
         for c in job.candidates:
@@ -7328,11 +7155,8 @@ async def job_dismiss_rest(request: Request, job_id: str):
         await loop.run_in_executor(None, _dismiss_all)
         hidden_count = done["n"]
     except OSError as e:
-        # Mid-batch store failure: the artists already hidden stay hidden,
-        # the rest are untouched — report the failure instead of a count.
-        # The page and every other tab are now stale by however many artists
-        # DID go through, so fan the change out with no origin: even the
-        # requesting tab must reload to show what actually happened.
+        # Mid-batch store failure: the artists already hidden stay hidden, the
+        # rest are untouched — report the failure instead of a count.
         if done["n"]:
             job.notify_review_changed()
         return JSONResponse({"error": str(e), "hidden": done["n"]},
@@ -7411,8 +7235,7 @@ async def job_retry(request: Request, job_id: str):
         )
 
     # A Retry is also the only user-triggered lane for an interrupted durable
-    # Web download. Always inspect afresh while authority is intact: both a
-    # cached CLEAR and a cached RESUME can be stale after a worker attempt.
+    # Web download.
     if not _run_lock_intact():
         busy = _lock_busy_response(request)
         if busy is not None:
@@ -7563,9 +7386,7 @@ async def job_retry(request: Request, job_id: str):
                 ),
                 timeout=cfg.WEB_FETCH_TIMEOUT,
             )
-        # Re-check under the submit lock. A live album lookup may have yielded
-        # the event loop, and concurrent Retry requests must still fold onto
-        # the one exact durable owner.
+        # Re-check under the submit lock.
         with _DOWNLOAD_SUBMIT_LOCK:
             duplicate = _find_job_touching_album(album_id)
             if duplicate:
@@ -7857,9 +7678,7 @@ async def job_undo(request: Request, job_id: str):
             d = Path(info["dir"])
         # Every intent and state/identity refresh reaches the durable job row
         # while the direct-operation lock still excludes another library
-        # writer. A restart can therefore resume a private held entry or an
-        # already-unlinked entry without treating an unrelated missing path as
-        # success.
+        # writer.
         job.single = info
 
         def _persist_progress():
@@ -7877,9 +7696,8 @@ async def job_undo(request: Request, job_id: str):
                 hidden_mod.unmark_single(info.get("artist") or "", info.get("album") or "")
         return removed
 
-    # Register under the same gate as the CLI handoff before taking the staging
-    # mutex. The handoff then either pauses this request before it starts or sees
-    # the active mutation and keeps the cross-process run lock held.
+    # Register under the same gate as the CLI handoff before taking the
+    # staging mutex.
     loop = asyncio.get_running_loop()
     state, operation_token, lock = await loop.run_in_executor(
         None, lambda: _begin_direct_library_operation("Undo"))
@@ -7913,10 +7731,8 @@ async def job_undo(request: Request, job_id: str):
             job.single = {**info, "removed": True}
             job.summary = f"Removed “{info.get('title')}” and undid the single."
         else:
-            # If the whole recorded directory is gone, clearing the single mark
-            # cannot delete anything. Otherwise a changed or unverifiable
-            # binding is left for the user rather than guessed from tags or
-            # filenames.
+            # If the whole recorded directory is gone, clearing the single
+            # mark cannot delete anything.
             from pathlib import Path as _Path
             dir_gone = (
                 info.get("owned_root") is None
@@ -7981,10 +7797,7 @@ async def job_cancel(request: Request, job_id: str):
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, lambda: job_mgr.request_cancel(job))
     # Repair stays on its single surface either way (idle start form once the
-    # cancel lands). A discarded review goes home to the page that owns it —
-    # landing on an unrelated (often empty) Queue reads like something broke.
-    # A cancelled queued job vanishes instantly → the queue; a running/scanning
-    # job stops cooperatively → keep them on the job page to watch it wind down.
+    # cancel lands).
     if job.execute_kind == "repair":
         dest = "/repair"
     elif job.execute_kind in _LIBRARY_SURFACE_KINDS:
@@ -8036,8 +7849,7 @@ async def queue_history(request: Request, p: int = 1):
 
     def _load_page(page):
         # Two layers: meaningful jobs as a scrollable card region, plain
-        # downloads as the paginated table underneath. Recovery obligations
-        # sit ahead of the bounded ordinary cards so age cannot hide them.
+        # downloads as the paginated table underneath.
         recoveries = _stamp(job_persistence.recovery_history())
         bulk = recoveries + _stamp(job_persistence.history_page(
             _HISTORY_BULK_CAP,
@@ -8088,7 +7900,6 @@ async def queue_clear(request: Request):
 async def queue_cancel_pending():
     # Parked reviews are deliberately exempt: the queue page no longer shows
     # them, and a bulk clear must never take something the user can't see.
-    # Each review has its own Discard on its own page.
     for j in list(job_mgr.registry.pending_and_running()):
         if j.status == job_mgr.JobStatus.AWAITING_REVIEW:
             continue
@@ -8173,9 +7984,8 @@ def _diagnostics():
         checks.append({"label": "Stranded upgrade backups", "ok": True,
                        "detail": "none"})
 
-    # Backups whose original is still missing the tracks they hold — orphaned by
-    # a hard kill that skipped the restore/delete. Retention keeps these rather
-    # than reaping the only copy; surface them so they can be reconciled.
+    # Backups whose original is still missing the tracks they hold — orphaned
+    # by a hard kill that skipped the restore/delete.
     try:
         from qobuz_librarian.library.backup import find_only_copy_backups
         orphans = find_only_copy_backups()
@@ -8351,27 +8161,14 @@ async def save_settings(request: Request, user_id: str = Form(""), auth_token: s
     # Blank means "keep the existing value" — the fields are not pre-filled,
     # so an empty submission must not wipe a previously-saved credential.
     if not auth_token.strip() and not user_id.strip() and cfg.QOBUZ_USER_AUTH_TOKEN:
-        # Blank submit with an env token = "keep the env creds". But downloads
-        # shell out to `rip`, which also needs a user id; a token-only env
-        # authenticates our own API calls yet fails every download. Only report
-        # connected when a usable user id actually exists (env id, or one already
-        # in the rip config) — otherwise show the needuser banner instead of a
-        # false green that dead-ends at the first download.
+        # Blank submit with an env token = "keep the env creds".
         if cfg.QOBUZ_USER_ID or _streamrip_has_userid():
             return RedirectResponse(url="/settings?connected=1", status_code=303)
         return _settings_response(request, error="needuser", user_id="",
                                   auth_token_prefill="", diagnostics=diags)
     new_token = auth_token.strip() or existing.get("auth_token", "")
     new_uid = user_id.strip() or existing.get("user_id", "")
-    # Both fields are mandatory. The token authenticates our API calls on its
-    # own, so the check below passes with just a token — but load_qobuz_token()
-    # and streamrip's login() both require the user id, so a token-only save
-    # would look connected yet fail with "no credentials" on the first search,
-    # and downloads would raise MissingCredentialsError. Refuse a half-config
-    # and name the missing field. Re-render rather than redirect on these two:
-    # the user typed something that didn't save, and a fresh GET can't pre-fill
-    # the password field — so a redirect would wipe the (long) token they just
-    # pasted.
+    # Both fields are mandatory.
     if new_token and not new_uid:
         return _settings_response(request, error="needuser",
                                   user_id=user_id.strip(),
@@ -8382,10 +8179,7 @@ async def save_settings(request: Request, user_id: str = Form(""), auth_token: s
                                   user_id=user_id.strip(),
                                   auth_token_prefill=auth_token.strip(),
                                   diagnostics=diags)
-    # Check the token with Qobuz *before* writing it. A token Qobuz outright
-    # rejects never lands in the config — we re-render with it still in the box
-    # so the user can fix a paste slip without losing it. A network/timeout
-    # failure can't tell us either way, so we save and flag it unverified.
+    # Check the token with Qobuz *before* writing it.
     verdict = "unreachable"
     if new_token:
         from qobuz_librarian.api.client import call_within
@@ -8414,8 +8208,7 @@ async def save_settings(request: Request, user_id: str = Form(""), auth_token: s
                                   diagnostics=diags)
     # Keep the dashboard's "token isn't authenticating" banner in step with
     # what we just verified — a freshly-fixed token shouldn't keep nagging
-    # until the next restart. An unverified save drops back to inconclusive
-    # rather than leaving a stale False from an earlier probe.
+    # until the next restart.
     _TOKEN_VALID = True if verdict == "ok" else None
     suffix = "&unverified=1" if verdict == "unreachable" else ""
     return RedirectResponse(url=f"/settings?connected=1{suffix}", status_code=303)
@@ -8429,12 +8222,7 @@ async def save_behavior(request: Request):
         return form.get(key, "").strip().lower() not in (
             "0", "false", "off", "no", ""
         )
-    # The real Settings form ships a hidden form_complete=1 marker. When
-    # it's present, every checkbox key is known to be authoritative
-    # (unchecked = absent = False). When it's absent — a scripted partial
-    # POST — only the keys the caller actually sent overwrite; the rest
-    # are left at their current value so a one-field toggle doesn't blow
-    # away the user's other booleans.
+    # The real Settings form ships a hidden form_complete=1 marker.
     is_complete = "form_complete" in form
     if is_complete:
         values = {k: (_posted_bool(k) if k in form else False)
@@ -8451,8 +8239,7 @@ async def save_behavior(request: Request):
                       bool(getattr(cfg, "PREFER_HIRES", False)))
     ok, warnings = settings_store.save(values)
     # A quality-policy change leaves a parked/saved Upgrade review promising
-    # targets the settings no longer produce. No silent re-scan (that's the
-    # user's bandwidth) — say so, and let the policy-aware refresh re-derive.
+    # targets the settings no longer produce.
     quality_note = False
     if quality_before != (str(getattr(cfg, "STREAMRIP_QUALITY", "")),
                           bool(getattr(cfg, "PREFER_HIRES", False))):
@@ -8491,23 +8278,17 @@ async def set_mode(request: Request, target: str = Form("")):
     from qobuz_librarian import run_lock
     want = (target or "").strip().lower()
     if want == "cli":
-        # Flip to CLI mode first so a /download or scan POST landing during the
-        # handoff is refused (503) instead of slipping past the check and racing
-        # the CLI over /staging once we release the lock below. The flip happens
-        # here on the event loop (atomic against /download's on-loop
-        # recheck-and-submit), while the active-job check and the release run
-        # under _auto_check_lock in a worker — the same lock the scan starters
-        # and review approval hold across THEIR recheck-and-enqueue, so the
-        # handoff either sees their job and refuses, or pauses them first.
+        # Flip to CLI mode first so a /download or scan POST landing during
+        # the handoff is refused (503) instead of slipping past the check and
+        # racing the CLI over /staging once we release the lock below.
         _CLI_MODE = True
 
         def _handoff():
             global _RUN_LOCK_HANDLE, _LOCK_BUSY_PID, _CLI_MODE
             with _auto_check_lock:
-                # Only work in flight blocks the handoff — the race this guards
-                # against is the CLI and a running worker sharing /staging. A
-                # parked review has no worker and can sit for weeks; refusing on
-                # it would make terminal mode unreachable.
+                # Only work in flight blocks the handoff — the race this
+                # guards against is the CLI and a running worker sharing
+                # /staging.
                 jobs_active = any(
                     j.status != job_mgr.JobStatus.AWAITING_REVIEW
                     for j in job_mgr.registry.pending_and_running()
@@ -8531,9 +8312,8 @@ async def set_mode(request: Request, target: str = Form("")):
                 "terminal."), status_code=303)
         return RedirectResponse(url="/settings?mode=cli", status_code=303)
     if want == "nolock":
-        # Durable recovery cannot inspect or reconcile saved work without exact
-        # single-writer authority. Older clients may still post this retired
-        # action; keep it fail-closed instead of silently accepting it.
+        # Durable recovery cannot inspect or reconcile saved work without
+        # exact single-writer authority.
         return RedirectResponse(
             url="/settings?error=" + urllib.parse.quote(
                 "The safety lock is required. Fix the data-folder filesystem "
@@ -8553,8 +8333,6 @@ async def set_mode(request: Request, target: str = Form("")):
             else:
                 _record_startup_recovery(lease)
                 # Terminal-first startup deliberately skipped persisted jobs.
-                # Rebind them while Web writes are still paused, then expose
-                # mutation routes only after the one-time restore completes.
                 _restore_jobs_once()
                 _LOCK_UNENFORCEABLE = False
                 _CLI_MODE = False
@@ -8570,9 +8348,8 @@ async def set_mode(request: Request, target: str = Form("")):
     return RedirectResponse(url="/settings", status_code=303)
 
 
-# Empty 500ms ticks before we emit a `: ping` heartbeat to keep
-# reverse proxies from dropping the EventSource on a quiet scan.
-# Defaults from cfg.SSE_HEARTBEAT_TICKS / cfg.SSE_MAX_WORKERS (env-tunable).
+# Empty 500ms ticks before we emit a `: ping` heartbeat to keep reverse
+# proxies from dropping the EventSource on a quiet scan.
 _SSE_HEARTBEAT_TICKS = cfg.SSE_HEARTBEAT_TICKS
 
 # Dedicated thread pool for SSE waits so a long-running scan with many
@@ -8986,10 +8763,8 @@ async def jobs_list(status: str = "", limit: int = 50):
         if len(matching) >= cap:
             break
 
-    # The registry only holds the newest MAX_FINISHED terminal jobs; the archive
-    # keeps far more. Append older finished rows (deduped) so they're reachable.
-    # Registry rows are the live copy and already cover the newest finishes, so
-    # the archive rows we add are strictly older and stay correctly ordered.
+    # The registry only holds the newest MAX_FINISHED terminal jobs; the
+    # archive keeps far more.
     if want_terminal and len(matching) < cap:
         from qobuz_librarian.web import job_persistence
         # Filter in SQL: fetching the newest `cap` rows and filtering here

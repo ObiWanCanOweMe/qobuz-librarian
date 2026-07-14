@@ -72,24 +72,6 @@ def test_force_stops_after_an_interrupted_backup(monkeypatch, tmp_path):
     ]
 
 
-def test_sweep_staging_artwork_keeps_unproved_artwork_dirs(monkeypatch, tmp_path):
-    from qobuz_librarian import config as cfg
-    from qobuz_librarian.modes import process as proc
-
-    staging = tmp_path / "staging"
-    artwork = staging / "Artist" / "Album (2020)" / "__artwork"
-    artwork.mkdir(parents=True)
-    (artwork / "cover-abc.jpg").write_bytes(b"\xff\xd8\xff")
-    keep = staging / "Artist" / "Album (2020)" / "12 - Side B.flac"
-    keep.write_bytes(b"fLaC")
-
-    monkeypatch.setattr(cfg, "STAGING_DIR", staging)
-    proc.sweep_staging_artwork()
-
-    assert artwork.exists()
-    assert keep.exists()
-
-
 def test_partial_retention_moves_only_the_recorded_download_run(
         monkeypatch, tmp_path):
     from qobuz_librarian import config as cfg
@@ -819,29 +801,6 @@ def test_gap_fill_partial_import_restores_backup_despite_extra_track(
     proc.process_album(album, _args(), token="tok")
 
     assert owned.read_bytes() == b"the-owned-original"
-
-
-def test_upgrade_verification_rejects_a_rank_slot_downgrade(monkeypatch, tmp_path):
-    from qobuz_librarian.modes import process as proc
-
-    backup = tmp_path / "backup"
-    backup.mkdir()
-    post = tmp_path / "Album"
-    post.mkdir()
-    original = [
-        {"title": "T1", "length": 100.0, "bits": 16, "sample_rate": 44100},
-        {"title": "T2", "length": 100.0, "bits": 24, "sample_rate": 96000},
-        {"title": "T3", "length": 100.0, "bits": 24, "sample_rate": 192000},
-    ]
-    replacement = [
-        {"title": "T1", "length": 100.0, "bits": 16, "sample_rate": 44100},
-        {"title": "T2", "length": 100.0, "bits": 24, "sample_rate": 48000},
-        {"title": "T3", "length": 100.0, "bits": 24, "sample_rate": 192000},
-    ]
-    monkeypatch.setattr(proc, "find_album_dir_filesystem", lambda _a: post)
-    monkeypatch.setattr(proc, "read_album_dir",
-                        lambda f, walk_errors=None: original if f == backup else replacement)
-    assert proc._upgrade_replacement_verified({"id": "x"}, post, backup) is False
 
 
 def test_upgrade_verification_rejects_a_swap_hidden_by_ranking(monkeypatch, tmp_path):

@@ -76,7 +76,7 @@ Docker is the supported way to run the **web UI**: the image bundles streamrip, 
 
 Auth is by token, not your password. You need a paid Qobuz account; this only downloads what your subscription entitles you to.
 
-Get the token from the [Qobuz web player](https://play.qobuz.com): sign in, open dev tools (F12), and find Local Storage for `play.qobuz.com` (**Application** tab in Chrome/Edge, **Storage** in Firefox). Open the `localuser` entry and copy its `token` value; the `id` field next to it is your user id. Paste the token into **Auth Token** on Settings; **Email or user ID** takes either your email or that numeric id. Credentials stay in the container and are used only for Qobuz authentication.
+Get the token from the [Qobuz web player](https://play.qobuz.com): sign in, open dev tools (F12), and find Local Storage for `play.qobuz.com` (**Application** tab in Chrome/Edge, **Storage** in Firefox). Open the `localuser` entry and copy its `token` value; the `id` field next to it is your user id. Paste the token into **Auth token** on Settings; **Email or user ID** takes either your email or that numeric id. Credentials stay in the container and are used only for Qobuz authentication.
 
 If you already run streamrip elsewhere, copy `password_or_token` from `~/.config/streamrip/config.toml` instead.
 

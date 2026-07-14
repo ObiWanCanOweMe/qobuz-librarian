@@ -61,16 +61,11 @@ def _discard_corrupt_db() -> bool:
 
 
 def _handle_db_error(e: sqlite3.Error) -> None:
-    """Recover from a corrupt-db error surfaced by a read/write.
-
-    SQLite data-page corruption (common after an unclean NAS/container power
-    off, the deployment this app targets) often passes connect + 'CREATE TABLE
-    IF NOT EXISTS' and only surfaces as 'database disk image is malformed' on a
-    later row access — which _ensure() never re-checks. Left alone the cache is
-    then permanently dead: every get/put raises, is swallowed, and every scan
-    refetches from Qobuz. So drop this thread's now-suspect connection and, when
-    the error is corruption, discard the malformed file and force the next
-    _ensure() to rebuild it.
+    """Recover from a corrupt-db error surfaced by a read/write. SQLite data-page
+    corruption (common after an unclean NAS/container power off, the
+    deployment this app targets) often passes connect + 'CREATE TABLE IF NOT
+    EXISTS' and only surfaces as 'database disk image is malformed' on a later
+    row access — which _ensure() never re-checks.
     """
     global _initialized, _generation
     conn = getattr(_local, "conn", None)
@@ -84,9 +79,7 @@ def _handle_db_error(e: sqlite3.Error) -> None:
         return
     with _init_lock:
         # First thread to notice clears the file and resets the init flag; a
-        # concurrent rebuild (which re-sets _initialized) isn't torn down. Bump
-        # the generation so sibling workers reopen against the rebuilt db rather
-        # than keep writing into the deleted inode.
+        # concurrent rebuild (which re-sets _initialized) isn't torn down.
         if _initialized and _discard_corrupt_db():
             _initialized = False
             _generation += 1
@@ -130,8 +123,7 @@ def _ensure() -> bool:
                 return True
             except sqlite3.Error as e:
                 # A corrupt db is the one error we can fix: drop it and retry
-                # once. Anything else (locked, full, unwritable) isn't ours to
-                # repair, so disable the cache and let the scan hit the API.
+                # once.
                 if attempt == 1 and _is_corrupt_error(e) and _discard_corrupt_db():
                     continue
                 vlog(f"album cache init failed ({e}); proceeding without it")
@@ -185,9 +177,7 @@ def get(album_id) -> dict | None:
 
 
 # Cap the albums table so it can't grow without bound over a library's
-# lifetime. An album's track list is fixed, so this is a size bound, not a
-# staleness one: keep the most-recently-fetched rows, drop the oldest beyond the
-# cap. Trim only every _TRIM_EVERY writes to keep it off the hot path.
+# lifetime.
 _CACHE_MAX_ALBUMS = 10000
 _TRIM_EVERY = 200
 _puts_since_trim = 0

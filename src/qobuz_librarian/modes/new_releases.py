@@ -87,11 +87,7 @@ def run_check_new_releases_mode(args):
     artists_with_news = 0
     failed_count = 0
 
-    # Managed explicitly rather than via `with ... as ex` so a Ctrl-C / AuthLost
-    # doesn't get stuck in the context manager's implicit shutdown(wait=True),
-    # which blocks until every in-flight network call returns (seconds-to-minutes
-    # against a slow/rate-limited Qobuz). The finally instead discards queued
-    # tasks and lets the few running requests finish detached.
+    # Managed explicitly rather than via `with ...
     ex = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="newrel")
     try:
         futures = {ex.submit(find_new_releases_for_artist, ad.name,
@@ -129,9 +125,7 @@ def run_check_new_releases_mode(args):
         log.info(fmt(C.YELLOW, "\n  ⚠  Cancelled — not recording this run."))
         raise
     finally:
-        # wait=False: never block on in-flight calls. cancel_futures discards
-        # any not-yet-started task. On the success path every future is already
-        # done, so this is just a clean teardown.
+        # wait=False: never block on in-flight calls.
         ex.shutdown(wait=False, cancel_futures=True)
 
     saved = None
@@ -139,11 +133,7 @@ def run_check_new_releases_mode(args):
         # UNION each reached artist's snapshot into the prior baseline rather
         # than replacing it — an over-cap catalog comes back as a different
         # slice each run, so a replace would let rotated-out ids re-surface as
-        # "new" (the same merge the web flow does). An artist that errored
-        # keeps its old entry. Only claim a COMPLETE baseline when the crawl
-        # actually reached artists cleanly: marking complete after an
-        # all-skipped/errored run would seed an empty baseline and permanently
-        # defeat the library scan's seeding.
+        # "new" (the same merge the web flow does).
         merged = dict(seen)
         for aid, ids in current_seen.items():
             merged[aid] = sorted(set(merged.get(aid, [])) | set(ids))

@@ -60,10 +60,7 @@ def scan_artist_for_downsample(artist_dir: Path):
         if not hires:
             continue
         # Scale each file's audio portion by its rate cut (96→48 ≈ half the
-        # samples, so ≈ half the audio bytes). audio_size already excludes the
-        # metadata and embedded art that don't shrink, so the total isn't
-        # inflated by a big cover — still an estimate (FLAC doesn't compress
-        # exactly linearly with rate), hence the "~" wherever it's shown.
+        # samples, so ≈ half the audio bytes).
         est = sum(int(h["audio_size"] * (1 - h["target"] / h["sr"])) for h in hires)
         out.append(DownsampleCandidate(
             album_dir=album_dir,

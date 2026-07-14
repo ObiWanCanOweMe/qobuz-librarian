@@ -136,10 +136,7 @@ def get_album(album_id, token):
         # A malformed/error 200 body (list/str/None) would crash on `.get` below
         # and escape every caller that only catches QobuzError — raise one here.
         raise QobuzError(f"album/get returned a non-dict response for {album_id!r}")
-    # Don't cache a track-less response. The album cache has no TTL, so a
-    # transient/partial 200 with an empty tracks block would otherwise report
-    # the album as empty forever; serve it this once but only persist a real
-    # track list.
+    # Don't cache a track-less response.
     if (album.get("tracks") or {}).get("items"):
         album_cache.put(album_id, album)
     return album
@@ -175,22 +172,10 @@ def search_tracks(query, token, limit=10):
 
 # ── ISRC lookup — STRICT equality (replacing the wrong recording is silent data loss) ────
 def find_qobuz_track_by_isrc(isrc, token):
-    """Look up a Qobuz track by exact ISRC. Returns the track dict or None.
-
-    Qobuz indexes ISRCs in track/search, but a text query for an ISRC
-    string can also surface tracks whose ISRC merely starts with the same
-    characters, or tracks whose title coincidentally contains the string.
-    This wrapper requires the returned track's ISRC field to equal the
-    query (case-folded, hyphens stripped) before declaring a hit, so
-    "exact match" actually means it.
-
-    Returns None for: empty input, a definitive API error (QobuzError — a 4xx
-    or an unparseable body, read as "nothing usable here"), no hit, or only
-    near-misses. AuthLost and QobuzUnavailable are NOT swallowed: both are abort
-    signals (not QobuzError) and propagate, so an expired token or a Qobuz outage
-    stops the run cleanly instead of mislabelling every track as "no ISRC match".
-    Caller decides what to do with None (skip, fall back to title match, or
-    prompt the user).
+    """Look up a Qobuz track by exact ISRC. Returns the track dict or None. Qobuz
+    indexes ISRCs in track/search, but a text query for an ISRC string can
+    also surface tracks whose ISRC merely starts with the same characters, or
+    tracks whose title coincidentally contains the string.
     """
     if not isrc:
         return None
@@ -240,12 +225,8 @@ def get_artist_albums(artist_id, token, limit=None, fresh=False):
         albums_obj = _envelope(data, "albums")
         _albums_raw = albums_obj.get("items")
         raw_list = _albums_raw if isinstance(_albums_raw, list) else None
-        # `block` is the usable albums (dicts only); `raw_len` is how much of the
-        # page Qobuz actually handed back. They differ when a page mixes a few
-        # malformed non-dict entries into an otherwise full page — and the
-        # difference is load-bearing: advancing the offset or detecting a short
-        # page by the FILTERED count would treat that full page as the end of the
-        # discography and silently hide the artist's remaining albums.
+        # `block` is the usable albums (dicts only); `raw_len` is how much of
+        # the page Qobuz actually handed back.
         block = [a for a in raw_list if isinstance(a, dict)] if raw_list else []
         raw_len = len(raw_list) if raw_list else 0
         if qobuz_total is None:
@@ -270,19 +251,12 @@ def get_artist_albums(artist_id, token, limit=None, fresh=False):
         # raw entries, matching how Qobuz reports `total`).
         if qobuz_total is not None and offset >= qobuz_total:
             break
-    # Only persist a discography we believe is whole. The catalog cache lives
-    # for weeks, so an entry that fell short because Qobuz handed back a short
-    # or empty page mid-pagination would keep hiding that artist's missing and
-    # new albums until it expired. If we got fewer than Qobuz's own total
-    # without hitting our own limit, treat the result as incomplete: it's fine
-    # for this run, but the next scan should re-fetch rather than trust it.
+    # Only persist a discography we believe is whole.
     complete = (qobuz_total is None
                 or len(items) >= qobuz_total
                 or len(items) >= limit)
     # Never cache an empty discography unless Qobuz explicitly said the artist
-    # has none (total == 0). A 200 with an error body (no "albums" key) yields
-    # items=[] and total=None, which would otherwise read as "complete" and
-    # hide that artist's whole catalog from scans for the cache's lifetime.
+    # has none (total == 0).
     if complete and (items or qobuz_total == 0):
         album_cache.put_catalog(cache_key, {"items": items, "total": qobuz_total})
     return items, qobuz_total

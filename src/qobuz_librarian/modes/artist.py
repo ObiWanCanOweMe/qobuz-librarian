@@ -66,10 +66,7 @@ def _downsample_note(album):
     sr = album.get("maximum_sampling_rate") or 0
     sr_hz = int(round(sr)) if sr >= 1000 else int(round(sr * 1000))
     # Cap the advertised rate to the active streamrip quality tier first, the
-    # same way album_max_quality() does. At tier 2 (CD lossless) a 192kHz master
-    # is already fetched at 44.1/48kHz, so there's no hi-res master left to
-    # downsample — without this cap the note promises a downsample step that
-    # never happens.
+    # same way album_max_quality() does.
     if sr_hz:
         sr_hz = min(sr_hz, streamrip_quality_cap()[1])
     target_hz = downsample_target_rate(sr_hz)
@@ -81,39 +78,21 @@ def _downsample_note(album):
 def run_artist_gap_fill(artist_name, artist_dir, args, token, *,
                       shared_queue=None, flush_callback=None,
                       skip_predicate=None, save_callback=None, fresh=False):
-    """Walk every album dir under artist_dir, match each to Qobuz, prompt to
-    fill gaps. The matching is library.discovery.match_album_dir; this function
-    is the prompting + sibling cleanup around it.
-
-    Returns (results, owned_titles, handled_ids, resolved_dirs, artist_id,
-    catalog). The last four are the hand-off the missing-albums step needs so an
-    album already matched to a folder here isn't re-offered as missing.
-
-    flush_callback (album fill walk): a zero-arg callable. When supplied, the
-    per-album prompt gains a 'd' option that downloads whatever is currently in
-    shared_queue, then resumes scanning. shared_queue must also be supplied.
-
-    skip_predicate (album fill walk): callable taking an album Path, returning
-    True to skip it entirely (no Qobuz query, no prompt, no result) — honours
-    the per-album seen file.
-
-    save_callback (modes 4 & 5): zero-arg callable invoked after this artist's
-    queue items are added to shared_queue, so the caller can persist the queue
-    for crash recovery. Fires once per artist, not per album.
+    """Walk every album dir under artist_dir, match each to Qobuz, prompt to fill
+    gaps. The matching is library.discovery.match_album_dir; this function is
+    the prompting + sibling cleanup around it. Returns (results, owned_titles,
+    handled_ids, resolved_dirs, artist_id, catalog).
     """
     album_dirs = list_artist_album_dirs(artist_dir)
     if not album_dirs:
         log.info(fmt(C.YELLOW, f"  ⚠  No album folders found under {artist_dir}."))
         # catalog=None, not []: the missing-albums step treats a non-None
-        # catalog as authoritative. Handing it an empty list here would make
-        # it report "caught up" without ever querying Qobuz.
+        # catalog as authoritative.
         return [], {}, set(), set(), None, None
 
     sibling_choices = {}  # picked_dir -> [siblings to delete after fill]
 
-    # Resolve the artist + pre-fetch the catalog. The catalog feeds both the
-    # sibling quality labels and the per-folder match (zero search-API cost when
-    # the folder's album is in it).
+    # Resolve the artist + pre-fetch the catalog.
     vlog("  Resolving artist + pre-fetching catalog …")
     artist_search_failed = False
     try:
@@ -221,10 +200,9 @@ def run_artist_gap_fill(artist_name, artist_dir, args, token, *,
     vlog("  Press 's' at any prompt to stop the scan.")
 
     results = []
-    # Folders set aside while picking among duplicate sibling groups are removed
-    # from album_dirs above, so the main loop never records a decision for them.
-    # Record them as decided here so the album walk doesn't re-prompt the same
-    # duplicate group on every run.
+    # Folders set aside while picking among duplicate sibling groups are
+    # removed from album_dirs above, so the main loop never records a decision
+    # for them.
     for d in sorted(skip_set, key=lambda p: p.name):
         results.append({"dir": d, "result": "sibling_skipped"})
     stopped_early = False
@@ -232,14 +210,12 @@ def run_artist_gap_fill(artist_name, artist_dir, args, token, *,
     # Scoped local — doesn't bleed into step 2 or the next artist in a walk.
     auto_yes_rest = False
     # In shared_queue mode, append decisions STRAIGHT into shared_queue (not a
-    # local list): a Ctrl-C mid-loop then leaves the current artist's approvals
-    # in the caller's queue (which the walk persists on interrupt) instead of
-    # dropping them, and the 'd' flush can act on them mid-artist. Non-shared
-    # mode keeps a local list that _execute_download_queue drains below.
+    # local list): a Ctrl-C mid-loop then leaves the current artist's
+    # approvals in the caller's queue (which the walk persists on interrupt)
+    # instead of dropping them, and the 'd' flush can act on them mid-artist.
     queue = shared_queue if shared_queue is not None else []
-    # AuthLost / QobuzUnavailable mid-loop: stash it, finish the hand-off so the
-    # artist's queue reaches shared_queue, then re-raise. Both mean "can't keep
-    # scanning" — a lost token or an unreachable API — so they stop the same way.
+    # AuthLost / QobuzUnavailable mid-loop: stash it, finish the hand-off so
+    # the artist's queue reaches shared_queue, then re-raise.
     pending_stop = None
 
     for i, ad in enumerate(album_dirs, 1):
@@ -315,11 +291,7 @@ def run_artist_gap_fill(artist_name, artist_dir, args, token, *,
             continue
 
         if m.status == "low_overlap":
-            # A different, similarly-named album fuzz-matched this folder. Like a
-            # path mismatch it is NOT accounted for — fall through WITHOUT adding
-            # to handled_ids/resolved_dirs, so the real album stays offerable in
-            # step 2 and we don't auto-queue a wrong-album full download (the
-            # DirMatch carries missing=[]/present=[] here).
+            # A different, similarly-named album fuzz-matched this folder.
             pred = (m.qobuz_album or {}).get("title") or "?"
             log.info(fmt(C.YELLOW,
                 f"    ⚠  Qobuz fuzzy-match has low track overlap with this "
@@ -352,9 +324,7 @@ def run_artist_gap_fill(artist_name, artist_dir, args, token, *,
 
         existing, missing, present = m.existing, m.missing, m.present
 
-        # Artist mode: complete is complete. The one nuance is a complete album
-        # where Qobuz is higher quality but our copy carries bonus tracks — offer
-        # an expanded edition that keeps them rather than a wipe-and-replace.
+        # Artist mode: complete is complete.
         if m.status == "complete":
             has_extras = False
             # --dry-run is preview-only: skip the interactive expanded-edition
@@ -394,11 +364,8 @@ def run_artist_gap_fill(artist_name, artist_dir, args, token, *,
                     f"    ✓  All {n_total} track(s) present — checking next"))
             results.append({"dir": ad, "result": "already_complete", "n_total": n_total})
             # Don't delete the picked album's siblings here: the sibling-group
-            # prompt promised deletion "on successful fill", but this branch did
-            # NO download (the folder was already complete). Deleting now would
-            # destroy a bonus-track sibling with no fill and no further consent,
-            # possibly many albums after the pick was made. The executor still
-            # deletes siblings after a real, verified fill.
+            # prompt promised deletion "on successful fill", but this branch
+            # did NO download (the folder was already complete).
             continue
 
         # Partial — offer to fill the gap.
@@ -665,8 +632,7 @@ def run_artist_mode(artist_name, args, token):
         return
 
     # --consolidate inside artist mode would prompt per album (a LOT on a
-    # 30-album scan). Auto-disabled here; saved/restored so a one-shot artist
-    # run doesn't bleed back into later album-mode runs.
+    # 30-album scan).
     saved_consolidate = args.consolidate
     if args.consolidate:
         args.consolidate = False
@@ -683,8 +649,7 @@ def run_artist_mode(artist_name, args, token):
         vlog(f"  Library: {artist_dir}")
 
         # fresh=True: an explicit single-artist run should see just-released
-        # albums. The library walk reuses these functions without it, so the
-        # bulk path keeps its cached catalog.
+        # albums.
         (gap_fill_results, owned_titles, handled_ids, resolved_dirs,
          artist_id, catalog) = run_artist_gap_fill(artist_name, artist_dir, args, token,
                                                    fresh=True)

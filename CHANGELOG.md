@@ -4,12 +4,13 @@ All notable changes to Qobuz Librarian are recorded here, newest first. The proj
 
 ## [Unreleased]
 
-- Interrupted library changes are safer to recover. Downloads, imports, migrations, lyrics writes, backups, and database updates resume only from verified state and otherwise stop without guessing.
-- Single-track Undo removes only the exact track recorded by the job, then cleans up only empty folders created for that download. Changed files, reused folders, symlinks, and uncertain records are left alone.
-- Library writes stay paused when the shared run lock cannot be enforced. Web-to-terminal handoff waits for active work, and the retired no-lock option is rejected.
-- The Beets integration requires and verifies 2.12.0, honours configured paths, and confines cleanup to the staging folders it opened.
-- Review choices, queue recovery, and History counts remain consistent across concurrent updates, retries, restarts, and interrupted work.
-- Automatic multi-artist folder moves are restored with durable crash recovery, no-overwrite checks, and coordinated Beets path updates.
+A long reliability pass over everything that moves or deletes files, ahead of the next release.
+
+- Interrupted downloads, imports, migrations, backups, and Undo now recover by re-checking what's actually on disk; anything that can't be verified is left in place instead of guessed at.
+- Undo on a single track removes exactly the file the job recorded, plus any folders it created that are now empty — replaced files, reused folders, and symlinks survive.
+- When the data folder can't enforce the single-writer lock, library writes stay paused instead of running unprotected.
+- beets 2.12.0 is now required and verified before imports run; cleanup stays inside the staging folders the import opened.
+- Albums credited to several artists can be re-filed under the primary artist again — the move now survives crashes and never overwrites an existing folder.
 
 ## [0.10.3] - 2026-07-10
 

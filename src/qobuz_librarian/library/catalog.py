@@ -57,8 +57,6 @@ from qobuz_librarian.ui_cli.logging import log, vlog
 
 # ── Multi-artist folder detection ─────────────────────────────────────────────
 # Beets writes ALBUMARTIST = "X, Y" for multi-artist releases.
-# Qobuz only returns the first artist. These separators widen the folder
-# search so existing multi-artist folders are found without re-downloading.
 _MULTI_ARTIST_SEPS = (
     ", ", " & ", " and ", " feat. ", " feat ",
     " ft. ", " ft ", " with ", " x ", " vs. ", " vs ",
@@ -160,19 +158,8 @@ def _decoration_year(name):
 def _is_split_album_merge(album_dir, post_dir, qartist):
     """True when album_dir and post_dir are the SAME album split across two
     folders, safe to consolidate into post_dir (where beets just filed the new
-    tracks).
-
-    The safe automatic shape is multi-artist: existing tracks under
-    'Primary, Other/Album', with new ones under 'Primary/Album'. A bare album
-    folder and a same-parent year-decorated folder are ambiguous releases and
-    must remain separate.
-
-    The names must describe the same album: equal once the year tag is
-    stripped (so an edition/live folder isn't fused with the studio album), and
-    not pinning two DIFFERENT years (different years are different releases — a
-    reissue, an annual live album — never one split). Resolution can fuzzy-match
-    a similarly-titled but DIFFERENT album into album_dir, so these string
-    guards are what stop an unrelated album from being consumed.
+    tracks). The safe automatic shape is multi-artist: existing tracks under
+    'Primary, Other/Album', with new ones under 'Primary/Album'.
     """
     if album_dir is None or post_dir is None:
         return False
@@ -188,9 +175,7 @@ def _is_split_album_merge(album_dir, post_dir, qartist):
         return False
     # strip_year_decoration also strips a "(Live 2008)"/"(Demos 1992)" marker,
     # so a distinct live/demo release can normalize equal to the studio album
-    # above. _decoration_year only parses pure-year parens, so its years-differ
-    # guard below misses these. Catch them explicitly: if the un-stripped names
-    # differ only by an album-variant marker, they're different releases.
+    # above.
     _an, _pn = normalize(album_dir.name), normalize(post_dir.name)
     if _an != _pn and (differs_by_album_variant(_an, _pn)
                        or differs_by_album_variant(_pn, _an)):
@@ -236,10 +221,7 @@ def predicted_album_paths(qobuz_album):
         years.append(yr)
 
     # Also look under the de-editioned title, in case the user's folder drops
-    # the tag ('Album (Deluxe)' → also 'Album'). A distinct-release marker —
-    # '(Live)', '(Acoustic)', a remix/demos/sessions set — is not an edition
-    # tag and stays attached, so a live album never predicts (and then hides
-    # behind) the studio album's bare folder.
+    # the tag ('Album (Deluxe)' → also 'Album').
     bare_titles = [title]
     stripped = strip_album_decorations(title)
     if stripped and stripped != title:
@@ -249,9 +231,7 @@ def predicted_album_paths(qobuz_album):
         for bt in bare_titles:
             for year in years:
                 # Common beets path-template forms: trailing-paren, leading
-                # [year], leading bare year. Match all three so a user who
-                # switched beets templates doesn't get the whole library
-                # listed as "missing".
+                # [year], leading bare year.
                 candidates.append(ad / f"{bt} ({year})")
                 candidates.append(ad / f"[{year}] {bt}")
                 candidates.append(ad / f"{year} - {bt}")
@@ -328,9 +308,8 @@ def find_album_dir_filesystem(qobuz_album):
             _push(ma)
 
     # Diacritics often differ between Qobuz and disk ('Beyoncé' vs 'Beyonce',
-    # 'Motörhead' vs 'Motorhead'); the exact .exists() checks above miss those,
-    # so also take any artist folder whose ASCII-folded name matches. The
-    # per-album title-similarity gate below still guards against a wrong folder.
+    # 'Motörhead' vs 'Motorhead'); the exact .exists() checks above miss
+    # those, so also take any artist folder whose ASCII-folded name matches.
     artist_norms = {normalize(av) for av in artist_variants if normalize(av)}
     if artist_norms and config.MUSIC_ROOT.exists():
         for d in _list_artist_subdirs_cached(config.MUSIC_ROOT):
@@ -497,19 +476,8 @@ def _norm_isrc(value):
 
 def _track_key(title_raw, disc, isrc, *, disc_scoped=True):
     """Identity keys for one track: ISRC plus the (optionally disc-scoped) title
-    in both its full and edition-stripped forms.
-
-    Titles are compared normalized (ASCII-folded, punctuation dropped). A
-    non-Latin title folds to '' under normalize, so fall back to the casefolded
-    raw title — but a non-Latin title with a Latin edition tag ("東京
-    (Remaster)") folds to just "remaster", which would make every such track
-    collide; so fall back to the raw whenever normalize keeps only a trailing
-    decoration too, not just when it keeps nothing. A genuinely empty title
-    leaves the key None so two untitled tracks never pair on an empty string.
-
-    disc_scoped is dropped when the two sides disagree on disc structure (see
-    compute_missing): a flat, disc-untagged folder reports every track on disc 1
-    and would otherwise fail to pair against a Qobuz album's later discs.
+    in both its full and edition-stripped forms. Titles are compared
+    normalized (ASCII-folded, punctuation dropped).
     """
     scope = disc if disc_scoped else None
 
@@ -526,8 +494,7 @@ def _track_key(title_raw, disc, isrc, *, disc_scoped=True):
 
 
 # Strongest identity first: an ISRC-identifiable track claims its exact slot
-# before a weaker title match can consume it. Reordering causes false
-# re-downloads of already-owned tracks.
+# before a weaker title match can consume it.
 _MATCH_LAYERS = ("isrc", "title", "stripped")
 
 
@@ -548,21 +515,8 @@ def _keys_match(a, b, layer):
 
 def _pair_indices(claim_keys, slot_keys):
     """One-to-one match claim_keys against slot_keys, strongest layer first.
-
     Returns a list over claim_keys of the slot index each claimed (None =
-    unclaimed). Each slot is consumed once, so a repeated title (a reprise, a
-    hidden track, two same-named versions) leaves the surplus unclaimed rather
-    than letting them all match a single file — the multiplicity that keeps a
-    real gap, or a bonus track before an upgrade wipe, from being silently
-    hidden.
-
-    A key whose ISRC also appears on the OTHER side is identity-locked: it can
-    only pair at the ISRC layer. Without that, a title match can hand track A's
-    second copy to track B ("Song (A twin), Song (B)" expected against two
-    files both tagged as the A recording reads complete), and the deletion
-    gates built on this matcher would discard a backup holding the only real B.
-    Tracks whose ISRC exists on neither the other side nor at all (different
-    edition, untagged rip) still pair by title as before.
+    unclaimed).
     """
     claim_isrcs = {k["isrc"] for k in claim_keys if k["isrc"]}
     slot_isrcs = {k["isrc"] for k in slot_keys if k["isrc"]}
@@ -962,12 +916,11 @@ def filter_owned_albums(catalog_pairs, owned_bare_titles, artist_name=None):
             cat_yr = None
         if key in owned_bare_titles:
             owned_years = owned_bare_titles[key]
-            # Exact bare-title match → owned regardless of year (reissue of the
-            # same work), EXCEPT a self-titled, undecorated, far-from-owned-year
-            # release: those are usually distinct same-titled albums, so let them
-            # fall through and be offered rather than hidden behind a year-blind
-            # own. A decorated edition stays owned even when self-titled (it's an
-            # edition of one we have), and unknown years stay owned (can't tell).
+            # Exact bare-title match → owned regardless of year (reissue of
+            # the same work), EXCEPT a self-titled, undecorated, far-from-
+            # owned-year release: those are usually distinct same-titled
+            # albums, so let them fall through and be offered rather than
+            # hidden behind a year-blind own.
             is_self_titled = self_titled_key is not None and key == self_titled_key
             distinct_self_titled = (
                 is_self_titled
@@ -978,18 +931,13 @@ def filter_owned_albums(catalog_pairs, owned_bare_titles, artist_name=None):
             if not distinct_self_titled:
                 continue
         # Fuzzy fallback for edition variants the stripper didn't fully
-        # normalize. Require the catalog title to be the owned one plus a
-        # suffix (an un-stripped edition tag) AND a nearby year — without those
-        # guards, sequels and numbered entries ('Load'/'Reload', 'Vol 1'/'Vol
-        # 2', 'II'/'III') get silently hidden from the missing list as owned.
+        # normalize.
         owned_fuzzy = False
         for owned, owned_years in owned_bare_titles.items():
             if not owned or not (key.startswith(owned) or owned.startswith(key)):
                 continue
             # The extra text on the longer title is what one release has and
-            # the other doesn't. If it's a distinct-release marker (live,
-            # acoustic, remix, …) these are different albums, so the prefix
-            # match mustn't hide a studio album behind an owned live one.
+            # the other doesn't.
             shorter, longer = sorted((key, owned), key=len)
             if differs_by_album_variant(shorter, longer):
                 continue
@@ -1053,12 +1001,7 @@ def dedup_album_versions(albums, prefer_hires=False):
         key_title = normalize(bare) or bare.strip().casefold()
         if not key_title:
             continue
-        # Include year in the group key. Without this, any trailing
-        # parenthetical gets stripped — including (LP2), (LP3), (LP4) —
-        # so all of a band's self-titled albums collapse into one dedup
-        # group and only the earliest-year representative reaches the missing-albums step.
-        # Albums with the same bare title AND the same year still dedup
-        # correctly (studio album + same-year deluxe edition).
+        # Include year in the group key.
         key = (key_title, album_year_int(a))
         groups.setdefault(key, []).append(a)
 
@@ -1839,8 +1782,7 @@ def _remove_empty_migration_directory_at(parent_fd, name, directory_fd):
     if not _migration_named_directory_matches(parent_fd, name, directory_fd):
         return False
     # Avoid a rename-and-rollback cycle for a directory that is already known
-    # to contain a conflict-kept entry. Besides needless churn, that cycle
-    # changes directory identities used by the sealed ownership receipt.
+    # to contain a conflict-kept entry.
     if os.listdir(directory_fd):
         return False
     for _ in range(16):
@@ -2090,9 +2032,7 @@ def multi_artist_migration_destination(album, source_dir):
     if not primary or normalize(current.parent.name) == normalize(primary):
         return None
 
-    # Keep the historical comma-only guard.  Applying the primary-name test
-    # to a real single-artist name such as "Tyler, The Creator" would silently
-    # file it below "Tyler".
+    # Keep the historical comma-only guard.
     if not _is_migration_candidate(current.parent.name, qartist_raw):
         return None
     return Path(config.MUSIC_ROOT) / primary / current.name
@@ -2294,16 +2234,9 @@ def match_dir_to_catalog(album_dir, catalog, artist_name, prefer_hires=False):
 
 
 def _pick_best_target_dir_match(scored_cands, target_dir):
-    """Among candidates whose predicted on-disk path resolves to target_dir,
-    pick the one whose tracks_count best fits the on-disk audio count.
-
+    """Among candidates whose predicted on-disk path resolves to target_dir, pick
+    the one whose tracks_count best fits the on-disk audio count.
     scored_cands: iterable of (combined_score: float, album_dict).
-    Returns (chosen_album, chosen_score) or (None, 0).
-
-    Fitting on track count keeps a 28-track anniversary box set with a bonus
-    live disc from outranking the standard 11-track album when target_dir holds
-    11 audio files — picking on quality alone there lists 'missing tracks' from
-    a completely different edition.
     """
     n_disk = _count_audio_files_in(target_dir)
     resolving = []
@@ -2337,33 +2270,11 @@ def _pick_best_target_dir_match(scored_cands, target_dir):
 def find_qobuz_album_for_dir(album_dir: Path, artist_name: str, token,
                              prefer_hires=False, catalog=None, target_dir=None):
     """Search Qobuz for the album matching an existing dir. Returns a fully-
-    populated album dict (with track list) or None.
-
-    Picks the highest-similarity match between the dir's bare name (stripped of
-    year/edition decorations) and the candidate's bare title. Requires the
-    candidate's artist name to match the queried artist (similarity >=
-    ARTIST_NAME_THRESH 0.85) so e.g. "Live at Pompeii" by The Beatles doesn't
-    match a Pink Floyd record. Lossless required.
-
-    Builds multiple search queries to handle beets-sanitized characters (e.g.
-    "Album_ Deluxe" was originally "Album: Deluxe" on Qobuz — searching with
-    the literal underscore demotes the deluxe edition out of the top results).
-
-    If a pre-fetched catalog is supplied, tries local matching first (zero
-    search-API cost). Falls back to per-folder search only when the local
-    match scores below threshold — handles compilation appearances and
-    folders for albums beyond ARTIST_CATALOG_LIMIT.
-
-    target_dir: when set, iterate all viable candidates (not just the top one)
-    and return the first whose predicted on-disk path resolves back to
-    target_dir. This lets sibling folders like "American Beauty (1970)" find
-    the original Qobuz edition rather than always resolving to the hi-res
-    deluxe edition that maps to a different folder. The catalog fast-path is
-    skipped when target_dir is set because it returns only one candidate.
+    populated album dict (with track list) or None. Picks the highest-
+    similarity match between the dir's bare name (stripped of year/edition
+    decorations) and the candidate's bare title.
     """
-    # Fast path: try pre-fetched catalog first. The catalog walk also handles
-    # the target_dir case so the upgrade walk doesn't fall back to the per-folder
-    # search API path for every album by an artist (a big win on long catalogs).
+    # Fast path: try pre-fetched catalog first.
     if catalog:
         if target_dir is None:
             local = match_dir_to_catalog(album_dir, catalog, artist_name, prefer_hires)
@@ -2378,9 +2289,6 @@ def find_qobuz_album_for_dir(album_dir: Path, artist_name: str, token,
             cands = _catalog_candidates_for_dir(
                 album_dir, catalog, artist_name, prefer_hires)
             # Pick by tracks_count fit (not first-resolving).
-            # Otherwise a 28-track anniversary edition with a bonus
-            # live disc outranks the 11-track standard album when
-            # both fuzzy-resolve to the same folder.
             scored = [(1.0 - 0.001 * i, c) for i, c in enumerate(cands)]
             best, _bs = _pick_best_target_dir_match(scored, target_dir)
             if best is not None:
@@ -2444,10 +2352,9 @@ def find_qobuz_album_for_dir(album_dir: Path, artist_name: str, token,
         return None
 
     _sort_by_match(candidates, prefer_hires)
-    # Threshold on the RAW score, not the year-boosted sort rank: a nearby-year
-    # but title-weak candidate can sort first yet fail the threshold, so don't
-    # let it shadow a higher-raw candidate that clears the bar. Keep the passing
-    # ones; the sort order then picks the best among them.
+    # Threshold on the RAW score, not the year-boosted sort rank: a nearby-
+    # year but title-weak candidate can sort first yet fail the threshold, so
+    # don't let it shadow a higher-raw candidate that clears the bar.
     passing = [c for c in candidates if c[0] >= config.ARTIST_DIR_MATCH_THRESH]
     if not passing:
         top = candidates[0]
@@ -2458,9 +2365,6 @@ def find_qobuz_album_for_dir(album_dir: Path, artist_name: str, token,
 
     # When a specific on-disk target is required, walk all viable candidates
     # and return the first whose predicted path resolves back to target_dir.
-    # This handles sibling folders (e.g. "American Beauty (1970)") where the
-    # top hit is a deluxe edition that maps to a different on-disk folder —
-    # we keep looking until we find a version that actually belongs here.
     if target_dir is not None:
         # Pick among the viable candidates by track-count fit, not score, so a
         # box set doesn't outrank the standard album the folder actually holds.
@@ -2549,9 +2453,8 @@ def find_expanded_edition(album, album_dir, existing, token, _args=None):
     if not candidates:
         return []
 
-    # Sort by quality descending (quality is king), then track count descending.
-    # We fetch full details in this order so the API budget goes to the most
-    # likely-best candidates first.
+    # Sort by quality descending (quality is king), then track count
+    # descending.
     candidates.sort(key=lambda r: (
         -(r.get("maximum_bit_depth") or 0),
         -(r.get("maximum_sampling_rate") or 0),
@@ -2576,8 +2479,6 @@ def find_expanded_edition(album, album_dir, existing, token, _args=None):
             continue
         new_extras = find_extras_in_existing(q_tracks, existing)
         # Keep candidates that are no worse than current on the extras axis.
-        # An equal-extras candidate at higher quality is still a useful pick
-        # (e.g. the same deluxe edition mastered at 24/192 vs 16/44.1).
         if len(new_extras) <= current_extras_count:
             found.append((full, new_extras))
             vlog(f"    candidate edition: {full.get('title')!r} "

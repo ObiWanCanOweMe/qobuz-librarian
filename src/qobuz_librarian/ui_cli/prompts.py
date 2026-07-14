@@ -20,10 +20,8 @@ from qobuz_librarian.ui_cli.sentinels import MORE, URL_QUERY
 
 # ── Fetch log ─────────────────────────────────────────────────────────────────
 
-# Once the JSONL grows beyond this, rotate the current file to .1 (one
-# backup kept) and start fresh. ~5 MB is plenty of history for the
-# Dashboard's "recent" widget and trivial to grep when you want full
-# history beyond what the UI shows.
+# Once the JSONL grows beyond this, rotate the current file to .1 (one backup
+# kept) and start fresh.
 _FETCH_LOG_MAX_BYTES = 5 * 1024 * 1024
 
 
@@ -57,8 +55,7 @@ def log_fetch(entry):
             if first == b"[":
                 # If the legacy-array migration didn't complete, the file is
                 # still a JSON array — appending a JSONL line would leave a
-                # hybrid that can't be parsed and hides all history. Skip the
-                # write; the next call retries the migration.
+                # hybrid that can't be parsed and hides all history.
                 if not _migrate_fetch_log_to_jsonl():
                     return
             _rotate_fetch_log_if_needed()
@@ -234,9 +231,7 @@ def confirm(msg, default_yes=True, auto_yes=False, on_eof=False, strict=False):
         try:
             r = input(fmt(C.CYAN, msg + suffix)).strip().lower()
         except EOFError:
-            # Closed stdin is not consent — and not an answer either. A caller
-            # that RECORDS the response (a saved preference) passes on_eof=None
-            # so it can tell "never answered" apart from an actual No.
+            # Closed stdin is not consent — and not an answer either.
             return on_eof
         if not r:
             return default_yes
@@ -256,8 +251,7 @@ def prompt_album_selection(albums, prefer_hires=False, can_load_more=False):
         return None
     if prefer_hires:
         # Sort by bit depth desc, sample rate desc, then year asc so the
-        # original pressing leads. Track count is deliberately not a factor —
-        # a bigger edition shouldn't float above the standard album.
+        # original pressing leads.
         albums = sorted(
             albums,
             key=lambda a: (-(a.get("maximum_bit_depth") or 0),
@@ -268,9 +262,8 @@ def prompt_album_selection(albums, prefer_hires=False, can_load_more=False):
     print()
     print(fmt(C.BOLD + C.WHITE, "  Qobuz search results:"))
     print()
-    # 120 is a comfortable max for a desktop terminal; on a narrow or
-    # mobile terminal, term_width() already returns ~60 and title_max
-    # scales down.
+    # 120 is a comfortable max for a desktop terminal; on a narrow or mobile
+    # terminal, term_width() already returns ~60 and title_max scales down.
     width = min(term_width(), 120)
     title_max = max(20, width - 32)
 

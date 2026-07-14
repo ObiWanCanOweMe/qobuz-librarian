@@ -76,8 +76,7 @@ def run_library_lyrics(*, dry_run=False, rescan=False, synced_only=False,
     # Seed the state file with a fast, no-network classification of files that
     # already carry lyrics, so the fetch pass only queries providers for the
     # tracks that actually need them — and its progress count reflects real
-    # work instead of ticking through thousands of already-lyriced files. A
-    # full rescan re-fetches everything anyway, so it skips this.
+    # work instead of ticking through thousands of already-lyriced files.
     if not rescan and not dry_run:
         report_progress("Scanning library lyrics", 0, total, "")
         indexed = lyric_fetch.index_existing(

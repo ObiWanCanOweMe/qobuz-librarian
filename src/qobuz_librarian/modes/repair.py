@@ -171,18 +171,11 @@ def _restore_flac_metadata(path, snap):
 
 def _backup_source_by_isrc(verified_truncated, album_dir, backup_path):
     """Map each truncated track's ISRC to where its originals now live in the
-    backup dir, so the refill can inherit the original's tags + embedded art by
-    reading from disk at retag time. backup_gap_fill_files preserves each file's
-    path relative to album_dir, so the backup copy is at the same relative spot.
-
-    One LIST of paths per ISRC, not one path: two originals can share an ISRC
-    (the same recording on two discs, a Track/Track.1 pair) with distinct
-    disc/track tags and art — collapsing them would stamp one twin's metadata
-    onto both refills. Paths are kept sorted so the retag pairs them with the
-    staged refills deterministically.
-
-    Keeping only paths (not the decoded art) means a fully-truncated hi-res
-    album's covers aren't all held in memory across the whole re-download."""
+    backup dir, so the refill can inherit the original's tags + embedded art
+    by reading from disk at retag time. backup_gap_fill_files preserves each
+    file's path relative to album_dir, so the backup copy is at the same
+    relative spot.
+    """
     out = {}
     for b in verified_truncated:
         isrc = _norm_isrc(b.get("isrc"))
@@ -203,23 +196,12 @@ def _backup_source_by_isrc(verified_truncated, album_dir, backup_path):
 
 def _retag_refills_in_staging(staged_dirs, source_by_isrc):
     """Carry the truncated originals' tags + art onto the matching refills (by
-    ISRC) while they're still in staging — before beets files them. A recording
-    that also appears on a compilation is downloaded by its track ID (so the
-    audio is the right recording) but tagged by Qobuz for whatever album it
-    files that ISRC under; without this the refill would import as the
-    compilation, contradicting the folder it lives in.
-
-    The originals' metadata is read from their backup copies on disk here,
-    one at a time, rather than held in memory from before the download.
-    Same-ISRC twins pair off in sorted order on both sides — each refill
-    consumes one distinct original, so two twins never share one twin's
-    disc/track tags — and an original left unconsumed (its refill never
-    surfaced in staging) counts as failed so its backup is kept.
-
-    Returns the ISRCs whose carry failed (snapshot unreadable, write failed,
-    or a picture dropped) so the caller keeps the originals' backup — it still
-    holds the only copy of those tags + art. With mutagen missing no carry is
-    possible at all, so every source ISRC counts as failed."""
+    ISRC) while they're still in staging — before beets files them. A
+    recording that also appears on a compilation is downloaded by its track ID
+    (so the audio is the right recording) but tagged by Qobuz for whatever
+    album it files that ISRC under; without this the refill would import as
+    the compilation, contradicting the folder it lives in.
+    """
     if _FLAC is None:
         return set(source_by_isrc)
     if not source_by_isrc:
@@ -264,19 +246,10 @@ def _make_retag_callback(retag_sources, retag_failed):
 
 def _resolve_parent_album(album_dir, artist_name, verified_truncated,
                           wanted_isrcs, token):
-    """Pick the Qobuz album that should drive where the refill is filed.
-
-    Qobuz files a recording under whichever album it returns first for the
-    ISRC — often a compilation the track also appears on — so the most-common
-    ISRC album can be the wrong edition. Prefer the album whose predicted path
-    is the folder being repaired, but only when it actually contains every
-    truncated recording (so a remaster that's missing them can't win). Fall
-    back to the most-common ISRC album, then to a synthetic dict off the folder
-    name. This only steers placement; the refill's tags come from the
-    originals, so a wrong guess here can't mistag the result.
-
-    AuthLost / QobuzUnavailable propagate so a token loss or outage aborts the
-    repair before anything is moved.
+    """Pick the Qobuz album that should drive where the refill is filed. Qobuz
+    files a recording under whichever album it returns first for the ISRC —
+    often a compilation the track also appears on — so the most-common ISRC
+    album can be the wrong edition.
     """
     try:
         match = find_qobuz_album_for_dir(
@@ -1534,17 +1507,13 @@ def _refills_intact(album_dir, wanted_counts, token, baseline_counts):
         raise
     except Exception:
         return False
-    # Require POSITIVE re-verification: every wanted ISRC must have re-matched a
-    # Qobuz recording AND passed the truncation gate. Checking only "not flagged
-    # truncated" was unsafe — a wanted ISRC whose post-repair lookup transiently
-    # returned nothing (4xx, index lag, strict-equality miss) lands in
-    # isrc_no_match, NOT verified_truncated, so it would read as intact and the
-    # only good-enough original's backup would be deleted while the refill is
-    # still short. An unverified ISRC now keeps the backup (caller's "couldn't
-    # verify → keep" branch). Compared as a multiset ON TOP of the baseline,
-    # like the presence gate: the scan verifies every file carrying the ISRC,
-    # so a healthy pre-existing twin also lands in verified_ok — it must not
-    # vouch for a refill that's absent or still short.
+    # Require POSITIVE re-verification: every wanted ISRC must have re-matched
+    # a Qobuz recording AND passed the truncation gate. Checking only "not
+    # flagged truncated" was unsafe — a wanted ISRC whose post-repair lookup
+    # transiently returned nothing (4xx, index lag, strict-equality miss)
+    # lands in isrc_no_match, NOT verified_truncated, so it would read as
+    # intact and the only good-enough original's backup would be deleted while
+    # the refill is still short.
     verified_ok = Counter()
     for isrc, n in dict(scan.get("verified_ok_isrcs") or {}).items():
         verified_ok[_norm_isrc(isrc)] += n
@@ -1553,17 +1522,7 @@ def _refills_intact(album_dir, wanted_counts, token, baseline_counts):
 
 
 def _prompt_library_album_for_repair(args, token):
-    """Library-scoped picker for repair mode. Returns (artist_dir, album_dir).
-
-    Only walks MUSIC_ROOT — no Qobuz album-level matching here. Earlier
-    versions of this picker called find_qobuz_album_for_dir, which guesses
-    the edition by folder-name similarity. That guess is what made repair
-    mode unsafe: it could match the 1992 master against the 2011 remaster
-    and propose to "fix" tracks that were actually fine for the version
-    the user owns. The new repair flow matches per-file by ISRC instead,
-    so this picker stays out of the catalog entirely.
-
-    Returns (None, None) when the user cancels."""
+    """Library-scoped picker for repair mode. Returns (artist_dir, album_dir)."""
     print()
     log.info(fmt(C.GRAY, "  Tip: '?' lists artists; '*' scans your whole library."))
     artist_dir = None
@@ -1740,9 +1699,6 @@ def repair_album_dir(album_dir, verified_truncated, artist_name, args, token,
         # originals are still in place. If the parent-album lookup hits a
         # transient outage the repair aborts cleanly with nothing moved,
         # rather than stranding the only copies in the backup dir.
-        # Snapshot the album beets is likely to file these into — a track's
-        # canonical Qobuz album can differ from album_dir — so a freshly
-        # refilled file can be told apart from tracks already living there.
         wanted_isrcs = {_norm_isrc(b.get("isrc")) for b in verified_truncated}
         wanted_isrcs.discard("")
         # Per-ISRC counts of the originals going to backup — the presence gate
@@ -1961,10 +1917,7 @@ def repair_album_dir(album_dir, verified_truncated, artist_name, args, token,
         # Baseline: ISRC counts of what remains on disk now that the truncated
         # originals are in the backup. The presence/intact gates below compare
         # against baseline + wanted, so a healthy PRE-EXISTING file sharing a
-        # refill's ISRC can't vouch for a refill that never came back. A
-        # degraded read (walk error) would understate the baseline and loosen
-        # the gates — None marks it unverifiable, and the gates then keep the
-        # backup rather than trust the count.
+        # refill's ISRC can't vouch for a refill that never came back.
         _bl_errs = []
         baseline_counts = Counter(
             _norm_isrc(et.get("isrc"))
@@ -1973,13 +1926,11 @@ def repair_album_dir(album_dir, verified_truncated, artist_name, args, token,
         if _bl_errs:
             baseline_counts = None
 
-        # Carry the truncated originals' own tags + art onto the refills before
-        # beets files them. The audio is fetched by track ID (the right
+        # Carry the truncated originals' own tags + art onto the refills
+        # before beets files them. The audio is fetched by track ID (the right
         # recording), but Qobuz returns its compilation/single album for that
         # ISRC, so without this the refill would import tagged + named for a
-        # different album than the folder it lives in. The originals now live in
-        # the backup dir; the retag reads their tags + art from there at apply
-        # time, so nothing is held in memory across the download.
+        # different album than the folder it lives in.
         retag_sources = _backup_source_by_isrc(
             verified_truncated, album_dir, backup_path)
         retag_failed = set()
@@ -2009,12 +1960,10 @@ def repair_album_dir(album_dir, verified_truncated, artist_name, args, token,
                 "being downloaded.",
             )
         except BaseException as exc:
-            # Interrupted or an unexpected failure mid-refill. Don't
-            # auto-restore: a partly-succeeded refill may already have
-            # written good replacements, and moving the truncated originals
-            # back would clobber them. Preserve the backup and point the
-            # user at it so the album isn't silently left short its tracks
-            # with no way to recover them.
+            # Interrupted or an unexpected failure mid-refill. Don't auto-
+            # restore: a partly-succeeded refill may already have written good
+            # replacements, and moving the truncated originals back would
+            # clobber them.
             if backup_path and backup_path.exists():
                 pin_repair_recovery(
                     "repair backup kept — refill was interrupted")
@@ -2199,12 +2148,10 @@ def repair_album_dir(album_dir, verified_truncated, artist_name, args, token,
                 )
             elif back_in_place:
                 # The re-downloaded tracks are physically back but couldn't be
-                # verified as intact (still short of the listed length, or no ISRC
-                # to check against). Keep the originals — deleting the only other
-                # copy on a presence check alone is how a bad re-rip silently
-                # replaces a good-enough track with a worse one. When the refill is
-                # also short, Qobuz's own master is truncated: re-running won't fix
-                # it, so say so rather than implying a retry would help.
+                # verified as intact (still short of the listed length, or no
+                # ISRC to check against). Keep the originals — deleting the
+                # only other copy on a presence check alone is how a bad re-
+                # rip silently replaces a good-enough track with a worse one.
                 pin_repair_recovery(
                     "repair backup kept — replacement could not be verified "
                     "intact")
@@ -2324,23 +2271,8 @@ def _report_repair_recovery(backup, *, reason=""):
 
 def _scan_report_repair(album_dir, artist_name, args, token, deep=True,
                         quiet=False):
-    """Scan one album dir by ISRC, report, confirm, and repair.
-
-    Returns "repaired" | "clean" | "skipped" | "failed" | "recovery".
-    Raises AuthLost to the caller (it decides whether to abort the whole
-    run/sweep). Shared by
-    the single-album picker path and the whole-library sweep so both behave
-    identically per album. Both the sweep and a single album pass deep=True, so
-    every track's length is verified against its real Qobuz recording — catching
-    a file that decodes fine but is short (truncated with its STREAMINFO rewritten
-    to match). That costs one Qobuz call per track (cached on re-scans), so a
-    sweep runs for a while on a big library.
-
-    quiet=True (the sweep) prints nothing for a healthy album — no header, no
-    "nothing to repair" — so a clean library doesn't bury its handful of real
-    findings under a screen of per-album reports. The caller keeps its own
-    progress line live; the report commits it only when there's something to
-    show.
+    """Scan one album dir by ISRC, report, confirm, and repair. Returns
+    "repaired" | "clean" | "skipped" | "failed" | "recovery".
     """
     if not quiet:
         section(f"Repair scan — {truncate(album_dir.name, 60)}")

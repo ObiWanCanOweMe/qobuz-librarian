@@ -36,8 +36,7 @@ def test_qobuz_get_maps_status_codes():
 
 def test_qobuz_get_retries_429_but_not_404():
     # 429 backs off and retries; a 404 is a definitive answer (QobuzError, the
-    # caller may read it as "no such album") and must not be retried. A 429 that
-    # never clears is transient → QobuzUnavailable, not QobuzError.
+    # caller may read it as "no such album") and must not be retried.
     with patch("qobuz_librarian.api.client._get_session") as sess:
         sess.return_value.get.side_effect = [_response(429), _response(429),
                                              _response(200, {"ok": True})]
@@ -55,11 +54,7 @@ def test_qobuz_get_retries_429_but_not_404():
 
 
 def test_qobuz_get_reports_token_validity(monkeypatch):
-    # The dashboard banner listens for auth state. A 200 reports the token good
-    # and a 401 reports it bad — reporting only failures leaves the banner stuck
-    # red after a transient 401 even once calls work. A 404 also clears it: Qobuz
-    # authenticated the request before answering "no such album", so the token is
-    # fine even though the lookup missed.
+    # The dashboard banner listens for auth state.
     from qobuz_librarian.api import auth
     seen = []
     monkeypatch.setattr(auth, "_auth_state_listeners", [seen.append])

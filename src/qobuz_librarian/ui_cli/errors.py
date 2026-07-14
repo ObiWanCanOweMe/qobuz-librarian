@@ -2,9 +2,7 @@
 import errno
 import sys
 
-# Exit-code contract for the CLI. Documented in --help; consumed by cron
-# scripts that need to distinguish transient (retry) from permanent
-# (page someone) failures.
+# Exit-code contract for the CLI.
 EXIT_GENERAL    = 1   # unspecified failure (default for crashes/unknown)
 EXIT_AUTH       = 2   # token invalid / expired
 EXIT_LOCK_BUSY  = 3   # another writer holds the lock

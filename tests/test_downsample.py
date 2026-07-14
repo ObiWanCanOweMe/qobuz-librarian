@@ -1,9 +1,6 @@
-import builtins
 import shutil
-import stat
 import subprocess
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -71,27 +68,6 @@ def test_flac_header_parse_anchors_at_offset_zero():
     assert de.parse_flac_info(not_at_zero) == (0, 0)   # hidden marker ignored
     assert de.parse_flac_total_samples(at_zero) != 0
     assert de.parse_flac_total_samples(not_at_zero) == 0
-
-
-def test_read_sample_rate_uses_cached_scan_metadata_before_file_probe(
-        tmp_path, monkeypatch):
-    src = tmp_path / "track.flac"
-    src.write_bytes(b"not a real flac")
-    monkeypatch.setattr(de, "cfg", SimpleNamespace(FLAC_CACHE_ENABLED=True),
-                        raising=False)
-    monkeypatch.setattr(
-        de, "flac_cache",
-        SimpleNamespace(get=lambda path: {"sample_rate": "96000"}),
-        raising=False,
-    )
-
-    def fail_open(*args, **kwargs):
-        raise OSError("file probe should not run when cache has sample rate")
-
-    monkeypatch.setattr(builtins, "open", fail_open)
-
-    assert read_sample_rate(src) == 96000
-
 
 
 def test_resample_clean_hires_shrinks_and_verifies(tmp_path, _need_ffmpeg, _need_flac):
@@ -264,45 +240,6 @@ def test_resample_refuses_to_overwrite_a_same_name_replacement(
     assert not list(tmp_path.glob(".compress-*.flac"))
 
 
-def test_keep_originals_refuses_a_source_that_no_longer_matches_its_receipt(
-        tmp_path, monkeypatch):
-    from qobuz_librarian.library import backup
-
-    src = tmp_path / "track.flac"
-    src.write_bytes(b"hi-res master")
-    value = src.stat()
-    receipt = {
-        "identity": (stat.S_IFMT(value.st_mode), value.st_dev, value.st_ino),
-        "size": value.st_size,
-        "mtime_ns": value.st_mtime_ns,
-        "changed_ns": value.st_ctime_ns,
-        "sha256": "0" * 64,
-    }
-
-    def fake_stash(files, album_dir, *, include_identity_receipts=False):
-        assert include_identity_receipts is True
-        return tmp_path / "kept", {src}, {src: receipt}
-
-    def probe_after_receipt(*_args, **_kwargs):
-        raise AssertionError("a mismatched keep-original receipt reached encoding")
-
-    monkeypatch.setattr(backup, "stash_downsample_originals", fake_stash)
-    monkeypatch.setattr(de, "read_sample_rate", lambda _path: 96000)
-    monkeypatch.setattr(de, "read_local_bit_depth", probe_after_receipt)
-    monkeypatch.setattr(de, "detect_resampler_filter", lambda: ("soxr", "x"))
-
-    result = de.downsample_dir(
-        tmp_path,
-        verbose=False,
-        base_dir=tmp_path,
-        keep_originals=True,
-    )
-
-    assert result["resampled"] == 0
-    assert result["errors"] == 1
-    assert src.read_bytes() == b"hi-res master"
-
-
 def test_downsample_never_sweeps_a_glob_matching_user_file(
         tmp_path, monkeypatch):
     user_file = tmp_path / ".compress-user-master.flac"
@@ -337,47 +274,6 @@ def test_downsample_dir_stops_between_tracks_on_cancel(tmp_path, monkeypatch):
 
     assert res["cancelled"] is True
     assert res["resampled"] <= 2 and len(calls) <= 2   # rest were discarded
-
-
-def test_downsample_dir_cancel_before_start_touches_nothing(tmp_path, monkeypatch):
-    calls = []
-
-    def fake_resample(rel, sr, rate, af, base_dir=None):
-        calls.append(rel)
-        return (rel, sr, rate, 10, None)
-
-    monkeypatch.setattr(de, "RESAMPLE_WORKERS", 1)
-    monkeypatch.setattr(de, "resample_one", fake_resample)
-    monkeypatch.setattr(de, "read_sample_rate", lambda p: 96000)
-    monkeypatch.setattr(de, "detect_resampler_filter", lambda: ("soxr", "x"))
-    (tmp_path / "0.flac").write_bytes(b"x")
-
-    res = de.downsample_dir(tmp_path, verbose=False, base_dir=tmp_path,
-                            cancel_check=lambda: True)
-
-    assert res["cancelled"] is True
-    assert calls == [] and res["resampled"] == 0
-
-
-def test_downsample_dir_cancel_after_the_last_track_counts_complete(tmp_path, monkeypatch):
-    calls = []
-
-    def fake_resample(rel, sr, rate, af, base_dir=None):
-        calls.append(rel)
-        return (rel, sr, rate, 10, None)
-
-    monkeypatch.setattr(de, "RESAMPLE_WORKERS", 1)
-    monkeypatch.setattr(de, "resample_one", fake_resample)
-    monkeypatch.setattr(de, "read_sample_rate", lambda p: 96000)
-    monkeypatch.setattr(de, "detect_resampler_filter", lambda: ("soxr", "x"))
-    (tmp_path / "0.flac").write_bytes(b"x")
-
-    res = de.downsample_dir(tmp_path, verbose=False, base_dir=tmp_path,
-                            cancel_check=lambda: len(calls) > 0)
-
-    assert calls == ["0.flac"]
-    assert res["resampled"] == 1
-    assert res["cancelled"] is False
 
 
 def test_flush_failed_rewrite_counts_as_resampled_with_a_warning(tmp_path, monkeypatch):

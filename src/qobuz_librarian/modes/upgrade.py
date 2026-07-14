@@ -23,10 +23,6 @@ from qobuz_librarian.ui_cli.prompts import _flush_stdin, confirm
 from qobuz_librarian.web import review_badges
 
 # process_album outcomes that mean "nothing to upgrade here", not a failure.
-# A backup-failed abort is deliberately absent: that's a real failure (Qobuz
-# would have had an upgrade, but the existing folder couldn't be safely backed
-# up) and the user should see it counted. The web upgrade flow imports this so
-# the CLI walk and the web both classify results the same way.
 BENIGN_UPGRADE_RESULTS = frozenset({
     "upgrade_only_no_op",
     "skipped_already_higher_quality",
@@ -245,16 +241,13 @@ def run_upgrade_walk_mode(args, token):
                     continue
                 if (_proc_result or {}).get("upgrade_unverified", False):
                     # Imported, but the rebuilt folder couldn't be verified as
-                    # complete as the original, so the backup was kept. Tally it
-                    # apart — it's neither a clean upgrade nor an outright fail.
+                    # complete as the original, so the backup was kept.
                     n_unverified_albums += 1
                     time.sleep(cfg.ARTIST_API_DELAY)
                     continue
                 if not (_proc_result or {}).get("imported", False):
                     # Attempted (Qobuz had a higher-quality copy) but didn't
                     # land — backup failed, download failed, import failed.
-                    # process_album already logged the reason; tally it so the
-                    # end-of-run summary doesn't imply a clean sweep.
                     n_failed_albums += 1
                     time.sleep(cfg.ARTIST_API_DELAY)
                     continue

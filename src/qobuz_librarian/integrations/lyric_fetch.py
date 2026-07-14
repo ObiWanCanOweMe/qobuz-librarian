@@ -95,19 +95,15 @@ MAX_TRACK_SECONDS  = 60 * 20
 
 # Duration-fit tolerances for synced lyrics. The lower-bound check is
 # deliberately loose: songs with long instrumental intros/outros legitimately
-# leave a large gap between the last lyric timestamp and the track end, and
-# a partial LRC is still useful. We only reject when the LRC ends *past* the
-# track or is so much shorter than the track that it's almost certainly the
-# wrong song.
+# leave a large gap between the last lyric timestamp and the track end, and a
+# partial LRC is still useful.
 LRC_OVERRUN_GRACE  = 15     # last timestamp may exceed track length by this much
 LRC_MIN_COVERAGE   = 0.2    # last timestamp should reach at least this fraction
 LRC_GAP_GRACE      = 240    # …unless the gap to track end is within this many seconds
 
 # Provider circuit breaker. With ≥8 workers transient errors compound quickly,
 # so the threshold is bumped from 3 to give providers more rope before being
-# disabled. After PROVIDER_COOLDOWN_SECONDS the provider is re-enabled and
-# given another chance — important for overnight runs where a brief provider
-# outage shouldn't disable that provider for hours.
+# disabled.
 PROVIDER_FAIL_THRESHOLD = 5
 PROVIDER_COOLDOWN_SECONDS = 600  # 10 min before a disabled provider gets retried
 _PROVIDER_ERROR_RE = re.compile(

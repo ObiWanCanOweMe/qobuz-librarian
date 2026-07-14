@@ -33,10 +33,8 @@ class CSRFMiddleware(BaseHTTPMiddleware):
             submitted = request.headers.get(CSRF_HEADER)
             if not submitted and 0 < content_length <= _MAX_FORM_BYTES:
                 # Read the body only when its length is declared and bounded —
-                # a chunked request with no Content-Length is never read here, so
-                # a tokenless POST can't make us buffer an unbounded body. body()
-                # (not form()) lets BaseHTTPMiddleware replay it to downstream
-                # Form() handlers, which would otherwise 422.
+                # a chunked request with no Content-Length is never read here,
+                # so a tokenless POST can't make us buffer an unbounded body.
                 try:
                     body = await request.body()
                     ct = request.headers.get("content-type", "")
@@ -46,10 +44,7 @@ class CSRFMiddleware(BaseHTTPMiddleware):
                         submitted = (parsed.get(CSRF_FORM_FIELD) or [None])[0]
                     # multipart/form-data isn't parsed here (doing so would
                     # consume the stream before downstream Form() handlers): a
-                    # multipart POST must carry the token in the CSRF header. The
-                    # htmx config adds it to every AJAX request; there are no
-                    # hand-built multipart forms today, so this is just a guard
-                    # for anyone adding a file-upload form later.
+                    # multipart POST must carry the token in the CSRF header.
                 except Exception:
                     submitted = None
             if not cookie_token or not submitted or not secrets.compare_digest(
@@ -61,12 +56,9 @@ class CSRFMiddleware(BaseHTTPMiddleware):
 
         response = await call_next(request)
         # Mint the cookie only when the client has none AND we're returning an
-        # HTML page — the page is what reads the token (from its <meta> tag) and
-        # then submits it, so static assets, /healthz, /sw.js and JSON /api
-        # responses don't need it. This avoids minting (and a Set-Cookie that
-        # defeats caching) on every probe/asset hit. Validation is unchanged:
-        # any HTML page load still seeds the cookie, so the first POST after a
-        # normal page view still has a cookie to check against.
+        # HTML page — the page is what reads the token (from its <meta> tag)
+        # and then submits it, so static assets, /healthz, /sw.js and JSON
+        # /api responses don't need it.
         is_html = response.headers.get("content-type", "").startswith("text/html")
         if not cookie_token and is_html:
             secure = (request.url.scheme == "https"
@@ -85,14 +77,9 @@ class CSRFMiddleware(BaseHTTPMiddleware):
         return response
 
 
-# script-src carries a per-request nonce (set on request.state.csp_nonce below)
-# rather than 'unsafe-inline', so a reflected/injected <script> can't run — only
-# the few inline blocks we mint with this request's nonce do. The SSE/progress
-# logic that htmx swaps in lives in the external app.js ('self'); a nonce can't
-# survive an htmx swap because the fragment's nonce wouldn't match the live
-# document's. style-src keeps 'unsafe-inline': the Tailwind build and
-# htmx's indicator styles lean on inline style, and autoescape is the real XSS
-# guard — locking styles down is a separate, far larger surface.
+# script-src carries a per-request nonce (set on request.state.csp_nonce
+# below) rather than 'unsafe-inline', so a reflected/injected <script> can't
+# run — only the few inline blocks we mint with this request's nonce do.
 def _csp(nonce: str) -> str:
     return (
         "default-src 'self'; "
@@ -123,8 +110,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         )
         if not cacheable_asset:
             # Job JSON and event streams contain the same private library data
-            # as the HTML pages. Override weaker route defaults such as SSE's
-            # `no-cache`, which still permits storage and revalidation.
+            # as the HTML pages.
             response.headers["Cache-Control"] = "no-store"
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")

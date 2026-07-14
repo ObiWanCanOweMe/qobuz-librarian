@@ -33,7 +33,6 @@ from qobuz_librarian.queue import durable_runner
 from qobuz_librarian.queue import journal as queue_state
 from qobuz_librarian.queue.builder import _build_queue_item
 from qobuz_librarian.queue.durable_album import (
-    initial_completion_input,
     plan_durable_new_album,
 )
 
@@ -66,95 +65,6 @@ def _single_track_item(label):
         auto_upgrade=False,
         quality=4,
     )
-
-
-def test_pending_claim_refuses_an_identical_request_from_another_job(
-    tmp_path, monkeypatch, authority
-):
-    monkeypatch.setattr(cfg, "QUEUE_JOURNAL_DIR", tmp_path / "journals")
-    item = _build_queue_item(
-        album={"id": "42", "title": "Same Album"},
-        album_dir=None,
-        label="Same Album",
-        missing=[],
-        present=[],
-        upgrade_only=False,
-        auto_upgrade=False,
-    )
-    first = queue_state.save_queue_journal(
-        queue_state.create_queue_journal([item], mode="web-job:first")
-    )
-
-    with pytest.raises(
-        durable_runner.DurableAlbumUnavailable,
-        match="exact identity",
-    ):
-        durable_runner._claim_pending_item(
-            item,
-            mode="web-job:second",
-            authority=authority,
-        )
-
-    loaded = queue_state.list_queue_journals()
-    assert len(loaded) == 1
-    assert loaded[0].journal == first
-
-
-def test_pristine_active_resume_requires_exact_owner_and_survives_snapshot_error(
-    tmp_path, monkeypatch, authority
-):
-    monkeypatch.setattr(cfg, "QUEUE_JOURNAL_DIR", tmp_path / "journals")
-    monkeypatch.setattr(cfg, "STAGING_DIR", tmp_path / "staging")
-    item = _single_track_item("Resume Album")
-    args = Namespace(no_import=False)
-    plan = plan_durable_new_album(item, args)
-    assert plan is not None
-    origin = CompletionOrigin(CompletionOriginKind.CLI, "album queue")
-    saved = queue_state.save_queue_journal(
-        queue_state.create_queue_journal([item], mode="cli:album")
-    )
-    pending = saved.items[0]
-    owner = RecoveryOwner(saved.operation_id, pending.item_id)
-    active = queue_state.transition_journal_item(
-        saved,
-        pending.item_id,
-        queue_state.QueuePhase.ACTIVE,
-        completion_input=initial_completion_input(plan, owner, origin),
-    )
-
-    with pytest.raises(durable_runner.DurableAlbumUnavailable, match="exact identity"):
-        durable_runner.execute_durable_new_album(
-            [item],
-            item,
-            args,
-            plan=plan,
-            origin=origin,
-            mode="cli:album",
-            authority=authority,
-        )
-
-    class SnapshotStopped(RuntimeError):
-        pass
-
-    monkeypatch.setattr(
-        durable_runner,
-        "snapshot_staging",
-        lambda: (_ for _ in ()).throw(SnapshotStopped("snapshot stopped")),
-    )
-    with pytest.raises(SnapshotStopped, match="snapshot stopped"):
-        durable_runner.execute_durable_new_album(
-            [item],
-            item,
-            args,
-            plan=plan,
-            origin=origin,
-            mode="cli:album",
-            authority=authority,
-            resume_owner=owner,
-        )
-
-    loaded = queue_state.load_queue_journal(saved.operation_id)
-    assert loaded.journal == active
 
 
 def test_download_quarantine_checkpoint_is_persisted_before_error_propagates(

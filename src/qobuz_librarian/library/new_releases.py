@@ -41,10 +41,7 @@ def load() -> dict:
     lr = data.get("last_run")
     if isinstance(lr, (int, float)):
         base["last_run"] = float(lr)
-    # The ARTIST_CATALOG_LIMIT the baseline was captured under. If the limit later
-    # grows, the baseline is missing albums past the old cap, so the check
-    # re-baselines (rather than dumping that back-slice as "new"). None = unknown
-    # (a baseline from before this was tracked) → treated as needing a re-baseline.
+    # The ARTIST_CATALOG_LIMIT the baseline was captured under.
     bl = data.get("baseline_limit")
     if isinstance(bl, int) and not isinstance(bl, bool):
         base["baseline_limit"] = bl

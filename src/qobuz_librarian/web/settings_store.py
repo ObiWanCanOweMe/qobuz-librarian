@@ -19,8 +19,7 @@ log = logging.getLogger("qobuz_librarian")
 SETTINGS_FILE = cfg.DATA_DIR / ".qobuz_settings.json"
 
 # Set by save() when an active job blocks the in-memory apply; drained by
-# drain_pending() once the worker idles. Lock guards the slot since save()
-# runs on the web request thread and drain_pending() runs on the worker.
+# drain_pending() once the worker idles.
 _pending_apply: Optional[dict] = None
 _pending_lock = threading.Lock()
 
@@ -45,17 +44,12 @@ BEHAVIOR_FIELDS = [
 BEHAVIOR_KEYS = [k for k, _, _ in BEHAVIOR_FIELDS]
 
 # Provider names lyric_fetch.py knows how to drive (mirrors the provider list
-# it wires up). Used to validate the Lyrics providers field: entries are
-# matched case-insensitively and normalised to these spellings; anything else
-# is dropped so a typo can't silently turn lyric fetching off.
+# it wires up).
 LYRICS_PROVIDER_CHOICES = [
     "Lrclib", "NetEase", "Megalobiz", "Musixmatch", "Genius",
 ]
 
 # (key, label, help, kind, choices, placeholder).
-# kind: "text" — free string; "enum" — choices is a list of allowed values;
-# "list" — comma-separated; stored as list on cfg. A list field with choices
-# is validated against them; choices=None means any entry is accepted.
 TEXT_FIELDS = [
     ("STREAMRIP_QUALITY", "Download quality",
      "Maximum quality to request. If Qobuz serves less than expected, "
@@ -273,11 +267,7 @@ def _apply(values: dict):
         elif kind == "enum":
             v = str(raw or "").strip().lower()
             if key == "STREAMRIP_QUALITY" and v in ("0", "1"):
-                # 0/1 are lossy MP3 tiers the FLAC-only pipeline discards. Coerce
-                # them to the smallest lossless tier so the saved value is honoured
-                # as 2 rather than failing the choices check and reverting to the
-                # default (the largest tier). config.py applies the same coercion
-                # on the env path.
+                # 0/1 are lossy MP3 tiers the FLAC-only pipeline discards.
                 v = "2"
             if choices and v not in choices:
                 continue  # ignore garbage, keep current
@@ -301,10 +291,9 @@ def load():
             data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 _apply(data)
-                # _apply coerces a persisted lossy STREAMRIP_QUALITY (0/1) to 2
-                # in cfg; normalise it on disk too so the stale value doesn't
-                # linger and get re-coerced on every load. Best-effort — cfg is
-                # already correct regardless of whether the rewrite lands.
+                # _apply coerces a persisted lossy STREAMRIP_QUALITY (0/1) to
+                # 2 in cfg; normalise it on disk too so the stale value
+                # doesn't linger and get re-coerced on every load.
                 if str(data.get("STREAMRIP_QUALITY", "")).strip() in ("0", "1"):
                     data["STREAMRIP_QUALITY"] = "2"
                     _atomic_write_settings(data)
@@ -316,17 +305,10 @@ def load():
 
 
 def _any_active_job() -> bool:
-    """True if a job is genuinely in flight (pending/scanning/running).
-
-    Parked reviews don't count: they sit for weeks by design, and deferring
-    saves under them means changes that never land while the settings page
-    shows the new values as current. The deferral only exists so a change
-    can't shift the ground under a job that's mid-run; a review approved
-    later executes with whatever the settings are at that moment, which is
-    what the person who just changed them expects.
-
-    Late import so settings_store can be loaded without jobs.py being
-    importable yet (eg during CLI startup that never touches the web).
+    """True if a job is genuinely in flight (pending/scanning/running). Parked
+    reviews don't count: they sit for weeks by design, and deferring saves
+    under them means changes that never land while the settings page shows the
+    new values as current.
     """
     try:
         from qobuz_librarian.web import jobs as job_mgr
@@ -376,22 +358,11 @@ def _atomic_write_settings(data: dict) -> bool:
 
 
 def save(values: dict):
-    """Apply settings and persist them atomically. Returns (ok, warnings).
-
-    Only real changes land in the settings file: a posted value that matches
-    what's already in effect — and was never saved before — stays out, so that
-    field keeps tracking its env var / default instead of being silently
-    pinned forever by an unrelated Settings save. Once a field HAS been saved
-    it stays in the file, and the file wins on load, as documented.
-
-    If a job is already active, the in-memory apply is deferred until the
-    worker idles (drain_pending). Persistence to disk still happens
-    immediately so the new values survive a restart. `ok` is False only if
-    persistence failed; `warnings` lists any list-field entries that were
-    dropped as unknown (e.g. a misspelt lyrics provider or an uninstalled
-    beets plugin) so the caller can tell the user instead of silently eating
-    them. The whole read-merge-write is serialised so concurrent saves don't
-    lose each other's keys.
+    """Apply settings and persist them atomically. Returns (ok, warnings). Only
+    real changes land in the settings file: a posted value that matches what's
+    already in effect — and was never saved before — stays out, so that field
+    keeps tracking its env var / default instead of being silently pinned
+    forever by an unrelated Settings save.
     """
     with _save_lock:
         return _save_locked(values)

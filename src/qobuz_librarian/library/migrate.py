@@ -2329,17 +2329,12 @@ def _carry_companion_files(plan: "MigrationPlan", result: "ExecResult", *,
                            destination_root_binding=None,
                            ) -> None:
     """Copy each migrated album folder's non-audio companions into the
-    destination folder(s) that received its audio.
-
-    Always a copy (never a move), even in in-place mode: the same cover can fan
-    out to several destinations (for example, AcoustID splitting one source
-    folder), the source folder may still hold audio that failed/skipped, and a
-    duplicated cover image is harmless. Best-effort — a companion failure is
-    logged, never fatal.
-    A skipped or pre-existing destination only anchors companions after a
-    fresh byte-for-byte check against its mapped source audio. Same-folder
-    layout only (cover beside the tracks); an album-level cover a level above
-    per-disc track folders is intentionally not chased."""
+    destination folder(s) that received its audio. Always a copy (never a
+    move), even in in-place mode: the same cover can fan out to several
+    destinations (for example, AcoustID splitting one source folder), the
+    source folder may still hold audio that failed/skipped, and a duplicated
+    cover image is harmless.
+    """
     folder_map: dict = {}
 
     def _cancelled() -> bool:

@@ -226,10 +226,7 @@ def _interactive_album_action(album, args, token, album_queue, flush_queue):
             # here so an accidental 'f' on an empty queue doesn't silently
             # queue+flush without the user seeing the option advertised.
             #
-            # --force means "re-download every track". A complete album has
-            # missing=[], so without this the queued item would download nothing
-            # and never drain from the queue. Queue the full track list so it
-            # actually re-rips the album.
+            # --force means "re-download every track".
             _missing = (list((album.get("tracks") or {}).get("items") or [])
                         if args.force else missing)
             album_id = album.get("id")
@@ -288,10 +285,9 @@ def run_album_mode(args, token, *, query_args=None, loop=False):
         if not album_queue:
             return
         banner(f"Executing queue — {len(album_queue)} album(s)", C.GREEN)
-        # _execute_download_queue drops finished items from album_queue in place
-        # and leaves the unfinished ones for a retry, so DON'T clear it — what
-        # remains is exactly the work to re-offer. len() after the call is the
-        # count still outstanding.
+        # _execute_download_queue drops finished items from album_queue in
+        # place and leaves the unfinished ones for a retry, so DON'T clear it
+        # — what remains is exactly the work to re-offer.
         _, drained = _execute_download_queue(album_queue, args, token,
                                              refresh_review=True)
         if not args.dry_run and not drained:
@@ -333,8 +329,6 @@ def run_album_mode(args, token, *, query_args=None, loop=False):
                 args.query = saved_query
                 if not loop:
                     # One-shot invocation: a Qobuz API failure is fatal.
-                    # Exit non-zero so cron/scripts can detect it (a plain
-                    # return falls through to a 0 exit).
                     raise SystemExit(1)
                 continue
             except Aborted as e:
@@ -369,8 +363,6 @@ def run_album_mode(args, token, *, query_args=None, loop=False):
                 "discarding queue (Ctrl+C means abort)."))
         raise
     finally:
-        # Flush only on a clean exit. A Ctrl-C discards the queue above, and an
-        # in-flight die()/AuthLost/QobuzUnavailable must not trigger a download
-        # pass against a dead token from inside the finally.
+        # Flush only on a clean exit.
         if not interrupted and sys.exc_info()[0] is None:
             _flush_queue()

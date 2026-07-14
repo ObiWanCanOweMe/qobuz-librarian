@@ -78,10 +78,9 @@ def run_downsample_walk_mode(args):
     for candidate in refresh.candidates:
         candidates_by_artist.setdefault(candidate.artist, []).append(candidate)
 
-    # First downsample with the keep-vs-delete choice unmade: ask once — the web
-    # UI asks the same thing — and save it as the standing default (changeable
-    # later in Settings). Default keeps the originals: the safe answer, and what
-    # a piped/unattended run that can't be asked falls back to.
+    # First downsample with the keep-vs-delete choice unmade: ask once — the
+    # web UI asks the same thing — and save it as the standing default
+    # (changeable later in Settings).
     if (refresh.candidates and not args.dry_run
             and cfg.DOWNSAMPLE_KEEP_ORIGINALS not in ("keep", "delete")):
         from qobuz_librarian.web import settings_store
@@ -91,9 +90,7 @@ def run_downsample_walk_mode(args):
             "(answering No deletes them to save space)",
             default_yes=True, auto_yes=False, on_eof=None, strict=True)
         if keep is None:
-            # Closed stdin never answered. Don't turn that into a saved
-            # standing preference — least of all the destructive one; run
-            # with the safe answer and leave the question open.
+            # Closed stdin never answered.
             cfg.DOWNSAMPLE_KEEP_ORIGINALS = "keep"
             log.info(fmt(C.GRAY,
                 "  No input available — keeping originals for this run; "
@@ -107,9 +104,7 @@ def run_downsample_walk_mode(args):
                 "change this any time in Settings."))
         log.info("")
 
-    # Auto-accept gate. Plain --yes deliberately does NOT cover this path — its
-    # contract is that destructive prompts still ask — so the user opts in
-    # explicitly here for an unattended run.
+    # Auto-accept gate.
     auto_accept_all = False
     if refresh.candidates and not args.dry_run:
         try:

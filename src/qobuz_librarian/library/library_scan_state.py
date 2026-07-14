@@ -12,8 +12,7 @@ STATE_VERSION = 1
 
 # save_kind and mark_review_retired both read-modify-write the shared file;
 # serialise them so a scan's periodic save and a review retire (discard /
-# worked-through) can't clobber each other's field. Readers need no lock —
-# _write_state swaps the file in atomically.
+# worked-through) can't clobber each other's field.
 _lock = threading.Lock()
 
 
@@ -21,15 +20,11 @@ def _empty_state():
     return {
         "version": STATE_VERSION,
         "updated_at": None,
-        # When the parked Library review derived from this snapshot was retired
-        # (discarded, or worked through to empty). The saved-state review
-        # reconstruction (web app) only rebuilds a review when a scan is newer
-        # than this — so a review the user deliberately finished doesn't
-        # resurrect, while a later scan's fresh review does.
+        # When the parked Library review derived from this snapshot was
+        # retired (discarded, or worked through to empty).
         "review_retired_at": 0.0,
         # Why the review retired: "discarded" (thrown away in one action) or
-        # "worked_through" (dismissed/downloaded down to empty). The Library
-        # page shows different copy for each; "" when no review has retired.
+        # "worked_through" (dismissed/downloaded down to empty).
         "review_retired_reason": "",
         "kinds": {},
     }

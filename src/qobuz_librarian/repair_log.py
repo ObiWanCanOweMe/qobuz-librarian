@@ -108,15 +108,12 @@ def warn_if_download_truncated(album_dir, token, label):
             "shorter than the Qobuz length — run Repair to refill."))
     return short
 
-# Lossless FLAC compresses music to roughly 0.40-0.65 of raw PCM; even
-# very compressible material rarely lands below ~0.30. A file whose
-# *audio portion* (file size minus metadata) is under 15% of the
-# uncompressed-equivalent size for the duration STREAMINFO claims is
-# almost certainly truncated — the header survives tail damage and lies
-# about how much audio is actually present. The metadata-aware variant
-# matters for hi-res FLAC with multi-MB embedded art: with art alone
-# eating >15% of expected_uncompressed, a real partial download could
-# slip past a whole-file ratio check.
+# Lossless FLAC compresses music to roughly 0.40-0.65 of raw PCM; even very
+# compressible material rarely lands below ~0.30. A file whose *audio portion*
+# (file size minus metadata) is under 15% of the uncompressed-equivalent size
+# for the duration STREAMINFO claims is almost certainly truncated — the
+# header survives tail damage and lies about how much audio is actually
+# present.
 _BYTE_SIZE_TRUNCATED_RATIO = 0.15
 
 # Verifying every FLAC frame's CRC costs a full read per file. Worth it for an
@@ -508,35 +505,15 @@ def scan_dir_for_isrc_repairs(album_dir, token,
     """Pair each FLAC in album_dir to its Qobuz recording via ISRC, then flag
     truncation by duration comparison (>30 s short AND either <85% ratio or
     >60 s short, so a long track can't hide a big shortfall behind the ratio).
-
-    Returns a dict with four keys:
-      verified_truncated  — ISRC match + duration short → safe to refill
-      verified_ok         — ISRC match, duration normal (count, not list)
-      no_isrc_tag         — no ISRC tag; recording identity unverifiable
-      isrc_no_match       — ISRC tag present but Qobuz returned no match
-
-    Only verified_truncated files are ever deleted and refilled; everything
-    else is surfaced to the user without modification. ISRC identity is
-    mandatory: album-edition guessing (find_qobuz_album_for_dir) can silently
-    swap a 1992 master for its 2011 remaster, which is wrong for surgical repair.
-
-    Either way, every FLAC is decode-probed locally (`flac -t`, no network), so
-    a file is only ever counted verified_ok when it actually decodes — frame-CRC
-    and middle-zero damage that leaves the size + STREAMINFO intact is caught.
-    The `deep` flag controls only the Qobuz duration cross-check, not whether we
-    read the file: deep=True (single-album repair and both whole-library sweeps)
-    looks every track up on Qobuz to also catch a file that decodes fine but is
-    genuinely shorter than the real recording — a track truncated at a frame
-    boundary with its STREAMINFO rewritten to the short length decodes fine and
-    isn't byte-short, so only the duration cross-check catches it. deep=False is
-    the cheaper mode, a Qobuz call only on a byte-short or won't-decode track.
-    When the `flac` tool is absent a file can't be decode-checked and is counted
-    `unverified`, never ok.
-
-    only_isrcs: when given (a set of normalised ISRCs), tracks whose ISRC is not
-    in the set are counted as verified_ok without an API call. _refills_intact
-    uses this to confirm just the freshly-refilled tracks instead of re-verifying
-    the whole album one network call per track."""
+    Returns a dict with four keys: verified_truncated — ISRC match + duration
+    short → safe to refill verified_ok — ISRC match, duration normal (count,
+    not list) no_isrc_tag — no ISRC tag; recording identity unverifiable
+    isrc_no_match — ISRC tag present but Qobuz returned no match Only
+    verified_truncated files are ever deleted and refilled; everything else is
+    surfaced to the user without modification. ISRC identity is mandatory:
+    album-edition guessing (find_qobuz_album_for_dir) can silently swap a 1992
+    master for its 2011 remaster, which is wrong for surgical repair.
+    """
     report = {
         "verified_truncated": [],
         "verified_ok": 0,
@@ -545,9 +522,7 @@ def scan_dir_for_isrc_repairs(album_dir, token,
         # truncated". A track whose lookup returned nothing lands in
         # isrc_no_match, so callers that must prove a refill is intact (repair
         # backup deletion) check membership here rather than absence from
-        # verified_truncated. A Counter, not a set: two files sharing one ISRC
-        # (a .1.flac collision pair, or the same recording on two discs) must
-        # each verify — one good twin can't vouch for the other.
+        # verified_truncated.
         "verified_ok_isrcs": Counter(),
         "no_isrc_tag": [],
         "isrc_no_match": [],

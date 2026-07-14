@@ -121,11 +121,10 @@ def _list_tree(root: Path):
 
 def _backup_dir_name(album_dir: Path, *, kind: str = "") -> str:
     # Shared name for upgrade and gap-fill backup dirs:
-    # "<ymd>_<hms>_<micro>[_<kind>]_<safe>". Microseconds keep two backups of the
-    # same album in the same wall-clock second from colliding into one dir (which
-    # mkdir(exist_ok=True) would silently merge, mixing two operations' files and
-    # breaking the 1:1 backup→restore mapping). The retention sweep only parses
-    # the leading ``\d{8}_\d{6}`` timestamp, so the extra segment is transparent.
+    # "<ymd>_<hms>_<micro>[_<kind>]_<safe>". Microseconds keep two backups of
+    # the same album in the same wall-clock second from colliding into one dir
+    # (which mkdir(exist_ok=True) would silently merge, mixing two operations'
+    # files and breaking the 1:1 backup→restore mapping).
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     safe = re.sub(r"[^\w\-_. ]", "_", album_dir.name)[:80]
     infix = f"{kind}_" if kind else ""
@@ -2433,14 +2432,11 @@ _XATTR_UNSUPPORTED = {errno.EINVAL, errno.ENOTSUP,
 
 def _fsync(path: Path) -> bool:
     """Force a file's bytes (or a directory's entries) to stable storage, and
-    report whether the flush is trustworthy.
-
-    A copy that's read back for hashing only proves the bytes are in the page
-    cache; forcing them to disk before the original is deleted is what makes a
-    verified copy survive a delayed-writeback failure (ENOSPC/EIO during the lazy
-    flush). Returns True only after a successful flush. A mount that does not
-    support fsync cannot prove the copy durable, so callers about to delete or
-    rewrite the only original must keep it instead."""
+    report whether the flush is trustworthy. A copy that's read back for
+    hashing only proves the bytes are in the page cache; forcing them to disk
+    before the original is deleted is what makes a verified copy survive a
+    delayed-writeback failure (ENOSPC/EIO during the lazy flush).
+    """
     try:
         fd = os.open(str(path), os.O_RDONLY)
         try:
@@ -2491,15 +2487,13 @@ def replacement_tree_durable(root: Path) -> bool:
 
 def _tree_digest(d: Path):
     """{relative-path: (size, sha256)} for every regular file under tree d, or
-    None on any stat/read error, an unexpected special file, or a symlink whose
-    target points outside the tree.
-
-    Content-verifies a cross-filesystem copy before the source is deleted: a
-    same-size copy that differs by even one byte — a transfer glitch, a partial
-    write that got re-padded — fails the match, so it can't pass as a valid
-    backup and let the original be removed. A symlink whose target lives outside
-    the tree isn't copied as bytes, so it can't be content-verified — refuse the
-    whole backup rather than record it by target string alone."""
+    None on any stat/read error, an unexpected special file, or a symlink
+    whose target points outside the tree. Content-verifies a cross-filesystem
+    copy before the source is deleted: a same-size copy that differs by even
+    one byte — a transfer glitch, a partial write that got re-padded — fails
+    the match, so it can't pass as a valid backup and let the original be
+    removed.
+    """
     out = {}
     entries = _list_tree(d)
     if entries is None:
@@ -2545,11 +2539,9 @@ _ORIGIN_SIDECAR = ".ql_backup_origin"
 # so this is an explicit belt-and-braces signal, not the sole protection.
 _PARTIAL_RESTORE_SENTINEL = ".ql_partial_restore"
 
-# Dropped into an upgrade backup kept because the re-rip couldn't be verified as
-# complete (e.g. a track came back truncated-but-decodable, so playtime dropped).
-# The backup is then the only fully-verified copy. A same-count, larger hi-res
-# re-rip can leave the origin looking redundant by bytes, so the sweep needs this
-# explicit "don't reap" marker on top of the content-presence proof.
+# Dropped into an upgrade backup kept because the re-rip couldn't be verified
+# as complete (e.g. a track came back truncated-but-decodable, so playtime
+# dropped). The backup is then the only fully-verified copy.
 _UNVERIFIED_UPGRADE_SENTINEL = ".ql_upgrade_unverified"
 
 # Dropped into a backup that exists only as an undo window — the downsample
@@ -5967,12 +5959,9 @@ def warn_pin_failed(bp: Path) -> None:
 
 
 # Memoize the orphan walk: every settings load/submit and the dashboard call
-# _diagnostics(), which calls this, and it rglob-walks every retained backup to
-# content-check redundancy. A burst of those hits (form POST → redirect →
-# dashboard render) would otherwise re-walk the whole backup tree each time. The
-# cache is invalidated when the backup dir's mtime changes (a backup added or
-# removed bumps it) or when the short TTL lapses (catches a sub-dir-only change,
-# e.g. a restore completing, that doesn't touch the parent's mtime).
+# _diagnostics(), which calls this, and it rglob-walks every retained backup
+# to content-check redundancy. A burst of those hits (form POST → redirect →
+# dashboard render) would otherwise re-walk the whole backup tree each time.
 _ONLY_COPY_TTL_SEC = 10.0
 _only_copy_cache: tuple[float, float, list] | None = None
 # Executor threads (retention) and the web diagnostic both call
@@ -9583,12 +9572,9 @@ def cleanup_old_upgrade_backups(retention_days: int | None = None,
             continue
         if entry.name.endswith(".partial") and not (entry / _ORIGIN_SIDECAR).is_file():
             # Stranded mid-copy dir from a hard kill during a cross-fs backup.
-            # A committed backup ALWAYS writes the origin sidecar (even one whose
-            # album name itself ends in '.partial'), so its absence marks a
-            # never-finished copy. Only reap once it's old enough that it can't
-            # be another process's actively-running cross-fs copy (also
-            # sidecar-less until it commits) — the run lock usually serialises
-            # this, but the grace window is cheap insurance.
+            # A committed backup ALWAYS writes the origin sidecar (even one
+            # whose album name itself ends in '.partial'), so its absence
+            # marks a never-finished copy.
             try:
                 stale = (time.time() - entry.stat().st_mtime) > 3600
             except OSError:

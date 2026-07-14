@@ -29,12 +29,7 @@ _initialized = False
 _generation = 0
 _local = threading.local()
 
-# Buffered-write state. A cold scan of a 200k-track library writes one row per
-# file; doing a commit per write turns into 200k disk syncs that dominate the
-# scan. Buffer instead, flush periodically + at end-of-scan + at process exit.
-# Keyed by path so a later put() for the same file replaces the earlier
-# buffered entry, and ``get()`` can read from the buffer before falling back
-# to disk (preserving the put→get visibility contract).
+# Buffered-write state.
 _PENDING_LOCK = threading.Lock()
 _PENDING_ROWS: dict[str, tuple] = {}  # path → (mtime_ns, size, payload_json)
 _PENDING_LIMIT = 500
@@ -367,8 +362,7 @@ def census():
         tiers[tier][1] += size
         if tier in ("hires96", "hires192"):
             # The integer-ratio family the resampler targets: 88.2/176.4 land
-            # on 44.1, everything else on 48. A 24-bit file already at 44.1/48
-            # has no rate to cut, so it adds nothing to the reclaim figure.
+            # on 44.1, everything else on 48.
             target = 44100 if sr % 44100 == 0 else 48000
             if sr > target:
                 reclaim += int(size * (1 - target / sr))

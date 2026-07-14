@@ -81,20 +81,16 @@ def quality_relation(left, right):
 
 
 def compare_album_quality(existing_tracks, qobuz_album):
-    """Classify per-track quality of existing tracks vs the Qobuz album.
-
-    Returns dict with classification (str) and counts. Classifications:
-      'no_existing' : existing list is empty
-      'unknown'     : couldn't read quality from any existing track
-      'all_lower'   : every readable track is below Qobuz quality
-      'mixed_below' : some below, some at; none above
-      'all_equal'   : every readable track matches Qobuz quality
-      'all_higher'  : every readable track is above Qobuz quality
-      'mixed_above' : some above, some at; none below
-      'mixed_both'  : some below AND some above (rare; treat conservatively)
-      'incomparable': at least one track trades bit depth for sample rate
-
-    A result containing unknown or incomparable quality is never classified as
+    """Classify per-track quality of existing tracks vs the Qobuz album. Returns
+    dict with classification (str) and counts. Classifications: 'no_existing'
+    : existing list is empty 'unknown' : couldn't read quality from any
+    existing track 'all_lower' : every readable track is below Qobuz quality
+    'mixed_below' : some below, some at; none above 'all_equal' : every
+    readable track matches Qobuz quality 'all_higher' : every readable track
+    is above Qobuz quality 'mixed_above' : some above, some at; none below
+    'mixed_both' : some below AND some above (rare; treat conservatively)
+    'incomparable': at least one track trades bit depth for sample rate A
+    result containing unknown or incomparable quality is never classified as
     an automatic upgrade candidate.
     """
     qbits, qrate = album_max_quality(qobuz_album)
@@ -264,13 +260,12 @@ def is_local_album_capped(album_dir, capped, album=None):
     key = _local_album_cap_key(album_dir)
     if key and key in capped:
         return True
-    # Path-independent fallback: a folder move / rename / migrate / consolidate
-    # changes the path-derived key, but it's the same album the user
-    # deliberately downsampled — so match the durable local cap by Qobuz album
-    # id, then by a loose artist+title fingerprint (the same identity the
-    # dismiss store uses). Without this, any reorg re-opens the
-    # downsample→upgrade loop the cap exists to stop. Errs toward "still
-    # capped" — the safe direction (won't re-download shed hi-res).
+    # Path-independent fallback: a folder move / rename / migrate /
+    # consolidate changes the path-derived key, but it's the same album the
+    # user deliberately downsampled — so match the durable local cap by Qobuz
+    # album id, then by a loose artist+title fingerprint (the same identity
+    # the dismiss store uses). Without this, any reorg re-opens the
+    # downsample→upgrade loop the cap exists to stop.
     if album:
         aid = str(album.get("id") or "")
         fp = hidden_mod.album_fingerprint(
@@ -419,9 +414,6 @@ def scan_artist_for_upgrades(artist_name, artist_dir, token, args, capped=None):
         # mark_single stored. The folder name (artist_name) can differ from it
         # ("Beatles" on disk vs "The Beatles" on Qobuz), which would miss the
         # mark and leak the downloaded single into the upgrade scan.
-        # Only skip when the album is still partial (has missing tracks) — a
-        # fully-present album should graduate out of the single marker and remain
-        # eligible for a quality upgrade, matching discovery.py semantics.
         if single_store is not None and missing:
             q_artist = (qobuz_album.get("artist") or {}).get("name") or artist_name
             if hidden_mod.is_single(q_artist, qobuz_album.get("title"), single_store):
@@ -440,13 +432,8 @@ def scan_artist_for_upgrades(artist_name, artist_dir, token, args, capped=None):
         if qual["n_unknown"]:
             continue
 
-        # Bonus tracks normally block wipe-and-replace. Before giving up,
-        # try to find an alternate Qobuz edition that covers everything
-        # on disk. Auto-promote a perfect match (no new extras, still an
-        # upgrade) silently — upgrade walk has no per-album picker by
-        # design. Critical for libraries assembled from partial-edition
-        # rips, where one stray track from a different edition currently
-        # blocks the entire upgrade.
+        # Bonus tracks normally block wipe-and-replace. Before giving up, try
+        # to find an alternate Qobuz edition that covers everything on disk.
         extras = find_extras_in_existing(qobuz_tracks, existing)
         if extras:
             cands = find_expanded_edition(qobuz_album, album_dir,

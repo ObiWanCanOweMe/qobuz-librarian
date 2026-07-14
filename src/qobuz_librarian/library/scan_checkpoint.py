@@ -21,13 +21,11 @@ import time
 from qobuz_librarian import config as cfg
 
 # The library gap-scan kinds pending() surfaces for the dashboard resume
-# prompt. The "repair" sweep also checkpoints here but resumes on a manual
-# re-run, so it's deliberately left out of this set.
+# prompt.
 _KINDS = ("missing", "partial")
 
 # save/clear are read-modify-write of the shared file; serialise them so two
-# scan kinds progressing in parallel can't clobber each other's entry. Readers
-# (load/pending) need no lock — _write swaps the file in atomically.
+# scan kinds progressing in parallel can't clobber each other's entry.
 _lock = threading.Lock()
 
 

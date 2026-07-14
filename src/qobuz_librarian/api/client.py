@@ -30,12 +30,7 @@ def _ua_string() -> str:
         return "qobuz-librarian (+streamrip-companion)"
 
 
-# One requests.Session per thread. The session only pools connections and
-# carries the User-Agent — auth is passed per request (X-User-Auth-Token) — so
-# there's no shared mutable state to protect. Giving each worker its own
-# session lets the parallel artist scan make real concurrent calls instead of
-# queuing behind one global lock, while keeping single-threaded callers
-# unchanged. `_get_session` is the seam tests patch.
+# One requests.Session per thread.
 _thread_local = threading.local()
 
 
@@ -47,18 +42,10 @@ def _get_session() -> requests.Session:
         _thread_local.session = s
     return s
 
-# Retry on transient failures (rate limit + 5xx). Three attempts, exponential
-# backoff capped at 8s — long enough to outwait a typical Qobuz hiccup, short
-# enough that a sustained outage still fails the call quickly. Honors a
-# Retry-After header if Qobuz sends one. 401/403/404 do NOT retry.
+# Retry on transient failures (rate limit + 5xx).
 #
 # Per-attempt timeout, derived from WEB_FETCH_TIMEOUT rather than a second
-# independently-tuned literal. The retry loop also respects an optional
-# per-call deadline (see request_deadline): a web request that's already
-# given up at WEB_FETCH_TIMEOUT shouldn't leave its executor thread retrying
-# — and possibly sleeping out a 30s Retry-After — for a result nobody's
-# waiting on. CLI and background jobs leave the deadline unset and keep the
-# full retry resilience.
+# independently-tuned literal.
 _REQUEST_TIMEOUT = max(2, int(config.WEB_FETCH_TIMEOUT) - 2)
 _RETRY_STATUSES  = (429, 500, 502, 503, 504)
 _MAX_ATTEMPTS    = 3
@@ -198,14 +185,10 @@ def qobuz_get(endpoint, params, token):
             # A 4xx other than the 401 handled above still means Qobuz
             # authenticated the request before answering — "no such album", a
             # bad query, a lapsed subscription — so the token itself is good.
-            # Clear a stale auth-lost banner just as a 200 would; only the 401
-            # path (and a 5xx, which may never have reached auth) leaves it set.
             if 400 <= r.status_code < 500:
                 notify_auth_state(True)
             raise QobuzError(f"HTTP {r.status_code} from {endpoint}: {r.text[:200]}")
-        # A 200 means Qobuz accepted the token. Report that so the web
-        # dashboard's auth banner recovers from an earlier transient 401
-        # instead of staying red until the next restart probe.
+        # A 200 means Qobuz accepted the token.
         notify_auth_state(True)
         try:
             return r.json()

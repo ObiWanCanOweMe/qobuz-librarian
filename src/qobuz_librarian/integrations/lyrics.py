@@ -59,14 +59,10 @@ def _run_lyric_hook(album_dir):
     except OSError:
         pass
     try:
-        # Always embed here, regardless of cfg.LYRICS_FORMAT. This runs on
-        # the *staging* dir before beets moves files: a .lrc written next
-        # to a staging FLAC is orphaned the moment beets relocates+renames
-        # the track (beets moves only the audio). Embedding puts the lyric
-        # *inside* the FLAC so it travels through the move intact, then
-        # write_post_import_sidecars() materialises the .lrc next to the
-        # final renamed file when the user wants one. Net effect: the song
-        # never lands in the library without its lyrics.
+        # Always embed here, regardless of cfg.LYRICS_FORMAT. This runs on the
+        # *staging* dir before beets moves files: a .lrc written next to a
+        # staging FLAC is orphaned the moment beets relocates+renames the
+        # track (beets moves only the audio).
         counts = lyric_fetch.fetch_for_paths(
             flacs,
             owned_root=cfg.STAGING_DIR,
@@ -122,19 +118,9 @@ def _run_lyric_hook(album_dir):
 
 
 def _resolve_signatures_to_paths(signatures, search_dirs):
-    """Walk search_dirs and match each FLAC's tag signature.
-
-    Returns the list of post-import paths that match. Used after beets
-    has moved files out of staging, to find where transient-from-staging
-    files landed. Stops as soon as every signature is matched. Unmatched
-    signatures are silently dropped (file was renamed in a way we can't
-    follow, or beets failed to import that specific track).
-
-    `signatures` is the list returned by _run_lyric_hook (pairs of
-    (sig, original_staging_path)); the staging path is informational
-    and ignored here. `search_dirs` is an iterable of post-import
-    album dirs — typically each queue item's resolved post_dir, plus
-    the primary album dir for process_album."""
+    """Walk search_dirs and match each FLAC's tag signature. Returns the list of
+    post-import paths that match.
+    """
     if not signatures:
         return []
     sig_set = {sig for sig, _ in signatures}
@@ -885,16 +871,9 @@ def write_post_import_sidecars(
 
 def _record_post_import_lyric_retry(post_paths):
     """Update LYRIC_RETRY_FILE with post-import paths of transient files.
-
-    Replaces the staging-keyed call to `_refresh_lyric_retry` from
-    inside `_run_lyric_hook`. Existing manifest entries whose files
-    no longer exist on disk are pruned (so stale staging paths from
-    pre-fix runs get cleaned up on the first post-fix run). New
-    post-import paths are merged in, deduped, and persisted.
-
-    `_refresh_lyric_retry` itself is still used by
-    `offer_resume_lyric_retry` after the resume's lyric_fetch run —
-    by then state is keyed by post-import paths so it works correctly."""
+    Replaces the staging-keyed call to `_refresh_lyric_retry` from inside
+    `_run_lyric_hook`.
+    """
     # Load→modify→save under the manifest lock so a concurrent retry-run prune
     # in the other worker lane can't clobber the entries we add here.
     with _manifest_lock():

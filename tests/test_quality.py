@@ -22,8 +22,7 @@ def test_streamrip_quality_tier_1_coerces_to_lossless(monkeypatch, capsys):
     # Tier 1 (320kbps MP3) is unsupported: the pipeline is FLAC-only and the
     # post-download cleanup discards every non-FLAC file, so a tier-1 setting
     # would rip each track and then delete it — the setting silently downloads
-    # nothing. config must coerce it to a lossless tier and say so, not pass 1
-    # through to a download that vanishes.
+    # nothing.
     import importlib
 
     from qobuz_librarian import config as cfg
@@ -41,9 +40,7 @@ def test_streamrip_quality_tier_1_coerces_to_lossless(monkeypatch, capsys):
 
 
 def test_album_max_quality_keeps_qobuz_master_when_downsample_enabled(monkeypatch):
-    # Upgrade discovery should still report the best Qobuz can provide. The
-    # downsample preference is a post-download storage choice, not a reason to
-    # hide a 24/192 master from the upgrade/baseline scan.
+    # Upgrade discovery should still report the best Qobuz can provide.
     monkeypatch.setattr("qobuz_librarian.config.STREAMRIP_QUALITY", 4)
     monkeypatch.setattr("qobuz_librarian.config.DOWNSAMPLE_HIRES_ENABLED", True)
     assert album_max_quality(
