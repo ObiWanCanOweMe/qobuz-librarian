@@ -1025,7 +1025,10 @@ def _check_staging_occupied():
     try:
         if not cfg.STAGING_DIR.exists():
             return
-        subdirs = [d for d in cfg.STAGING_DIR.iterdir() if d.is_dir()]
+        subdirs = [
+            d for d in cfg.STAGING_DIR.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        ]
         if subdirs:
             log.info(fmt(C.YELLOW,
                 f"\n  ⚠  {len(subdirs)} album folder(s) remain in "

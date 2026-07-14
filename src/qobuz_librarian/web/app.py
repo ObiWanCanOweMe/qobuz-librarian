@@ -2095,7 +2095,10 @@ def _staging_album_count() -> int:
     stranded. Only meaningful when nothing is actively writing — the caller
     suppresses the banner while a job is running."""
     try:
-        return sum(1 for d in cfg.STAGING_DIR.iterdir() if d.is_dir())
+        return sum(
+            1 for d in cfg.STAGING_DIR.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        )
     except OSError:
         return 0
 
