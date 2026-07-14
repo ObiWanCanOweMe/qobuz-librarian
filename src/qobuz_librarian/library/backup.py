@@ -1329,6 +1329,21 @@ def capture_album_source_receipt(album_dir):
         _close_descriptors(descriptors)
 
 
+def _fidelity_without_root_sidecars(snapshot):
+    """The copy carries the tracks, never the backup's own root metadata."""
+    if snapshot is None:
+        return None
+    return {
+        "directories": snapshot["directories"],
+        "files": {
+            relative: value
+            for relative, value in snapshot["files"].items()
+            if PurePosixPath(relative).parent != PurePosixPath(".")
+            or PurePosixPath(relative).name not in _SIDECARS
+        },
+    }
+
+
 def _tree_copy_fidelity_matches(source, destination) -> bool:
     if source is None or destination is None:
         return False
@@ -2389,7 +2404,8 @@ def _copy_tree_manifest_at(source_root_fd, destination_root_fd, manifest) -> boo
             and _tree_manifest(destination_root_fd) == manifest
             and _tree_fidelity_snapshot(source_root_fd) == source_fidelity
             and _tree_copy_fidelity_matches(
-                source_fidelity, destination_fidelity)
+                _fidelity_without_root_sidecars(source_fidelity),
+                destination_fidelity)
             and _fsync_directory_fds(destination_root_fd)
         )
     except (OSError, TypeError, ValueError):

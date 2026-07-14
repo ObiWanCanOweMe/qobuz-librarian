@@ -251,6 +251,30 @@ def test_backup_refuses_rather_than_leave_unprotected_sole_copy(tmp_path, monkey
 
 
 
+def test_cross_fs_restore_succeeds_with_backup_sidecars_present(tmp_path, monkeypatch):
+    # Every upgrade backup carries its origin and receipt sidecars, and a
+    # failed upgrade adds pin markers. The staged cross-filesystem restore
+    # copies only the music, so verifying the copy must not count the
+    # backup's own root metadata against it.
+    import qobuz_librarian.library.backup as bkmod
+    monkeypatch.setattr(bkmod.cfg, "UPGRADE_BACKUP_DIR", tmp_path)
+    monkeypatch.setattr(bkmod.cfg, "MUSIC_ROOT", tmp_path)
+    backup = tmp_path / "backup"
+    backup.mkdir()
+    (backup / "track1.flac").write_bytes(b"a" * 50_000)
+    (backup / "cover.jpg").write_bytes(b"art")
+    original = tmp_path / "Album"
+    backup_result = _seal_test_backup(bkmod, backup, original, kind="upgrade")
+    assert bkmod.pin_unverified_upgrade_backup(backup_result)
+    monkeypatch.setattr(bkmod, "_same_filesystem", lambda *_: False)
+
+    assert restore_upgrade_backup(backup_result, original) is True
+    assert (original / "track1.flac").read_bytes() == b"a" * 50_000
+    assert (original / "cover.jpg").read_bytes() == b"art"
+    assert not (original / bkmod._RECEIPT_SIDECAR).exists()
+    assert not backup.exists()
+
+
 def test_restore_upgrade_backup_exdev_verifies_before_dropping_backup(tmp_path, monkeypatch):
     import qobuz_librarian.library.backup as bkmod
     monkeypatch.setattr(bkmod.cfg, "UPGRADE_BACKUP_DIR", tmp_path)
