@@ -224,6 +224,70 @@ def test_cancelled_download_discards_staging_and_clears_journal(
     assert queue_state.list_queue_journals() == ()
 
 
+def test_failed_download_leaving_only_art_stays_retryable(
+    tmp_path, monkeypatch, authority
+):
+    # A failed rip that leaves nothing but redownloaded art (a failed upgrade
+    # is the common case) is disposed and retried instead of blocking the
+    # queue for recovery.
+    staging = tmp_path / "staging"
+    monkeypatch.setattr(cfg, "STAGING_DIR", staging)
+    monkeypatch.setattr(cfg, "QUEUE_JOURNAL_DIR", tmp_path / "journals")
+    item = _single_track_item("Art Only Album")
+    args = Namespace(no_import=False)
+    plan = plan_durable_new_album(item, args)
+    assert plan is not None
+
+    monkeypatch.setattr(durable_runner, "snapshot_staging", lambda: set())
+
+    def incomplete_download(**kwargs):
+        journal = queue_state.list_queue_journals()[0].journal
+        owner = journal.items[0].completion_input["owner"]
+        kwargs["recovery_checkpoint"](
+            {
+                "version": 1,
+                "kind": "staging-run",
+                "owner": owner,
+                "record": {
+                    "version": 2,
+                    "path": str(staging / (".qobuz-run-" + "a" * 24)),
+                    "root_identity": [1, 10, 0o40700, 0, 1, 2],
+                    "owner": owner,
+                },
+            }
+        )
+
+    disposed = []
+    monkeypatch.setattr(durable_runner, "run_album_download", incomplete_download)
+    monkeypatch.setattr(
+        durable_runner, "retire_empty_download_staging", lambda *a, **k: False
+    )
+    monkeypatch.setattr(
+        durable_runner,
+        "retire_download_staging_after_import",
+        lambda result, **kwargs: disposed.append(result) or True,
+    )
+    absent = StagingReferenceInspection(StagingReferenceStatus.ABSENT)
+    monkeypatch.setattr(durable_runner, "inspect_staging_run_reference", lambda *_: absent)
+    monkeypatch.setattr(durable_runner, "inspect_staging_group_reference", lambda *_: absent)
+
+    result = durable_runner.execute_durable_new_album(
+        [item],
+        item,
+        args,
+        plan=plan,
+        origin=CompletionOrigin(CompletionOriginKind.CLI, "album queue"),
+        mode="cli:album",
+        authority=authority,
+    )
+
+    assert result.status is durable_runner.DurableAlbumStatus.RETRY
+    assert disposed == [item]
+    saved = queue_state.list_queue_journals()[0].journal.items[0]
+    assert saved.phase is queue_state.QueuePhase.PENDING
+    assert saved.recovery_references == ()
+
+
 def test_durable_album_removes_queue_only_under_live_completion_proof(
     tmp_path, monkeypatch, authority
 ):

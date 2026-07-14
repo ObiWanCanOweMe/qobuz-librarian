@@ -18,6 +18,7 @@ from qobuz_librarian.download import (
     exact_download_coverage,
     refresh_staged_track_bindings,
     retain_download_staging,
+    retire_download_staging_after_import,
     retire_empty_download_staging,
     run_album_download,
     staged_track_bindings,
@@ -342,6 +343,19 @@ def _retry_or_attention_after_download(
         _require_authority(authority)
     except (OSError, TypeError, ValueError, queue_state.QueueJournalError):
         retired_empty = False
+    if not retired_empty:
+        # A failed rip can leave nothing but redownloaded art (a failed
+        # upgrade is the common case); that is not recoverable user data,
+        # so dispose it and keep the item retryable instead of blocking.
+        try:
+            _require_authority(authority)
+            retired_empty = retire_download_staging_after_import(
+                result,
+                recovery_checkpoint=checkpoint_group,
+            )
+            _require_authority(authority)
+        except (OSError, TypeError, ValueError, queue_state.QueueJournalError):
+            retired_empty = False
     if retired_empty:
         journal = _load_exact(operation_id)
         reconciled = _reconcile_absent_staging(

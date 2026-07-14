@@ -617,8 +617,9 @@ def _lock_busy_response(request, *, durable_resume_job_id: str | None = None):
         else:
             msg = ("An interrupted download could not be verified safely. Downloads "
                    "and scans are paused, and its saved queue and staged files were "
-                   "left unchanged. Check the application log for the blocked "
-                   "recovery reason, correct it, then restart Qobuz Librarian.")
+                   "left unchanged. Open that download from Queue or History and "
+                   "use Retry to settle it; if it stays blocked, check the "
+                   "application log.")
     elif (
         _startup_recovery_status_value() == "resume_required"
         and not _durable_resume_allowed(durable_resume_job_id or "")
@@ -3248,7 +3249,7 @@ def _make_download_run(
                         j.error = (
                             "The download did not reach a safely settled "
                             "completion. Its recovery state was retained; "
-                            "restart Qobuz Librarian after checking the log."
+                            "use Retry to settle it and try again."
                         )
         benign = {"already_complete", "skipped_already_higher_quality",
                   "skipped_has_extras", "dry_run", "user_skipped",

@@ -32,6 +32,8 @@ from qobuz_librarian.integrations.beets import (
 )
 from qobuz_librarian.integrations.staging import (
     StagingReferenceStatus,
+    discard_file_group,
+    discard_group,
     inspect_staging_group_reference,
     inspect_staging_run_reference,
     isolated_staging_run_names,
@@ -947,6 +949,77 @@ def _continue_prelaunch_settlement(
     return _settled_result(action)
 
 
+def _discard_parked_item_staging(authority, journal, item):
+    """Throw away a blocked item's parked staging groups on user authority."""
+    owner = {"operation_id": journal.operation_id, "item_id": item.item_id}
+    for reference in _staging_references(item):
+        if reference.kind != _STAGING_GROUP_KIND:
+            return None
+        _require_authority(authority)
+        inspection = _staging_inspection(reference, owner)
+        _require_authority(authority)
+        status = getattr(inspection, "status", None)
+        if status is StagingReferenceStatus.ABSENT:
+            continue
+        if status is not StagingReferenceStatus.MATCH:
+            return None
+        path = reference.data.get("path")
+        if not isinstance(path, str):
+            return None
+        _require_authority(authority)
+        discarded = discard_group(
+            Path(path), expected_owner=owner
+        ) or discard_file_group(Path(path), expected_owner=owner)
+        _require_authority(authority)
+        if not discarded:
+            return None
+    current, current_item, reason, _changed = _reconcile_item_staging(
+        authority,
+        journal,
+        item,
+        block_unsettled=False,
+    )
+    if reason is not None:
+        return None
+    return current, current_item
+
+
+def _settle_unstarted_download(authority, journal, item, action):
+    """Finish settling a download that blocked before any library mutation."""
+    frozen = parse_completion_input_record(
+        item.completion_input,
+        expected_owner=RecoveryOwner(journal.operation_id, item.item_id),
+    )
+    if frozen is None or frozen.lineages or frozen.counts is not None:
+        return _blocked_settlement(
+            "This item has no exact pre-launch Beets state to settle."
+        )
+    _require_authority(authority)
+    journal = queue_state.transition_journal_item(
+        journal,
+        item.item_id,
+        queue_state.QueuePhase.ACTIVE,
+    )
+    _require_authority(authority)
+    if action is BlockedItemSettlementAction.RETRY:
+        return _settled_result(action)
+    if len(journal.items) != 1 or journal.retirements:
+        return _blocked_settlement(
+            "Only a single-download operation can be discarded here."
+        )
+    try:
+        _require_authority(authority)
+        journal = queue_state.reset_unstarted_item_to_pending(journal, item.item_id)
+        _require_authority(authority)
+        queue_state.clear_queue_journal(journal.operation_id, explicit_discard=True)
+        _require_authority(authority)
+    except (OSError, ValueError, queue_state.QueueJournalError):
+        return _blocked_settlement(
+            "The discarded download could not be cleared from the saved queue."
+        )
+    return _settled_result(action)
+
+
 def settle_blocked_item(
     *,
     authority: RunLockLease,
@@ -954,7 +1027,8 @@ def settle_blocked_item(
     item_id: str,
     action: BlockedItemSettlementAction,
 ) -> BlockedItemSettlementResult:
-    """Retry or discard only a live-proved, pre-launch managed Beets abort."""
+    """Retry or discard a live-proved pre-launch abort: a parked download
+    or a managed Beets state that never launched."""
     if type(action) is not BlockedItemSettlementAction:
         raise ValueError("action must be retry or discard")
     try:
@@ -980,15 +1054,22 @@ def settle_blocked_item(
             block_unsettled=False,
         )
         if staging_reason is not None:
-            return _blocked_settlement(
-                "Staged download recovery state is still present or could not "
-                "be proved absent, so this item remains blocked."
-            )
+            settled_staging = _discard_parked_item_staging(authority, journal, item)
+            if settled_staging is None:
+                return _blocked_settlement(
+                    "Staged download recovery state is still present or could not "
+                    "be proved absent, so this item remains blocked."
+                )
+            journal, item = settled_staging
 
         managed_references = _references(item, _MANAGED_KINDS)
         reference = managed_references[0] if len(managed_references) == 1 else None
         if reference is None:
-            return _blocked_settlement("This item has no exact pre-launch Beets state to settle.")
+            if item.recovery_references:
+                return _blocked_settlement(
+                    "This item has no exact pre-launch Beets state to settle."
+                )
+            return _settle_unstarted_download(authority, journal, item, action)
         if reference.kind == _MANAGED_SETTLEMENT_KIND:
             return _continue_prelaunch_settlement(
                 authority,

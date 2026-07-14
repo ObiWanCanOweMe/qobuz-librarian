@@ -718,3 +718,128 @@ def test_startup_recovery_is_fail_closed_and_settles_exact_work(
     assert remaining[download_incomplete_id].phase is journal.QueuePhase.ACTIVE
 
 
+
+
+def _blocked_download_journal(tmp_path, monkeypatch, *, label):
+    from argparse import Namespace
+
+    from qobuz_librarian.integrations.staging import (
+        create_staging_run,
+        retain_staging_run,
+    )
+    from qobuz_librarian.queue.durable_album import (
+        initial_completion_input,
+        plan_durable_new_album,
+    )
+
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "run.lock")
+    monkeypatch.setattr(cfg, "STAGING_DIR", tmp_path / "staging")
+    monkeypatch.setattr(cfg, "QUEUE_JOURNAL_DIR", tmp_path / "journals")
+
+    track = {"id": "101", "media_number": 1, "track_number": 1}
+    item = _build_queue_item(
+        album={
+            "id": "42",
+            "title": label,
+            "maximum_bit_depth": 24,
+            "maximum_sampling_rate": 96,
+            "tracks": {"items": [track]},
+        },
+        album_dir=None,
+        label=label,
+        missing=[track],
+        present=[],
+        upgrade_only=False,
+        auto_upgrade=False,
+        quality=4,
+    )
+    plan = plan_durable_new_album(item, Namespace(no_import=False))
+    assert plan is not None
+    saved = journal.save_queue_journal(
+        journal.create_queue_journal([item], mode="web-job:abc12345")
+    )
+    item_id = saved.items[0].item_id
+    owner = RecoveryOwner(saved.operation_id, item_id)
+    owner_record = {"operation_id": saved.operation_id, "item_id": item_id}
+    initial = initial_completion_input(
+        plan,
+        owner,
+        CompletionOrigin(CompletionOriginKind.WEB_JOB, "abc12345"),
+    )
+    current = journal.transition_journal_item(
+        saved,
+        item_id,
+        journal.QueuePhase.ACTIVE,
+        completion_input=initial,
+    )
+
+    run_records = []
+    run = create_staging_run(owner=owner_record, on_created=run_records.append)
+    current = journal.append_staging_run_reference(current, item_id, run_records[0])
+    album_dir = run.path / "Artist" / label
+    album_dir.mkdir(parents=True)
+    (album_dir / "01 - Song.flac").write_bytes(b"partial audio")
+    intents = []
+    retained = retain_staging_run(
+        run,
+        label="download-incomplete",
+        on_intent=intents.append,
+    )
+    assert retained is not None
+    current = journal.append_staging_group_intent(current, item_id, intents[0])
+    journal.transition_journal_item(
+        current,
+        item_id,
+        journal.QueuePhase.BLOCKED,
+        block_reason="download-incomplete",
+    )
+    return saved.operation_id, item_id, retained
+
+
+def test_user_retry_discards_parked_staging_and_frees_the_item(tmp_path, monkeypatch):
+    # A download that stopped before any library mutation parks its partial
+    # rip and blocks. The user's Retry throws the parked staging away and
+    # returns the item to a resumable state instead of demanding a restart.
+    operation_id, item_id, retained = _blocked_download_journal(
+        tmp_path, monkeypatch, label="Blocked Album"
+    )
+
+    authority = run_lock.acquire()
+    try:
+        settled = startup_recovery.settle_blocked_item(
+            authority=authority,
+            operation_id=operation_id,
+            item_id=item_id,
+            action=startup_recovery.BlockedItemSettlementAction.RETRY,
+        )
+    finally:
+        authority.close()
+
+    assert settled.status is startup_recovery.BlockedItemSettlementStatus.RETRYABLE
+    assert not retained.path.exists()
+    reloaded = journal.load_queue_journal(operation_id).journal
+    saved_item = reloaded.items[0]
+    assert saved_item.phase is journal.QueuePhase.ACTIVE
+    assert saved_item.recovery_references == ()
+    assert saved_item.block_reason is None
+
+
+def test_user_discard_clears_the_blocked_download_operation(tmp_path, monkeypatch):
+    operation_id, item_id, retained = _blocked_download_journal(
+        tmp_path, monkeypatch, label="Discarded Album"
+    )
+
+    authority = run_lock.acquire()
+    try:
+        settled = startup_recovery.settle_blocked_item(
+            authority=authority,
+            operation_id=operation_id,
+            item_id=item_id,
+            action=startup_recovery.BlockedItemSettlementAction.DISCARD,
+        )
+    finally:
+        authority.close()
+
+    assert settled.status is startup_recovery.BlockedItemSettlementStatus.DISCARDED
+    assert not retained.path.exists()
+    assert journal.load_queue_journal(operation_id).status is journal.QueueLoadStatus.ABSENT
