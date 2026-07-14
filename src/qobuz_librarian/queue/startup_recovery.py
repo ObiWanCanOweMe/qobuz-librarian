@@ -37,6 +37,8 @@ from qobuz_librarian.integrations.staging import (
     inspect_staging_group_reference,
     inspect_staging_run_reference,
     isolated_staging_run_names,
+    retain_staging_run,
+    staging_run_from_record,
 )
 from qobuz_librarian.library.backup import (
     library_backup_record,
@@ -950,11 +952,9 @@ def _continue_prelaunch_settlement(
 
 
 def _discard_parked_item_staging(authority, journal, item):
-    """Throw away a blocked item's parked staging groups on user authority."""
+    """Throw away a blocked item's staged download on user authority."""
     owner = {"operation_id": journal.operation_id, "item_id": item.item_id}
     for reference in _staging_references(item):
-        if reference.kind != _STAGING_GROUP_KIND:
-            return None
         _require_authority(authority)
         inspection = _staging_inspection(reference, owner)
         _require_authority(authority)
@@ -963,6 +963,42 @@ def _discard_parked_item_staging(authority, journal, item):
             continue
         if status is not StagingReferenceStatus.MATCH:
             return None
+        if reference.kind == _STAGING_RUN_KIND:
+            # A crash leaves the run root itself behind, never parked. Park
+            # it the way a deliberate stop would — the park refuses while any
+            # writer still holds a descriptor — then discard the parked copy.
+            # The park checkpoint needs the item active; a crash between the
+            # transition and the reconcile just re-blocks on the next pass.
+            run = staging_run_from_record(reference.data)
+            if run is None:
+                return None
+
+            def checkpoint(record, item_id=item.item_id):
+                nonlocal journal
+                journal = queue_state.append_staging_group_intent(
+                    journal,
+                    item_id,
+                    record,
+                )
+
+            _require_authority(authority)
+            journal = queue_state.transition_journal_item(
+                journal,
+                item.item_id,
+                queue_state.QueuePhase.ACTIVE,
+            )
+            _require_authority(authority)
+            retained = retain_staging_run(
+                run,
+                label="discarded",
+                on_intent=checkpoint,
+            )
+            _require_authority(authority)
+            if retained is None or not discard_group(
+                retained, expected_owner=owner
+            ):
+                return None
+            continue
         path = reference.data.get("path")
         if not isinstance(path, str):
             return None
@@ -976,7 +1012,7 @@ def _discard_parked_item_staging(authority, journal, item):
     current, current_item, reason, _changed = _reconcile_item_staging(
         authority,
         journal,
-        item,
+        _find_item(journal, item.item_id),
         block_unsettled=False,
     )
     if reason is not None:

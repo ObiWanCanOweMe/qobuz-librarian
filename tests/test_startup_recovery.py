@@ -720,7 +720,7 @@ def test_startup_recovery_is_fail_closed_and_settles_exact_work(
 
 
 
-def _blocked_download_journal(tmp_path, monkeypatch, *, label):
+def _blocked_download_journal(tmp_path, monkeypatch, *, label, parked=True):
     from argparse import Namespace
 
     from qobuz_librarian.integrations.staging import (
@@ -779,6 +779,14 @@ def _blocked_download_journal(tmp_path, monkeypatch, *, label):
     album_dir = run.path / "Artist" / label
     album_dir.mkdir(parents=True)
     (album_dir / "01 - Song.flac").write_bytes(b"partial audio")
+    if not parked:
+        journal.transition_journal_item(
+            current,
+            item_id,
+            journal.QueuePhase.BLOCKED,
+            block_reason="download-staging-run-present",
+        )
+        return saved.operation_id, item_id, run
     intents = []
     retained = retain_staging_run(
         run,
@@ -817,6 +825,33 @@ def test_user_retry_discards_parked_staging_and_frees_the_item(tmp_path, monkeyp
 
     assert settled.status is startup_recovery.BlockedItemSettlementStatus.RETRYABLE
     assert not retained.path.exists()
+    reloaded = journal.load_queue_journal(operation_id).journal
+    saved_item = reloaded.items[0]
+    assert saved_item.phase is journal.QueuePhase.ACTIVE
+    assert saved_item.recovery_references == ()
+    assert saved_item.block_reason is None
+
+
+def test_user_retry_discards_a_crashed_downloads_live_run(tmp_path, monkeypatch):
+    # A crash mid-rip leaves the run root itself behind (never parked). The
+    # user's Retry after the restart must be able to throw it away too.
+    operation_id, item_id, run = _blocked_download_journal(
+        tmp_path, monkeypatch, label="Crashed Album", parked=False
+    )
+
+    authority = run_lock.acquire()
+    try:
+        settled = startup_recovery.settle_blocked_item(
+            authority=authority,
+            operation_id=operation_id,
+            item_id=item_id,
+            action=startup_recovery.BlockedItemSettlementAction.RETRY,
+        )
+    finally:
+        authority.close()
+
+    assert settled.status is startup_recovery.BlockedItemSettlementStatus.RETRYABLE
+    assert not run.path.exists()
     reloaded = journal.load_queue_journal(operation_id).journal
     saved_item = reloaded.items[0]
     assert saved_item.phase is journal.QueuePhase.ACTIVE
