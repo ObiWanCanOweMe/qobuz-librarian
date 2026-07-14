@@ -235,6 +235,7 @@ def test_durable_album_removes_queue_only_under_live_completion_proof(
     monkeypatch.setattr(cfg, "STAGING_DIR", staging)
     monkeypatch.setattr(cfg, "QUEUE_JOURNAL_DIR", tmp_path / "journals")
     monkeypatch.setattr(cfg, "BEETS_DB_PATH", beets_dir / "library.db")
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", tmp_path / "music")
 
     item = _single_track_item("Safe Album")
     queue = [item]

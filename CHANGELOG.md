@@ -9,7 +9,7 @@ All notable changes to Qobuz Librarian are recorded here, newest first. The proj
 - Library writes stay paused when the shared run lock cannot be enforced. Web-to-terminal handoff waits for active work, and the retired no-lock option is rejected.
 - The Beets integration requires and verifies 2.12.0, honours configured paths, and confines cleanup to the staging folders it opened.
 - Review choices, queue recovery, and History counts remain consistent across concurrent updates, retries, restarts, and interrupted work.
-- Automatic post-import folder moves, including multi-artist split-folder merges, are no longer offered. The filesystem move and Beets path update cannot share one crash-safe commit, so albums keep their imported folders instead of risking an inconsistent library after a restart.
+- Automatic multi-artist folder moves are restored with durable crash recovery, no-overwrite checks, and coordinated Beets path updates.
 
 ## [0.10.3] - 2026-07-10
 

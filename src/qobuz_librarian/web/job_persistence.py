@@ -29,8 +29,10 @@ history updates degrade to a no-op.  Job admission is stricter: work that can
 change the library is not allowed to enter a worker unless its owner row is
 durable first.
 """
+import hashlib
 import json
 import logging
+import math
 import re
 import sqlite3
 import threading
@@ -178,6 +180,17 @@ CREATE TABLE IF NOT EXISTS durable_job_completions (
 )
 """
 
+_POST_IMPORT_RELOCATION_HANDOFF_SCHEMA = """
+CREATE TABLE IF NOT EXISTS post_import_relocation_handoffs (
+    job_id         TEXT NOT NULL,
+    operation_id   TEXT NOT NULL UNIQUE,
+    job_created_at REAL NOT NULL,
+    album_id       TEXT NOT NULL,
+    handoff_hash   TEXT NOT NULL,
+    acknowledged_at REAL NOT NULL
+)
+"""
+
 
 _SCHEMA_VERSION = 4
 
@@ -191,6 +204,7 @@ def init() -> None:
         try:
             conn.execute(_SCHEMA)
             conn.execute(_DURABLE_COMPLETION_SCHEMA)
+            conn.execute(_POST_IMPORT_RELOCATION_HANDOFF_SCHEMA)
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_durable_job_completion_album "
                 "ON durable_job_completions(job_id, job_created_at, album_id)"
@@ -256,14 +270,16 @@ _PERSIST_SQL = (
     " created_at, finished_at, single, attention, recoveries) "
     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
+_CURRENT_JOB_SINGLE = object()
 
 
-def _job_values(job):
+def _job_values(job, *, single=_CURRENT_JOB_SINGLE):
     """Serialise one job while its lock is held, or return None."""
     try:
         candidates_json = json.dumps(job.candidates or [], default=str)
         execute_args_json = json.dumps(job.execute_args or {}, default=str)
-        single_json = json.dumps(job.single or {}, default=str)
+        single_value = job.single if single is _CURRENT_JOB_SINGLE else single
+        single_json = json.dumps(single_value or {}, default=str)
         # Recovery receipts are a safety boundary. Never stringify an unknown
         # value into a plausible-looking record: either the exact JSON carrier
         # is saved or this persist reports failure.
@@ -296,27 +312,97 @@ def _job_values(job):
     )
 
 
+def _persist_locked(job) -> bool:
+    """Write one ordinary snapshot while the caller holds ``job._lock``."""
+    values = _job_values(job)
+    if values is None:
+        return False
+    with _lock:
+        conn = _get_conn()
+        if conn is None:
+            return False
+        try:
+            conn.execute(_PERSIST_SQL, values)
+            conn.commit()
+            return True
+        except sqlite3.Error as e:
+            _note_write_failure(f"persist {job.id}", e)
+            return False
+
+
 def persist(job) -> bool:
     """Write the job's current state to disk. Return whether it reached disk."""
-    # Keep the job lock through the database commit. Besides producing one
-    # coherent snapshot, this preserves save order: an older delayed save can't
-    # pause after serialising and then overwrite a newer selection. The database
-    # lock is always taken second; readers and cleanup never take a job lock.
+    # Keep the job lock through both the preservation decision and the database
+    # commit. A save already waiting on this lock must honour a relocation gate
+    # that was engaged while it waited.
     with job._lock:
-        values = _job_values(job)
-        if values is None:
+        if getattr(job, "_preserve_persisted_single", False) is True:
+            return _persist_preserving_single_locked(job)
+        return _persist_locked(job)
+
+
+def _persist_preserving_single_locked(job) -> bool:
+    """Save while preserving Undo; the caller holds ``job._lock``."""
+    values = _job_values(job)
+    if values is None:
+        return False
+    with _lock:
+        conn = _get_conn()
+        if conn is None:
+            job._single_undo_unavailable = True
             return False
-        with _lock:
-            conn = _get_conn()
-            if conn is None:
+        try:
+            updated = conn.execute(
+                "UPDATE jobs SET title=?, artist=?, kind=?, status=?, "
+                "phase=?, candidates=?, error=?, summary=?, "
+                "review_verb=?, execute_kind=?, execute_args=?, "
+                "finished_at=?, attention=?, recoveries=? "
+                "WHERE id=? AND created_at=? AND album_id=?",
+                (
+                    values[1], values[2], values[4], values[5], values[6],
+                    values[7], values[8], values[9], values[10], values[11],
+                    values[12], values[14], values[16], values[17], values[0],
+                    values[13], values[3],
+                ),
+            )
+            if updated.rowcount != 1:
+                conn.rollback()
+                job._single_undo_unavailable = True
                 return False
+            row = conn.execute(
+                "SELECT single FROM jobs "
+                "WHERE id=? AND created_at=? AND album_id=?",
+                (values[0], values[13], values[3]),
+            ).fetchone()
             try:
-                conn.execute(_PERSIST_SQL, values)
-                conn.commit()
-                return True
-            except sqlite3.Error as e:
-                _note_write_failure(f"persist {job.id}", e)
-                return False
+                durable_single = json.loads(row[0])
+            except (IndexError, TypeError, ValueError):
+                durable_single = None
+            conn.commit()
+            if type(durable_single) is dict:
+                job.single = durable_single
+                job.__dict__.pop("_single_undo_unavailable", None)
+            else:
+                job.single = {}
+                job._single_undo_unavailable = True
+            return True
+        except sqlite3.Error as exc:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            _note_write_failure(
+                f"persist {job.id} while preserving its Undo record",
+                exc,
+            )
+            job._single_undo_unavailable = True
+            return False
+
+
+def persist_preserving_single(job) -> bool:
+    """Save job state without changing an indeterminate durable Undo record."""
+    with job._lock:
+        return _persist_preserving_single_locked(job)
 
 
 def admit(job) -> bool:
@@ -526,6 +612,235 @@ def durable_completion_acknowledged(
             return None
 
 
+def _relocation_handoff_consumer(job) -> dict | None:
+    try:
+        job_id = job.id
+        created_at = job.created_at
+        album_id = job.album_id
+    except AttributeError:
+        return None
+    if (
+        type(job_id) is not str
+        or not job_id
+        or "\x00" in job_id
+        or type(created_at) not in (int, float)
+        or not math.isfinite(created_at)
+        or normalise_album_id(album_id) != album_id
+    ):
+        return None
+    return {
+        "kind": "web-single",
+        "job_id": job_id,
+        "job_created_at": created_at,
+        "album_id": album_id,
+    }
+
+
+def _valid_relocation_handoff_consumer(value) -> bool:
+    return (
+        type(value) is dict
+        and set(value) == {
+            "kind", "job_id", "job_created_at", "album_id",
+        }
+        and value.get("kind") == "web-single"
+        and type(value.get("job_id")) is str
+        and bool(value["job_id"])
+        and "\x00" not in value["job_id"]
+        and type(value.get("job_created_at")) in (int, float)
+        and math.isfinite(value["job_created_at"])
+        and normalise_album_id(value.get("album_id")) == value.get("album_id")
+    )
+
+
+def _relocation_handoff_hash(consumer, payload) -> str | None:
+    if not _valid_relocation_handoff_consumer(consumer) or type(payload) is not dict:
+        return None
+    try:
+        encoded_payload = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if json.loads(encoded_payload) != payload:
+            return None
+        encoded = json.dumps(
+            {"consumer": consumer, "payload": payload},
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def persist_post_import_relocation_handoff(
+    job,
+    *,
+    operation_id: str,
+    handoff_hash: str,
+    single: dict,
+) -> bool:
+    """Atomically save one Web-single Undo snapshot and relocation handoff."""
+    if (
+        type(operation_id) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", operation_id) is None
+        or type(handoff_hash) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", handoff_hash) is None
+        or type(single) is not dict
+    ):
+        return False
+    try:
+        single_snapshot = json.loads(json.dumps(
+            single,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ))
+    except (TypeError, ValueError, UnicodeError):
+        return False
+    if single_snapshot != single:
+        return False
+    with job._lock:
+        consumer = _relocation_handoff_consumer(job)
+        if consumer is None:
+            return False
+        if _relocation_handoff_hash(consumer, single_snapshot) != handoff_hash:
+            return False
+        values = _job_values(job, single=single_snapshot)
+        if values is None:
+            return False
+        with _lock:
+            conn = _get_conn()
+            if conn is None:
+                return False
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                job_row = conn.execute(
+                    "SELECT created_at, album_id, single FROM jobs WHERE id=?",
+                    (consumer["job_id"],),
+                ).fetchone()
+                if (
+                    job_row is None
+                    or job_row[0] != consumer["job_created_at"]
+                    or job_row[1] != consumer["album_id"]
+                ):
+                    conn.rollback()
+                    return False
+                existing = conn.execute(
+                    "SELECT job_id, job_created_at, album_id, handoff_hash "
+                    "FROM post_import_relocation_handoffs "
+                    "WHERE operation_id=?",
+                    (operation_id,),
+                ).fetchone()
+                expected = (
+                    consumer["job_id"],
+                    consumer["job_created_at"],
+                    consumer["album_id"],
+                    handoff_hash,
+                )
+                if existing is not None:
+                    try:
+                        saved_single = json.loads(job_row[2])
+                    except (TypeError, ValueError):
+                        conn.rollback()
+                        return False
+                    if existing != expected or saved_single != single_snapshot:
+                        conn.rollback()
+                        return False
+                conn.execute(_PERSIST_SQL, values)
+                if existing is None:
+                    conn.execute(
+                        "INSERT INTO post_import_relocation_handoffs "
+                        "(job_id, operation_id, job_created_at, album_id, "
+                        "handoff_hash, acknowledged_at) VALUES (?,?,?,?,?,?)",
+                        (
+                            consumer["job_id"],
+                            operation_id,
+                            consumer["job_created_at"],
+                            consumer["album_id"],
+                            handoff_hash,
+                            time.time(),
+                        ),
+                    )
+                conn.commit()
+                job.single = single_snapshot
+                job.__dict__.pop("_single_undo_unavailable", None)
+                return True
+            except sqlite3.Error as exc:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                _note_write_failure(
+                    f"persist relocation handoff for {consumer['job_id']}",
+                    exc,
+                )
+                return False
+
+
+def post_import_relocation_handoff_persisted(
+    operation_id: str,
+    handoff: dict,
+) -> bool | None:
+    """Verify an exact sealed handoff; only definite absence permits rollback."""
+    if (
+        type(operation_id) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", operation_id) is None
+        or type(handoff) is not dict
+        or set(handoff) != {"consumer", "hash"}
+        or not _valid_relocation_handoff_consumer(handoff.get("consumer"))
+        or type(handoff.get("hash")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", handoff["hash"]) is None
+    ):
+        return None
+    consumer = handoff["consumer"]
+    with _lock:
+        conn = _get_conn()
+        if conn is None:
+            return None
+        try:
+            row = conn.execute(
+                "SELECT h.job_id, h.job_created_at, h.album_id, "
+                "h.handoff_hash, j.created_at, j.album_id, j.single "
+                "FROM post_import_relocation_handoffs AS h "
+                "LEFT JOIN jobs AS j ON j.id=h.job_id "
+                "WHERE h.operation_id=?",
+                (operation_id,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            _log.debug(
+                "couldn't inspect relocation handoff %s: %s",
+                operation_id,
+                exc,
+            )
+            return None
+    if row is None:
+        return False
+    if (
+        row[:4] != (
+            consumer["job_id"],
+            consumer["job_created_at"],
+            consumer["album_id"],
+            handoff["hash"],
+        )
+        or row[4] != consumer["job_created_at"]
+        or row[5] != consumer["album_id"]
+    ):
+        return None
+    try:
+        single = json.loads(row[6])
+    except (TypeError, ValueError):
+        return None
+    if _relocation_handoff_hash(consumer, single) != handoff["hash"]:
+        return None
+    return True
+
+
 def prepare_recovery_resolution(
         location: str, receipt: dict | None) -> RecoveryResolutionPlan | None:
     """Seal exact persisted Repair records before a manual Restore mutates."""
@@ -666,6 +981,10 @@ def delete(job_id: str) -> None:
                 "DELETE FROM durable_job_completions WHERE job_id=?",
                 (job_id,),
             )
+            conn.execute(
+                "DELETE FROM post_import_relocation_handoffs WHERE job_id=?",
+                (job_id,),
+            )
             conn.commit()
         except sqlite3.Error:
             pass
@@ -743,6 +1062,11 @@ def prune_finished(keep: int, *, retain_job_id: str | None = None) -> None:
                 "DELETE FROM durable_job_completions "
                 "WHERE NOT EXISTS (SELECT 1 FROM jobs "
                 "WHERE jobs.id=durable_job_completions.job_id)"
+            )
+            conn.execute(
+                "DELETE FROM post_import_relocation_handoffs "
+                "WHERE NOT EXISTS (SELECT 1 FROM jobs "
+                "WHERE jobs.id=post_import_relocation_handoffs.job_id)"
             )
             conn.commit()
         except sqlite3.Error as e:
@@ -936,6 +1260,11 @@ def clear_history(*, retain_job_id: str | None = None) -> None:
                 "DELETE FROM durable_job_completions "
                 "WHERE NOT EXISTS (SELECT 1 FROM jobs "
                 "WHERE jobs.id=durable_job_completions.job_id)"
+            )
+            conn.execute(
+                "DELETE FROM post_import_relocation_handoffs "
+                "WHERE NOT EXISTS (SELECT 1 FROM jobs "
+                "WHERE jobs.id=post_import_relocation_handoffs.job_id)"
             )
             conn.commit()
         except sqlite3.Error as e:

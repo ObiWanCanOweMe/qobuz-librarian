@@ -8,11 +8,9 @@ from pathlib import Path
 
 from qobuz_librarian.completion import (
     CompletionOrigin,
-    CompletionOriginKind,
     RecoveryOwner,
     SourceTransitionKind,
     StagedBinding,
-    completion_acknowledgement_hash,
 )
 from qobuz_librarian.completion_live import capture_new_album_completion
 from qobuz_librarian.download import (
@@ -63,6 +61,10 @@ from qobuz_librarian.queue.library_backup_recovery import (
     finish_library_backup_settlement,
     prepare_library_backup_settlement,
 )
+from qobuz_librarian.queue.post_import_finalizer import (
+    finalize_carrier_retirement,
+    plan_post_import_action,
+)
 from qobuz_librarian.run_lock import RunLockLease
 
 _STAGING_RUN = "download-staging-run"
@@ -72,55 +74,6 @@ _MANAGED_CARRIER = "managed-beets"
 _LIBRARY_BACKUP_INTENT = "library-backup-intent"
 _LIBRARY_BACKUP_CARRIER = "library-backup"
 _LIBRARY_BACKUP_SETTLEMENT = "library-backup-settlement"
-
-
-def _acknowledge_external_completion(
-    completion_input,
-    completion_evidence,
-    acknowledge_completion,
-    *,
-    planned,
-    post_dir,
-):
-    """Durably tell an external queue owner before its last proof is removed."""
-    origin = completion_input.origin
-    if origin.kind is CompletionOriginKind.CLI and not callable(
-        acknowledge_completion
-    ):
-        return False
-    if (
-        origin.kind not in {
-            CompletionOriginKind.CLI,
-            CompletionOriginKind.WEB_JOB,
-        }
-        or not callable(acknowledge_completion)
-    ):
-        raise DurableAlbumUnavailable(
-            "the Web job completion could not be acknowledged durably"
-        )
-    owner = completion_input.owner
-    completion_hash = completion_acknowledgement_hash(
-        completion_input,
-        completion_evidence,
-    )
-    try:
-        acknowledged = acknowledge_completion(
-            origin,
-            owner,
-            album_id=completion_input.expectation.album_id,
-            completion_hash=completion_hash,
-            planned=planned,
-            post_dir=str(post_dir),
-        )
-    except Exception as exc:
-        raise DurableAlbumUnavailable(
-            "the Web job completion could not be acknowledged durably"
-        ) from exc
-    if acknowledged is not True:
-        raise DurableAlbumUnavailable(
-            "the Web job completion could not be acknowledged durably"
-        )
-    return True
 
 
 class DurableAlbumStatus(str, Enum):
@@ -490,6 +443,9 @@ def execute_durable_new_album(
             journal_item.item_id,
             queue_state.QueuePhase.ACTIVE,
             completion_input=initial,
+            multi_artist_filing=bool(
+                getattr(args, "migrate_multi_artist", False)
+            ),
         )
         _require_authority(authority)
     operation_id = journal.operation_id
@@ -1193,22 +1149,21 @@ def execute_durable_new_album(
                     raise DurableAlbumUnavailable("managed completion changed during publication")
                 live_lease.revalidate()
                 _require_authority(authority)
-                externally_acknowledged = _acknowledge_external_completion(
-                    ready_input,
-                    evidence,
-                    acknowledge_completion,
-                    planned=_journal_item(journal, item_id).planned,
-                    post_dir=post_dir,
+                post_import_action = plan_post_import_action(
+                    journal,
+                    item_id,
+                    post_dir,
+                    authority=authority,
                 )
                 _require_authority(authority)
-                if externally_acknowledged:
-                    live_lease.revalidate()
+                live_lease.revalidate()
                 journal = queue_state.commit_completed_item_removal(
                     journal,
                     queue,
                     item_id=item_id,
                     caller_item=item,
                     live_evidence=evidence,
+                    post_import_action=post_import_action,
                 )
                 _require_authority(authority)
                 live_lease.revalidate()
@@ -1237,9 +1192,11 @@ def execute_durable_new_album(
 
     try:
         _require_authority(authority)
-        journal, retirement = queue_state.process_carrier_retirement(
+        journal, final_path, retirement = finalize_carrier_retirement(
             journal,
-            item_id=item_id,
+            item_id,
+            authority=authority,
+            acknowledge_completion=acknowledge_completion,
         )
         _require_authority(authority)
     except (OSError, ValueError, queue_state.QueueJournalError):
@@ -1250,6 +1207,8 @@ def execute_durable_new_album(
             operation_id,
             item_id,
         )
+    if final_path is not None:
+        post_dir = final_path
     if retirement.outcome not in {
         ManagedCarrierRetirementOutcome.RETIRED,
         ManagedCarrierRetirementOutcome.ALREADY_ABSENT,

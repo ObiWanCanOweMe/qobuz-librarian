@@ -70,7 +70,7 @@ _JOURNAL_KEYS = frozenset({
     "retirements",
     "legacy_source_sha256",
 })
-_ITEM_KEYS = frozenset({
+_LEGACY_ITEM_KEYS = frozenset({
     "item_id",
     "phase",
     "planned",
@@ -79,14 +79,34 @@ _ITEM_KEYS = frozenset({
     "completion_input",
     "completion_evidence",
 })
+_ITEM_KEYS = _LEGACY_ITEM_KEYS | {"multi_artist_filing"}
 _REFERENCE_KEYS = frozenset({"name", "kind", "data"})
-_RETIREMENT_KEYS = frozenset({
+_POST_IMPORT_ACTION_KEYS = frozenset({
+    "action_id",
+    "kind",
+    "source",
+    "destination",
+    "expectation",
+    "phase",
+    "relocation_operation_id",
+    "handoff_hash",
+})
+_POST_IMPORT_ACTION_KINDS = frozenset({"split-gap-fill", "whole-album"})
+_LEGACY_RETIREMENT_KEYS = frozenset({
     "item_id",
     "reference",
     "manifest_hash",
     "quarantine_name",
     "state",
 })
+_RETIREMENT_KEYS = _LEGACY_RETIREMENT_KEYS | {
+    "planned",
+    "completion_input",
+    "completion_evidence",
+    "final_path",
+    "action",
+    "completion_acknowledged",
+}
 _LEGACY_KEYS = frozenset({"version", "saved_at", "mode", "count", "items"})
 _JOURNAL_LOCK_NAME = ".queue-journal.lock"
 _MAX_JOURNAL_BYTES = 64 * 1024 * 1024
@@ -165,6 +185,12 @@ class CarrierRetirementState(str, Enum):
     PRIVATE = "private"
 
 
+class PostImportActionPhase(str, Enum):
+    PLANNED = "planned"
+    HANDOFF = "handoff"
+    COMMITTED = "committed"
+
+
 class QueueLoadStatus(str, Enum):
     ABSENT = "absent"
     READY = "ready"
@@ -211,6 +237,21 @@ class JournalItem:
     block_reason: str | None = None
     completion_input: dict[str, Any] | None = None
     completion_evidence: dict[str, Any] | None = None
+    multi_artist_filing: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PostImportAction:
+    """One exact folder-layout action owned by a carrier retirement."""
+
+    action_id: str
+    kind: str
+    source: str
+    destination: str
+    expectation: dict[str, Any]
+    phase: PostImportActionPhase = PostImportActionPhase.PLANNED
+    relocation_operation_id: str | None = None
+    handoff_hash: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +263,12 @@ class CarrierRetirement:
     manifest_hash: str
     quarantine_name: str
     state: CarrierRetirementState = CarrierRetirementState.PUBLIC
+    planned: dict[str, Any] | None = None
+    completion_input: dict[str, Any] | None = None
+    completion_evidence: dict[str, Any] | None = None
+    final_path: str | None = None
+    action: PostImportAction | None = None
+    completion_acknowledged: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -497,14 +544,118 @@ def _canonical_recovery_references(references):
     return tuple(sorted(references, key=_reference_sort_key))
 
 
-def _retirement_payload(retirement: CarrierRetirement) -> dict[str, Any]:
+def _canonical_library_album_path(value, field_name):
+    if type(value) is not str or not os.path.isabs(value) or "\x00" in value:
+        raise ValueError(f"{field_name} must be an absolute album path")
+    root = Path(os.path.abspath(os.fspath(cfg.MUSIC_ROOT)))
+    path = Path(os.path.abspath(value))
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        raise ValueError(f"{field_name} is outside the music library") from None
+    if len(relative.parts) != 2 or os.fspath(path) != value:
+        raise ValueError(f"{field_name} is not an exact album path")
+    return value
+
+
+def _post_import_action_payload(action: PostImportAction) -> dict[str, Any]:
     return {
+        "action_id": action.action_id,
+        "kind": action.kind,
+        "source": action.source,
+        "destination": action.destination,
+        "expectation": _json_copy(action.expectation),
+        "phase": action.phase.value,
+        "relocation_operation_id": action.relocation_operation_id,
+        "handoff_hash": action.handoff_hash,
+    }
+
+
+def _parse_post_import_action(value: Any) -> PostImportAction:
+    if type(value) is not dict or set(value) != _POST_IMPORT_ACTION_KEYS:
+        raise ValueError("post-import action has an invalid schema")
+    action_id = _validate_id(value["action_id"], "post-import action_id")
+    kind = value["kind"]
+    if kind not in _POST_IMPORT_ACTION_KINDS:
+        raise ValueError("post-import action kind is invalid")
+    source = _canonical_library_album_path(
+        value["source"], "post-import source"
+    )
+    destination = _canonical_library_album_path(
+        value["destination"], "post-import destination"
+    )
+    if source == destination:
+        raise ValueError("post-import action paths are identical")
+    from qobuz_librarian.library.post_import_relocation import (
+        canonical_post_import_relocation_expectation,
+    )
+
+    expectation = canonical_post_import_relocation_expectation(
+        value["expectation"],
+        source=source,
+        destination=destination,
+    )
+    if expectation is None:
+        raise ValueError("post-import action expectation is invalid")
+    try:
+        phase = PostImportActionPhase(value["phase"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("post-import action phase is invalid") from exc
+    operation_id = value["relocation_operation_id"]
+    handoff_hash = value["handoff_hash"]
+    if phase is PostImportActionPhase.PLANNED:
+        if operation_id is not None or handoff_hash is not None:
+            raise ValueError("planned post-import action has a handoff")
+    else:
+        operation_id = _validate_id(
+            operation_id, "post-import relocation operation_id"
+        )
+        handoff_hash = _validate_id(
+            handoff_hash, "post-import handoff_hash"
+        )
+    return PostImportAction(
+        action_id=action_id,
+        kind=kind,
+        source=source,
+        destination=destination,
+        expectation=expectation,
+        phase=phase,
+        relocation_operation_id=operation_id,
+        handoff_hash=handoff_hash,
+    )
+
+
+def _retirement_payload(retirement: CarrierRetirement) -> dict[str, Any]:
+    payload = {
         "item_id": retirement.item_id,
         "reference": _reference_payload(retirement.reference),
         "manifest_hash": retirement.manifest_hash,
         "quarantine_name": retirement.quarantine_name,
         "state": retirement.state.value,
     }
+    if retirement.planned is None:
+        if (
+            retirement.completion_input is not None
+            or retirement.completion_evidence is not None
+            or retirement.final_path is not None
+            or retirement.action is not None
+            or retirement.completion_acknowledged is not True
+        ):
+            raise ValueError("legacy carrier retirement has new-format state")
+        return payload
+    payload.update({
+        "planned": _validate_planned(retirement.planned),
+        "completion_input": _json_copy(retirement.completion_input),
+        "completion_evidence": _json_copy(retirement.completion_evidence),
+        "final_path": retirement.final_path,
+        "action": (
+            None
+            if retirement.action is None
+            else _post_import_action_payload(retirement.action)
+        ),
+        "completion_acknowledged": retirement.completion_acknowledged,
+    })
+    return payload
 
 
 def _strict_managed_reference(
@@ -843,7 +994,10 @@ def _parse_retirement(
     *,
     expected_operation_id: str,
 ) -> CarrierRetirement:
-    if type(value) is not dict or set(value) != _RETIREMENT_KEYS:
+    if type(value) is not dict:
+        raise ValueError("carrier retirement has an invalid schema")
+    keys = frozenset(value)
+    if keys not in {_LEGACY_RETIREMENT_KEYS, _RETIREMENT_KEYS}:
         raise ValueError("carrier retirement has an invalid schema")
     item_id = _validate_id(value["item_id"], "retirement item_id")
     reference = _parse_reference(value["reference"])
@@ -866,12 +1020,101 @@ def _parse_retirement(
         state = CarrierRetirementState(value["state"])
     except (TypeError, ValueError) as exc:
         raise ValueError("carrier retirement has an invalid state") from exc
+    if keys == _LEGACY_RETIREMENT_KEYS:
+        return CarrierRetirement(
+            item_id=item_id,
+            reference=reference,
+            manifest_hash=manifest_hash,
+            quarantine_name=quarantine_name,
+            state=state,
+        )
+
+    planned = _validate_planned(value["planned"])
+    owner = RecoveryOwner(expected_operation_id, item_id)
+    completion_input = parse_completion_input_record(
+        value["completion_input"], expected_owner=owner
+    )
+    if completion_input is None or not completion_input_ready(completion_input):
+        raise ValueError("carrier retirement completion input is invalid")
+    if (
+        normalise_album_id(planned["album"].get("id"))
+        != completion_input.expectation.album_id
+    ):
+        raise ValueError("carrier retirement album does not match completion input")
+    completion_evidence = parse_completion_record(
+        value["completion_evidence"],
+        expected_owner=owner,
+        expected_expectation=completion_input.expectation,
+        expected_download=completion_input.download_coverage(),
+    )
+    if completion_evidence is None:
+        raise ValueError("carrier retirement completion evidence is invalid")
+    if completion_evidence.managed_manifest_hash != manifest_hash:
+        raise ValueError("carrier retirement manifest does not match completion")
+    original_path = _canonical_library_album_path(
+        os.path.join(
+            completion_evidence.library_root,
+            completion_evidence.album_path,
+        ),
+        "carrier retirement completion path",
+    )
+    final_path = _canonical_library_album_path(
+        value["final_path"], "carrier retirement final_path"
+    )
+    action = (
+        None
+        if value["action"] is None
+        else _parse_post_import_action(value["action"])
+    )
+    acknowledged = value["completion_acknowledged"]
+    if type(acknowledged) is not bool:
+        raise ValueError("carrier retirement acknowledgement is invalid")
+    if acknowledged and action is not None:
+        raise ValueError("acknowledged carrier retirement still has an action")
+    if action is not None:
+        if action.kind == "whole-album":
+            if action.source != original_path:
+                raise ValueError(
+                    "whole-album action does not start at its completion path"
+                )
+            expected_final = (
+                action.destination
+                if action.phase is PostImportActionPhase.COMMITTED
+                else action.source
+            )
+        else:
+            planned_album_dir = planned.get("album_dir")
+            try:
+                planned_album_dir = _canonical_library_album_path(
+                    planned_album_dir,
+                    "split action planned album path",
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "split action requires an exact planned album path"
+                ) from exc
+            if (
+                action.destination != original_path
+                or action.source != planned_album_dir
+            ):
+                raise ValueError(
+                    "split action does not join its planned and completed paths"
+                )
+            expected_final = action.destination
+        if final_path != expected_final:
+            raise ValueError("carrier retirement path does not match its action")
     return CarrierRetirement(
         item_id=item_id,
         reference=reference,
         manifest_hash=manifest_hash,
         quarantine_name=quarantine_name,
         state=state,
+        planned=planned,
+        completion_input=completion_input.to_record(),
+        completion_evidence=completion_evidence.to_record(),
+        final_path=final_path,
+        action=action,
+        completion_acknowledged=acknowledged,
     )
 
 
@@ -894,12 +1137,19 @@ def _item_payload(item: JournalItem) -> dict[str, Any]:
             if item.completion_evidence is None
             else _json_copy(item.completion_evidence)
         ),
+        "multi_artist_filing": item.multi_artist_filing,
     }
 
 
 def _parse_item(value: Any, *, expected_operation_id: str) -> JournalItem:
-    if not isinstance(value, dict) or set(value) != _ITEM_KEYS:
+    if (
+        not isinstance(value, dict)
+        or frozenset(value) not in {_LEGACY_ITEM_KEYS, _ITEM_KEYS}
+    ):
         raise ValueError("journal item has an invalid schema")
+    multi_artist_filing = value.get("multi_artist_filing", False)
+    if type(multi_artist_filing) is not bool:
+        raise ValueError("multi_artist_filing must be a boolean")
     item_id = _validate_id(value["item_id"], "item_id")
     try:
         phase = QueuePhase(value["phase"])
@@ -965,6 +1215,8 @@ def _parse_item(value: Any, *, expected_operation_id: str) -> JournalItem:
         raise ValueError("pending journal items cannot carry recovery state")
     if phase is QueuePhase.PENDING and completion_input is not None:
         raise ValueError("pending journal items cannot carry completion input")
+    if phase is QueuePhase.PENDING and multi_artist_filing:
+        raise ValueError("pending journal items cannot freeze filing policy")
     if phase is QueuePhase.ACTIVE and completion_input is None:
         raise ValueError("active journal items require completion input")
     if phase is QueuePhase.ACTIVE:
@@ -1048,6 +1300,7 @@ def _parse_item(value: Any, *, expected_operation_id: str) -> JournalItem:
         block_reason=block_reason,
         completion_input=completion_input,
         completion_evidence=completion_evidence,
+        multi_artist_filing=multi_artist_filing,
     )
 
 
@@ -2035,6 +2288,7 @@ def transition_journal_item(
     block_reason: str | None = None,
     completion_input: CompletionInput | dict[str, Any] | None | object = _UNSET,
     completion_evidence: dict[str, Any] | None | object = _UNSET,
+    multi_artist_filing: bool | object = _UNSET,
 ) -> QueueJournal:
     """Copy and durably commit one phase change without mutating the old snapshot."""
     if not isinstance(phase, QueuePhase):
@@ -2188,6 +2442,21 @@ def transition_journal_item(
         raise QueueJournalBlocked(
             "completion input may only append active source lineage"
         )
+    if multi_artist_filing is _UNSET:
+        filing_policy = target.multi_artist_filing
+    else:
+        if type(multi_artist_filing) is not bool:
+            raise ValueError("multi_artist_filing must be a boolean")
+        filing_policy = multi_artist_filing
+        if filing_policy != target.multi_artist_filing and not (
+            target.phase in (QueuePhase.PENDING, QueuePhase.BLOCKED)
+            and phase is QueuePhase.ACTIVE
+            and target.completion_input is None
+        ):
+            raise QueueJournalBlocked(
+                "multi-artist filing policy can be frozen only when work "
+                "first becomes active"
+            )
     updated = replace(
         target,
         phase=phase,
@@ -2207,6 +2476,7 @@ def transition_journal_item(
                 else _json_copy(completion_evidence)
             )
         ),
+        multi_artist_filing=filing_policy,
     )
     items = list(previous.items)
     items[target_index] = _parse_item(
@@ -2771,7 +3041,12 @@ def reset_unstarted_item_to_pending(
         raise QueueJournalBlocked(
             "only empty, unstarted active work can return to pending"
         )
-    updated = replace(target, phase=QueuePhase.PENDING, completion_input=None)
+    updated = replace(
+        target,
+        phase=QueuePhase.PENDING,
+        completion_input=None,
+        multi_artist_filing=False,
+    )
     items = list(previous.items)
     items[target_index] = _parse_item(
         _item_payload(updated),
@@ -2958,6 +3233,7 @@ def commit_completed_item_removal(
     item_id: str,
     caller_item,
     live_evidence: CompletionEvidence,
+    post_import_action: dict[str, Any] | None | object = _UNSET,
 ) -> QueueJournal:
     """Replace a completed entry with durable carrier-cleanup authority.
 
@@ -2984,6 +3260,7 @@ def commit_completed_item_removal(
         target=target,
         resolved_carrier=resolved_carrier,
         live_record=live_record,
+        post_import_action=post_import_action,
     )
     del caller_items[caller_index]
     return saved
@@ -3043,10 +3320,11 @@ def _commit_completed_retirement(
     target,
     resolved_carrier,
     live_record,
+    post_import_action,
 ):
     journal_items = list(previous.items)
     del journal_items[target_index]
-    retirement = _parse_retirement({
+    payload = {
         "item_id": target.item_id,
         "reference": _reference_payload(resolved_carrier),
         "manifest_hash": live_record["managed_manifest_hash"],
@@ -3055,7 +3333,56 @@ def _commit_completed_retirement(
             f"{secrets.token_hex(32)}"
         ),
         "state": CarrierRetirementState.PUBLIC.value,
-    }, expected_operation_id=previous.operation_id)
+    }
+    if post_import_action is not _UNSET:
+        if post_import_action is not None and type(post_import_action) is not dict:
+            raise ValueError("post_import_action must be an action record or null")
+        original_path = _canonical_library_album_path(
+            os.path.join(
+                live_record["library"]["root"],
+                live_record["library"]["album"]["path"],
+            ),
+            "completed album path",
+        )
+        action = (
+            None
+            if post_import_action is None
+            else _parse_post_import_action(_json_copy(post_import_action))
+        )
+        action_matches = action is None or (
+            action.phase is PostImportActionPhase.PLANNED
+            and (
+                action.kind == "whole-album"
+                and action.source == original_path
+                or action.kind == "split-gap-fill"
+                and action.destination == original_path
+                and target.planned.get("album_dir") is not None
+                and action.source == target.planned["album_dir"]
+            )
+        )
+        if not action_matches:
+            raise QueueJournalBlocked(
+                "post-import action does not match the completed album"
+            )
+        initial_final_path = (
+            action.destination
+            if action is not None and action.kind == "split-gap-fill"
+            else original_path
+        )
+        payload.update({
+            "planned": target.planned,
+            "completion_input": target.completion_input,
+            "completion_evidence": live_record,
+            "final_path": initial_final_path,
+            "action": (
+                None if action is None else _post_import_action_payload(action)
+            ),
+            "completion_acknowledged": False,
+        })
+    retirement = _parse_retirement(
+        payload,
+        expected_operation_id=previous.operation_id,
+    )
     return _compare_and_commit(
         previous,
         replace(
@@ -3072,6 +3399,7 @@ def commit_recovered_completed_item_removal(
     *,
     item_id: str,
     live_evidence: CompletionEvidence,
+    post_import_action: dict[str, Any] | None | object = _UNSET,
 ) -> QueueJournal:
     """Replace a recovered COMPLETE item without inventing a runtime queue."""
     previous = _reload_matching_journal(journal)
@@ -3084,6 +3412,281 @@ def commit_recovered_completed_item_removal(
         target=target,
         resolved_carrier=resolved_carrier,
         live_record=live_record,
+        post_import_action=post_import_action,
+    )
+
+
+def _retirement_target(previous: QueueJournal, item_id: str):
+    _validate_id(item_id, "retirement item_id")
+    retirement_index = next(
+        (
+            index
+            for index, retirement in enumerate(previous.retirements)
+            if retirement.item_id == item_id
+        ),
+        None,
+    )
+    if retirement_index is None:
+        raise KeyError(f"unknown carrier retirement: {item_id}")
+    return retirement_index, previous.retirements[retirement_index]
+
+
+def _replace_retirement(
+    previous: QueueJournal,
+    retirement_index: int,
+    retirement: CarrierRetirement,
+) -> QueueJournal:
+    retirements = list(previous.retirements)
+    retirements[retirement_index] = _parse_retirement(
+        _retirement_payload(retirement),
+        expected_operation_id=previous.operation_id,
+    )
+    return _compare_and_commit(
+        previous,
+        replace(previous, retirements=tuple(retirements)),
+    )
+
+
+@_locked_transaction
+def clear_planned_noop_post_import_action(
+    journal: QueueJournal,
+    *,
+    item_id: str,
+    action_id: str,
+) -> QueueJournal:
+    """Clear only an exact planned action that safely changed nothing."""
+    action_id = _validate_id(action_id, "post-import action_id")
+    previous = _reload_matching_journal(journal)
+    retirement_index, retirement = _retirement_target(previous, item_id)
+    action = retirement.action
+    expected_final = None
+    if action is not None:
+        expected_final = (
+            action.source
+            if action.kind == "whole-album"
+            else action.destination
+        )
+    if (
+        retirement.planned is None
+        or action is None
+        or action.action_id != action_id
+        or action.phase is not PostImportActionPhase.PLANNED
+        or retirement.final_path != expected_final
+    ):
+        raise QueueJournalBlocked(
+            "post-import action is not the exact planned no-op"
+        )
+    return _replace_retirement(
+        previous,
+        retirement_index,
+        replace(retirement, action=None),
+    )
+
+
+@_locked_transaction
+def checkpoint_post_import_action_handoff(
+    journal: QueueJournal,
+    *,
+    item_id: str,
+    action_id: str,
+    operation_id: str,
+    handoff_hash: str,
+) -> QueueJournal:
+    """Bind a planned action to one exact retained relocation handoff."""
+    action_id = _validate_id(action_id, "post-import action_id")
+    operation_id = _validate_id(
+        operation_id, "post-import relocation operation_id"
+    )
+    handoff_hash = _validate_id(handoff_hash, "post-import handoff_hash")
+    previous = _reload_matching_journal(journal)
+    retirement_index, retirement = _retirement_target(previous, item_id)
+    action = retirement.action
+    if (
+        retirement.planned is None
+        or action is None
+        or action.action_id != action_id
+        or action.phase is not PostImportActionPhase.PLANNED
+    ):
+        raise QueueJournalBlocked(
+            "post-import action is not the exact planned action"
+        )
+    updated_action = replace(
+        action,
+        phase=PostImportActionPhase.HANDOFF,
+        relocation_operation_id=operation_id,
+        handoff_hash=handoff_hash,
+    )
+    return _replace_retirement(
+        previous,
+        retirement_index,
+        replace(retirement, action=updated_action),
+    )
+
+
+@_locked_transaction
+def commit_post_import_action(
+    journal: QueueJournal,
+    *,
+    item_id: str,
+    action_id: str,
+    operation_id: str,
+    handoff_hash: str,
+    final_path,
+) -> QueueJournal:
+    """Commit the exact handed-off action and its resulting album path."""
+    action_id = _validate_id(action_id, "post-import action_id")
+    operation_id = _validate_id(
+        operation_id, "post-import relocation operation_id"
+    )
+    handoff_hash = _validate_id(handoff_hash, "post-import handoff_hash")
+    try:
+        final_path = os.fspath(final_path)
+    except TypeError as exc:
+        raise ValueError("post-import final_path is invalid") from exc
+    final_path = _canonical_library_album_path(
+        final_path, "post-import final_path"
+    )
+    previous = _reload_matching_journal(journal)
+    retirement_index, retirement = _retirement_target(previous, item_id)
+    action = retirement.action
+    if (
+        retirement.planned is None
+        or action is None
+        or action.action_id != action_id
+        or action.phase is not PostImportActionPhase.HANDOFF
+        or action.relocation_operation_id != operation_id
+        or action.handoff_hash != handoff_hash
+        or action.destination != final_path
+    ):
+        raise QueueJournalBlocked(
+            "post-import action handoff changed before commit"
+        )
+    return _replace_retirement(
+        previous,
+        retirement_index,
+        replace(
+            retirement,
+            action=replace(action, phase=PostImportActionPhase.COMMITTED),
+            final_path=final_path,
+        ),
+    )
+
+
+@_locked_transaction
+def clear_committed_post_import_action(
+    journal: QueueJournal,
+    *,
+    item_id: str,
+    action_id: str,
+) -> QueueJournal:
+    """Clear only the exact action whose retained receipt was released."""
+    action_id = _validate_id(action_id, "post-import action_id")
+    previous = _reload_matching_journal(journal)
+    retirement_index, retirement = _retirement_target(previous, item_id)
+    action = retirement.action
+    if (
+        retirement.planned is None
+        or action is None
+        or action.action_id != action_id
+        or action.phase is not PostImportActionPhase.COMMITTED
+        or retirement.final_path != action.destination
+    ):
+        raise QueueJournalBlocked(
+            "post-import action is not the exact committed action"
+        )
+    return _replace_retirement(
+        previous,
+        retirement_index,
+        replace(retirement, action=None),
+    )
+
+
+@_locked_transaction
+def acknowledge_carrier_retirement_completion(
+    journal: QueueJournal,
+    *,
+    item_id: str,
+) -> QueueJournal:
+    """Record that the caller durably accepted the final album path."""
+    previous = _reload_matching_journal(journal)
+    retirement_index, retirement = _retirement_target(previous, item_id)
+    if retirement.planned is None:
+        raise QueueJournalBlocked(
+            "legacy carrier retirement has no completion acknowledgement"
+        )
+    if retirement.action is not None:
+        raise QueueJournalBlocked(
+            "carrier completion cannot be acknowledged before its action settles"
+        )
+    if retirement.completion_acknowledged:
+        return previous
+    return _replace_retirement(
+        previous,
+        retirement_index,
+        replace(retirement, completion_acknowledged=True),
+    )
+
+
+def post_import_relocation_handoff_matches(operation_id, handoff):
+    """Check whether one relocation handoff is still owned by queue state."""
+    try:
+        operation_id = _validate_id(
+            operation_id, "post-import relocation operation_id"
+        )
+        if type(handoff) is not dict or set(handoff) != {"consumer", "hash"}:
+            return False
+        consumer = handoff["consumer"]
+        handoff_hash = _validate_id(
+            handoff["hash"], "post-import handoff_hash"
+        )
+        if (
+            type(consumer) is not dict
+            or set(consumer) != {
+                "kind",
+                "queue_operation_id",
+                "item_id",
+                "action_id",
+            }
+            or consumer["kind"] != "queue-completion"
+        ):
+            return False
+        queue_operation_id = _validate_id(
+            consumer["queue_operation_id"], "queue operation_id"
+        )
+        item_id = _validate_id(consumer["item_id"], "queue item_id")
+        action_id = _validate_id(
+            consumer["action_id"], "post-import action_id"
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+    try:
+        loaded = load_queue_journal(queue_operation_id)
+    except Exception:
+        return None
+    if loaded.status is QueueLoadStatus.BLOCKED:
+        return None
+    if loaded.status is not QueueLoadStatus.READY or loaded.journal is None:
+        return False
+    retirement = next(
+        (
+            value
+            for value in loaded.journal.retirements
+            if value.item_id == item_id
+        ),
+        None,
+    )
+    action = None if retirement is None else retirement.action
+    return bool(
+        action is not None
+        and action.action_id == action_id
+        and action.phase in {
+            PostImportActionPhase.HANDOFF,
+            PostImportActionPhase.COMMITTED,
+        }
+        and action.relocation_operation_id == operation_id
+        and action.handoff_hash is not None
+        and secrets.compare_digest(action.handoff_hash, handoff_hash)
     )
 
 
@@ -3095,17 +3698,14 @@ def process_carrier_retirement(
 ):
     """Retire one durable carrier and acknowledge only a settled outcome."""
     previous = _reload_matching_journal(journal)
-    retirement_index = next(
-        (
-            index
-            for index, retirement in enumerate(previous.retirements)
-            if retirement.item_id == item_id
-        ),
-        None,
-    )
-    if retirement_index is None:
-        raise KeyError(f"unknown carrier retirement: {item_id}")
-    retirement = previous.retirements[retirement_index]
+    retirement_index, retirement = _retirement_target(previous, item_id)
+    if retirement.planned is not None and (
+        retirement.action is not None
+        or not retirement.completion_acknowledged
+    ):
+        raise QueueJournalBlocked(
+            "carrier retirement must settle its post-import completion first"
+        )
 
     from qobuz_librarian.integrations.beets import (
         ManagedCarrierRetirementOutcome,
@@ -3306,6 +3906,7 @@ def _finish_prelaunch_managed_settlement(
                 recovery_references=(),
                 block_reason=None,
                 completion_input=None,
+                multi_artist_filing=False,
             )),
             expected_operation_id=previous.operation_id,
         )
@@ -3347,6 +3948,7 @@ def _commit_absent_managed_settlement(
                 recovery_references=(),
                 block_reason=None,
                 completion_input=None,
+                multi_artist_filing=False,
             )),
             expected_operation_id=previous.operation_id,
         )

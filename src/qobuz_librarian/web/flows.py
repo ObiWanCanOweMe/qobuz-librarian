@@ -60,6 +60,7 @@ def build_args():
         no_upgrade=False, no_downsample=False,
         prefer_hires=cfg.PREFER_HIRES,
         consolidate=False,
+        migrate_multi_artist=cfg.MIGRATE_MULTI_ARTIST,
         include_comps=False,
         include_singles=False,
         no_catalog=False,

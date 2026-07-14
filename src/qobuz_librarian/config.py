@@ -547,11 +547,13 @@ DOWNSAMPLE_KEEP_ORIGINALS = _env_downsample_choice()
 # so shared options behave the same across interfaces.
 #   PREFER_HIRES         pick the hi-res master when an album has several versions
 #   CONSOLIDATE          after import, merge sibling/duplicate album folders
+#   MIGRATE_MULTI_ARTIST move "Primary, Other/<album>" into "Primary/<album>"
 # CONSOLIDATE defaults off: it moves/merges folders, which is opinionated for
 # someone else's library layout. It's CLI-only and prompts per folder anyway;
 # turn it on via env or CLI if you want it.
 PREFER_HIRES         = _env_bool("PREFER_HIRES",         True)
 CONSOLIDATE          = _env_bool("CONSOLIDATE",          False)
+MIGRATE_MULTI_ARTIST = _env_bool("MIGRATE_MULTI_ARTIST", False)
 
 # Drop obvious live/tour/session/acoustic releases from the "missing albums"
 # gap list. Off by default so behaviour is unchanged: many people do want the

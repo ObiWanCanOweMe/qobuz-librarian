@@ -64,7 +64,14 @@ from qobuz_librarian.library.catalog import (
     find_album_dir_by_track_signatures,
     find_album_dir_filesystem,
     folder_holds_all_tracks,
+    prompt_and_migrate_multi_artist_folder,
     track_signatures_for_album_dirs,
+)
+from qobuz_librarian.library.post_import_relocation import (
+    PostImportRelocationAttention,
+    PostImportRelocationUnavailable,
+    RelocationKind,
+    relocate_post_import_album,
 )
 from qobuz_librarian.library.scanner import clear_scan_caches
 from qobuz_librarian.quality.decision import mark_local_album_capped
@@ -359,6 +366,337 @@ def _clear_import_ownership(item):
     item.pop("_import_ownership_created_directories", None)
     item.pop("_import_ownership_created_files", None)
     item.pop("_import_ownership_directory_changes", None)
+
+
+def _strict_relative_ancestor(directory, file_relative):
+    directory_parts = PurePosixPath(directory).parts
+    file_parts = PurePosixPath(file_relative).parts
+    return (
+        len(directory_parts) < len(file_parts)
+        and file_parts[:len(directory_parts)] == directory_parts
+    )
+
+
+def _relocation_location_key(value):
+    return (
+        value["relative"],
+        *(value[field] for field in _IMPORT_OWNERSHIP_IDENTITY_FIELDS),
+    )
+
+
+def _validated_relocation_changes(receipt, name):
+    changes = receipt.get(name) if isinstance(receipt, dict) else None
+    if not isinstance(changes, list):
+        return None
+    by_before = {}
+    after_keys = set()
+    for change in changes:
+        before = change.get("before") if isinstance(change, dict) else None
+        after = change.get("after") if isinstance(change, dict) else None
+        if (
+            not isinstance(change, dict)
+            or set(change) != {"before", "after"}
+            or not _valid_import_ownership_location(before)
+            or not _valid_import_ownership_location(after)
+            or set(before) != {
+                "relative", *_IMPORT_OWNERSHIP_IDENTITY_FIELDS}
+            or set(after) != {
+                "relative", *_IMPORT_OWNERSHIP_IDENTITY_FIELDS}
+        ):
+            return None
+        before_key = _relocation_location_key(before)
+        after_key = _relocation_location_key(after)
+        if before_key in by_before or after_key in after_keys:
+            return None
+        by_before[before_key] = dict(after)
+        after_keys.add(after_key)
+    return by_before
+
+
+def _advance_import_ownership_after_relocation(item, receipt):
+    """Carry a committed relocation into an import's exact Undo proof."""
+    payload = item.get("_import_ownership")
+    records = payload.get("items") if isinstance(payload, dict) else None
+    root = payload.get("root") if isinstance(payload, dict) else None
+    file_changes = _validated_relocation_changes(receipt, "file_changes")
+    directory_changes = _validated_relocation_changes(
+        receipt, "directory_changes")
+    released = (
+        receipt.get("released_files", [])
+        if isinstance(receipt, dict) else None
+    )
+    created = (
+        receipt.get("created_directories")
+        if isinstance(receipt, dict) else None
+    )
+    if (
+        not isinstance(records, list)
+        or not records
+        or not isinstance(root, str)
+        or root != os.path.abspath(os.fspath(cfg.MUSIC_ROOT))
+        or not isinstance(receipt, dict)
+        or type(receipt.get("version")) is not int
+        or receipt.get("version") != 2
+        or file_changes is None
+        or directory_changes is None
+        or not isinstance(released, list)
+        or not isinstance(created, list)
+    ):
+        _clear_import_ownership(item)
+        return
+
+    changed_file_locations = set(file_changes)
+    changed_file_locations.update(
+        _relocation_location_key(after) for after in file_changes.values())
+    released_locations = {}
+    for entry in released:
+        if (
+            not _valid_import_ownership_location(entry)
+            or set(entry) != {
+                "relative", *_IMPORT_OWNERSHIP_IDENTITY_FIELDS}
+        ):
+            _clear_import_ownership(item)
+            return
+        key = _relocation_location_key(entry)
+        if key in released_locations or key in changed_file_locations:
+            _clear_import_ownership(item)
+            return
+        released_locations[key] = dict(entry)
+
+    created_by_relative = {}
+    for entry in created:
+        if (
+            not _valid_import_ownership_location(entry)
+            or set(entry) != {
+                "relative", *_IMPORT_OWNERSHIP_IDENTITY_FIELDS}
+            or entry["relative"] in created_by_relative
+        ):
+            _clear_import_ownership(item)
+            return
+        created_by_relative[entry["relative"]] = dict(entry)
+
+    updates = []
+    final_leaves = set()
+    relocation_created = {}
+    released_uses = {key: 0 for key in released_locations}
+    for record in records:
+        current_identity = (
+            record.get("file") if isinstance(record, dict) else None)
+        current_relative = (
+            record.get("relative") if isinstance(record, dict) else None)
+        companions = (
+            record.get("companions") if isinstance(record, dict) else None)
+        record_created = (
+            record.get("created_directories")
+            if isinstance(record, dict) else None
+        )
+        if (
+            not _valid_import_ownership_identity(current_identity)
+            or not _valid_import_ownership_relative(current_relative)
+            or not isinstance(companions, list)
+            or len(companions) > 1
+            or not isinstance(record_created, list)
+        ):
+            _clear_import_ownership(item)
+            return
+
+        current = _ownership_location(current_relative, current_identity)
+        current_key = _relocation_location_key(current)
+        if current_key in released_locations:
+            _clear_import_ownership(item)
+            return
+        final = file_changes.get(current_key, current)
+        final_key = _relocation_location_key(final)
+        if final_key in final_leaves:
+            _clear_import_ownership(item)
+            return
+        final_leaves.add(final_key)
+        if final is not current:
+            try:
+                final_path = Path(root).joinpath(
+                    *PurePosixPath(final["relative"]).parts)
+                final_path.relative_to(Path(os.path.abspath(os.fspath(
+                    item["_resolved_post_dir"]))))
+            except (KeyError, OSError, TypeError, ValueError):
+                _clear_import_ownership(item)
+                return
+
+        advanced_created = []
+        advanced_relative = set()
+        for existing in record_created:
+            if (
+                not _valid_import_ownership_location(existing)
+                or set(existing) != {
+                    "relative", *_IMPORT_OWNERSHIP_IDENTITY_FIELDS}
+            ):
+                _clear_import_ownership(item)
+                return
+            advanced = directory_changes.get(
+                _relocation_location_key(existing), existing)
+            changed_inode = (
+                advanced["device"], advanced["inode"]
+            ) != (existing["device"], existing["inode"])
+            if (
+                changed_inode
+                and created_by_relative.get(advanced["relative"])
+                != advanced
+            ):
+                continue
+            if not _strict_relative_ancestor(
+                advanced["relative"], final["relative"]
+            ):
+                continue
+            previous = next(
+                (
+                    entry for entry in advanced_created
+                    if entry["relative"] == advanced["relative"]
+                ),
+                None,
+            )
+            if previous is not None and previous != advanced:
+                _clear_import_ownership(item)
+                return
+            if previous is None:
+                advanced_created.append(dict(advanced))
+                advanced_relative.add(advanced["relative"])
+
+        final_companions = []
+        if companions:
+            companion = companions[0]
+            companion_identity = (
+                companion.get("file")
+                if isinstance(companion, dict) else None)
+            companion_relative = (
+                companion.get("relative")
+                if isinstance(companion, dict) else None)
+            if (
+                not isinstance(companion, dict)
+                or set(companion) != {"kind", "relative", "file"}
+                or companion.get("kind") != "artwork"
+                or not _exact_import_ownership_identity(companion_identity)
+                or not _valid_import_ownership_relative(companion_relative)
+                or companion_relative == current_relative
+            ):
+                _clear_import_ownership(item)
+                return
+            companion_location = _ownership_location(
+                companion_relative, companion_identity)
+            companion_key = _relocation_location_key(companion_location)
+            if companion_key in released_locations:
+                released_uses[companion_key] += 1
+            else:
+                final_companion = file_changes.get(
+                    companion_key,
+                    companion_location,
+                )
+                final_companion_key = _relocation_location_key(
+                    final_companion)
+                companion_parent = PurePosixPath(
+                    final_companion["relative"]).parent.as_posix()
+                if (
+                    final_companion["relative"] == final["relative"]
+                    or not _strict_relative_ancestor(
+                        companion_parent, final["relative"])
+                ):
+                    if companion_key in file_changes:
+                        _clear_import_ownership(item)
+                        return
+                else:
+                    if final_companion_key in final_leaves:
+                        _clear_import_ownership(item)
+                        return
+                    final_leaves.add(final_companion_key)
+                    final_companions.append({
+                        "kind": "artwork",
+                        "relative": final_companion["relative"],
+                        "file": _ownership_identity_from_location(
+                            final_companion),
+                    })
+
+        for relative, entry in created_by_relative.items():
+            if (
+                relative not in advanced_relative
+                and _strict_relative_ancestor(relative, final["relative"])
+            ):
+                previous = relocation_created.get(relative)
+                if previous is not None and previous != entry:
+                    _clear_import_ownership(item)
+                    return
+                relocation_created[relative] = dict(entry)
+
+        updates.append({
+            "record": record,
+            "relative": final["relative"],
+            "file": _ownership_identity_from_location(final),
+            "created_directories": advanced_created,
+            "companions": final_companions,
+        })
+
+    created_files = item.get("_import_ownership_created_files", [])
+    if not isinstance(created_files, list):
+        _clear_import_ownership(item)
+        return
+    advanced_created_files = []
+    for record in created_files:
+        path = record.get("path") if isinstance(record, dict) else None
+        identity = record.get("file") if isinstance(record, dict) else None
+        try:
+            relative = Path(os.path.abspath(os.fspath(path))).relative_to(
+                Path(root)
+            ).as_posix()
+        except (OSError, TypeError, ValueError):
+            _clear_import_ownership(item)
+            return
+        if (
+            set(record) != {"path", "file"}
+            or not _valid_import_ownership_relative(relative)
+            or not _exact_import_ownership_identity(identity)
+        ):
+            _clear_import_ownership(item)
+            return
+        current = _ownership_location(relative, identity)
+        current_key = _relocation_location_key(current)
+        if current_key in released_locations:
+            released_uses[current_key] += 1
+            continue
+        final_created = file_changes.get(current_key, current)
+        final_key = _relocation_location_key(final_created)
+        try:
+            final_path = Path(root).joinpath(
+                *PurePosixPath(final_created["relative"]).parts
+            )
+            final_path.relative_to(Path(os.path.abspath(os.fspath(
+                item["_resolved_post_dir"]
+            ))))
+        except (KeyError, OSError, TypeError, ValueError):
+            if current_key in file_changes:
+                _clear_import_ownership(item)
+                return
+            continue
+        if final_key in final_leaves:
+            _clear_import_ownership(item)
+            return
+        final_leaves.add(final_key)
+        advanced_created_files.append({
+            "path": os.path.abspath(os.fspath(final_path)),
+            "file": _ownership_identity_from_location(final_created),
+        })
+
+    if any(uses > 1 for uses in released_uses.values()):
+        _clear_import_ownership(item)
+        return
+    for update in updates:
+        record = update.pop("record")
+        record.update(update)
+    if relocation_created:
+        item["_import_ownership_created_directories"] = list(
+            relocation_created.values())
+    else:
+        item.pop("_import_ownership_created_directories", None)
+    if advanced_created_files:
+        item["_import_ownership_created_files"] = advanced_created_files
+    else:
+        item.pop("_import_ownership_created_files", None)
 
 
 def _post_import_change_within_item(item, change):
@@ -809,11 +1147,100 @@ def _queue_item_needs_retry(item):
     return item.get("n_ok", 0) == 0
 
 
-def _resolve_queue_item(item, args, imported_globally):
+def _reunite_split_album(
+    item,
+    album_dir,
+    post_dir,
+    *,
+    authority=None,
+    await_handoff=False,
+    operation_id_out=None,
+):
+    """Safely reunite one album that Beets filed across artist folders."""
+    if type(await_handoff) is not bool:
+        raise ValueError("the relocation handoff option is invalid")
+    operation_capture = (
+        operation_id_out if isinstance(operation_id_out, dict) else None
+    )
+    if await_handoff and operation_capture is None:
+        raise ValueError("a deferred relocation requires an operation receiver")
+    if operation_capture is not None:
+        operation_capture.clear()
+    split_artist = (item["album"].get("artist") or {}).get("name") or ""
+    if not _is_split_album_merge(album_dir, post_dir, split_artist):
+        return post_dir
+    try:
+        if authority is not None:
+            _require_executor_authority(authority)
+        relocation_kwargs = {
+            "kind": RelocationKind.SPLIT_GAP_FILL,
+            "authority": authority,
+        }
+        if await_handoff:
+            relocation_kwargs["await_handoff"] = True
+        relocation = relocate_post_import_album(
+            album_dir,
+            post_dir,
+            **relocation_kwargs,
+        )
+        if authority is not None:
+            _require_executor_authority(authority)
+    except PostImportRelocationAttention:
+        raise
+    except (PostImportRelocationUnavailable, OSError, ValueError) as exc:
+        if authority is not None:
+            _require_executor_authority(authority)
+        log.info(fmt(
+            C.YELLOW,
+            "  ⚠  Beets placed this album across two artist folders; "
+            "the automatic consolidation was skipped safely and "
+            "neither folder was overwritten.",
+        ))
+        vlog(f"split-folder consolidation refused: {exc}")
+        return post_dir
+
+    if not relocation.changed:
+        reason = relocation.reason or "nothing was safe to move"
+        log.info(fmt(
+            C.YELLOW,
+            "  ⚠  Beets placed this album across two artist "
+            f"folders; both were kept because {reason}.",
+        ))
+        return post_dir
+
+    post_dir = relocation.destination
+    if operation_capture is not None:
+        if relocation.operation_id is None:
+            raise PostImportRelocationAttention(
+                "the split-folder relocation lost its recovery identity"
+            )
+        operation_capture["operation_id"] = relocation.operation_id
+    item["_resolved_post_dir"] = post_dir
+    receipt = relocation.ownership_receipt
+    if (
+        isinstance(item.get("_import_ownership"), dict)
+        and isinstance(receipt, dict)
+    ):
+        _advance_import_ownership_after_relocation(item, receipt)
+    elif isinstance(item.get("_import_ownership"), dict):
+        _clear_import_ownership(item)
+    clear_scan_caches()
+    message = (
+        "  ✓  Consolidated the existing album files into "
+        f"{truncate(post_dir.name, 40)} without overwriting."
+    )
+    if relocation.reason:
+        message += f" {relocation.reason.capitalize()}."
+    log.info(fmt(C.GREEN, message))
+    return post_dir
+
+
+def _resolve_queue_item(item, args, imported_globally, *, authority=None):
     """Resolve backup and compute result for one completed queue item.
 
-    Handles art cleanup, split-folder detection, sibling retention, and backup
-    restoration. Mutates item["imported"] and item["_resolved_post_dir"].
+    Handles art cleanup, safe folder consolidation, sibling retention, and
+    backup restoration. Mutates item["imported"] and
+    item["_resolved_post_dir"].
     Returns a result dict in process_album's shape.
     """
     item["imported"] = imported_globally
@@ -822,8 +1249,8 @@ def _resolve_queue_item(item, args, imported_globally):
     _sibs = item.get("siblings_to_delete", [])
     item["_siblings_preserved"] = [os.fspath(path) for path in _sibs]
 
-    # One strict per-album success flag — art cleanup, sibling deletion, and
-    # backup resolution must all agree. A partial result
+    # One strict per-album success flag — art cleanup, sibling deletion,
+    # backup resolution, and opt-in migration must all agree. A partial result
     # (e.g. 5/12 tracks ok) must not delete backups or siblings.
     _item_strict_success = (
         imported_globally
@@ -831,27 +1258,118 @@ def _resolve_queue_item(item, args, imported_globally):
         and item.get("n_fail", 0) == 0
         and item.get("n_lossy", 0) == 0
     )
-    post_dir = None
     ownership_scope_used = False
+    ownership_source_dir = None
+    ownership_source_required = (
+        imported_globally
+        and item.get("_capture_import_ownership") is True
+    )
+    if ownership_source_required:
+        ownership_source_dir = _verified_import_album_dir(item)
+        ownership_scope_used = ownership_source_dir is not None
+
+    ownership_move = None
+    item.pop("_post_import_relocation_pending", None)
+    deferred_relocation_handoff = (
+        item.get("_defer_post_import_relocation_handoff") is True
+    )
+    migration_requested = (
+        getattr(args, "migrate_multi_artist", False)
+        and _item_strict_success
+        and (
+            not ownership_source_required
+            or deferred_relocation_handoff
+        )
+    )
+    migration_source_dir = ownership_source_dir
+    if migration_requested and not ownership_source_required:
+        migration_source_dir = find_album_dir_by_track_signatures(
+            item.get("post_import_signatures")
+        )
+    deferred_web_single_migration = (
+        migration_requested
+        and deferred_relocation_handoff
+        and ownership_source_required
+        and ownership_scope_used
+    )
+    deferred_web_split_reunion = (
+        deferred_relocation_handoff
+        and ownership_source_required
+        and ownership_scope_used
+        and _item_strict_success
+        and _is_split_album_merge(
+            album_dir,
+            ownership_source_dir,
+            (item["album"].get("artist") or {}).get("name") or "",
+        )
+    )
+    if deferred_web_single_migration or deferred_web_split_reunion:
+        item["_post_import_relocation_pending"] = True
+    if (
+        migration_requested
+        and migration_source_dir is not None
+        and not deferred_web_single_migration
+    ):
+        ownership_move = (
+            {} if isinstance(item.get("_import_ownership"), dict) else None
+        )
+        if authority is not None:
+            _require_executor_authority(authority)
+        migration_kwargs = {
+            "ownership_move_out": ownership_move,
+            "authority": authority,
+            "source_dir": migration_source_dir,
+        }
+        _migrated = prompt_and_migrate_multi_artist_folder(
+            item["album"],
+            args,
+            **migration_kwargs,
+        )
+        if authority is not None:
+            _require_executor_authority(authority)
+    else:
+        _migrated = None
+        if (
+            migration_requested
+            and ownership_source_required
+            and not ownership_scope_used
+        ):
+            log.info(fmt(
+                C.YELLOW,
+                "  ⚠  Multi-artist folder filing was skipped because the "
+                "exact imported album folder could not be verified.",
+            ))
+        elif migration_requested and migration_source_dir is None:
+            log.info(fmt(
+                C.YELLOW,
+                "  ⚠  Multi-artist folder filing was skipped because the "
+                "exact imported album could not be located.",
+            ))
+    post_dir = _migrated
+    post_dir_exact = post_dir is not None
+    if post_dir is None and ownership_scope_used:
+        post_dir = ownership_source_dir
+        post_dir_exact = True
     if (
         post_dir is None
         and imported_globally
-        and album_dir is None
-        and item.get("_capture_import_ownership") is True
+        and not ownership_source_required
     ):
-        post_dir = _verified_import_album_dir(item)
-        ownership_scope_used = post_dir is not None
-    if post_dir is None and imported_globally:
         post_dir = find_album_dir_by_track_signatures(
             item.get("post_import_signatures"))
-    if post_dir is None:
+        post_dir_exact = post_dir is not None
+    if post_dir is None and not ownership_source_required:
         post_dir = find_album_dir_filesystem(item["album"])
     # For brand-new albums (album_dir=None), find_album_dir_filesystem may
     # return None if the cache hasn't refreshed. Clear and retry once.
     # Only bother when beets actually ran — if the import was never attempted
     # the cache is already correct and clearing it for every short-circuited
     # item in a large cancelled batch would thrash it O(n) times for nothing.
-    if post_dir is None and imported_globally:
+    if (
+        post_dir is None
+        and imported_globally
+        and not ownership_source_required
+    ):
         clear_scan_caches()
         post_dir = find_album_dir_filesystem(item["album"])
     if post_dir is None:
@@ -863,7 +1381,23 @@ def _resolve_queue_item(item, args, imported_globally):
     # Stash resolved post-import dir so the lyric-retry resolver can
     # use it without redoing the find_album_dir_filesystem dance.
     item["_resolved_post_dir"] = post_dir
-    item["_resolved_post_dir_from_import_ownership"] = ownership_scope_used
+    item["_resolved_post_dir_from_import_ownership"] = (
+        ownership_source_required
+    )
+    if (
+        isinstance(item.get("_import_ownership"), dict)
+        and isinstance(ownership_move, dict)
+        and ownership_move.get("version") == 2
+    ):
+        _advance_import_ownership_after_relocation(item, ownership_move)
+    elif (
+        isinstance(item.get("_import_ownership"), dict)
+        and ownership_scope_used
+        and post_dir is not None
+        and os.path.abspath(os.fspath(post_dir))
+        != os.path.abspath(os.fspath(ownership_source_dir))
+    ):
+        _clear_import_ownership(item)
     had_any_success = (
         imported_globally and item.get("n_ok", 0) > 0 and album_has_content
     )
@@ -872,14 +1406,13 @@ def _resolve_queue_item(item, args, imported_globally):
         if post_dir:
             if item.get("resampled_n", 0) > 0:
                 mark_local_album_capped(post_dir, qobuz_album=item["album"])
-        split_artist = (item["album"].get("artist") or {}).get("name") or ""
-        if (
-            not ownership_scope_used
-            and _is_split_album_merge(album_dir, post_dir, split_artist)
-        ):
-            log.info(fmt(C.YELLOW,
-                "  ⚠  Beets placed this album across two artist folders; "
-                "both were left unchanged for manual review."))
+        if not ownership_source_required and post_dir_exact:
+            post_dir = _reunite_split_album(
+                item,
+                album_dir,
+                post_dir,
+                authority=authority,
+            )
         # A sibling is only eligible for retirement after a clean, complete
         # replacement. Bind each move to its pre-download receipt, carry its
         # unique companion files without overwrite, then retire only the exact
@@ -1465,17 +1998,36 @@ def _recovered_completion_details(
         (entry for entry in journal.items if entry.item_id == owner.item_id),
         None,
     )
-    if (
-        saved is None
-        or saved.phase not in {
-            queue_state.QueuePhase.RESOLVING,
-            queue_state.QueuePhase.COMPLETE,
-        }
-        or saved.planned != planned
-    ):
+    retirement = next(
+        (
+            entry
+            for entry in journal.retirements
+            if entry.item_id == owner.item_id
+        ),
+        None,
+    )
+    if saved is not None:
+        if (
+            saved.phase not in {
+                queue_state.QueuePhase.RESOLVING,
+                queue_state.QueuePhase.COMPLETE,
+            }
+            or saved.planned != planned
+        ):
+            return None
+        completion_record = saved.completion_input
+    elif retirement is not None:
+        if (
+            retirement.planned != planned
+            or retirement.action is not None
+            or retirement.final_path != post_dir
+        ):
+            return None
+        completion_record = retirement.completion_input
+    else:
         return None
     completion_input = parse_completion_input_record(
-        saved.completion_input,
+        completion_record,
         expected_owner=owner,
     )
     coverage = (
@@ -1736,7 +2288,8 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
                               else "disk_full" if disk_full
                               else "io_error" if io_error
                               else "auth_lost")
-        results.append(_resolve_queue_item(item, args, False))
+        results.append(_resolve_queue_item(
+            item, args, False, authority=authority))
 
     def _handle_download_exception(item, exc):
         nonlocal interrupted, disk_full, io_error, auth_lost_exc
@@ -1769,7 +2322,8 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
                 io_error = True
         else:
             raise exc
-        results.append(_resolve_queue_item(item, args, False))
+        results.append(_resolve_queue_item(
+            item, args, False, authority=authority))
 
     def _record_durable_completion(item, post_dir, idx):
         nonlocal any_imported, cancelled
@@ -2047,13 +2601,15 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
                     "    ✗  The backup was interrupted; skipping this "
                     "album."))
                 item["result"] = "upgrade_aborted_backup_failed"
-                results.append(_resolve_queue_item(item, args, False))
+                results.append(_resolve_queue_item(
+                    item, args, False, authority=authority))
                 continue
             if bp is None:
                 log.info(fmt(C.RED,
                     "    ✗  Could not back up; skipping this album."))
                 item["result"] = "upgrade_aborted_backup_failed"
-                results.append(_resolve_queue_item(item, args, False))
+                results.append(_resolve_queue_item(
+                    item, args, False, authority=authority))
                 continue   # nothing downloaded — stays queued for retry
             item["backup_path"] = bp
         # Snapshot staging AFTER the backup: a custom config can point
@@ -2074,7 +2630,8 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
             log.info(fmt(C.YELLOW,
                 "    Cancelled — retained this album's partial download "
                 "for review."))
-            results.append(_resolve_queue_item(item, args, False))
+            results.append(_resolve_queue_item(
+                item, args, False, authority=authority))
             continue
 
         summary_n_ok = item.get("n_ok", 0)
@@ -2197,7 +2754,8 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
                     # in the fetch log instead of falling through to "downloaded"
                     # (the album did not import).
                     item["result"] = "interrupted"
-                    results.append(_resolve_queue_item(item, args, False))
+                    results.append(_resolve_queue_item(
+                        item, args, False, authority=authority))
                     continue
 
                 parking_receipts = tuple(
@@ -2228,7 +2786,8 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
                     # Label as interrupted (not "downloaded") — beets did not
                     # finish importing this album.
                     item["result"] = "interrupted"
-                    results.append(_resolve_queue_item(item, args, False))
+                    results.append(_resolve_queue_item(
+                        item, args, False, authority=authority))
                     continue
 
                 if item_imported and (
@@ -2271,7 +2830,8 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
         # the resolve that now follows it.
         if not _queue_item_needs_retry(item):
             _drop(item)
-        results.append(_resolve_queue_item(item, args, item_imported))
+        results.append(_resolve_queue_item(
+            item, args, item_imported, authority=authority))
 
         # Same post-import length recheck process_album runs, here covering every
         # queue path (walk fill, artist/album queue, repair refill, resume,

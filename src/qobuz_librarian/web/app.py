@@ -1,6 +1,7 @@
 """FastAPI web application for Qobuz Librarian."""
 import asyncio
 import concurrent.futures
+import copy
 import ctypes
 import errno
 import hashlib
@@ -207,6 +208,16 @@ def _startup_recovery_status_value() -> str | None:
     if _STARTUP_RECOVERY_UNKNOWN:
         return "attention_required"
     return _recovery_status_value(_STARTUP_RECOVERY_RESULT)
+
+
+def _post_import_relocation_recovery():
+    if (
+        _STARTUP_RECOVERY_UNKNOWN
+        or getattr(_STARTUP_RECOVERY_RESULT, "reason", None)
+        != "post-import-relocation-unsettled"
+    ):
+        return None
+    return getattr(_STARTUP_RECOVERY_RESULT, "post_import_relocation", None)
 
 
 def _recovery_status_value(result) -> str | None:
@@ -602,10 +613,27 @@ def _lock_busy_response(request, *, durable_resume_job_id: str | None = None):
                "are paused so another process cannot write to the library "
                "at the same time. Restart Qobuz Librarian before continuing.")
     elif (_startup_recovery_status_value() == "attention_required"):
-        msg = ("An interrupted download could not be verified safely. Downloads "
-               "and scans are paused, and its saved queue and staged files were "
-               "left unchanged. Check the application log for the blocked "
-               "recovery reason, correct it, then restart Qobuz Librarian.")
+        relocation = _post_import_relocation_recovery()
+        if relocation is not None:
+            from qobuz_librarian.queue.startup_recovery import (
+                POST_IMPORT_RELOCATION_LOG_ENTRY,
+            )
+
+            paths = "; ".join(str(path) for path in relocation.paths)
+            msg = (
+                "An interrupted library-folder move could not be verified safely. "
+                f"Recovery reason: {relocation.reason or 'reason not reported'}. "
+                f"Paths needing attention: {paths or 'none reported'}. "
+                "Downloads and scans are paused so the files remain unchanged. "
+                f"See the “{POST_IMPORT_RELOCATION_LOG_ENTRY}” entry in the "
+                "application log for the same details. Resolve the reported "
+                "recovery problem, then restart Qobuz Librarian."
+            )
+        else:
+            msg = ("An interrupted download could not be verified safely. Downloads "
+                   "and scans are paused, and its saved queue and staged files were "
+                   "left unchanged. Check the application log for the blocked "
+                   "recovery reason, correct it, then restart Qobuz Librarian.")
     elif (
         _startup_recovery_status_value() == "resume_required"
         and not _durable_resume_allowed(durable_resume_job_id or "")
@@ -5157,6 +5185,235 @@ def _album_dir_for_owned_file(path, landed_dir):
     return album_dir if relative.parts else None
 
 
+def _single_download_undo_snapshot(
+    queue_item,
+    landed_dir,
+    *,
+    album,
+    track,
+    artist,
+    title,
+    track_title,
+):
+    """Build one exact single-track Undo record from current ownership."""
+    owned_path = None
+    owned_file_path = None
+    owned_binding = _single_owned_path(
+        queue_item.get("_import_ownership"),
+        landed_dir,
+        queue_item.get("_import_ownership_created_directories"),
+        queue_item.get("_import_ownership_created_files"),
+    )
+    if owned_binding is not None:
+        owned_path, owned_file_path = owned_binding
+        actual_album_dir = _album_dir_for_owned_file(
+            owned_file_path, landed_dir
+        )
+        if actual_album_dir is None:
+            owned_path = None
+            owned_file_path = None
+        else:
+            landed_dir = actual_album_dir
+    single = {
+        "album_id": str(album.get("id") or ""),
+        "track_id": str(track.get("id") or ""),
+        "dir": str(landed_dir) if landed_dir else "",
+        "isrc": track.get("isrc") or "",
+        "track_no": track.get("track_number"),
+        "disc_no": track.get("media_number") or 1,
+        "title": track_title,
+        "artist": artist,
+        "album": title,
+        "marked": False,
+    }
+    if owned_path is not None:
+        single["owned_path"] = owned_path
+        single["owned_root"] = str(
+            Path(os.path.abspath(os.fspath(cfg.MUSIC_ROOT)))
+        )
+    return single, landed_dir, owned_path, owned_file_path
+
+
+def _refresh_post_import_relocation_recovery(authority) -> bool:
+    """Refresh the existing global write gate after a handoff interruption."""
+    try:
+        recovered = _record_startup_recovery(authority)
+    except Exception:
+        return False
+    return _recovery_status_value(recovered) == "clear"
+
+
+def _persist_single_download_undo(
+    job,
+    queue_item,
+    *,
+    ownership_valid,
+    source_single=None,
+    destination_single=None,
+) -> None:
+    """Commit a single-track Undo proof before its relocation can be retired."""
+    from qobuz_librarian import run_lock
+    from qobuz_librarian.completion import normalise_album_id
+    from qobuz_librarian.library.post_import_relocation import (
+        PostImportRelocationAttention,
+        acknowledge_post_import_relocation,
+        seal_post_import_relocation_handoff,
+    )
+    from qobuz_librarian.web import job_persistence
+
+    operation_key = "_post_import_relocation_operation_id"
+    if operation_key not in queue_item:
+        with job._lock:
+            preserve_existing = (
+                getattr(job, "_preserve_persisted_single", False) is True
+            )
+            if ownership_valid and preserve_existing:
+                job.__dict__.pop("_preserve_persisted_single", None)
+        persisted = job_persistence.persist(job)
+        if ownership_valid and persisted is not True:
+            with job._lock:
+                if preserve_existing:
+                    job._preserve_persisted_single = True
+            raise RuntimeError(
+                "The downloaded track's Undo record could not be saved durably."
+            )
+        if ownership_valid and persisted is True:
+            with job._lock:
+                job.__dict__.pop("_preserve_persisted_single", None)
+        return
+
+    def restore_source(*, clear_preservation=False) -> None:
+        with job._lock:
+            if type(source_single) is dict:
+                job.single = source_single
+            if clear_preservation:
+                job.__dict__.pop("_preserve_persisted_single", None)
+
+    def accept_destination(single_snapshot) -> None:
+        with job._lock:
+            job.single = copy.deepcopy(single_snapshot)
+            job.__dict__.pop("_single_undo_unavailable", None)
+            job.__dict__.pop("_preserve_persisted_single", None)
+
+    # Engage this before sealing or persisting the destination. Any ordinary
+    # job save that was already waiting must preserve the durable source Undo.
+    with job._lock:
+        job._preserve_persisted_single = True
+        single_snapshot = copy.deepcopy(destination_single)
+
+    authority = run_lock.current_lease()
+    operation_id = queue_item.get(operation_key)
+    album_id = normalise_album_id(job.album_id)
+    planned_album = queue_item.get("album")
+    planned_album_id = normalise_album_id(
+        planned_album.get("id") if isinstance(planned_album, dict) else None
+    )
+    single_album_id = normalise_album_id(
+        single_snapshot.get("album_id")
+        if isinstance(single_snapshot, dict)
+        else None
+    )
+    binding_valid = (
+        ownership_valid is True
+        and album_id == job.album_id
+        and planned_album_id == album_id
+        and single_album_id == album_id
+    )
+    if authority is None or not binding_valid:
+        _refresh_post_import_relocation_recovery(authority)
+        restore_source(clear_preservation=True)
+        raise PostImportRelocationAttention(
+            "The relocated track could not be bound to its exact Undo record."
+        )
+
+    consumer = {
+        "kind": "web-single",
+        "job_id": job.id,
+        "job_created_at": job.created_at,
+        "album_id": album_id,
+    }
+    try:
+        handoff_hash = seal_post_import_relocation_handoff(
+            operation_id,
+            consumer=consumer,
+            payload=single_snapshot,
+            authority=authority,
+        )
+    except Exception as exc:
+        _refresh_post_import_relocation_recovery(authority)
+        restore_source(clear_preservation=True)
+        raise PostImportRelocationAttention(
+            "The relocated track's Undo handoff could not be sealed."
+        ) from exc
+
+    handoff = {"consumer": consumer, "hash": handoff_hash}
+    persistence_error = None
+    try:
+        persisted = job_persistence.persist_post_import_relocation_handoff(
+            job,
+            operation_id=operation_id,
+            handoff_hash=handoff_hash,
+            single=single_snapshot,
+        )
+    except BaseException as exc:
+        persisted = False
+        persistence_error = exc
+    if persisted is not True:
+        # A failed return can still mean SQLite committed before reporting an
+        # I/O error. The preservation gate was engaged before the attempt, so
+        # no ordinary save can expose the stale source snapshot while the
+        # destination commit is still uncertain.
+        queue_item["_post_import_relocation_handoff_unknown"] = True
+        try:
+            proof_before = (
+                job_persistence.post_import_relocation_handoff_persisted(
+                    operation_id,
+                    handoff,
+                )
+            )
+        except BaseException:
+            proof_before = None
+        recovered_clear = _refresh_post_import_relocation_recovery(authority)
+        try:
+            proof_after = (
+                job_persistence.post_import_relocation_handoff_persisted(
+                    operation_id,
+                    handoff,
+                )
+            )
+        except BaseException:
+            proof_after = None
+        if proof_before is True or proof_after is True:
+            accept_destination(single_snapshot)
+            queue_item.pop("_post_import_relocation_handoff_unknown", None)
+            queue_item["_post_import_relocation_final_proven"] = True
+            if recovered_clear:
+                return
+        elif proof_before is False or proof_after is False:
+            queue_item.pop("_post_import_relocation_handoff_unknown", None)
+            restore_source(clear_preservation=True)
+        raise PostImportRelocationAttention(
+            "The relocated track's Undo record could not be saved durably."
+        ) from persistence_error
+
+    accept_destination(single_snapshot)
+    queue_item.pop("_post_import_relocation_handoff_unknown", None)
+    queue_item["_post_import_relocation_final_proven"] = True
+
+    try:
+        acknowledge_post_import_relocation(
+            operation_id,
+            handoff_hash,
+            authority=authority,
+        )
+    except Exception as exc:
+        if _refresh_post_import_relocation_recovery(authority):
+            return
+        raise PostImportRelocationAttention(
+            "The relocated track's durable Undo handoff needs recovery."
+        ) from exc
+
+
 def _make_single_track_run(album, track, token):
     """Run a single-track download: download just ``track`` via the per-track
     queue path (the same isolation repair uses — never a whole-album rip)."""
@@ -5166,9 +5423,14 @@ def _make_single_track_run(album, track, token):
             album_year,
             compute_missing,
             find_existing_tracks,
+            prompt_and_migrate_multi_artist_folder,
         )
         from qobuz_librarian.queue.builder import _build_queue_item
-        from qobuz_librarian.queue.executor import _execute_download_queue
+        from qobuz_librarian.queue.executor import (
+            _advance_import_ownership_after_relocation,
+            _execute_download_queue,
+            _reunite_split_album,
+        )
         from qobuz_librarian.ui_cli.errors import plural
         from qobuz_librarian.web import job_persistence
         from qobuz_librarian.web.flows import (
@@ -5197,59 +5459,156 @@ def _make_single_track_run(album, track, token):
             force_track_by_track=True,
         )
         qi["_capture_import_ownership"] = True
+        qi["_defer_post_import_relocation_handoff"] = True
         _note_staging_wait(j, "Downloading", 0, 1)
         owned_path = None
-        owned_file_path = None
+        source_single = None
         with job_mgr.staging_lock():
-            _execute_download_queue([qi], args, token)
-            landed_dir = qi.get("_resolved_post_dir") or album_dir
-            download_succeeded = (
-                qi.get("n_ok", 0) > 0
-                and qi.get("imported", False)
-                and qi.get("n_fail", 0) == 0
-            )
-            if download_succeeded:
-                # The import hook reports beets' real destination. Bind it
-                # before another managed writer can be attributed to this job.
-                owned_binding = _single_owned_path(
-                    qi.get("_import_ownership"),
-                    landed_dir,
-                    qi.get("_import_ownership_created_directories"),
-                    qi.get("_import_ownership_created_files"),
+            try:
+                _execute_download_queue([qi], args, token)
+                landed_dir = qi.get("_resolved_post_dir") or album_dir
+                download_succeeded = (
+                    qi.get("n_ok", 0) > 0
+                    and qi.get("imported", False)
+                    and qi.get("n_fail", 0) == 0
                 )
-                if owned_binding is not None:
-                    owned_path, owned_file_path = owned_binding
-                    actual_album_dir = _album_dir_for_owned_file(
-                        owned_file_path, landed_dir)
-                    if actual_album_dir is None:
-                        # The sealed file proof and the already verified album
-                        # scope disagree. Keep the download, but do not invent
-                        # a folder boundary from a `Disc N`-looking name.
-                        owned_path = None
-                        owned_file_path = None
-                    else:
-                        landed_dir = actual_album_dir
-                # Persist the complete import result while the staging lock
-                # still protects its ownership evidence.  Marking, pruning,
-                # and the library refresh are all optional follow-up work and
-                # must not be able to strand a landed track without Undo proof.
-                single = {
-                    "album_id": str(album.get("id") or ""),
-                    "track_id": str(track.get("id") or ""),
-                    "dir": str(landed_dir) if landed_dir else "",
-                    "isrc": track.get("isrc") or "",
-                    "track_no": track.get("track_number"),
-                    "disc_no": track.get("media_number") or 1,
-                    "title": t_title, "artist": artist, "album": title,
-                    "marked": False,
-                }
-                if owned_path is not None:
-                    single["owned_path"] = owned_path
-                    single["owned_root"] = str(
-                        Path(os.path.abspath(os.fspath(cfg.MUSIC_ROOT)))
+                if download_succeeded:
+                    single, landed_dir, owned_path, _owned_file_path = (
+                        _single_download_undo_snapshot(
+                            qi,
+                            landed_dir,
+                            album=album,
+                            track=track,
+                            artist=artist,
+                            title=title,
+                            track_title=t_title,
+                        )
                     )
-                j.single = single
-                job_persistence.persist(j)
+                    j.single = single
+                    _persist_single_download_undo(
+                        j,
+                        qi,
+                        ownership_valid=owned_path is not None,
+                    )
+                    source_single = copy.deepcopy(single)
+
+                    if (
+                        qi.get("_post_import_relocation_pending") is True
+                        and owned_path is not None
+                    ):
+                        from qobuz_librarian import run_lock
+
+                        authority = run_lock.current_lease()
+                        if authority is None:
+                            raise RuntimeError(
+                                "Automatic filing paused because write "
+                                "authority could not be verified."
+                            )
+                        original_landed_dir = landed_dir
+                        ownership_move = {}
+                        operation_capture = {}
+                        split_ownership_advanced = False
+                        try:
+                            migrated = _reunite_split_album(
+                                qi,
+                                album_dir,
+                                original_landed_dir,
+                                authority=authority,
+                                await_handoff=True,
+                                operation_id_out=operation_capture,
+                            )
+                            split_ownership_advanced = (
+                                "operation_id" in operation_capture
+                            )
+                            if (
+                                not split_ownership_advanced
+                                and getattr(args, "migrate_multi_artist", False)
+                            ):
+                                migrated = prompt_and_migrate_multi_artist_folder(
+                                    album,
+                                    args,
+                                    ownership_move_out=ownership_move,
+                                    operation_id_out=operation_capture,
+                                    authority=authority,
+                                    source_dir=original_landed_dir,
+                                    await_handoff=True,
+                                )
+                        finally:
+                            if "operation_id" in operation_capture:
+                                qi["_post_import_relocation_operation_id"] = (
+                                    operation_capture["operation_id"]
+                                )
+
+                        if "_post_import_relocation_operation_id" in qi:
+                            if migrated is None:
+                                raise RuntimeError(
+                                    "The relocated track's destination was lost."
+                                )
+                            landed_dir = migrated
+                            qi["_resolved_post_dir"] = landed_dir
+                            if not split_ownership_advanced:
+                                _advance_import_ownership_after_relocation(
+                                    qi,
+                                    ownership_move,
+                                )
+                            single, landed_dir, owned_path, _owned_file_path = (
+                                _single_download_undo_snapshot(
+                                    qi,
+                                    landed_dir,
+                                    album=album,
+                                    track=track,
+                                    artist=artist,
+                                    title=title,
+                                    track_title=t_title,
+                                )
+                            )
+                            with j._lock:
+                                j._preserve_persisted_single = True
+                                j.single = single
+                            _persist_single_download_undo(
+                                j,
+                                qi,
+                                ownership_valid=owned_path is not None,
+                                source_single=source_single,
+                                destination_single=single,
+                            )
+                        elif (
+                            migrated is not None
+                            and os.path.abspath(os.fspath(migrated))
+                            != os.path.abspath(os.fspath(original_landed_dir))
+                        ):
+                            _refresh_post_import_relocation_recovery(authority)
+                            raise RuntimeError(
+                                "The relocated track's recovery identity was lost."
+                            )
+                        else:
+                            landed_dir = original_landed_dir
+                    qi.pop("_post_import_relocation_pending", None)
+            except BaseException:
+                if (
+                    qi.get("_post_import_relocation_pending") is True
+                    or "_post_import_relocation_operation_id" in qi
+                ):
+                    from qobuz_librarian import run_lock
+
+                    _refresh_post_import_relocation_recovery(
+                        run_lock.current_lease()
+                    )
+                    with j._lock:
+                        if (
+                            type(source_single) is dict
+                            and qi.get(
+                                "_post_import_relocation_final_proven"
+                            ) is not True
+                            and qi.get(
+                                "_post_import_relocation_handoff_unknown"
+                            ) is not True
+                        ):
+                            j.single = source_single
+                            j.__dict__.pop(
+                                "_preserve_persisted_single", None
+                            )
+                raise
         if not download_succeeded:
             j.status = job_mgr.JobStatus.FAILED
             if qi.get("n_fail"):
@@ -5292,7 +5651,8 @@ def _make_single_track_run(album, track, token):
             # Complete means any parked Gap Fill candidate for it is stale.
             from qobuz_librarian.web.flows import prune_library_review_candidates
             prune_library_review_candidates(album)
-        single["marked"] = marked
+        with j._lock:
+            j.single["marked"] = marked
         if owned_path is None:
             j.summary += (
                 " Undo isn't available because the downloaded file "
@@ -7013,6 +7373,15 @@ async def job_retry(request: Request, job_id: str):
             url="/queue?error=" + urllib.parse.quote(
                 "Nothing to retry for that job."),
             status_code=303)
+    if (
+        getattr(job, "_preserve_persisted_single", False) is True
+        or getattr(job, "_single_undo_unavailable", False) is True
+    ):
+        return _durable_recovery_response(
+            request,
+            "This track's saved recovery state is uncertain, so Retry is "
+            "paused. No download was started. Restart Qobuz Librarian.",
+        )
     form = await request.form()
     raw_recovery_operation = form.get("recovery_operation_id")
     raw_recovery_item = form.get("recovery_item_id")
@@ -7421,7 +7790,18 @@ async def job_undo(request: Request, job_id: str):
     # ages out of the registry — the file checks below already handle a track
     # that vanished in the meantime.
     job = job_mgr.registry.get(job_id) or job_mgr.load_historical_job(job_id)
-    info = dict(getattr(job, "single", None) or {}) if job else {}
+    undo_uncertain = bool(
+        job
+        and (
+            getattr(job, "_preserve_persisted_single", False) is True
+            or getattr(job, "_single_undo_unavailable", False) is True
+        )
+    )
+    info = (
+        dict(getattr(job, "single", None) or {})
+        if job and not undo_uncertain
+        else {}
+    )
     if not job or not info.get("dir") or info.get("removed"):
         if _is_htmx(request):
             if job:

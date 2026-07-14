@@ -100,6 +100,557 @@ def test_binding_requires_the_full_created_directory_record(tmp_path):
     ) is None
 
 
+def test_relocation_keeps_copied_track_and_artwork_undoable(
+        tmp_path, monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.queue import executor
+    from qobuz_librarian.web import app as app_mod
+
+    music_root = tmp_path / "music"
+    source = music_root / "Artist, Other" / "Album"
+    destination_artist = music_root / "Artist"
+    destination = destination_artist / "Album"
+    source.mkdir(parents=True)
+    destination.mkdir(parents=True)
+    existing = destination_artist / "Other Album"
+    existing.mkdir()
+    track = source / "01 - Track.flac"
+    lyrics = source / "01 - Track.lrc"
+    artwork = source / "cover.jpg"
+    track.write_bytes(b"audio")
+    lyrics.write_bytes(b"lyrics")
+    artwork.write_bytes(b"artwork")
+    manifest = _ownership_manifest(
+        music_root, track, created=[source.parent, source])
+    manifest["items"][0]["companions"] = [{
+        "kind": "artwork",
+        "relative": artwork.relative_to(music_root).as_posix(),
+        "file": app_mod._owned_file_identity(artwork.stat()),
+    }]
+
+    copied_track = destination / track.name
+    copied_lyrics = destination / lyrics.name
+    copied_artwork = destination / artwork.name
+    copied_track.write_bytes(track.read_bytes())
+    copied_lyrics.write_bytes(lyrics.read_bytes())
+    copied_artwork.write_bytes(artwork.read_bytes())
+    source_album_before = executor._ownership_location(
+        source.relative_to(music_root).as_posix(),
+        app_mod._owned_file_identity(source.stat()),
+    )
+    destination_album = executor._ownership_location(
+        destination.relative_to(music_root).as_posix(),
+        app_mod._owned_file_identity(destination.stat()),
+    )
+    before_track = executor._ownership_location(
+        track.relative_to(music_root).as_posix(),
+        app_mod._owned_file_identity(track.stat()),
+    )
+    before_artwork = executor._ownership_location(
+        artwork.relative_to(music_root).as_posix(),
+        app_mod._owned_file_identity(artwork.stat()),
+    )
+    after_track = executor._ownership_location(
+        copied_track.relative_to(music_root).as_posix(),
+        app_mod._owned_file_identity(copied_track.stat()),
+    )
+    after_artwork = executor._ownership_location(
+        copied_artwork.relative_to(music_root).as_posix(),
+        app_mod._owned_file_identity(copied_artwork.stat()),
+    )
+    before_lyrics = executor._ownership_location(
+        lyrics.relative_to(music_root).as_posix(),
+        app_mod._owned_file_identity(lyrics.stat()),
+    )
+    after_lyrics = executor._ownership_location(
+        copied_lyrics.relative_to(music_root).as_posix(),
+        app_mod._owned_file_identity(copied_lyrics.stat()),
+    )
+    track.unlink()
+    lyrics.unlink()
+    artwork.unlink()
+    source.rmdir()
+    source.parent.rmdir()
+
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", music_root)
+    item = {
+        "_resolved_post_dir": destination,
+        "_import_ownership": manifest,
+        "_import_ownership_created_files": [{
+            "path": str(source / lyrics.name),
+            "file": executor._ownership_identity_from_location(before_lyrics),
+        }],
+    }
+    executor._advance_import_ownership_after_relocation(item, {
+        "version": 2,
+        "file_changes": [
+            {"before": before_track, "after": after_track},
+            {"before": before_lyrics, "after": after_lyrics},
+            {"before": before_artwork, "after": after_artwork},
+        ],
+        "directory_changes": [{
+            "before": source_album_before,
+            "after": destination_album,
+        }],
+        "created_directories": [destination_album],
+    })
+
+    binding = app_mod._single_owned_path(
+        manifest,
+        destination,
+        item.get("_import_ownership_created_directories"),
+        item.get("_import_ownership_created_files"),
+    )
+    assert binding is not None
+    owned, bound_track = binding
+    assert bound_track == copied_track
+    assert {entry["relative"] for entry in owned["companions"]} == {
+        copied_artwork.relative_to(music_root).as_posix(),
+        copied_lyrics.relative_to(music_root).as_posix(),
+    }
+    assert app_mod._unlink_owned_path(music_root, owned) == copied_track
+    assert not copied_track.exists()
+    assert not copied_lyrics.exists()
+    assert not copied_artwork.exists()
+    assert not destination.exists()
+    assert existing.is_dir()
+    assert destination_artist.is_dir()
+
+
+def test_relocation_does_not_claim_identical_existing_artwork(
+        tmp_path, monkeypatch):
+    import copy
+
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.queue import executor
+    from qobuz_librarian.web import app as app_mod
+
+    music_root = tmp_path / "music"
+    source = music_root / "Artist, Other" / "Album"
+    destination = music_root / "Artist" / "Album"
+    source.mkdir(parents=True)
+    destination.mkdir(parents=True)
+    track = source / "01 - Track.flac"
+    artwork = source / "cover.jpg"
+    existing_artwork = destination / artwork.name
+    existing = destination / "02 - Existing.flac"
+    track.write_bytes(b"audio")
+    artwork.write_bytes(b"same artwork")
+    existing_artwork.write_bytes(artwork.read_bytes())
+    existing.write_bytes(b"existing audio")
+    manifest = _ownership_manifest(
+        music_root, track, created=[source.parent, source])
+    manifest["items"][0]["companions"] = [{
+        "kind": "artwork",
+        "relative": artwork.relative_to(music_root).as_posix(),
+        "file": app_mod._owned_file_identity(artwork.stat()),
+    }]
+    before_track = executor._ownership_location(
+        track.relative_to(music_root).as_posix(),
+        app_mod._owned_file_identity(track.stat()),
+    )
+    copied_track = destination / track.name
+    copied_track.write_bytes(track.read_bytes())
+    after_track = executor._ownership_location(
+        copied_track.relative_to(music_root).as_posix(),
+        app_mod._owned_file_identity(copied_track.stat()),
+    )
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", music_root)
+
+    refused = {
+        "_resolved_post_dir": destination,
+        "_import_ownership": copy.deepcopy(manifest),
+    }
+    executor._advance_import_ownership_after_relocation(refused, {
+        "version": 2,
+        "file_changes": [],
+        "directory_changes": [],
+        "created_directories": [],
+        "released_files": [before_track],
+    })
+    assert "_import_ownership" not in refused
+
+    track.unlink()
+    item = {
+        "_resolved_post_dir": destination,
+        "_import_ownership": manifest,
+    }
+    executor._advance_import_ownership_after_relocation(item, {
+        "version": 2,
+        "file_changes": [{
+            "before": before_track,
+            "after": after_track,
+        }],
+        "directory_changes": [],
+        "created_directories": [],
+        # The relocation retained the conflicting source artwork instead of
+        # transferring ownership to the pre-existing destination copy.
+        "released_files": [],
+    })
+
+    assert manifest["items"][0]["companions"] == []
+    binding = app_mod._single_owned_path(manifest, destination)
+    assert binding is not None
+    owned, bound_track = binding
+    assert app_mod._unlink_owned_path(music_root, owned) == bound_track
+    assert not copied_track.exists()
+    assert artwork.read_bytes() == b"same artwork"
+    assert existing_artwork.read_bytes() == b"same artwork"
+    assert existing.read_bytes() == b"existing audio"
+    assert destination.is_dir()
+
+
+def test_queue_web_single_defers_relocation_until_undo_is_saved(
+        tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from qobuz_librarian.queue import executor
+
+    source = tmp_path / "music" / "Artist, Guest" / "Album"
+    source.mkdir(parents=True)
+    (source / "01.flac").write_bytes(b"audio")
+    authority = object()
+
+    monkeypatch.setattr(
+        executor, "_verified_import_album_dir", lambda _item: source)
+    monkeypatch.setattr(
+        executor,
+        "prompt_and_migrate_multi_artist_folder",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Web relocation must wait for the original durable Undo record"
+        ),
+    )
+    item = {
+        "album": {
+            "artist": {"name": "Artist, Guest"},
+            "tracks": {"items": []},
+        },
+        "album_dir": None,
+        "backup_path": None,
+        "gap_fill_backup_path": None,
+        "siblings_to_delete": [],
+        "n_ok": 1,
+        "n_fail": 0,
+        "n_lossy": 0,
+        "auto_upgrade": False,
+        "_capture_import_ownership": True,
+        "_defer_post_import_relocation_handoff": True,
+        "_import_ownership": {},
+    }
+
+    executor._resolve_queue_item(
+        item,
+        SimpleNamespace(
+            no_import=False,
+            consolidate=False,
+            migrate_multi_artist=True,
+        ),
+        imported_globally=True,
+        authority=authority,
+    )
+
+    assert item["_resolved_post_dir"] == source
+    assert item["_post_import_relocation_pending"] is True
+    assert "_post_import_relocation_operation_id" not in item
+
+
+def test_queue_web_single_defers_and_hands_off_split_reunion_when_setting_off(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from qobuz_librarian.library.post_import_relocation import (
+        RelocationKind,
+        RelocationResult,
+    )
+    from qobuz_librarian.queue import executor
+
+    old_dir = tmp_path / "music" / "Artist, Guest" / "Album"
+    landed_dir = tmp_path / "music" / "Artist" / "Album"
+    old_dir.mkdir(parents=True)
+    landed_dir.mkdir(parents=True)
+    (old_dir / "01.flac").write_bytes(b"old")
+    (landed_dir / "02.flac").write_bytes(b"new")
+    authority = object()
+    calls = []
+
+    monkeypatch.setattr(
+        executor, "_verified_import_album_dir", lambda _item: landed_dir
+    )
+    monkeypatch.setattr(executor, "_is_split_album_merge", lambda *_args: True)
+    monkeypatch.setattr(executor, "_require_executor_authority", lambda _a: None)
+    monkeypatch.setattr(executor, "clear_scan_caches", lambda: None)
+    monkeypatch.setattr(
+        executor,
+        "_advance_import_ownership_after_relocation",
+        lambda item, receipt: calls.append((item, receipt)),
+    )
+
+    def relocate(source, destination, *, kind, authority, await_handoff):
+        assert (source, destination) == (old_dir, landed_dir)
+        assert kind is RelocationKind.SPLIT_GAP_FILL
+        assert await_handoff is True
+        return RelocationResult(
+            destination=landed_dir,
+            published_files=1,
+            operation_id="1" * 64,
+            ownership_receipt={"version": 2},
+            changed=True,
+        )
+
+    monkeypatch.setattr(executor, "relocate_post_import_album", relocate)
+    item = {
+        "album": {
+            "artist": {"name": "Artist, Guest"},
+            "tracks": {"items": []},
+        },
+        "album_dir": old_dir,
+        "backup_path": None,
+        "gap_fill_backup_path": None,
+        "siblings_to_delete": [],
+        "n_ok": 1,
+        "n_fail": 0,
+        "n_lossy": 0,
+        "auto_upgrade": False,
+        "_capture_import_ownership": True,
+        "_defer_post_import_relocation_handoff": True,
+        "_import_ownership": {},
+    }
+    executor._resolve_queue_item(
+        item,
+        SimpleNamespace(
+            no_import=False,
+            consolidate=False,
+            migrate_multi_artist=False,
+        ),
+        imported_globally=True,
+        authority=authority,
+    )
+    assert item["_post_import_relocation_pending"] is True
+
+    operation = {}
+    result = executor._reunite_split_album(
+        item,
+        old_dir,
+        landed_dir,
+        authority=authority,
+        await_handoff=True,
+        operation_id_out=operation,
+    )
+    assert result == landed_dir
+    assert operation == {"operation_id": "1" * 64}
+    assert calls == [(item, {"version": 2})]
+
+
+def test_queue_ambiguous_source_cannot_authorise_filing_or_split_reunion(
+        tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from qobuz_librarian.queue import executor
+
+    older_match = tmp_path / "music" / "Artist" / "Album"
+    split_source = tmp_path / "music" / "Artist, Guest" / "Album"
+    older_match.mkdir(parents=True)
+    split_source.mkdir(parents=True)
+    (older_match / "01.flac").write_bytes(b"older")
+    monkeypatch.setattr(
+        executor,
+        "find_album_dir_by_track_signatures",
+        lambda _signatures: None,
+    )
+    monkeypatch.setattr(
+        executor, "find_album_dir_filesystem", lambda _album: older_match)
+    monkeypatch.setattr(executor, "clear_scan_caches", lambda: None)
+    monkeypatch.setattr(
+        executor,
+        "prompt_and_migrate_multi_artist_folder",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an ambiguous older album folder must not be migrated"
+        ),
+    )
+    monkeypatch.setattr(executor, "_is_split_album_merge", lambda *_args: True)
+    monkeypatch.setattr(
+        executor,
+        "relocate_post_import_album",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a fuzzy fallback must not authorise split-folder relocation"
+        ),
+    )
+    item = {
+        "album": {
+            "artist": {"name": "Artist, Guest"},
+            "tracks": {"items": []},
+        },
+        "album_dir": split_source,
+        "backup_path": None,
+        "gap_fill_backup_path": None,
+        "siblings_to_delete": [],
+        "n_ok": 1,
+        "n_fail": 0,
+        "n_lossy": 0,
+        "auto_upgrade": False,
+        "post_import_signatures": ["new-import"],
+    }
+
+    executor._resolve_queue_item(
+        item,
+        SimpleNamespace(
+            no_import=False,
+            consolidate=False,
+            migrate_multi_artist=True,
+        ),
+        imported_globally=True,
+        authority=object(),
+    )
+
+    assert item["_resolved_post_dir"] == older_match
+
+
+def test_queue_capture_only_repair_does_not_file_its_held_album(
+        tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from qobuz_librarian.queue import executor
+
+    exact_source = tmp_path / "music" / "Artist, Guest" / "Album"
+    exact_source.mkdir(parents=True)
+    (exact_source / "01.flac").write_bytes(b"source")
+    authority = object()
+
+    monkeypatch.setattr(
+        executor,
+        "_verified_import_album_dir",
+        lambda _item: exact_source,
+    )
+    monkeypatch.setattr(
+        executor,
+        "prompt_and_migrate_multi_artist_folder",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Repair must keep its held album at the selected path"
+        ),
+    )
+    monkeypatch.setattr(
+        executor,
+        "_advance_import_ownership_after_relocation",
+        lambda *_args: pytest.fail("Repair did not relocate its held album"),
+    )
+    monkeypatch.setattr(
+        executor,
+        "_is_split_album_merge",
+        lambda *_args: pytest.fail(
+            "exact ownership must keep split cleanup disabled"),
+    )
+    item = {
+        "album": {
+            "artist": {"name": "Artist, Guest"},
+            "tracks": {"items": []},
+        },
+        "album_dir": exact_source,
+        "backup_path": None,
+        "gap_fill_backup_path": None,
+        "siblings_to_delete": [],
+        "n_ok": 1,
+        "n_fail": 0,
+        "n_lossy": 0,
+        "auto_upgrade": False,
+        "_capture_import_ownership": True,
+        "_import_ownership": {},
+    }
+
+    executor._resolve_queue_item(
+        item,
+        SimpleNamespace(
+            no_import=False,
+            consolidate=False,
+            migrate_multi_artist=True,
+        ),
+        imported_globally=True,
+        authority=authority,
+    )
+
+    assert item["_resolved_post_dir"] == exact_source
+    assert item["_resolved_post_dir_from_import_ownership"] is True
+
+
+def test_queue_split_gap_fill_uses_durable_relocation_with_held_authority(
+        tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from qobuz_librarian.library.post_import_relocation import (
+        RelocationKind,
+        RelocationResult,
+    )
+    from qobuz_librarian.queue import executor
+
+    old_dir = tmp_path / "music" / "Artist, Guest" / "Album"
+    destination = tmp_path / "music" / "Artist" / "Album"
+    old_dir.mkdir(parents=True)
+    destination.mkdir(parents=True)
+    (old_dir / "01.flac").write_bytes(b"old")
+    (destination / "02.flac").write_bytes(b"new")
+    authority = object()
+    calls = []
+
+    monkeypatch.setattr(
+        executor, "find_album_dir_by_track_signatures",
+        lambda _signatures: destination)
+    monkeypatch.setattr(
+        executor, "_is_split_album_merge", lambda *_args: True)
+    monkeypatch.setattr(
+        executor, "_require_executor_authority", lambda lease: calls.append(
+            ("authority", lease)))
+    monkeypatch.setattr(executor, "clear_scan_caches", lambda: None)
+
+    def relocate(source, target, *, kind, authority):
+        calls.append(("relocate", source, target, kind, authority))
+        return RelocationResult(
+            destination=target,
+            published_files=1,
+            changed=True,
+        )
+
+    monkeypatch.setattr(executor, "relocate_post_import_album", relocate)
+    item = {
+        "album": {
+            "artist": {"name": "Artist"},
+            "tracks": {"items": []},
+        },
+        "album_dir": old_dir,
+        "backup_path": None,
+        "gap_fill_backup_path": None,
+        "siblings_to_delete": [],
+        "n_ok": 1,
+        "n_fail": 0,
+        "n_lossy": 0,
+        "auto_upgrade": False,
+        "post_import_signatures": ["new-track"],
+    }
+
+    executor._resolve_queue_item(
+        item,
+        SimpleNamespace(
+            no_import=False,
+            consolidate=False,
+            migrate_multi_artist=False,
+        ),
+        imported_globally=True,
+        authority=authority,
+    )
+
+    assert calls == [
+        ("authority", authority),
+        (
+            "relocate",
+            old_dir,
+            destination,
+            RelocationKind.SPLIT_GAP_FILL,
+            authority,
+        ),
+        ("authority", authority),
+    ]
+    assert item["_resolved_post_dir"] == destination
+
+
 def test_created_artwork_and_sidecar_remain_exactly_undoable(
         tmp_path, monkeypatch):
     import copy
@@ -583,51 +1134,137 @@ def test_single_ownership_is_persisted_before_library_refresh(
 
     import qobuz_librarian.api.search as search_mod
     import qobuz_librarian.library.catalog as cat_mod
+    import qobuz_librarian.library.post_import_relocation as relocation_mod
     import qobuz_librarian.queue.executor as ex_mod
+    import qobuz_librarian.run_lock as run_lock_mod
     import qobuz_librarian.web.app as app_mod
     import qobuz_librarian.web.flows as flows_mod
     from qobuz_librarian.web import job_persistence
 
     music_root = tmp_path / "music"
-    album_dir = music_root / "Allie X" / "Girl With No Face (2024)"
-    album_dir.mkdir(parents=True)
-    track_path = album_dir / "03 - Black Eye.flac"
+    source_dir = music_root / "Allie X, Guest" / "Girl With No Face (2024)"
+    destination = music_root / "Allie X" / "Girl With No Face (2024)"
+    source_dir.mkdir(parents=True)
+    track_path = source_dir / "03 - Black Eye.flac"
     track_path.write_bytes(b"downloaded audio")
+    manifest = _ownership_manifest(
+        music_root, track_path, created=[source_dir])
     album = {
         "id": "alb1", "title": "Girl With No Face", "year": 2024,
-        "artist": {"name": "Allie X"},
+        "artist": {"name": "Allie X, Guest"},
         "tracks": {"items": [
             {"id": "trk7", "title": "Black Eye", "track_number": 3},
             {"id": "trk8", "title": "Galina", "track_number": 4},
         ]},
     }
     monkeypatch.setattr(app_mod.cfg, "MUSIC_ROOT", music_root)
+    monkeypatch.setattr(app_mod.cfg, "MIGRATE_MULTI_ARTIST", True)
     monkeypatch.setattr(app_mod, "_get_token", lambda: "tok")
     monkeypatch.setattr(search_mod, "get_album", lambda *_args: album)
     monkeypatch.setattr(cat_mod, "find_existing_tracks", lambda *a, **k: ([], None))
 
     def fake_exec(queue, *args, **kwargs):
         item = queue[0]
+        assert item["_defer_post_import_relocation_handoff"] is True
         item.update({
             "n_ok": 1,
             "n_fail": 0,
             "imported": True,
-            "_resolved_post_dir": album_dir,
-            "_import_ownership": _ownership_manifest(
-                music_root, track_path, created=[album_dir]),
+            "_resolved_post_dir": source_dir,
+            "_post_import_relocation_pending": True,
+            "_import_ownership": manifest,
         })
 
     events = []
 
     def capture(job):
         events.append(("persist", copy.deepcopy(job.single)))
+        return True
+
+    authority = object()
+
+    def seal(operation_id, *, consumer, payload, authority):
+        events.append(("seal", operation_id, consumer, copy.deepcopy(payload)))
+        assert authority is authority_token
+        return "2" * 64
+
+    def persist_handoff(job, *, operation_id, handoff_hash, single):
+        events.append((
+            "handoff",
+            operation_id,
+            handoff_hash,
+            copy.deepcopy(single),
+        ))
+        return True
+
+    def acknowledge(operation_id, handoff_hash, *, authority):
+        events.append(("ack", operation_id, handoff_hash))
+        assert authority is authority_token
+
+    def relocate(
+        relocated_album,
+        _args,
+        *,
+        ownership_move_out,
+        operation_id_out,
+        authority,
+        source_dir,
+        await_handoff,
+    ):
+        events.append(("relocate", None))
+        assert relocated_album is album
+        assert source_dir == globals_source
+        assert authority is authority_token
+        assert await_handoff is True
+        before_track = ex_mod._ownership_location(
+            track_path.relative_to(music_root).as_posix(),
+            app_mod._owned_file_identity(track_path.stat()),
+        )
+        before_dir = ex_mod._ownership_location(
+            globals_source.relative_to(music_root).as_posix(),
+            app_mod._owned_file_identity(globals_source.stat()),
+        )
+        destination.parent.mkdir(parents=True)
+        globals_source.rename(destination)
+        moved_track = destination / track_path.name
+        after_track = ex_mod._ownership_location(
+            moved_track.relative_to(music_root).as_posix(),
+            app_mod._owned_file_identity(moved_track.stat()),
+        )
+        after_dir = ex_mod._ownership_location(
+            destination.relative_to(music_root).as_posix(),
+            app_mod._owned_file_identity(destination.stat()),
+        )
+        ownership_move_out.update({
+            "version": 2,
+            "file_changes": [{"before": before_track, "after": after_track}],
+            "directory_changes": [{"before": before_dir, "after": after_dir}],
+            "created_directories": [],
+            "released_files": [],
+        })
+        operation_id_out["operation_id"] = "1" * 64
+        return destination
 
     def fail_refresh(*args, **kwargs):
         events.append(("refresh", None))
         raise OSError("forced refresh failure")
 
     monkeypatch.setattr(ex_mod, "_execute_download_queue", fake_exec)
+    authority_token = authority
+    globals_source = source_dir
+    monkeypatch.setattr(
+        cat_mod, "prompt_and_migrate_multi_artist_folder", relocate)
+    monkeypatch.setattr(run_lock_mod, "current_lease", lambda: authority_token)
+    monkeypatch.setattr(
+        relocation_mod, "seal_post_import_relocation_handoff", seal)
+    monkeypatch.setattr(
+        relocation_mod, "acknowledge_post_import_relocation", acknowledge)
     monkeypatch.setattr(job_persistence, "persist", capture)
+    monkeypatch.setattr(
+        job_persistence,
+        "persist_post_import_relocation_handoff",
+        persist_handoff,
+    )
     monkeypatch.setattr(flows_mod, "_refresh_after_local_album_change", fail_refresh)
     monkeypatch.setattr(
         app_mod.cfg, "SUPPRESS_SINGLE_TRACK_GAPS", False, raising=False)
@@ -647,22 +1284,246 @@ def test_single_ownership_is_persisted_before_library_refresh(
         assert _wait_for(lambda: job.status == jm.JobStatus.FAILED)
         refresh_index = next(
             index for index, event in enumerate(events) if event[0] == "refresh")
+        seal_index = next(
+            index for index, event in enumerate(events) if event[0] == "seal")
         persisted_index, persisted = next(
+            (index, event[3])
+            for index, event in enumerate(events)
+            if event[0] == "handoff"
+        )
+        ack_index = next(
+            index for index, event in enumerate(events) if event[0] == "ack")
+        relocate_index = next(
+            index for index, event in enumerate(events)
+            if event[0] == "relocate"
+        )
+        source_persist_index, source_persisted = next(
             (index, event[1])
             for index, event in enumerate(events)
             if event[0] == "persist"
             and isinstance(event[1], dict)
-            and event[1].get("owned_path") is not None
+            and event[1].get("owned_path", {}).get("relative", "").startswith(
+                "Allie X, Guest/"
+            )
         )
-        assert persisted_index < refresh_index
+        assert source_persist_index < relocate_index
+        assert relocate_index < seal_index < persisted_index < ack_index
+        assert ack_index < refresh_index
+        assert source_persisted["dir"] == str(source_dir)
         assert persisted["album_id"] == "alb1"
         assert persisted["track_id"] == "trk7"
-        assert persisted["dir"] == str(album_dir)
+        assert persisted["dir"] == str(destination)
         detail = client.get(f"/jobs/{job.id}")
         assert detail.status_code == 200
         assert "Undo (removes track)" in detail.text
     finally:
         _remove_job(job)
+
+
+def test_relocation_handoff_failure_refreshes_recovery_and_stops(monkeypatch):
+    from types import SimpleNamespace
+
+    import pytest
+
+    import qobuz_librarian.library.post_import_relocation as relocation_mod
+    import qobuz_librarian.run_lock as run_lock_mod
+    import qobuz_librarian.web.app as app_mod
+    from qobuz_librarian.web import job_persistence
+
+    authority = object()
+    recovery_calls = []
+    job = jm.Job(id="single-handoff-failure", album_id="123")
+    source_single = {
+        "album_id": "123",
+        "track_id": "track-1",
+        "owned_path": {"relative": "Artist, Guest/Album/01.flac"},
+    }
+    job.single = {
+        "album_id": "123",
+        "track_id": "track-1",
+        "owned_path": {"relative": "Artist/Album/01.flac"},
+    }
+    item = {
+        "album": {"id": "123"},
+        "_post_import_relocation_operation_id": "1" * 64,
+    }
+
+    monkeypatch.setattr(run_lock_mod, "current_lease", lambda: authority)
+    monkeypatch.setattr(
+        relocation_mod,
+        "seal_post_import_relocation_handoff",
+        lambda *_args, **_kwargs: "2" * 64,
+    )
+    monkeypatch.setattr(
+        relocation_mod,
+        "acknowledge_post_import_relocation",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an unpersisted handoff must never be acknowledged"
+        ),
+    )
+    def reject_handoff(persisted_job, **_kwargs):
+        assert persisted_job._preserve_persisted_single is True
+        return False
+
+    monkeypatch.setattr(
+        job_persistence,
+        "persist_post_import_relocation_handoff",
+        reject_handoff,
+    )
+    monkeypatch.setattr(
+        job_persistence,
+        "post_import_relocation_handoff_persisted",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        app_mod,
+        "_record_startup_recovery",
+        lambda lease: recovery_calls.append(lease) or SimpleNamespace(
+            status=SimpleNamespace(value="attention_required")
+        ),
+    )
+
+    with pytest.raises(relocation_mod.PostImportRelocationAttention):
+        app_mod._persist_single_download_undo(
+            job,
+            item,
+            ownership_valid=True,
+            source_single=source_single,
+            destination_single=job.single,
+        )
+
+    assert recovery_calls == [authority]
+    assert job.single == source_single
+    assert job._preserve_persisted_single is False
+
+
+def test_relocation_handoff_uncertainty_is_frozen_before_recovery(monkeypatch):
+    import qobuz_librarian.library.post_import_relocation as relocation_mod
+    import qobuz_librarian.run_lock as run_lock_mod
+    import qobuz_librarian.web.app as app_mod
+    from qobuz_librarian.web import job_persistence
+
+    authority = object()
+    job = jm.Job(id="single-handoff-uncertain", album_id="123")
+    destination_single = {
+        "album_id": "123",
+        "track_id": "track-1",
+        "owned_path": {"relative": "Artist/Album/01.flac"},
+    }
+    job.single = destination_single
+    item = {
+        "album": {"id": "123"},
+        "_post_import_relocation_operation_id": "1" * 64,
+    }
+
+    monkeypatch.setattr(run_lock_mod, "current_lease", lambda: authority)
+    monkeypatch.setattr(
+        relocation_mod,
+        "seal_post_import_relocation_handoff",
+        lambda *_args, **_kwargs: "2" * 64,
+    )
+    monkeypatch.setattr(
+        job_persistence,
+        "persist_post_import_relocation_handoff",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        job_persistence,
+        "post_import_relocation_handoff_persisted",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        app_mod,
+        "_record_startup_recovery",
+        lambda _authority: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        app_mod._persist_single_download_undo(
+            job,
+            item,
+            ownership_valid=True,
+            source_single={
+                "album_id": "123",
+                "track_id": "track-1",
+                "owned_path": {
+                    "relative": "Artist, Guest/Album/01.flac",
+                },
+            },
+            destination_single=destination_single,
+        )
+
+    assert job._preserve_persisted_single is True
+    assert item["_post_import_relocation_handoff_unknown"] is True
+    assert job.single == destination_single
+
+
+def test_proven_handoff_resyncs_frozen_destination_before_unfreezing(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    import qobuz_librarian.library.post_import_relocation as relocation_mod
+    import qobuz_librarian.run_lock as run_lock_mod
+    import qobuz_librarian.web.app as app_mod
+    from qobuz_librarian.web import job_persistence
+
+    authority = object()
+    job = jm.Job(id="single-handoff-proven", album_id="123")
+    source_single = {
+        "album_id": "123",
+        "track_id": "track-1",
+        "owned_path": {"relative": "Artist, Guest/Album/01.flac"},
+    }
+    destination_single = {
+        "album_id": "123",
+        "track_id": "track-1",
+        "owned_path": {"relative": "Artist/Album/01.flac"},
+    }
+    # Model the waiting preserving save having reloaded the durable source into
+    # memory after the worker froze its immutable destination payload.
+    job.single = source_single
+    item = {
+        "album": {"id": "123"},
+        "_post_import_relocation_operation_id": "1" * 64,
+    }
+
+    monkeypatch.setattr(run_lock_mod, "current_lease", lambda: authority)
+    monkeypatch.setattr(
+        relocation_mod,
+        "seal_post_import_relocation_handoff",
+        lambda *_args, **_kwargs: "2" * 64,
+    )
+    monkeypatch.setattr(
+        job_persistence,
+        "persist_post_import_relocation_handoff",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        job_persistence,
+        "post_import_relocation_handoff_persisted",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        app_mod,
+        "_record_startup_recovery",
+        lambda _authority: SimpleNamespace(
+            status=SimpleNamespace(value="clear")
+        ),
+    )
+
+    app_mod._persist_single_download_undo(
+        job,
+        item,
+        ownership_valid=True,
+        source_single=source_single,
+        destination_single=destination_single,
+    )
+
+    assert job.single == destination_single
+    assert job._preserve_persisted_single is False
+    assert item["_post_import_relocation_final_proven"] is True
+    assert "_post_import_relocation_handoff_unknown" not in item
 
 
 def test_get_track_downloads_one_without_hiding_album_gaps_by_default(

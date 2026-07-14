@@ -1497,6 +1497,50 @@ def test_durable_startup_recovery_pauses_mutations_but_not_browsing(
     assert message in blocked.text
 
 
+def test_folder_move_recovery_pause_names_cause_and_exact_paths(
+        client, monkeypatch, tmp_path):
+    from qobuz_librarian.library.post_import_relocation import (
+        RelocationRecoveryResult,
+        RelocationRecoveryStatus,
+    )
+    from qobuz_librarian.queue.startup_recovery import (
+        StartupRecoveryResult,
+        StartupRecoveryStatus,
+    )
+    from qobuz_librarian.web import app as webapp
+
+    affected_paths = (
+        tmp_path / "music" / "Artist One" / "Album One",
+        tmp_path / "music" / "Artist Two" / "Album Two",
+    )
+    monkeypatch.setattr(webapp, "_STARTUP_RECOVERY_UNKNOWN", False)
+    monkeypatch.setattr(
+        webapp,
+        "_STARTUP_RECOVERY_RESULT",
+        StartupRecoveryResult(
+            StartupRecoveryStatus.ATTENTION_REQUIRED,
+            reason="post-import-relocation-unsettled",
+            post_import_relocation=RelocationRecoveryResult(
+                RelocationRecoveryStatus.ATTENTION_REQUIRED,
+                "exact relocation evidence changed",
+                affected_paths,
+            ),
+        ),
+    )
+
+    blocked = client.post(
+        "/download", data={"album_id": "1"}, follow_redirects=False
+    )
+
+    assert blocked.status_code == 503
+    assert "interrupted library-folder move" in blocked.text
+    assert "exact relocation evidence changed" in blocked.text
+    assert "Paths needing attention" in blocked.text
+    assert all(str(path) in blocked.text for path in affected_paths)
+    assert "Post-import folder-move recovery needs attention" in blocked.text
+    assert "interrupted download" not in blocked.text
+
+
 @pytest.mark.parametrize(
     ("origin_value", "expected", "unexpected"),
     [
@@ -4761,6 +4805,245 @@ def test_durable_completion_ack_survives_ordinary_job_saves(monkeypatch):
         job_created_at=job.created_at,
         album_id="124",
     ) is False
+
+
+def test_single_relocation_handoff_is_atomic_and_exact(monkeypatch):
+    import hashlib
+    import json
+
+    from qobuz_librarian.web import job_persistence
+
+    job_persistence._reset_for_tests()
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence.init()
+
+    job = jm.Job(id="relocated-single", album_id="123")
+    assert job_persistence.persist(job)
+    job.single = {
+        "album_id": "123",
+        "owned_path": {"relative": "Artist/Album/01.flac"},
+    }
+    consumer = {
+        "kind": "web-single",
+        "job_id": job.id,
+        "job_created_at": job.created_at,
+        "album_id": job.album_id,
+    }
+    handoff_hash = hashlib.sha256(json.dumps(
+        {"consumer": consumer, "payload": job.single},
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    operation_id = "1" * 64
+    handoff = {"consumer": consumer, "hash": handoff_hash}
+
+    assert job_persistence.persist_post_import_relocation_handoff(
+        job,
+        operation_id=operation_id,
+        handoff_hash=handoff_hash,
+        single=job.single,
+    ) is True
+    assert job_persistence.load_one(job.id)["single"] == job.single
+    assert job_persistence.post_import_relocation_handoff_persisted(
+        operation_id, handoff
+    ) is True
+    assert job_persistence.persist_post_import_relocation_handoff(
+        job,
+        operation_id=operation_id,
+        handoff_hash=handoff_hash,
+        single=job.single,
+    ) is True
+
+    job.single["unexpected"] = True
+    assert job_persistence.persist_post_import_relocation_handoff(
+        job,
+        operation_id=operation_id,
+        handoff_hash=handoff_hash,
+        single=job.single,
+    ) is False
+    assert "unexpected" not in job_persistence.load_one(job.id)["single"]
+    assert job_persistence.post_import_relocation_handoff_persisted(
+        operation_id, handoff
+    ) is True
+
+    assert job_persistence.persist(job)
+    assert job_persistence.post_import_relocation_handoff_persisted(
+        operation_id, handoff
+    ) is None
+    job_persistence.delete(job.id)
+    assert job_persistence.post_import_relocation_handoff_persisted(
+        operation_id, handoff
+    ) is False
+
+
+@pytest.mark.parametrize(
+    ("durable_relative", "memory_relative"),
+    [
+        ("Artist, Guest/Album/01.flac", "Artist/Album/01.flac"),
+        ("Artist/Album/01.flac", "Artist, Guest/Album/01.flac"),
+    ],
+)
+def test_uncertain_terminal_save_preserves_exact_durable_single(
+    monkeypatch,
+    durable_relative,
+    memory_relative,
+):
+    from qobuz_librarian.web import job_persistence
+
+    job_persistence._reset_for_tests()
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence.init()
+    job = jm.Job(id="uncertain-single", album_id="123")
+    durable = {
+        "album_id": "123",
+        "track_id": "track-1",
+        "owned_path": {"relative": durable_relative},
+    }
+    memory = {
+        "album_id": "123",
+        "track_id": "track-1",
+        "owned_path": {"relative": memory_relative},
+    }
+    job.single = durable
+    assert job_persistence.persist(job)
+    job.single = memory
+    job.status = jm.JobStatus.FAILED
+    job._preserve_persisted_single = True
+    jm.registry.add(job)
+    try:
+        jm._finish_task_phase(job)
+        assert job_persistence.load_one(job.id)["single"] == durable
+        assert job.single == durable
+        assert job._preserve_persisted_single is True
+
+        job.single = memory
+        jm._finish_task_phase(job)
+        assert job_persistence.load_one(job.id)["single"] == durable
+        assert job.single == durable
+
+        job_persistence.delete(job.id)
+        job.single = memory
+        jm._finish_task_phase(job)
+        assert job_persistence.load_one(job.id) is None
+        assert job.single["track_id"] == "track-1"
+        assert job._single_undo_unavailable is True
+    finally:
+        _remove_job(job)
+
+
+def test_waiting_save_rechecks_the_preserve_gate_under_the_job_lock(
+    monkeypatch,
+):
+    from qobuz_librarian.web import job_persistence
+
+    class SignallingLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self.signal_waiter = False
+            self.waiting = threading.Event()
+
+        def acquire(self, *args, **kwargs):
+            if self.signal_waiter:
+                self.waiting.set()
+            return self._lock.acquire(*args, **kwargs)
+
+        def release(self):
+            self._lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self.release()
+
+    job_persistence._reset_for_tests()
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence.init()
+    job = jm.Job(id="single-save-race", album_id="123")
+    source = {
+        "album_id": "123",
+        "owned_path": {"relative": "Artist, Guest/Album/01.flac"},
+    }
+    destination = {
+        "album_id": "123",
+        "owned_path": {"relative": "Artist/Album/01.flac"},
+    }
+    job.single = source
+    assert job_persistence.persist(job)
+    job.single = destination
+
+    lock = SignallingLock()
+    job._lock = lock
+    saved = []
+    lock.acquire()
+    lock.signal_waiter = True
+    worker = threading.Thread(
+        target=lambda: saved.append(job_persistence.persist(job)),
+    )
+    worker.start()
+    try:
+        assert lock.waiting.wait(timeout=2)
+        job._preserve_persisted_single = True
+    finally:
+        lock.release()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert saved == [True]
+    assert job_persistence.load_one(job.id)["single"] == source
+    assert job.single == source
+
+
+def test_handoff_uses_frozen_destination_after_preserving_save_reloads_source(
+    monkeypatch,
+):
+    from qobuz_librarian.web import job_persistence
+
+    job_persistence._reset_for_tests()
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence.init()
+    job = jm.Job(id="single-handoff-race", album_id="123")
+    source = {
+        "album_id": "123",
+        "owned_path": {"relative": "Artist, Guest/Album/01.flac"},
+    }
+    destination = {
+        "album_id": "123",
+        "owned_path": {"relative": "Artist/Album/01.flac"},
+    }
+    job.single = source
+    assert job_persistence.persist(job)
+    consumer = {
+        "kind": "web-single",
+        "job_id": job.id,
+        "job_created_at": job.created_at,
+        "album_id": job.album_id,
+    }
+    handoff_hash = job_persistence._relocation_handoff_hash(
+        consumer,
+        destination,
+    )
+    assert handoff_hash is not None
+
+    with job._lock:
+        job._preserve_persisted_single = True
+        job.single = destination
+    # This is the deterministic interleaving: a generic save that was waiting
+    # on the gate preserves the source row and reloads it into live memory.
+    assert job_persistence.persist(job)
+    assert job.single == source
+
+    assert job_persistence.persist_post_import_relocation_handoff(
+        job,
+        operation_id="1" * 64,
+        handoff_hash=handoff_hash,
+        single=destination,
+    ) is True
+    assert job_persistence.load_one(job.id)["single"] == destination
+    assert job.single == destination
 
 
 def test_persistence_never_restores_a_recovery_as_reviewable(monkeypatch):

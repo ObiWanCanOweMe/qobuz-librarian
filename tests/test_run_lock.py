@@ -191,6 +191,61 @@ def test_cli_refuses_unsettled_durable_recovery_after_acquiring_lock(
     assert lease.closed is True
 
 
+def test_cli_folder_move_recovery_pause_names_cause_and_exact_paths(
+        monkeypatch, capsys, tmp_path):
+    from qobuz_librarian import cli, run_lock
+    from qobuz_librarian.library.post_import_relocation import (
+        RelocationRecoveryResult,
+        RelocationRecoveryStatus,
+    )
+    from qobuz_librarian.queue.startup_recovery import (
+        StartupRecoveryResult,
+        StartupRecoveryStatus,
+    )
+
+    class Lease:
+        closed = False
+
+        def intact(self):
+            return not self.closed
+
+        def close(self):
+            self.closed = True
+
+    affected_paths = (
+        tmp_path / "music" / "Artist One" / "Album One",
+        tmp_path / "music" / "Artist Two" / "Album Two",
+    )
+    lease = Lease()
+    monkeypatch.setattr(run_lock, "acquire", lambda: lease)
+    monkeypatch.setattr(
+        cli,
+        "_recover_startup_queue",
+        lambda authority: StartupRecoveryResult(
+            StartupRecoveryStatus.ATTENTION_REQUIRED,
+            reason="post-import-relocation-unsettled",
+            post_import_relocation=RelocationRecoveryResult(
+                RelocationRecoveryStatus.ATTENTION_REQUIRED,
+                "exact relocation evidence changed",
+                affected_paths,
+            ),
+        ),
+    )
+
+    with pytest.raises(SystemExit) as stopped:
+        cli.acquire_run_lock()
+
+    message = capsys.readouterr().err
+    assert stopped.value.code == 1
+    assert lease.closed is True
+    assert "interrupted library-folder move" in message
+    assert "exact relocation evidence changed" in message
+    assert "Paths needing attention" in message
+    assert all(str(path) in message for path in affected_paths)
+    assert "Post-import folder-move recovery needs attention" in message
+    assert "interrupted download" not in message
+
+
 def test_cli_retry_choice_reopens_one_exact_blocked_terminal_queue(monkeypatch):
     from qobuz_librarian import cli, run_lock
     from qobuz_librarian.completion import (

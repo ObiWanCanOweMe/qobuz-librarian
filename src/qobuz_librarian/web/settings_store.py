@@ -30,6 +30,9 @@ BEHAVIOR_FIELDS = [
      "When several editions are available, choose the highest quality allowed "
      "by your download quality setting. Turn this off to favour the original "
      "edition."),
+    ("MIGRATE_MULTI_ARTIST", "Migrate multi-artist folders",
+     "After import, file albums credited to multiple artists under the primary "
+     "album artist instead of a combined artist folder."),
     ("DOWNSAMPLE_HIRES_ENABLED", "Downsample new hi-res downloads",
      "Before import, reduce newly downloaded hi-res FLACs to 44.1 or 48 kHz. "
      "The hi-res files are not kept."),

@@ -43,7 +43,15 @@ These settings apply to new jobs. A field you change on the Settings page keeps 
 | `AUTO_UPGRADE_ENABLED` | `false` | CLI-only compatibility option: during CLI gap-fill walks, also offer eligible quality upgrades. In the web UI, use Upgrade for quality work. |
 | `DOWNSAMPLE_HIRES_ENABLED` | `false` | Downsample hi-res FLACs as they download (see below) |
 | `UPGRADE_SINGLES_ENABLED` | `false` | Let the Upgrade walk re-rip tracks you pulled as singles |
+| `MIGRATE_MULTI_ARTIST` | `false` | Re-file `A, B/Album` under `A/Album` after import |
 | `CONSOLIDATE` | `false` | Merge sibling/duplicate album folders (CLI-only) |
+
+`MIGRATE_MULTI_ARTIST` affects new imports only. It never replaces a name that
+already exists under the primary artist; conflicting files stay in their
+original folder for review. If Beets splits a gap-filled album between the
+combined and primary artist folders, Qobuz Librarian safely reunites only the
+non-conflicting files regardless of this preference. Both operations resume or
+roll back after a restart before other library work begins.
 
 `DOWNSAMPLE_HIRES_ENABLED` only touches new downloads (88.2 / 176.4 / 352.8 kHz → 44.1; 96 / 192 / 384 → 48; bit depth preserved, originals replaced atomically). To downsample hi-res already in your library, use the on-demand **Downsample** mode instead.
 
@@ -185,3 +193,4 @@ On first run the Search page *offers* a one-time baseline scan (`AUTO_LIBRARY_SC
 - **Upgrade** and **Downsample** change files only when you start them. Upgrade backs up the originals first (`UPGRADE_BACKUP_RETENTION_DAYS`); Downsample rewrites in place after verifying each file decodes — or, with *Keep originals when downsampling* set to keep (`DOWNSAMPLE_KEEP_ORIGINALS`; you're asked to choose keep or delete on your first downsample), parks the hi-res copies in the backup area first so the rewrite can be undone from Settings → Diagnostics until the retention window ends.
 - **Lyrics** writes tags or `.lrc` sidecars, not the audio.
 - **Consolidation** (`CONSOLIDATE`, off) merges duplicate folders, CLI-only (it needs per-folder confirmation).
+- **`MIGRATE_MULTI_ARTIST`** (off) re-files `A, B/Album` under `A/Album` after import.

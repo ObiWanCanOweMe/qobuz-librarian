@@ -3,6 +3,7 @@ import math
 from datetime import datetime, timezone
 
 from qobuz_librarian import config as cfg
+from qobuz_librarian import run_lock
 from qobuz_librarian.download import (
     download_staged_files,
     retain_download_staging,
@@ -43,6 +44,7 @@ from qobuz_librarian.library.catalog import (
     find_extras_in_existing,
     folder_holds_all_tracks,
     is_lossless_album,
+    prompt_and_migrate_multi_artist_folder,
     track_signatures_for_album_dirs,
 )
 from qobuz_librarian.library.scanner import (
@@ -1461,14 +1463,40 @@ def process_album(album, args, *, allow_force=True, label=None,
             log.info(fmt(C.YELLOW,
                 "\n  --consolidate requested but beets import didn't succeed — skipping."))
 
-    # ── Post-import cleanup: duplicate cover art ────────────────────────────
+    # ── Post-import cleanup: folder layout and duplicate cover art ──────────
     if imported:
-        post_dir = (
-            find_album_dir_by_track_signatures(post_import_signatures)
-            if post_import_signatures else None
-        )
+        strict_success = n_fail == 0 and n_lossy == 0
+        post_dir_exact = False
+        if getattr(args, "migrate_multi_artist", False) and strict_success:
+            migration_source = (
+                find_album_dir_by_track_signatures(post_import_signatures)
+                if post_import_signatures else None
+            )
+            if migration_source is None:
+                log.info(fmt(
+                    C.YELLOW,
+                    "  ⚠  Multi-artist folder filing was skipped because "
+                    "the exact imported album could not be located.",
+                ))
+                post_dir = None
+            else:
+                post_dir = prompt_and_migrate_multi_artist_folder(
+                    album,
+                    args,
+                    authority=run_lock.current_lease(),
+                    source_dir=migration_source,
+                )
+                post_dir_exact = post_dir is not None
+        else:
+            post_dir = None
         if post_dir is None:
-            post_dir = find_album_dir_filesystem(album)
+            post_dir = (
+                find_album_dir_by_track_signatures(post_import_signatures)
+                if post_import_signatures else None
+            )
+            post_dir_exact = post_dir is not None
+            if post_dir is None:
+                post_dir = find_album_dir_filesystem(album)
         # A brand-new album can land in a folder the cached listing predates;
         # clear the cache and look once more before giving up, or art cleanup
         # and the lyric-retry queue silently no-op.
@@ -1479,10 +1507,48 @@ def process_album(album, args, *, allow_force=True, label=None,
             if resampled_n > 0:
                 mark_local_album_capped(post_dir, qobuz_album=album)
             split_artist = (album.get("artist") or {}).get("name") or ""
-            if _is_split_album_merge(album_dir, post_dir, split_artist):
-                log.info(fmt(C.YELLOW,
-                    "  ⚠  Beets placed this album across two artist folders; "
-                    "both were left unchanged for manual review."))
+            if (
+                post_dir_exact
+                and _is_split_album_merge(album_dir, post_dir, split_artist)
+            ):
+                from qobuz_librarian.library.post_import_relocation import (
+                    PostImportRelocationAttention,
+                    PostImportRelocationUnavailable,
+                    RelocationKind,
+                    relocate_post_import_album,
+                )
+
+                try:
+                    relocation = relocate_post_import_album(
+                        album_dir,
+                        post_dir,
+                        kind=RelocationKind.SPLIT_GAP_FILL,
+                        authority=run_lock.current_lease(),
+                    )
+                except PostImportRelocationAttention:
+                    raise
+                except (PostImportRelocationUnavailable, OSError, ValueError) as exc:
+                    log.info(fmt(
+                        C.YELLOW,
+                        "  ⚠  Beets split this album across two artist folders; "
+                        "the safe reunion was refused and both copies were kept.",
+                    ))
+                    vlog(f"split-folder reunion refused: {exc}")
+                else:
+                    if relocation.changed:
+                        message = (
+                            f"  ✓  Reunited {relocation.published_files} existing "
+                            f"file(s) in the primary-artist folder."
+                        )
+                        if relocation.reason:
+                            message += f" {relocation.reason.capitalize()}."
+                        log.info(fmt(C.GREEN, message))
+                    else:
+                        log.info(fmt(
+                            C.YELLOW,
+                            "  ⚠  Split-folder detected, but every source name "
+                            "already exists at the destination; both were kept.",
+                        ))
             # Resolve transient-lyric signatures captured pre-beets
             if transient_lyric_sigs:
                 resolved = _resolve_signatures_to_paths(

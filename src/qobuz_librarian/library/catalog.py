@@ -446,7 +446,7 @@ def find_album_dir_by_track_signatures(signatures):
 
     from qobuz_librarian.integrations.rip import _flac_signature
 
-    counts = {}
+    matches = {}
     for artist_dir in _artist_dirs_for_track_signatures(wanted):
         try:
             flacs = sorted(p for p in artist_dir.rglob("*.flac") if p.is_file())
@@ -459,11 +459,14 @@ def find_album_dir_by_track_signatures(signatures):
             album_dir = fp.parent
             if _DISC_FOLDER_RE.match(album_dir.name):
                 album_dir = album_dir.parent
-            counts[album_dir] = counts.get(album_dir, 0) + 1
+            matches.setdefault(album_dir, set()).add(sig)
 
-    if not counts:
-        return None
-    return max(counts, key=lambda p: counts[p])
+    complete = [
+        album_dir
+        for album_dir, matched in matches.items()
+        if matched == wanted
+    ]
+    return complete[0] if len(complete) == 1 else None
 
 
 def find_existing_tracks(qobuz_album, *, album_dir=None):
@@ -2072,21 +2075,114 @@ def _rollback_migration_rename(source_parent_fd, source_name,
     return True
 
 
+def multi_artist_migration_destination(album, source_dir):
+    """Return the opt-in primary-artist destination for an exact album path."""
+    current = Path(source_dir)
+    qartist_raw = (album.get("artist") or {}).get("name") or ""
+    if not qartist_raw:
+        return None
+    if qartist_raw.lower().strip() in {
+        "various artists", "various", "va", "compilations", "soundtrack",
+    }:
+        return None
+
+    primary = beets_sanitize(_primary_artist_of(qartist_raw))
+    if not primary or normalize(current.parent.name) == normalize(primary):
+        return None
+
+    # Keep the historical comma-only guard.  Applying the primary-name test
+    # to a real single-artist name such as "Tyler, The Creator" would silently
+    # file it below "Tyler".
+    if not _is_migration_candidate(current.parent.name, qartist_raw):
+        return None
+    return Path(config.MUSIC_ROOT) / primary / current.name
+
+
 def prompt_and_migrate_multi_artist_folder(
     album,
     args,
     *,
     ownership_move_out=None,
+    operation_id_out=None,
+    authority=None,
+    source_dir=None,
+    await_handoff=False,
 ):
-    """Leave imported multi-artist folders unchanged.
+    """Safely move an imported ``Primary, Other/Album`` below ``Primary``.
 
-    This compatibility boundary remains for older callers, but automatic
-    post-import folder moves are not offered because a filesystem rename and
-    the Beets path update cannot be committed as one restart-safe operation.
+    The public option remains opt-in.  Publication is additive and
+    crash-recoverable: an existing destination name is kept, never replaced.
     """
-    if isinstance(ownership_move_out, dict):
-        ownership_move_out.clear()
-    return find_album_dir_filesystem(album)
+    from qobuz_librarian import run_lock
+    from qobuz_librarian.library.post_import_relocation import (
+        PostImportRelocationAttention,
+        PostImportRelocationUnavailable,
+        RelocationKind,
+        relocate_post_import_album,
+    )
+
+    capture = ownership_move_out if isinstance(ownership_move_out, dict) else None
+    if capture is not None:
+        capture.clear()
+    operation_capture = (
+        operation_id_out if isinstance(operation_id_out, dict) else None
+    )
+    if await_handoff is True and operation_capture is None:
+        raise ValueError("a deferred relocation requires an operation receiver")
+    if type(await_handoff) is not bool:
+        raise ValueError("the relocation handoff option is invalid")
+    if operation_capture is not None:
+        operation_capture.clear()
+
+    current = (
+        Path(source_dir)
+        if source_dir is not None
+        else find_album_dir_filesystem(album)
+    )
+    if current is None:
+        return None
+
+    destination = multi_artist_migration_destination(album, current)
+    if destination is None:
+        return current
+    lease = authority if authority is not None else run_lock.current_lease()
+    try:
+        relocate_kwargs = {
+            "kind": RelocationKind.WHOLE_ALBUM,
+            "authority": lease,
+        }
+        if await_handoff is True:
+            relocate_kwargs["await_handoff"] = True
+        result = relocate_post_import_album(
+            current,
+            destination,
+            **relocate_kwargs,
+        )
+    except PostImportRelocationAttention:
+        raise
+    except (PostImportRelocationUnavailable, OSError, ValueError) as exc:
+        log.info(fmt(
+            C.YELLOW,
+            "  ⚠  Multi-artist folder move was skipped safely; "
+            f"the imported files remain at {current}."
+        ))
+        vlog(f"multi-artist folder move refused: {exc}")
+        return current
+
+    if not result.changed:
+        if result.reason:
+            log.info(fmt(C.YELLOW, f"  ⚠  Multi-artist folder unchanged: {result.reason}."))
+        return current
+
+    if capture is not None and result.ownership_receipt is not None:
+        capture.update(result.ownership_receipt)
+    if operation_capture is not None:
+        operation_capture["operation_id"] = result.operation_id
+    message = f"  ✓  Filed imported album under primary artist: {destination}."
+    if result.reason:
+        message += f" {result.reason.capitalize()}."
+    log.info(fmt(C.GREEN, message))
+    return destination
 
 
 # ── Qobuz catalog matching ────────────────────────────────────────────────────

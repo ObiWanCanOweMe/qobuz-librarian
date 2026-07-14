@@ -679,8 +679,8 @@ def test_executor_auto_downsample_marker_prefers_signature_over_old_folder(
     assert marked == [final_dir]
 
 
-def test_executor_leaves_split_multi_artist_folders_unchanged(
-        monkeypatch, tmp_path):
+def test_executor_reunites_split_multi_artist_folders(monkeypatch, tmp_path):
+    from qobuz_librarian.library.post_import_relocation import RelocationResult
     from qobuz_librarian.queue import executor
 
     old_dir = tmp_path / "music" / "Artist, Guest" / "Album"
@@ -695,6 +695,18 @@ def test_executor_leaves_split_multi_artist_folders_unchanged(
     monkeypatch.setattr(
         executor, "find_album_dir_by_track_signatures", lambda _sigs: final_dir)
     monkeypatch.setattr(executor, "_is_split_album_merge", lambda *_args: True)
+    relocations = []
+
+    def relocate(source, destination, *, kind, authority):
+        relocations.append((source, destination, kind, authority))
+        return RelocationResult(
+            destination=destination,
+            published_files=1,
+            ownership_receipt={"version": 2},
+            changed=True,
+        )
+
+    monkeypatch.setattr(executor, "relocate_post_import_album", relocate)
 
     item = {
         "album": {"artist": {"name": "Artist"}, "tracks": {"items": []}},
@@ -712,6 +724,13 @@ def test_executor_leaves_split_multi_artist_folders_unchanged(
         item, Namespace(no_import=False, consolidate=False),
         imported_globally=True)
 
+    assert relocations == [(
+        old_dir,
+        final_dir,
+        executor.RelocationKind.SPLIT_GAP_FILL,
+        None,
+    )]
+    assert item["_resolved_post_dir"] == final_dir
     assert old_track.read_bytes() == b"old"
     assert new_track.read_bytes() == b"new"
 
@@ -744,8 +763,9 @@ def test_executor_self_heal_retry_no_files_keeps_first_download_state(
         executor, "_staged_album_dirs",
         lambda _item: [first_staged] if first_staged.exists() else [],
     )
+    # Production threads the exact held run-lock lease into resolution.
     monkeypatch.setattr(executor, "_resolve_queue_item",
-                        lambda item, _args, imported: {
+                        lambda item, _args, imported, *, authority=None: {
                             "result": "imported" if imported else item.get("result"),
                             "n_ok": item.get("n_ok", 0),
                         })
@@ -943,7 +963,7 @@ def test_executor_per_album_isolation_one_album_failure_keeps_others(monkeypatch
         executor, "retain_download_staging", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(executor, "_consolidate_duplicate_albums", lambda: None)
     monkeypatch.setattr(executor, "_resolve_queue_item",
-                        lambda item, args, imported_globally: {
+                        lambda item, args, imported_globally, *, authority=None: {
                             "dir": item["album_dir"], "imported": imported_globally,
                             "result": "downloaded" if imported_globally else "failed",
                             "n_ok": item.get("n_ok", 0),
@@ -1036,7 +1056,7 @@ def test_partial_beets_import_retains_exact_run_and_queue_item(
     monkeypatch.setattr(
         executor,
         "_resolve_queue_item",
-        lambda queue_item, _args, imported: {
+        lambda queue_item, _args, imported, *, authority=None: {
             "result": queue_item.get("result"),
             "imported": imported,
             "n_ok": queue_item.get("n_ok", 0),
@@ -1101,7 +1121,7 @@ def test_executor_keeps_only_failed_downloads_for_retry(monkeypatch, tmp_path):
     monkeypatch.setattr(executor, "beets_import_albums", lambda _d: "ok")
     monkeypatch.setattr(executor, "_consolidate_duplicate_albums", lambda: None)
     monkeypatch.setattr(executor, "_resolve_queue_item",
-                        lambda item, args, ok: {
+                        lambda item, args, ok, *, authority=None: {
                             "dir": None, "imported": ok,
                             "result": "downloaded" if item["n_ok"] else "failed",
                             "n_ok": item["n_ok"], "n_fail": 0, "n_lossy": 0,
@@ -1544,6 +1564,7 @@ def test_durable_retry_stops_without_legacy_resolution(monkeypatch):
 
 def test_recovered_completion_is_saved_and_published_without_execution(
         monkeypatch, tmp_path):
+    from qobuz_librarian import run_lock
     from qobuz_librarian.completion import (
         CompletionOrigin,
         CompletionOriginKind,
@@ -1634,12 +1655,20 @@ def test_recovered_completion_is_saved_and_published_without_execution(
         lambda _dirs: None,
     )
     monkeypatch.setattr(executor, "log_fetch", lambda _payload: None)
+    monkeypatch.setattr(
+        executor,
+        "prompt_and_migrate_multi_artist_folder",
+        lambda *_a, **_kw: pytest.fail(
+            "durable recovery repeated its completed filing action"
+        ),
+    )
 
     args = Namespace(
         dry_run=False,
         no_import=False,
         no_downsample=True,
         consolidate=False,
+        migrate_multi_artist=True,
     )
     results, drained = executor._execute_download_queue(
         queue,
@@ -1667,8 +1696,10 @@ def test_executor_resumes_exact_saved_album_before_staging_preflight(
     )
 
     staging = tmp_path / "staging"
+    album_dir = tmp_path / "music" / "Artist, Guest" / "Album"
     post_dir = tmp_path / "music" / "Artist" / "Album"
     staging.mkdir()
+    album_dir.mkdir(parents=True)
     post_dir.mkdir(parents=True)
     monkeypatch.setattr(cfg, "STAGING_DIR", staging)
     monkeypatch.setattr(cfg, "QUEUE_JOURNAL_DIR", tmp_path / "journals")
@@ -1683,9 +1714,9 @@ def test_executor_resumes_exact_saved_album_before_staging_preflight(
     item = _qitem(
         title="Album",
         album=album,
-        album_dir=None,
+        album_dir=album_dir,
         missing=album["tracks"]["items"],
-        present=[],
+        present=[{"id": "present-track"}],
     )
     queue = [item]
     saved = queue_state.save_queue_journal(
@@ -1752,6 +1783,13 @@ def test_executor_resumes_exact_saved_album_before_staging_preflight(
         lambda _dirs: None,
     )
     monkeypatch.setattr(executor, "log_fetch", lambda _payload: None)
+    monkeypatch.setattr(
+        executor,
+        "relocate_post_import_album",
+        lambda *_a, **_kw: pytest.fail(
+            "durable completion repeated its completed filing action"
+        ),
+    )
 
     args = Namespace(
         dry_run=False,

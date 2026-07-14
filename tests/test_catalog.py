@@ -2,6 +2,8 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from qobuz_librarian import config
 from qobuz_librarian.library import catalog
 from qobuz_librarian.library.catalog import (
@@ -42,6 +44,94 @@ def test_automatic_multi_artist_migration_is_fail_closed(
     assert source_track.read_bytes() == b"source"
     assert destination_track.read_bytes() == b"destination"
     assert capture == {}
+
+
+def test_multi_artist_migration_uses_the_exact_imported_source(
+        tmp_path, monkeypatch):
+    from qobuz_librarian.library import post_import_relocation
+
+    music_root = tmp_path / "music"
+    source = music_root / "Artist, Other" / "Album"
+    destination = music_root / "Artist" / "Album"
+    source.mkdir(parents=True)
+    monkeypatch.setattr(config, "MUSIC_ROOT", music_root)
+    monkeypatch.setattr(
+        catalog,
+        "find_album_dir_filesystem",
+        lambda _album: pytest.fail("fuzzy lookup replaced an exact import path"),
+    )
+    seen = []
+
+    def relocate(actual_source, actual_destination, *, kind, authority):
+        seen.append((actual_source, actual_destination, kind, authority))
+        return post_import_relocation.RelocationResult(
+            destination=actual_destination,
+            published_files=1,
+            ownership_receipt={"version": 2},
+            changed=True,
+        )
+
+    monkeypatch.setattr(
+        post_import_relocation,
+        "relocate_post_import_album",
+        relocate,
+    )
+    authority = object()
+    capture = {}
+
+    result = catalog.prompt_and_migrate_multi_artist_folder(
+        {"artist": {"name": "Artist"}},
+        SimpleNamespace(yes=True),
+        authority=authority,
+        ownership_move_out=capture,
+        source_dir=source,
+    )
+
+    assert result == destination
+    assert capture == {"version": 2}
+    assert seen == [(
+        source,
+        destination,
+        post_import_relocation.RelocationKind.WHOLE_ALBUM,
+        authority,
+    )]
+
+
+def test_signature_album_lookup_requires_one_unique_complete_match(
+        tmp_path, monkeypatch):
+    from qobuz_librarian.integrations import rip
+
+    music_root = tmp_path / "music"
+    artist = music_root / "Artist"
+    partial = artist / "Partial"
+    complete = artist / "Complete"
+    duplicate = artist / "Duplicate"
+    partial.mkdir(parents=True)
+    signature_one = ("Artist", "Album", "One", "ISRC-1")
+    signature_two = ("Artist", "Album", "Two", "ISRC-2")
+    signatures = {}
+
+    def add_track(folder, name, signature):
+        track = folder / name
+        track.write_bytes(b"audio")
+        signatures[track] = signature
+
+    add_track(partial, "01.flac", signature_one)
+    monkeypatch.setattr(config, "MUSIC_ROOT", music_root)
+    monkeypatch.setattr(rip, "_flac_signature", signatures.get)
+
+    wanted = [signature_one, signature_two]
+    assert catalog.find_album_dir_by_track_signatures(wanted) is None
+
+    complete.mkdir()
+    add_track(complete, "01.flac", signature_one)
+    add_track(complete, "02.flac", signature_two)
+    assert catalog.find_album_dir_by_track_signatures(wanted) == complete
+
+    duplicate.mkdir()
+    add_track(duplicate, "01.flac", signature_one)
+    add_track(duplicate, "02.flac", signature_two)
+    assert catalog.find_album_dir_by_track_signatures(wanted) is None
 
 
 def _qt(title, isrc="", disc=1, **kw):

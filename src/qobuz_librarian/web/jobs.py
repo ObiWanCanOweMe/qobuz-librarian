@@ -314,6 +314,8 @@ class Job:
     # fold reads it so a partial refresh can't masquerade as a complete one
     # after the fold rewrites the scan's summary.
     _unchecked_artists: int = field(default=0, repr=False)
+    _preserve_persisted_single: bool = field(default=False, repr=False)
+    _single_undo_unavailable: bool = field(default=False, repr=False)
     # When set to (current, total, unit), push_progress reports THESE counts in
     # place of the caller's — so a multi-item execute (repairing 16 albums) keeps
     # the progress card on "album 3 / 16" even while each album's inner phases

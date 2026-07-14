@@ -76,6 +76,63 @@ def test_startup_recovery_refuses_an_unclaimed_isolated_run(tmp_path, monkeypatc
     assert result.reason == "unclaimed-staging-run"
 
 
+def test_post_import_relocation_recovery_precedes_queue_recovery(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    affected_paths = (
+        tmp_path / "music" / "Artist One" / "Album One",
+        tmp_path / "music" / "Artist Two" / "Album Two",
+    )
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "run.lock")
+    authority = run_lock.acquire()
+    try:
+        def needs_attention(
+            *,
+            authority: run_lock.RunLockLease,
+            handoff_matches,
+        ):
+            assert authority.intact() is True
+            assert callable(handoff_matches)
+            return SimpleNamespace(
+                status=startup_recovery.RelocationRecoveryStatus.ATTENTION_REQUIRED,
+                reason="exact relocation evidence changed",
+                paths=affected_paths,
+            )
+
+        monkeypatch.setattr(
+            startup_recovery,
+            "reconcile_post_import_relocations",
+            needs_attention,
+        )
+        monkeypatch.setattr(
+            startup_recovery,
+            "_load_namespace",
+            lambda _authority: pytest.fail(
+                "queue recovery ran before relocation attention was settled"
+            ),
+        )
+        blocked = startup_recovery.recover_startup_state(authority=authority)
+    finally:
+        authority.close()
+
+    assert blocked.status is startup_recovery.StartupRecoveryStatus.ATTENTION_REQUIRED
+    assert blocked.reason == "post-import-relocation-unsettled"
+    assert blocked.post_import_relocation.reason == "exact relocation evidence changed"
+    assert blocked.post_import_relocation.paths == affected_paths
+    recovery_log = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith(
+            "Post-import folder-move recovery needs attention"
+        )
+    )
+    assert "exact relocation evidence changed" in recovery_log
+    assert "Paths needing attention" in recovery_log
+    assert all(str(path) in recovery_log for path in affected_paths)
+
+
 def test_restart_pins_a_gap_fill_carrier_before_queue_work_can_resume(
     tmp_path,
     monkeypatch,
@@ -493,6 +550,7 @@ def test_startup_recovery_is_fail_closed_and_settles_exact_work(
     monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "run.lock")
     monkeypatch.setattr(cfg, "STAGING_DIR", tmp_path / "staging")
     monkeypatch.setattr(cfg, "BEETS_DB_PATH", tmp_path / "beets" / "library.db")
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", Path("/music"))
 
     identifiers = iter(f"{number:064x}" for number in range(1, 20))
     monkeypatch.setattr(journal, "_new_id", lambda: next(identifiers))

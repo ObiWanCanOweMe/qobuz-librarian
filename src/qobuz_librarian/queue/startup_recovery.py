@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -12,7 +13,6 @@ from qobuz_librarian import config as cfg
 from qobuz_librarian.completion import (
     CompletionOriginKind,
     RecoveryOwner,
-    completion_acknowledgement_hash,
     completion_input_ready,
     parse_completion_input_record,
 )
@@ -43,11 +43,20 @@ from qobuz_librarian.library.backup import (
     pin_unverified_upgrade_backup,
     warn_pin_failed,
 )
+from qobuz_librarian.library.post_import_relocation import (
+    RelocationRecoveryResult,
+    RelocationRecoveryStatus,
+    reconcile_post_import_relocations,
+)
 from qobuz_librarian.queue import journal as queue_state
 from qobuz_librarian.queue.library_backup_recovery import (
     LibraryBackupResolutionStatus,
     finish_library_backup_settlement,
     prepare_library_backup_settlement,
+)
+from qobuz_librarian.queue.post_import_finalizer import (
+    finalize_carrier_retirement,
+    plan_post_import_action,
 )
 from qobuz_librarian.run_lock import RunLockLease
 
@@ -77,6 +86,9 @@ _LIBRARY_BACKUP_KINDS = frozenset({
     _LIBRARY_BACKUP_CARRIER_KIND,
     _LIBRARY_BACKUP_SETTLEMENT_KIND,
 })
+POST_IMPORT_RELOCATION_LOG_ENTRY = (
+    "Post-import folder-move recovery needs attention"
+)
 
 
 class StartupRecoveryStatus(str, Enum):
@@ -119,6 +131,7 @@ class StartupRecoveryResult:
     status: StartupRecoveryStatus
     items: tuple[StartupRecoveryItem, ...] = ()
     reason: str | None = None
+    post_import_relocation: RelocationRecoveryResult | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,8 +148,34 @@ class _SettlementJournalFailure(RuntimeError):
     """A committed operator decision could not be written back durably."""
 
 
-class _CompletionAcknowledgementUnavailable(RuntimeError):
-    pass
+def _post_import_relocation_handoff_matches(operation_id, handoff):
+    """Consult jobs.db without making the UI persistence layer a hard import."""
+    try:
+        from qobuz_librarian.web import job_persistence
+
+        job_persistence.init()
+        return job_persistence.post_import_relocation_handoff_persisted(
+            operation_id,
+            handoff,
+        )
+    except Exception:
+        return None
+
+
+def _combined_post_import_relocation_handoff_matches(operation_id, handoff):
+    """Accept either durable queue or Web ownership of a relocation handoff."""
+    queue_match = queue_state.post_import_relocation_handoff_matches(
+        operation_id,
+        handoff,
+    )
+    if queue_match is True:
+        return True
+    web_match = _post_import_relocation_handoff_matches(operation_id, handoff)
+    if web_match is True:
+        return True
+    if queue_match is None or web_match is None:
+        return None
+    return False
 
 
 def _require_authority(authority: RunLockLease) -> None:
@@ -515,43 +554,6 @@ def _needs_cli_completion_caller(
     return completion_input.origin.kind is CompletionOriginKind.CLI
 
 
-def _acknowledge_external_completion(
-    item,
-    completion_input,
-    completion_evidence,
-    acknowledge_completion,
-    *,
-    post_dir,
-):
-    origin = completion_input.origin
-    if (
-        origin.kind not in {
-            CompletionOriginKind.CLI,
-            CompletionOriginKind.WEB_JOB,
-        }
-        or not callable(acknowledge_completion)
-    ):
-        raise _CompletionAcknowledgementUnavailable
-    completion_hash = completion_acknowledgement_hash(
-        completion_input,
-        completion_evidence,
-    )
-    try:
-        acknowledged = acknowledge_completion(
-            origin,
-            completion_input.owner,
-            album_id=completion_input.expectation.album_id,
-            completion_hash=completion_hash,
-            planned=item.planned,
-            post_dir=str(post_dir),
-        )
-    except Exception as exc:
-        raise _CompletionAcknowledgementUnavailable from exc
-    if acknowledged is not True:
-        raise _CompletionAcknowledgementUnavailable
-    return True
-
-
 @contextmanager
 def _capture_live_completion(journal, item, *, expected_manifest_hash=None):
     owner, completion_input, download = _completion_input(journal, item)
@@ -584,37 +586,34 @@ def _block_resolving(authority, journal, item, reason):
     _require_authority(authority)
 
 
-def _recover_complete(authority, journal, item, acknowledge_completion):
-    _owner, completion_input, _download = _completion_input(journal, item)
+def _recover_complete(authority, journal, item, _acknowledge_completion):
     with _capture_live_completion(journal, item) as (
         _managed_lease,
         live_lease,
         evidence,
     ):
         _require_authority(authority)
-        externally_acknowledged = _acknowledge_external_completion(
-            item,
-            completion_input,
-            evidence,
-            acknowledge_completion,
-            post_dir=(
-                Path(evidence.library_root) / evidence.album_path
-            ),
+        post_dir = Path(evidence.library_root) / evidence.album_path
+        post_import_action = plan_post_import_action(
+            journal,
+            item.item_id,
+            post_dir,
+            authority=authority,
         )
         _require_authority(authority)
-        if externally_acknowledged:
-            live_lease.revalidate()
+        live_lease.revalidate()
         saved = queue_state.commit_recovered_completed_item_removal(
             journal,
             item_id=item.item_id,
             live_evidence=evidence,
+            post_import_action=post_import_action,
         )
         live_lease.revalidate()
         _require_authority(authority)
         return saved
 
 
-def _recover_resolving(authority, journal, item, acknowledge_completion):
+def _recover_resolving(authority, journal, item, _acknowledge_completion):
     owner = RecoveryOwner(journal.operation_id, item.item_id)
     reference = _single_reference(item, _MANAGED_CARRIER_KIND)
     if reference is None:
@@ -723,28 +722,20 @@ def _recover_resolving(authority, journal, item, acknowledge_completion):
                     "managed completion changed during journal publication"
                 )
             _require_authority(authority)
-            externally_acknowledged = _acknowledge_external_completion(
-                (
-                    completed_item := next(
-                        value
-                        for value in completed.items
-                        if value.item_id == item.item_id
-                    )
-                ),
-                _completion_input(completed, completed_item)[1],
-                evidence,
-                acknowledge_completion,
-                post_dir=(
-                    Path(evidence.library_root) / evidence.album_path
-                ),
+            post_dir = Path(evidence.library_root) / evidence.album_path
+            post_import_action = plan_post_import_action(
+                completed,
+                item.item_id,
+                post_dir,
+                authority=authority,
             )
             _require_authority(authority)
-            if externally_acknowledged:
-                live_lease.revalidate()
+            live_lease.revalidate()
             queue_state.commit_recovered_completed_item_removal(
                 completed,
                 item_id=item.item_id,
                 live_evidence=evidence,
+                post_import_action=post_import_action,
             )
             live_lease.revalidate()
             _require_authority(authority)
@@ -1088,6 +1079,25 @@ def recover_startup_state(
 ) -> StartupRecoveryResult:
     """Settle only exact restart evidence; never run downloads or imports."""
     try:
+        _require_authority(authority)
+        relocation = reconcile_post_import_relocations(
+            authority=authority,
+            handoff_matches=_combined_post_import_relocation_handoff_matches,
+        )
+        _require_authority(authority)
+        if relocation.status is not RelocationRecoveryStatus.CLEAR:
+            paths = "; ".join(os.fspath(path) for path in relocation.paths)
+            logging.getLogger("qobuz_librarian").error(
+                "%s: %s. Paths needing attention: %s.",
+                POST_IMPORT_RELOCATION_LOG_ENTRY,
+                relocation.reason or "reason not reported",
+                paths or "none reported",
+            )
+            return StartupRecoveryResult(
+                StartupRecoveryStatus.ATTENTION_REQUIRED,
+                reason="post-import-relocation-unsettled",
+                post_import_relocation=relocation,
+            )
         while True:
             loads = _load_namespace(authority)
             if any(loaded.status is queue_state.QueueLoadStatus.BLOCKED for loaded in loads):
@@ -1161,9 +1171,11 @@ def recover_startup_state(
             if retirement is not None:
                 journal, item = retirement
                 _require_authority(authority)
-                _saved, result = queue_state.process_carrier_retirement(
+                _saved, _final_path, result = finalize_carrier_retirement(
                     journal,
-                    item_id=item.item_id,
+                    item.item_id,
+                    authority=authority,
+                    acknowledge_completion=acknowledge_completion,
                 )
                 _require_authority(authority)
                 if result.outcome not in {
@@ -1277,7 +1289,6 @@ def recover_startup_state(
         OSError,
         TypeError,
         ValueError,
-        _CompletionAcknowledgementUnavailable,
         queue_state.QueueJournalError,
     ):
         return StartupRecoveryResult(

@@ -141,6 +141,8 @@ services:
       # prompts per folder; off by default (it moves folders). Set "true"
       # if you want it offered on CLI runs.
       CONSOLIDATE: "${CONSOLIDATE:-false}"
+      # Move "Primary, Other/<album>" into "Primary/<album>" after import.
+      MIGRATE_MULTI_ARTIST: "${MIGRATE_MULTI_ARTIST:-false}"
       # Cover art placement: sidecar (image beside tracks) | embed | both.
       ARTWORK: "${ARTWORK:-sidecar}"
 

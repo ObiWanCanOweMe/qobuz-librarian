@@ -319,7 +319,12 @@ def _offer_blocked_cli_settlement(authority, result):
     return (fresh, False) if verified else (result, False)
 
 
-def _die_unsettled_startup_recovery(authority, *, kept: bool = False) -> None:
+def _die_unsettled_startup_recovery(
+    authority,
+    result=None,
+    *,
+    kept: bool = False,
+) -> None:
     try:
         authority.close()
     except OSError:
@@ -331,6 +336,26 @@ def _die_unsettled_startup_recovery(authority, *, kept: bool = False) -> None:
             "was started.\n"
         )
         color = C.YELLOW
+    elif (
+        getattr(result, "reason", None) == "post-import-relocation-unsettled"
+        and getattr(result, "post_import_relocation", None) is not None
+    ):
+        from qobuz_librarian.queue.startup_recovery import (
+            POST_IMPORT_RELOCATION_LOG_ENTRY,
+        )
+
+        relocation = result.post_import_relocation
+        paths = "; ".join(str(path) for path in relocation.paths)
+        message = (
+            "\n✗  An interrupted library-folder move could not be verified safely.\n"
+            f"   Recovery reason: {relocation.reason or 'reason not reported'}\n"
+            f"   Paths needing attention: {paths or 'none reported'}\n"
+            "   Library changes are paused so the files remain unchanged. See "
+            f"the “{POST_IMPORT_RELOCATION_LOG_ENTRY}” entry in the application "
+            "log for the same details. Resolve the reported recovery problem, "
+            "then restart Qobuz Librarian.\n"
+        )
+        color = C.RED
     else:
         message = (
             "\n✗  An interrupted download could not be verified safely.\n"
@@ -382,7 +407,7 @@ def acquire_run_lock():
         if result.status is StartupRecoveryStatus.ATTENTION_REQUIRED:
             result, kept = _offer_blocked_cli_settlement(lease, result)
         if result.status is StartupRecoveryStatus.ATTENTION_REQUIRED:
-            _die_unsettled_startup_recovery(lease, kept=kept)
+            _die_unsettled_startup_recovery(lease, result, kept=kept)
         return lease
     if lease is not None:
         lease.close()
@@ -579,6 +604,11 @@ def parse_args():
                    action="store_true",
                    help="force-skip pre-import downsampling for this run "
                         "(only relevant when DOWNSAMPLE_HIRES_ENABLED is on)")
+    p.add_argument("--migrate-multi-artist", dest="migrate_multi_artist",
+                   action=argparse.BooleanOptionalAction,
+                   default=cfg.MIGRATE_MULTI_ARTIST,
+                   help="after import, safely re-file 'Primary, Other' albums "
+                        "under 'Primary'")
     p.add_argument("--migrate", action="store_true",
                    help="one-time setup: reorganise an existing library into the "
                         "Artist/Album layout (local-only; no Qobuz login needed)")
@@ -885,7 +915,7 @@ def main():
             ), EXIT_GENERAL)
         result = _record_startup_recovery(_lockfile)
         if result.status is StartupRecoveryStatus.ATTENTION_REQUIRED:
-            _die_unsettled_startup_recovery(_lockfile)
+            _die_unsettled_startup_recovery(_lockfile, result)
         if result.status is StartupRecoveryStatus.RESUME_REQUIRED:
             log.info(fmt(
                 C.YELLOW,
