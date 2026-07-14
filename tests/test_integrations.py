@@ -497,6 +497,43 @@ def test_prepare_staging_tags_sets_aside_untagged_keeps_tagged(tmp_path, monkeyp
     assert capture_file(tagged, expected=dirty.identity) is not None
 
 
+def test_prepare_managed_staging_tags_returns_bindings_in_input_order(
+    tmp_path, monkeypatch, _need_ffmpeg
+):
+    # The scan walks the tree in directory order, but the durable runner
+    # compares the result against the catalogue-ordered bindings. The records
+    # must come back in the order they were passed, not readdir order.
+    from qobuz_librarian.integrations import beets
+    from qobuz_librarian.integrations.staging import capture_file
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    monkeypatch.setattr("qobuz_librarian.config.STAGING_DIR", staging)
+
+    album = staging / "Artist" / "Album"
+    binding = []
+    for n in (1, 2, 3):
+        path = album / f"0{n} - Track {n}.flac"
+        _make_silent_flac(path)
+        from mutagen.flac import FLAC
+        f = FLAC(str(path))
+        f["albumartist"], f["album"], f["title"] = ["Artist"], ["Album"], [f"Track {n}"]
+        f.save()
+        clean = capture_file(path)
+        binding.append({
+            "slot": f"qobuz:{n}",
+            "path": str(clean.path),
+            "identity": list(clean.identity),
+        })
+
+    # Hand them in reverse of on-disk name order; the walk won't match this.
+    binding.reverse()
+    rewritten = beets.prepare_managed_staging_tags(
+        [album], binding, authority_check=lambda: None
+    )
+    assert [r["slot"] for r in rewritten] == [b["slot"] for b in binding]
+
+
 # ── beets: import override pins non-destructive duplicate handling ─────────
 
 

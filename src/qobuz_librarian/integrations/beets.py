@@ -996,6 +996,12 @@ def _prepare_staging_tags(
             )
         if len(refreshed) != len(managed_by_path):
             raise OSError("managed beets preflight did not bind every source")
+        # The scan walks the staging tree in directory order; the caller
+        # compares this against the catalogue-ordered bindings, so return the
+        # records in the order they were handed in rather than readdir order.
+        order = {record["slot"]: index
+                 for index, record in enumerate(managed_bindings)}
+        refreshed.sort(key=lambda record: order[record["slot"]])
         return tuple(refreshed)
     return moved
 
