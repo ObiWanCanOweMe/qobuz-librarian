@@ -17,5 +17,5 @@ With login enabled, every endpoint needs the session cookie. A missing or invali
 
 ```bash
 # Is any job running or scanning?
-curl -s -b 'qf_session=<your-cookie>' http://localhost:8666/api/queue/count | jq '.running'
+curl -s -b 'ql_session=<your-cookie>' http://localhost:8666/api/queue/count | jq '.running'
 ```

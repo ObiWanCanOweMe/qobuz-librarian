@@ -562,7 +562,7 @@ def client(monkeypatch):
     _run_web_executors_inline(monkeypatch, app_mod)
     with _SameThreadASGIClient(app_mod.app) as c:
         c.get("/queue")
-        token = c.cookies.get("qf_csrf")
+        token = c.cookies.get("ql_csrf")
         c.headers.update({"X-CSRF-Token": token})
         yield c
 
@@ -880,7 +880,7 @@ def test_lock_busy_refuses_destructive_routes(monkeypatch):
     _run_web_executors_inline(monkeypatch, webapp)
     with _SameThreadASGIClient(webapp.app) as c:
         c.get("/queue")
-        token = c.cookies.get("qf_csrf")
+        token = c.cookies.get("ql_csrf")
         c.headers.update({"X-CSRF-Token": token})
         monkeypatch.setattr(webapp, "_LOCK_BUSY_PID", 4321)
 
@@ -3406,13 +3406,13 @@ def _enable_auth(monkeypatch, tmp_path, *, configure=True):
 def test_login_rejects_wrong_password(monkeypatch, tmp_path):
     with _enable_auth(monkeypatch, tmp_path) as c:
         c.get("/login")
-        tok = c.cookies.get("qf_csrf")
+        tok = c.cookies.get("ql_csrf")
         r = c.post("/login",
                    data={"username": "admin", "password": "nope",
                          "_csrf_token": tok},
                    headers={"X-CSRF-Token": tok}, follow_redirects=False)
         assert r.status_code == 401
-        assert "qf_session" not in r.cookies
+        assert "ql_session" not in r.cookies
         # Still locked out afterwards.
         assert c.get("/", follow_redirects=False).status_code == 303
 
@@ -3420,7 +3420,7 @@ def test_login_rejects_wrong_password(monkeypatch, tmp_path):
 def test_login_accepts_correct_password(monkeypatch, tmp_path):
     with _enable_auth(monkeypatch, tmp_path) as c:
         c.get("/login")
-        tok = c.cookies.get("qf_csrf")
+        tok = c.cookies.get("ql_csrf")
         r = c.post("/login",
                    data={"username": "admin", "password": "hunter2hunter",
                          "_csrf_token": tok},
@@ -3435,7 +3435,7 @@ def test_authenticated_pages_are_not_stored_in_the_browser_cache(
         monkeypatch, tmp_path):
     with _enable_auth(monkeypatch, tmp_path) as c:
         c.get("/login")
-        tok = c.cookies.get("qf_csrf")
+        tok = c.cookies.get("ql_csrf")
         c.post(
             "/login",
             data={"username": "admin", "password": "hunter2hunter",
@@ -3478,7 +3478,7 @@ def test_login_returns_to_the_page_that_bounced(monkeypatch, tmp_path):
         assert r.headers["location"] == "/login?next=/queue"
         r = c.get("/login?next=/queue")
         assert 'name="next" value="/queue"' in r.text
-        tok = c.cookies.get("qf_csrf")
+        tok = c.cookies.get("ql_csrf")
         r = c.post("/login",
                    data={"username": "admin", "password": "hunter2hunter",
                          "_csrf_token": tok, "next": "/queue"},
@@ -3501,7 +3501,7 @@ def test_login_next_cannot_leave_the_app(monkeypatch, tmp_path):
 
     with _enable_auth(monkeypatch, tmp_path) as c:
         c.get("/login")
-        tok = c.cookies.get("qf_csrf")
+        tok = c.cookies.get("ql_csrf")
         r = c.post("/login",
                    data={"username": "admin", "password": "hunter2hunter",
                          "_csrf_token": tok, "next": "//evil.example"},

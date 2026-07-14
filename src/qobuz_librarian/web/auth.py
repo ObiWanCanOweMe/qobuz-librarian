@@ -23,7 +23,7 @@ from starlette.responses import JSONResponse, RedirectResponse, Response
 
 from qobuz_librarian import config as cfg
 
-SESSION_COOKIE = "qf_session"
+SESSION_COOKIE = "ql_session"
 LOGIN_PATH = "/login"
 SETUP_PATH = "/setup"
 MIN_PASSWORD_LEN = 8

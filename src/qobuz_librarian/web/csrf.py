@@ -4,7 +4,7 @@ import secrets
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import PlainTextResponse
 
-CSRF_COOKIE_NAME = "qf_csrf"
+CSRF_COOKIE_NAME = "ql_csrf"
 CSRF_FORM_FIELD = "_csrf_token"
 CSRF_HEADER = "X-CSRF-Token"
 
