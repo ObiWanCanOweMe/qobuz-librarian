@@ -6,6 +6,7 @@ candidates to the job, and execution runs over the candidates the user kept.
 """
 import argparse
 import json
+import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -2020,9 +2021,15 @@ def scan_repairs(job, token):
                 scan_checkpoint.save("repair", scanned, job.candidates, {})
     scan_checkpoint.clear("repair")
     # Honest summary: report what was actually decode-verified, and never
-    # claim completeness the scan didn't earn.
+    # claim completeness the scan didn't earn. With the flac tool present,
+    # an unverified track means the app couldn't lock the file for checking,
+    # which is an ownership problem, not a missing tool.
+    unver_reason = (
+        "the app couldn't lock them — check file ownership and PUID"
+        if shutil.which("flac") else "no flac tool"
+    )
     unver = (f" {plural(n_unverified, 'track')} couldn't be decode-checked "
-             "(no flac tool)." if n_unverified else "")
+             f"({unver_reason})." if n_unverified else "")
     fail = (f" {plural(n_failed, 'album')} couldn't be scanned; re-run to retry."
             if n_failed else "")
     if total:
