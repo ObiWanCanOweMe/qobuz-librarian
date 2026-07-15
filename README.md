@@ -61,6 +61,7 @@ curl -O https://raw.githubusercontent.com/jarynclouatre/qobuz-librarian/main/com
 curl -O https://raw.githubusercontent.com/jarynclouatre/qobuz-librarian/main/.env.example
 cp .env.example .env
 # edit .env: at minimum, point QL_MUSIC_DIR at your music folder
+mkdir -p music   # skip if QL_MUSIC_DIR points at an existing folder
 docker compose up -d
 ```
 

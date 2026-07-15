@@ -581,10 +581,10 @@ def _lock_busy_response(request, *, durable_resume_job_id: str | None = None):
         msg = ("Another Qobuz Librarian run is active. Downloads and scans are "
                "paused so only one process writes to the library at a time. "
                "Stop the other run first, then restart Qobuz Librarian.")
-    elif _UNWRITABLE_VOLUMES:
-        msg = (f"Required {plural(len(_UNWRITABLE_VOLUMES), 'volume')} not "
+    elif (unwritable := _unwritable_volumes()):
+        msg = (f"Required {plural(len(unwritable), 'volume')} not "
                "writable: "
-               f"{', '.join(_UNWRITABLE_VOLUMES)}. On a NAS, set "
+               f"{', '.join(unwritable)}. On a NAS, set "
                "PUID/PGID to the share owner and confirm the host "
                "directories exist. Downloads can't run until fixed.")
     elif _LOCK_UNENFORCEABLE:
@@ -656,7 +656,7 @@ def _web_writes_paused() -> bool:
         _SHUTTING_DOWN
         or _CLI_MODE
         or _LOCK_BUSY_PID is not None
-        or bool(_UNWRITABLE_VOLUMES)
+        or bool(_unwritable_volumes())
         or _LOCK_UNENFORCEABLE
         or not _run_lock_intact()
         or _startup_recovery_status_value() in {
@@ -666,9 +666,32 @@ def _web_writes_paused() -> bool:
     )
 
 
-# Populated at startup. Empty list means OK; non-empty means destructive
-# POSTs return 503 until the container restarts with the volumes mounted.
-_UNWRITABLE_VOLUMES: list[str] = []
+def _unwritable_volumes() -> list[str]:
+    """Live probe of the critical mounts; empty means writes may run.
+
+    Probed on every gated attempt rather than sealed at startup, so fixing
+    ownership on the host opens the gate without a container restart — the
+    Diagnostics page re-checks live, and the gate has to agree with it.
+    Opt-in via env so tests and dev runs without /staging or /music mounted
+    don't trip on it; the bundled compose sets it to 1."""
+    if os.environ.get("QL_CHECK_VOLUMES") != "1":
+        return []
+    problems = []
+    # The label (the container-internal mount name) is what the operator
+    # checks in their compose.yaml; the resolved cfg path is what's tested.
+    for label, path in (("STAGING_DIR", cfg.STAGING_DIR),
+                        ("MUSIC_ROOT", cfg.MUSIC_ROOT)):
+        p = Path(path)
+        unreachable = not p.exists()
+        not_a_dir = p.exists() and not p.is_dir()
+        unwritable = p.exists() and p.is_dir() and not os.access(str(p), os.W_OK)
+        if unreachable or not_a_dir or unwritable:
+            problems.append(
+                f"{label}={path!s}"
+                + (" (missing)" if unreachable
+                   else " (not a directory)" if not_a_dir
+                   else " (read-only)"))
+    return problems
 
 
 def _has_startup_write_authority() -> bool:
@@ -1373,29 +1396,11 @@ async def _lifespan(_app: FastAPI):
             else None
         )
 
-        _UNWRITABLE_VOLUMES.clear()
-        # Opt-in via env so tests / dev runs that don't have /staging /music
-        # mounted don't trip on the gate. The bundled compose sets this to 1.
-        if os.environ.get("QL_CHECK_VOLUMES") == "1":
-            # The label (the container-internal mount name) is what the
-            # operator checks in their compose.yaml; the resolved cfg path is
-            # what's actually being tested.
-            for label, path in (("STAGING_DIR", cfg.STAGING_DIR),
-                                ("MUSIC_ROOT", cfg.MUSIC_ROOT)):
-                p = Path(path)
-                unreachable = not p.exists()
-                not_a_dir = p.exists() and not p.is_dir()
-                unwritable = p.exists() and p.is_dir() and not os.access(str(p), os.W_OK)
-                if unreachable or not_a_dir or unwritable:
-                    _UNWRITABLE_VOLUMES.append(
-                        f"{label}={path!s}"
-                        + (" (missing)" if unreachable
-                           else " (not a directory)" if not_a_dir
-                           else " (read-only)"))
-            if _UNWRITABLE_VOLUMES:
-                _log.error("STARTUP: critical volumes not usable: %s. Write "
-                           "endpoints will return 503 until container restarts "
-                           "with mounts fixed.", _UNWRITABLE_VOLUMES)
+        problems = _unwritable_volumes()
+        if problems:
+            _log.error("STARTUP: critical volumes not usable: %s. Write "
+                       "endpoints will return 503 until the mounts are "
+                       "fixed.", problems)
         # Heavy, throttled maintenance: prune_missing() stats every cached file
         # (100k+ on a NAS library), so run it in the background instead of blocking
         # the app from serving its first request.

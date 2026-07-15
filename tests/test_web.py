@@ -3249,7 +3249,7 @@ def test_web_pauses_new_writes_if_its_run_lock_is_displaced(monkeypatch):
     monkeypatch.setattr(app_mod, "_CLI_MODE", False)
     monkeypatch.setattr(app_mod, "_LOCK_BUSY_PID", None)
     monkeypatch.setattr(app_mod, "_LOCK_UNENFORCEABLE", False)
-    monkeypatch.setattr(app_mod, "_UNWRITABLE_VOLUMES", [])
+    monkeypatch.setattr(app_mod, "_unwritable_volumes", lambda: [])
     monkeypatch.setattr(app_mod, "_SHUTTING_DOWN", False)
 
     assert app_mod._web_writes_paused() is True
@@ -3992,6 +3992,32 @@ def test_post_baseline_library_scan_control_recedes(client, monkeypatch):
     assert "Scan for music added outside the app" in r.text
     assert ">Scan library</button>" not in r.text
     assert ">Check new releases</button>" in r.text
+
+
+def test_volume_gate_reopens_without_a_restart(tmp_path, monkeypatch):
+    # The writability verdict used to be sealed at startup, so fixing the
+    # ownership of a root-created music folder left downloads refusing while
+    # Diagnostics — which re-checks live — showed green. The gate probes live
+    # now and has to agree with Diagnostics.
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.web import app as webapp
+
+    music = tmp_path / "music"
+    music.mkdir()
+    monkeypatch.setenv("QL_CHECK_VOLUMES", "1")
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(cfg, "STAGING_DIR", tmp_path / "staging")
+    (tmp_path / "staging").mkdir()
+
+    music.chmod(0o500)
+    try:
+        assert any("MUSIC_ROOT" in item and "read-only" in item
+                   for item in webapp._unwritable_volumes())
+        assert webapp._web_writes_paused() is True
+    finally:
+        music.chmod(0o700)
+
+    assert webapp._unwritable_volumes() == []
 
 
 def test_new_release_check_stays_reachable_while_a_review_is_parked(
