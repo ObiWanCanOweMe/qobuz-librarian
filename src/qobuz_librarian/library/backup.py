@@ -9622,6 +9622,21 @@ def _dispose_retention_candidate(candidate, *, allow_smaller_audio=False):
     )
 
 
+def retire_verified_repair_backup(backup) -> bool:
+    """Dispose a repair's originals once each is verifiably superseded.
+
+    The same proof the age sweep applies: every file the backup holds must
+    have, at its exact path in the album, a decode-clean track of at least
+    its duration. Size may shrink — the backup holds the damaged copies."""
+    if (
+        not isinstance(backup, BackupResult)
+        or not isinstance(backup.receipt, dict)
+        or not backup.receipt.get("origin")
+    ):
+        return False
+    return _dispose_retention_candidate(backup, allow_smaller_audio=True)
+
+
 def _views_are_byte_identical(replacement_view: Path, backup_view: Path) -> bool:
     """Every payload file present at the origin with an identical digest."""
     try:

@@ -19,6 +19,7 @@ from qobuz_librarian.library.backup import (
     backup_gap_fill_files,
     pin_unverified_upgrade_backup,
     restore_gap_fill_backup,
+    retire_verified_repair_backup,
     warn_pin_failed,
 )
 from qobuz_librarian.library.catalog import (
@@ -2131,21 +2132,31 @@ def repair_album_dir(album_dir, verified_truncated, artist_name, args, token,
                     "tags or artwork could not be carried onto it.",
                 )
             elif repaired:
-                if not pin_unverified_upgrade_backup(
+                if retire_verified_repair_backup(backup_path):
+                    resolve_recovery(
                         backup_path,
-                        "repair backup kept — exact requested-track result "
-                        "not yet proven"):
-                    warn_pin_failed(backup_path)
-                log.info(fmt(C.YELLOW,
-                    "  ⚠  Replacement tracks passed the current checks, but "
-                    "Repair cannot yet prove the exact final track set. Your "
-                    f"originals remain in a recovery backup:\n     {backup_path}"))
-                checkpoint_recovery(
-                    backup_path,
-                    "verification",
-                    "Replacement tracks passed the current checks, but the "
-                    "exact requested-track result could not be proven.",
-                )
+                        "The replacement tracks verified, so the truncated "
+                        "originals' backup was removed.",
+                    )
+                    log.info(fmt(C.GREEN,
+                        "  ✓  Replacement tracks verified — removed the "
+                        "truncated originals' backup."))
+                else:
+                    if not pin_unverified_upgrade_backup(
+                            backup_path,
+                            "repair backup kept — could not be proven "
+                            "redundant after a verified refill"):
+                        warn_pin_failed(backup_path)
+                    log.info(fmt(C.YELLOW,
+                        "  ⚠  Replacement tracks verified, but the originals' "
+                        "backup couldn't be proven redundant — keeping it:\n"
+                        f"     {backup_path}"))
+                    checkpoint_recovery(
+                        backup_path,
+                        "verification",
+                        "The replacement tracks verified, but the originals' "
+                        "backup could not be proven redundant.",
+                    )
             elif back_in_place:
                 # The re-downloaded tracks are physically back but couldn't be
                 # verified as intact (still short of the listed length, or no
@@ -2221,8 +2232,9 @@ def repair_album_dir(album_dir, verified_truncated, artist_name, args, token,
                     )
 
         # ── Replaced-tracks log (only on a genuine, in-place repair) ──────
-        repair_settled = repaired and recovery_result() is None
-        if repair_settled:
+        # A verified refill is a repair whether or not the originals' backup
+        # could also be retired; a kept backup rides along in "backup".
+        if repaired:
             log_entries = [{
                 "artist": artist_name,
                 "album":  album_dir.name,
@@ -2235,10 +2247,10 @@ def repair_album_dir(album_dir, verified_truncated, artist_name, args, token,
                     f"     {cfg.REPAIR_LOG_PATH}"))
 
         return {
-            "n_ok": n_ok_final if repair_settled else 0,
-            "n_fail": (n_fail_final if repair_settled
+            "n_ok": n_ok_final if repaired else 0,
+            "n_fail": (n_fail_final if repaired
                        else max(n_fail_final, len(verified_truncated))),
-            "imported": repair_settled,
+            "imported": repaired,
             "backup": recovery_result(),
         }
     finally:

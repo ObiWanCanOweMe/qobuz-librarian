@@ -330,6 +330,46 @@ def test_backup_receipt_survives_ctime_only_metadata_drift(tmp_path, monkeypatch
     assert bkmod.load_backup_result(owned, expected_owner=owner) is None
 
 
+def test_retire_verified_repair_backup_needs_superseding_tracks(tmp_path, monkeypatch):
+    # After a verified refill the originals' backup may be retired only when
+    # every file it holds has, at the same path, a decode-clean track of at
+    # least its duration. Size may shrink — the backup holds the damaged
+    # copies, and a corrupt original is often larger than its clean refill.
+    _need_audio_tools()
+    import qobuz_librarian.library.backup as bkmod
+    monkeypatch.setattr(bkmod.cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    monkeypatch.setattr(bkmod.cfg, "MUSIC_ROOT", tmp_path / "music")
+    album = tmp_path / "music" / "Artist" / "Album (2020)"
+    album.mkdir(parents=True)
+    _real_flac(album / "01.flac", seconds=2)
+    quiet = tmp_path / "quiet.flac"
+    import subprocess
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+         "-i", "anoisesrc=duration=2:color=white:amplitude=0.05",
+         "-ac", "2", "-ar", "44100", "-sample_fmt", "s16", "-c:a", "flac",
+         str(quiet)], check=True)
+
+    kept = tmp_path / "backups" / "kept"
+    kept.mkdir(parents=True)
+    shutil.copyfile(album / "01.flac", kept / "01.flac")
+    (album / "01.flac").write_bytes(quiet.read_bytes())
+    assert (album / "01.flac").stat().st_size < (kept / "01.flac").stat().st_size
+    superseded = _seal_test_backup(bkmod, kept, album, kind="gap-fill")
+
+    orphan = tmp_path / "backups" / "kept2"
+    orphan.mkdir(parents=True)
+    shutil.copyfile(kept / "01.flac", orphan / "02.flac")
+    unmatched = _seal_test_backup(bkmod, orphan, album, kind="gap-fill")
+
+    assert bkmod.retire_verified_repair_backup(unmatched) is False
+    assert (orphan / "02.flac").exists()
+
+    assert bkmod.retire_verified_repair_backup(superseded) is True
+    assert not kept.exists()
+    assert (album / "01.flac").read_bytes() == quiet.read_bytes()
+
+
 def test_gap_fill_backup_copies_a_source_it_cannot_lease(tmp_path, monkeypatch):
     # A repair source the app doesn't own can't carry a write lease. With
     # the scan's sealed receipt pinning its content, the backup must take

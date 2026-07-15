@@ -2058,6 +2058,7 @@ def _redownload_damaged_album(payload, token, *, recovery_checkpoint=None):
         backup_album_dir,
         pin_unverified_upgrade_backup,
         restore_upgrade_backup,
+        retire_verified_repair_backup,
         warn_pin_failed,
     )
     from qobuz_librarian.modes.process import (
@@ -2172,24 +2173,32 @@ def _redownload_damaged_album(payload, token, *, recovery_checkpoint=None):
     imported_ok = bool(result.get("imported")) and result.get("n_ok", 0) > 0
     if backup:
         if imported_ok and _upgrade_replacement_verified(full, album_dir, backup):
-            # Carry useful companions, but keep the original until Repair has
-            # an exact final requested-track inventory rather than only the
-            # current album-level comparison.
+            # Carry useful companions, then retire the original's backup when
+            # every file it holds is verifiably superseded in the new album.
             carried = _carry_non_audio_from_backup(
                 full, album_dir, backup)
             if carried is not None:
-                result["repair_unverified"] = True
-                pin_repair_recovery(
-                    "repair backup kept — exact requested-track result not "
-                    "yet proven")
-                log.info("  Re-download passed the current checks, but Repair "
-                         "cannot yet prove the exact final track set. Your "
-                         f"original album remains at {backup}.")
-                checkpoint_recovery(
-                    "verification",
-                    "The replacement passed the current checks, but the exact "
-                    "requested-track result could not be proven.",
-                )
+                if retire_verified_repair_backup(backup):
+                    checkpoint_recovery(
+                        "resolved",
+                        "The re-download verified, so the original album's "
+                        "backup was removed.",
+                        retained=False,
+                    )
+                    log.info("  Re-download verified; removed the original "
+                             "album's backup.")
+                else:
+                    pin_repair_recovery(
+                        "repair backup kept — could not be proven redundant "
+                        "after a verified re-download")
+                    log.info("  Re-download verified, but the original "
+                             "album's backup couldn't be proven redundant; "
+                             f"keeping it at {backup}.")
+                    checkpoint_recovery(
+                        "verification",
+                        "The re-download verified, but the original album's "
+                        "backup could not be proven redundant.",
+                    )
             else:
                 result["repair_unverified"] = True
                 pin_repair_recovery(
@@ -2366,14 +2375,10 @@ def execute_repairs(job, chosen, token):
             failed += 1
             continue
         # Each chosen album was flagged as damaged, so anything that didn't
-        # end up downloaded-and-imported is a real failure.
-        recovery_kept = any(
-            record.get("album_dir") == str(Path(p["album_dir"]))
-            for record in (getattr(job, "recoveries", []) or [])
-            if isinstance(record, dict)
-        )
-        if (not recovery_kept
-                and result and result.get("n_ok", 0) > 0 and result.get("imported")
+        # end up downloaded-and-imported is a real failure. A kept backup is
+        # not one — a verified repair counts, and the backup is reported in
+        # the summary's recovery tail.
+        if (result and result.get("n_ok", 0) > 0 and result.get("imported")
                 and result.get("n_fail", 0) == 0
                 and not result.get("repair_unverified")):
             fixed += 1

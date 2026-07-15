@@ -120,8 +120,11 @@ def test_no_isrc_redownload_failure_restores_original_folder(tmp_path, monkeypat
     assert restored == {"bp": backup, "dir": album_dir}
 
 
-def test_no_isrc_redownload_keeps_originals_until_result_is_exact(
+def test_no_isrc_redownload_keeps_an_unprovable_backup(
         tmp_path, monkeypatch):
+    # A verified re-download retires the original album's backup only when it
+    # can be proven redundant; this fixture's backup can't be, so it stays —
+    # and no disposal transaction may even start for it.
     from qobuz_librarian.library.backup import BackupResult
     from qobuz_librarian.web import flows
 
@@ -176,7 +179,7 @@ def test_no_isrc_redownload_keeps_originals_until_result_is_exact(
         recovery_checkpoint=lambda recovery: recoveries.append(recovery) or True,
     )
 
-    assert result["repair_unverified"] is True
+    assert "repair_unverified" not in result
     assert backup_dir.is_dir()
     assert recoveries[-1].retained is True
     assert recoveries[-1].backup is backup
@@ -428,9 +431,14 @@ def test_parse_args_rejects_incompatible_flag_combos():
 
 def _call_repair_album_dir(tmp_path, monkeypatch, *, n_ok, n_fail, imported,
                            present=True, intact=True, recovery_checkpoint=None,
-                           execute_calls=None, relocation_error=None):
+                           execute_calls=None, relocation_error=None,
+                           retire=None):
     import qobuz_librarian.modes.repair as repair_mod
     from qobuz_librarian.library.backup import capture_gap_fill_source_receipt
+
+    if retire is not None:
+        monkeypatch.setattr(repair_mod, "retire_verified_repair_backup",
+                            lambda _backup: retire)
 
     album_dir = tmp_path / "Artist" / "Album (2020)"
     album_dir.mkdir(parents=True)
@@ -490,17 +498,27 @@ def _backup_files(tmp_path):
     return list(root.rglob("*")) if root.exists() else []
 
 
-def test_repair_backup_is_retained_until_exact_result_can_be_proven(
+def test_repair_counts_a_verified_refill_and_settles_its_backup(
         tmp_path, monkeypatch):
-    # The current checks can verify a useful refill, but not the exact final
-    # requested-track inventory, so the original remains available for review.
-    result, p = _call_repair_album_dir(tmp_path / "ok", monkeypatch,
+    # This fixture album never receives a superseding track, so the real
+    # retirement proof refuses and the backup is kept — the repair still
+    # counts; the kept backup rides along for the summary's recovery tail.
+    result, p = _call_repair_album_dir(tmp_path / "kept", monkeypatch,
                                        n_ok=1, n_fail=0, imported=True,
                                        present=True, intact=True)
     assert [f for f in _backup_files(p) if f.is_file()]
-    assert result["n_ok"] == 0
-    assert result["imported"] is False
+    assert result["n_ok"] == 1
+    assert result["imported"] is True
     assert result["backup"] is not None
+
+    # When the originals' backup is provably superseded it is retired and
+    # the recovery record resolves.
+    result, p = _call_repair_album_dir(tmp_path / "ok", monkeypatch,
+                                       n_ok=1, n_fail=0, imported=True,
+                                       present=True, intact=True, retire=True)
+    assert result["n_ok"] == 1
+    assert result["imported"] is True
+    assert result["backup"] is None
 
     # Re-downloaded but still truncated (a short re-rip passing the decode
     # gate): the originals' backup is KEPT, not deleted on presence alone, and
