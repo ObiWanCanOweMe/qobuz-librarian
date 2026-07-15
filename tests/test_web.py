@@ -3994,6 +3994,35 @@ def test_post_baseline_library_scan_control_recedes(client, monkeypatch):
     assert ">Check new releases</button>" in r.text
 
 
+def test_new_release_check_stays_reachable_while_a_review_is_parked(
+        client, monkeypatch):
+    # A parked review can live for months, and it hides the baseline-ready
+    # strip — the manual check used to live only there, so it was
+    # unreachable the whole time.
+    from qobuz_librarian.web import app as webapp
+
+    monkeypatch.setattr(webapp, "_read_creds",
+                        lambda: {"auth_token": "dummy", "user_id": "dummy"})
+    monkeypatch.setattr(
+        "qobuz_librarian.library.new_releases.is_baseline_complete",
+        lambda: True)
+    monkeypatch.setattr(webapp, "_TOKEN_VALID", True)
+    monkeypatch.setattr(webapp, "_library_scan_state",
+                        lambda: {"ready": True, "count": 3, "message": ""})
+    monkeypatch.setattr(webapp, "_census_view", lambda: None)
+    parked = jm.Job(title="Library scan")
+    parked.execute_kind = "library"
+    parked.status = jm.JobStatus.AWAITING_REVIEW
+    jm.registry.add(parked)
+    try:
+        r = client.get("/library")
+        assert r.status_code == 200
+        assert ">Check new releases</button>" in r.text
+        assert 'class="ql-header-refresh"' in r.text
+    finally:
+        _remove_job(parked)
+
+
 def test_pre_baseline_library_keeps_the_scan_hero(client, monkeypatch):
     from qobuz_librarian.web import app as webapp
 
