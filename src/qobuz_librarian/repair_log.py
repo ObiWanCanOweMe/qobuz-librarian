@@ -184,9 +184,14 @@ class _HeldRepairSource:
                 self._parts[-1], file_flags, dir_fd=self._directories[-1])
             if not stat.S_ISREG(os.fstat(self.descriptor).st_mode):
                 raise OSError("repair source is not a regular file")
+            # A file the app user doesn't own can't carry a write lease
+            # (F_SETLEASE needs ownership or CAP_LEASE), which used to end
+            # its diagnosis as "unverified" — so a broken file on a
+            # mixed-ownership library was never flagged. Diagnosis is sound
+            # without the lease: the sealed receipt and every intact()
+            # recheck compare the full stat identity, so a concurrent write
+            # downgrades the verdict instead of standing behind it.
             self.exclusion = acquire_inode_write_exclusion(self.descriptor)
-            if self.exclusion is None:
-                raise OSError("repair source is busy or cannot be held")
 
             receipt = self._seal_receipt()
             if receipt is None or not self._receipt_matches(receipt):
@@ -245,8 +250,8 @@ class _HeldRepairSource:
         }
 
     def intact(self):
-        if (self.descriptor is None or self.exclusion is None
-                or not self.exclusion.intact()
+        if (self.descriptor is None
+                or self.exclusion is not None and not self.exclusion.intact()
                 or not self._receipt_matches(self.source_receipt)):
             return False
         try:

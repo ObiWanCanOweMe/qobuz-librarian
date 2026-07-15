@@ -330,6 +330,52 @@ def test_backup_receipt_survives_ctime_only_metadata_drift(tmp_path, monkeypatch
     assert bkmod.load_backup_result(owned, expected_owner=owner) is None
 
 
+def test_gap_fill_backup_copies_a_source_it_cannot_lease(tmp_path, monkeypatch):
+    # A repair source the app doesn't own can't carry a write lease. With
+    # the scan's sealed receipt pinning its content, the backup must take
+    # the copy route instead of giving up — the copy is app-owned, so the
+    # rest of the transaction keeps ordinary leases. Without a receipt the
+    # refusal stands.
+    import qobuz_librarian.library.backup as bkmod
+    monkeypatch.setattr(bkmod.cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    monkeypatch.setattr(bkmod.cfg, "MUSIC_ROOT", tmp_path / "music")
+    album = tmp_path / "music" / "Artist" / "Album (2020)"
+    album.mkdir(parents=True)
+    source = album / "01 - Damaged.flac"
+    source.write_bytes(b"damaged audio bytes")
+
+    fd = os.open(source, os.O_RDONLY)
+    try:
+        sealed = bkmod._gap_fill_file_receipt(fd)
+    finally:
+        os.close(fd)
+    expected = bkmod._normalise_gap_fill_expected_receipts(
+        {"01 - Damaged.flac": sealed})
+
+    real_acquire = bkmod.acquire_inode_write_exclusion
+    denied = source.stat().st_ino
+
+    def deny_source(descriptor):
+        if os.fstat(descriptor).st_ino == denied:
+            return None
+        return real_acquire(descriptor)
+
+    monkeypatch.setattr(bkmod, "acquire_inode_write_exclusion", deny_source)
+
+    result = bkmod.backup_gap_fill_files(
+        [source], album, expected_receipts=expected)
+    assert result is not None and result.complete
+    assert not source.exists()
+    assert (result.path / "01 - Damaged.flac").read_bytes() == (
+        b"damaged audio bytes")
+
+    other = album / "02 - Other.flac"
+    other.write_bytes(b"other")
+    denied = other.stat().st_ino
+    assert bkmod.backup_gap_fill_files([other], album) is None
+    assert other.read_bytes() == b"other"
+
+
 def test_discard_redundant_backup_requires_byte_identical_files(tmp_path, monkeypatch):
     # The age sweep's size proof can't override a keep pin — a same-size
     # origin file could still be a different rendition whose original

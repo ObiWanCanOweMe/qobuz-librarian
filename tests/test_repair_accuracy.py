@@ -181,3 +181,64 @@ def test_duration_gate_ignores_unreadable_length_tag(monkeypatch, tmp_path):
     r = rl.scan_dir_for_isrc_repairs(album, "tok", deep=True)
     assert r["verified_truncated"] == []
     assert r["verified_ok"] == 1
+
+
+def test_scan_diagnoses_a_file_it_cannot_lease(tmp_path, _need_tools):
+    # A write lease needs file ownership (or CAP_LEASE), so on a
+    # mixed-ownership library the scan used to give up on every non-owned
+    # file as "unverified" — a genuinely broken one was never flagged. The
+    # sealed receipt already proves the file held still, so diagnosis must
+    # carry on without the lease.
+    album = tmp_path / "Artist" / "Album (2020)"
+    album.mkdir(parents=True)
+    good = album / "01.flac"
+    bad = album / "02.flac"
+    _make_flac(good)
+    _make_flac(bad)
+    _frame_corrupt(bad)
+    assert not _decodes(bad)
+
+    with patch("qobuz_librarian.repair_log.acquire_inode_write_exclusion",
+               return_value=None), \
+         patch("qobuz_librarian.repair_log.find_qobuz_track_by_isrc",
+               return_value=_QT):
+        r = scan_dir_for_isrc_repairs(album, "token", deep=False)
+
+    assert r["unverified"] == 0, f"lease refusal must not skip diagnosis (got {r})"
+    assert r["verified_ok"] == 1
+    assert "02.flac" in _names(r["verified_truncated"])
+    assert r["verified_truncated"][0]["reason"] == "decode_failed"
+    assert r["verified_truncated"][0].get("source_receipt"), (
+        "a lease-less verdict still needs the exact receipt the repair act "
+        "verifies against")
+
+
+def test_scan_downgrades_a_file_that_changes_mid_check(tmp_path, _need_tools):
+    # Without a lease nothing blocks a concurrent writer, so the stat-identity
+    # recheck is the whole safety story: a file that changes during its check
+    # must land in "unverified", never in a repair verdict.
+    from qobuz_librarian import repair_log as rl
+
+    album = tmp_path / "Artist" / "Album (2020)"
+    album.mkdir(parents=True)
+    p = album / "01.flac"
+    _make_flac(p)
+
+    real_flac_audio_ok = rl.flac_audio_ok
+
+    def mutate_then_check(path, *, descriptor=None):
+        with open(p, "ab") as fh:
+            fh.write(b"x")
+        return real_flac_audio_ok(path, descriptor=descriptor)
+
+    with patch("qobuz_librarian.repair_log.acquire_inode_write_exclusion",
+               return_value=None), \
+         patch("qobuz_librarian.repair_log.flac_audio_ok",
+               side_effect=mutate_then_check), \
+         patch("qobuz_librarian.repair_log.find_qobuz_track_by_isrc",
+               return_value=_QT):
+        r = scan_dir_for_isrc_repairs(album, "token", deep=False)
+
+    assert r["unverified"] == 1, f"a mid-check change must downgrade (got {r})"
+    assert r["verified_ok"] == 0
+    assert r["verified_truncated"] == []

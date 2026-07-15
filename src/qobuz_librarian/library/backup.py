@@ -1008,10 +1008,18 @@ def _fidelity_fd(descriptor, *, include_times=True):
     return result
 
 
-def _copy_fidelity_fd(source_fd, destination_fd) -> None:
-    """Copy and verify ownership, permissions, times, xattrs and ACL xattrs."""
+def _copy_fidelity_fd(source_fd, destination_fd, *, adopt_owner=False) -> None:
+    """Copy and verify ownership, permissions, times, xattrs and ACL xattrs.
+
+    ``adopt_owner`` keeps the destination's own ownership instead of the
+    source's — the app can't chown a copy of a file it doesn't own, and a
+    backup copy the app owns is what lets the rest of that transaction hold
+    ordinary leases."""
     source = _fidelity_fd(source_fd)
     destination = os.fstat(destination_fd)
+    if adopt_owner:
+        source["uid"] = int(destination.st_uid)
+        source["gid"] = int(destination.st_gid)
     if (int(destination.st_uid), int(destination.st_gid)) != (
             source["uid"], source["gid"]):
         os.fchown(destination_fd, source["uid"], source["gid"])
@@ -1646,7 +1654,7 @@ def _release_copy_publication(publication) -> None:
         publication.close()
 
 
-def _copy_file_noreplace_at(source_fd, publication):
+def _copy_file_noreplace_at(source_fd, publication, *, adopt_owner=False):
     """Durably copy one held file into a private directory without overwrite.
 
     The caller-owned ``publication`` receives the read-only descriptor and
@@ -1660,6 +1668,10 @@ def _copy_file_noreplace_at(source_fd, publication):
         raise OSError("backup source is not a regular file")
     source_digest = _file_digest_fd(source_fd)
     source_fidelity = _fidelity_fd(source_fd, include_times=False)
+    copy_fidelity = dict(source_fidelity)
+    if adopt_owner:
+        copy_fidelity["uid"] = os.geteuid()
+        copy_fidelity["gid"] = os.getegid()
     source_mtime_ns = int(os.fstat(source_fd).st_mtime_ns)
     temporary_name = None
     writable_file = None
@@ -1707,14 +1719,14 @@ def _copy_file_noreplace_at(source_fd, publication):
                     raise OSError("backup copy made no write progress")
                 written += count
             offset += len(chunk)
-        _copy_fidelity_fd(source_fd, writable_fd)
+        _copy_fidelity_fd(source_fd, writable_fd, adopt_owner=adopt_owner)
         os.fsync(writable_fd)
         if (
             _file_digest_fd(writable_fd) != source_digest
             or _file_digest_fd(source_fd) != source_digest
             or _fidelity_fd(source_fd, include_times=False) != source_fidelity
             or _fidelity_fd(
-                writable_fd, include_times=False) != source_fidelity
+                writable_fd, include_times=False) != copy_fidelity
             or int(os.fstat(source_fd).st_mtime_ns) != source_mtime_ns
             or int(os.fstat(writable_fd).st_mtime_ns) != source_mtime_ns
             or os.fstat(writable_fd).st_nlink != 1
@@ -1751,7 +1763,7 @@ def _copy_file_noreplace_at(source_fd, publication):
             or _fidelity_fd(source_fd, include_times=False) != source_fidelity
             or _fidelity_fd(
                 publication.descriptor,
-                include_times=False) != source_fidelity
+                include_times=False) != copy_fidelity
             or int(os.fstat(source_fd).st_mtime_ns) != source_mtime_ns
             or int(os.fstat(
                 publication.descriptor).st_mtime_ns) != source_mtime_ns
@@ -1797,7 +1809,7 @@ def _copy_file_noreplace_at(source_fd, publication):
                         source_fd, include_times=False) == source_fidelity
                     and _fidelity_fd(
                         publication.descriptor,
-                        include_times=False) == source_fidelity
+                        include_times=False) == copy_fidelity
                     and int(os.fstat(source_fd).st_mtime_ns)
                         == source_mtime_ns
                     and int(os.fstat(
@@ -7160,7 +7172,8 @@ def backup_gap_fill_files(file_paths, album_dir: Path, *,
     def _source_intact(record):
         try:
             return (
-                record["source_lease"].intact()
+                (record["source_lease"] is None
+                 or record["source_lease"].intact())
                 and _named_entry_matches(
                     record["source_parent_fd"],
                     record["parts"][-1],
@@ -7314,8 +7327,19 @@ def backup_gap_fill_files(file_paths, album_dir: Path, *,
                 receipt = _gap_fill_file_receipt(source_fd, digest)
                 if expected is not None and expected.get(relative_text) != receipt:
                     raise OSError("verified source receipt changed")
+                # A file the app user doesn't own can't carry a write lease.
+                # With a sealed receipt pinning its exact content the copy
+                # route below still moves it safely — every gate re-hashes
+                # against the receipt, and the copy the app makes is its own,
+                # so the rest of the transaction holds ordinary leases.
                 source_lease = acquire_inode_write_exclusion(source_fd)
-                if source_lease is None or not source_lease.intact():
+                if source_lease is not None and not source_lease.intact():
+                    raise OSError("source has an active or uncertain writer")
+                if source_lease is None and expected is None:
+                    if os.fstat(source_fd).st_uid != os.geteuid():
+                        raise OSError(
+                            "the app does not own this file — check "
+                            "ownership and PUID")
                     raise OSError("source has an active or uncertain writer")
                 records.append({
                     "parts": parts,
@@ -7444,7 +7468,8 @@ def backup_gap_fill_files(file_paths, album_dir: Path, *,
                 moved = False
                 move_exception = None
                 if (
-                    _same_filesystem(public, backup_root)
+                    record["source_lease"] is not None
+                    and _same_filesystem(public, backup_root)
                     and os.fstat(record["source_fd"]).st_nlink == 1
                 ):
                     try:
@@ -7492,7 +7517,10 @@ def backup_gap_fill_files(file_paths, album_dir: Path, *,
                 publication = _CopyPublication(
                     destination_parent_fd, parts[-1])
                 copied_digest = _copy_file_noreplace_at(
-                    record["source_fd"], publication)
+                    record["source_fd"],
+                    publication,
+                    adopt_owner=record["source_lease"] is None,
+                )
                 destination_fd = publication.descriptor
                 destination_lease = publication.lease
                 if (
@@ -7519,7 +7547,8 @@ def backup_gap_fill_files(file_paths, album_dir: Path, *,
                     record["source_fd"],
                     prefix="ql-gap-remove",
                     commit_guard=lambda: (
-                        record["source_lease"].intact()
+                        (record["source_lease"] is None
+                         or record["source_lease"].intact())
                         and _backup_intact(record)
                     ),
                 )

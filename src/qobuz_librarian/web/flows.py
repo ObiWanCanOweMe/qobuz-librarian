@@ -2022,10 +2022,12 @@ def scan_repairs(job, token):
     scan_checkpoint.clear("repair")
     # Honest summary: report what was actually decode-verified, and never
     # claim completeness the scan didn't earn. With the flac tool present,
-    # an unverified track means the app couldn't lock the file for checking,
-    # which is an ownership problem, not a missing tool.
+    # an unverified track means the file couldn't be read or changed while
+    # it was being checked — unreadable is an ownership problem, not a
+    # missing tool.
     unver_reason = (
-        "the app couldn't lock them — check file ownership and PUID"
+        "the app couldn't read them or they changed mid-check — check "
+        "file ownership and PUID"
         if shutil.which("flac") else "no flac tool"
     )
     unver = (f" {plural(n_unverified, 'track')} couldn't be decode-checked "
