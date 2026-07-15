@@ -2,6 +2,13 @@
 
 All notable changes to Qobuz Librarian are recorded here, newest first. The project follows [semantic versioning](https://semver.org/); dates are when each version was tagged during local development.
 
+## [0.11.2] - 2026-07-15
+
+A first-run fix and a documentation accuracy pass.
+
+- A music folder that Docker created as root no longer traps a first download behind a restart: the quick start creates the folder up front, and the writability check probes live — fixing ownership on the host takes effect immediately and always agrees with what Settings → Diagnostics shows.
+- Docs now match current behaviour: a verified repair retires its recovery backup (only an unprovable one is kept), and the folder-ownership guidance lives in the permissions section.
+
 ## [0.11.1] - 2026-07-15
 
 Fixes from driving every flow end to end against a live library — downloads, cancels, crashes, restarts, repairs.
