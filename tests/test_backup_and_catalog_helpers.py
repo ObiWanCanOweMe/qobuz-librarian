@@ -1,6 +1,7 @@
 """Tests for backup/restore safety and consolidation helpers."""
 import os
 import shutil
+import time
 
 import pytest
 
@@ -273,6 +274,60 @@ def test_cross_fs_restore_succeeds_with_backup_sidecars_present(tmp_path, monkey
     assert (original / "cover.jpg").read_bytes() == b"art"
     assert not (original / bkmod._RECEIPT_SIDECAR).exists()
     assert not backup.exists()
+
+
+def test_backup_receipt_survives_ctime_only_metadata_drift(tmp_path, monkeypatch):
+    # A chown or chmod sweep — a boot-time ownership fix, a NAS permission
+    # change — bumps every file's ctime without touching content. A sealed
+    # receipt has to keep loading, reopening from the journal, and restoring
+    # across that, while any real content change still refuses.
+    import qobuz_librarian.library.backup as bkmod
+    monkeypatch.setattr(bkmod.cfg, "UPGRADE_BACKUP_DIR", tmp_path)
+    monkeypatch.setattr(bkmod.cfg, "MUSIC_ROOT", tmp_path)
+    backup = tmp_path / "backup"
+    backup.mkdir()
+    (backup / "track1.flac").write_bytes(b"a" * 50_000)
+    (backup / "cover.jpg").write_bytes(b"art")
+    original = tmp_path / "Album"
+    backup_result = _seal_test_backup(bkmod, backup, original, kind="upgrade")
+
+    owner = {"operation_id": "a" * 64, "item_id": "b" * 64}
+    owned = tmp_path / "backup2"
+    owned.mkdir()
+    (owned / "track1.flac").write_bytes(b"c" * 50_000)
+    owned_fd = bkmod._open_backup_directory(owned)
+    try:
+        assert bkmod._write_backup_origin_durable(owned_fd, tmp_path / "Album2")
+        owned_result = bkmod._seal_backup_result(
+            owned, owned_fd, tmp_path / "Album2",
+            kind="gap-fill", complete=True, requested=1, backed_up=1,
+            owner=owner)
+    finally:
+        os.close(owned_fd)
+    assert owned_result.receipt is not None
+    record = bkmod.library_backup_record(owned_result, expected_owner=owner)
+    assert record is not None
+
+    time.sleep(0.05)
+    for entry in (backup, *backup.rglob("*"), owned, *owned.rglob("*")):
+        os.chmod(entry, entry.stat().st_mode)
+    sealed = backup_result.receipt["tree"]["files"]["track1.flac"]["changed_ns"]
+    assert (backup / "track1.flac").stat().st_ctime_ns != sealed
+
+    reloaded = bkmod.load_backup_result(backup_result.path)
+    assert reloaded is not None and reloaded.complete
+    assert bkmod.load_library_backup_record(
+        record, expected_owner=owner) is not None
+
+    assert restore_upgrade_backup(reloaded, original) is True
+    assert (original / "track1.flac").read_bytes() == b"a" * 50_000
+    assert not backup.exists()
+
+    sealed2 = owned_result.receipt["tree"]["files"]["track1.flac"]
+    (owned / "track1.flac").write_bytes(b"d" * 50_000)
+    os.utime(owned / "track1.flac",
+             ns=(sealed2["mtime_ns"], sealed2["mtime_ns"]))
+    assert bkmod.load_backup_result(owned, expected_owner=owner) is None
 
 
 def test_restore_upgrade_backup_exdev_verifies_before_dropping_backup(tmp_path, monkeypatch):

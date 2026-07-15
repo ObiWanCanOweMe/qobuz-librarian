@@ -2029,6 +2029,42 @@ def _exact_tree_snapshot(root_fd, *, ignore_root_names=()):
         return None
 
 
+def _tree_matches_ignoring_ctime(current, expected) -> bool:
+    """Match sealed trees across chown/chmod events, which bump only ctime."""
+    if type(current) is not dict or type(expected) is not dict:
+        return False
+    if (
+        current.get("root_identity") != expected.get("root_identity")
+        or current.get("directories") != expected.get("directories")
+        or type(current.get("files")) is not dict
+        or type(expected.get("files")) is not dict
+        or set(current["files"]) != set(expected["files"])
+    ):
+        return False
+    for name, value in current["files"].items():
+        original = expected["files"][name]
+        if type(value) is not dict or type(original) is not dict:
+            return False
+        if (
+            _fidelity_without(value, "changed_ns")
+            != _fidelity_without(original, "changed_ns")
+        ):
+            return False
+    return True
+
+
+def _receipt_matches_ignoring_ctime(current, expected) -> bool:
+    """Equate receipts whose sealed trees differ only in file ctimes."""
+    if type(current) is not dict or type(expected) is not dict:
+        return False
+    return (
+        _fidelity_without(current, "tree")
+            == _fidelity_without(expected, "tree")
+        and _tree_matches_ignoring_ctime(
+            current.get("tree"), expected.get("tree"))
+    )
+
+
 def _run_backup_sigint_deferred(callback):
     """Defer Ctrl-C only across one raw-resource adoption."""
     if threading.current_thread() is not threading.main_thread():
@@ -3037,7 +3073,11 @@ def _read_backup_receipt(directory_fd):
                 _RECEIPT_SIDECAR, *_OPTIONAL_RECEIPT_MARKERS),
         )
         if current != receipt["tree"]:
-            return None
+            if not _tree_matches_ignoring_ctime(current, receipt["tree"]):
+                return None
+            # Ownership or permission fixes bump every ctime under the sealed
+            # values; adopt the live tree so exact checks bind to it from here.
+            receipt["tree"] = current
         return receipt
     except (OSError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
         return None
@@ -3297,7 +3337,9 @@ def _disposal_snapshot_matches_receipt(snapshot, receipt) -> bool:
         )
         or not set(immutable["files"]) <= set(snapshot["files"])
         or any(
-            snapshot["files"].get(name) != expected
+            type(snapshot["files"].get(name)) is not dict
+            or _fidelity_without(snapshot["files"][name], "changed_ns")
+                != _fidelity_without(expected, "changed_ns")
             for name, expected in immutable["files"].items()
         )
         or _RECEIPT_SIDECAR not in extra_files
@@ -3530,7 +3572,8 @@ def library_backup_record(backup, *, expected_owner=None):
         or reopened.complete != backup.complete
         or reopened.requested != backup.requested
         or reopened.backed_up != backup.backed_up
-        or reopened.receipt != backup.receipt
+        or not _receipt_matches_ignoring_ctime(
+            reopened.receipt, backup.receipt)
     ):
         return None
     return canonical
@@ -3553,7 +3596,8 @@ def load_library_backup_record(value, *, expected_owner=None):
         or reopened.complete != canonical["complete"]
         or reopened.requested != canonical["requested"]
         or reopened.backed_up != canonical["backed_up"]
-        or reopened.receipt != canonical["receipt"]
+        or not _receipt_matches_ignoring_ctime(
+            reopened.receipt, canonical["receipt"])
     ):
         return None
     return reopened
@@ -3652,7 +3696,7 @@ def _validated_backup_result(backup, *, origin=None, kinds=None,
         supplied_receipt_valid
         and receipt is not None
         and effective_complete is not None
-        and receipt == backup.receipt
+        and _receipt_matches_ignoring_ctime(receipt, backup.receipt)
         and receipt["requested"] == backup.requested
         and receipt["backed_up"] == backup.backed_up
         and effective_complete is backup.complete
@@ -3736,7 +3780,8 @@ def _write_receipt_marker(backup, name, note) -> bool:
             return False
         return (
             _read_exact_text_at(directory_fd, name) == expected
-            and _read_backup_receipt(directory_fd) == backup.receipt
+            and _receipt_matches_ignoring_ctime(
+                _read_backup_receipt(directory_fd), backup.receipt)
         )
     except (OSError, TypeError, ValueError):
         return False
@@ -3995,25 +4040,14 @@ def _tree_snapshot_is_exact_remainder(current, expected) -> bool:
         )
     ):
         return False
-    missing_file_identities = {
-        tuple(snapshot["identity"])
-        for name, snapshot in expected["files"].items()
-        if name not in current["files"]
-    }
     for name, snapshot in current["files"].items():
         original = expected["files"].get(name)
         if snapshot == original:
             continue
         if (
             original is None
-            or tuple(original["identity"]) not in missing_file_identities
-            or {
-                key: value for key, value in snapshot.items()
-                if key != "changed_ns"
-            } != {
-                key: value for key, value in original.items()
-                if key != "changed_ns"
-            }
+            or _fidelity_without(snapshot, "changed_ns")
+                != _fidelity_without(original, "changed_ns")
         ):
             return False
     return True
@@ -4137,8 +4171,10 @@ def _reconcile_ownerless_disposal_residue(root_fd, quarantine_name):
                 if (
                     not _named_directory_matches(
                         root_fd, carrier_name, public_fd)
-                    or _exact_tree_snapshot(public_fd)
-                        != manifest["snapshot"]
+                    or not _tree_matches_ignoring_ctime(
+                        _exact_tree_snapshot(public_fd),
+                        manifest["snapshot"],
+                    )
                 ):
                     return "attention", manifest
             if (
@@ -4167,7 +4203,7 @@ def _reconcile_ownerless_disposal_residue(root_fd, quarantine_name):
                 quarantine_fd, "held", held_fd)
             or current is None
             or not _tree_snapshot_is_exact_remainder(current, expected)
-            or current != expected
+            or not _tree_matches_ignoring_ctime(current, expected)
         ):
             return "attention", manifest
         held_files = {}
@@ -4191,7 +4227,8 @@ def _reconcile_ownerless_disposal_residue(root_fd, quarantine_name):
         if (
             not _backup_root_is_public(backup_root, root_fd)
             or not _named_directory_matches(root_fd, carrier_name, held_fd)
-            or _exact_tree_snapshot(held_fd) != expected
+            or not _tree_matches_ignoring_ctime(
+                _exact_tree_snapshot(held_fd), expected)
             or _directory_entry_names(quarantine_fd) != manifest_only
         ):
             return "attention", manifest
@@ -4320,7 +4357,8 @@ def reconcile_library_backup_disposal(
             if (
                 not _named_directory_matches(
                     root_fd, backup_path.name, public_backup_fd)
-                or public_snapshot != public_expected
+                or not _tree_matches_ignoring_ctime(
+                    public_snapshot, public_expected)
             ):
                 return BackupDisposalReconciliation(
                     "attention", quarantine_path)
@@ -4378,7 +4416,7 @@ def reconcile_library_backup_disposal(
                 "attention", quarantine_path)
 
         if replacement_proof is None:
-            if current != expected:
+            if not _tree_matches_ignoring_ctime(current, expected):
                 return BackupDisposalReconciliation(
                     "attention", quarantine_path)
             if not _restore_quarantined_entry(
@@ -4594,7 +4632,8 @@ def dispose_backup(
                     receipt,
                 )
             )
-            if authorised_snapshot != snapshot:
+            if not _tree_matches_ignoring_ctime(
+                    snapshot, authorised_snapshot):
                 return False
             if disposal["quarantine_name"] != quarantine_name:
                 return False
