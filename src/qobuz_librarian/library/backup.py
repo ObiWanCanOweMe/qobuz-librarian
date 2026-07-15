@@ -5926,6 +5926,20 @@ def _read_backup_origin(bp: Path):
         return None
 
 
+_KEEP_MARKERS = (
+    _PARTIAL_RESTORE_SENTINEL,
+    _UNVERIFIED_UPGRADE_SENTINEL,
+    _COMPANION_CARRY_INTENT_SENTINEL,
+    _COMPANION_CARRY_READY_SENTINEL,
+    _COMPANION_CARRY_COMMITTED_SENTINEL,
+)
+
+
+def backup_keep_markers_present(bp) -> bool:
+    """True when an explicit keep pin protects this backup from the age sweep."""
+    return any((Path(bp) / marker).is_file() for marker in _KEEP_MARKERS)
+
+
 def _backup_safe_to_reap(bp: Path) -> bool:
     """True ONLY when ``bp`` is provably redundant — every track it holds is
     confirmed back at its origin. The age sweep reaps on this, so the burden of
@@ -5949,13 +5963,7 @@ def _backup_safe_to_reap(bp: Path) -> bool:
     clears by hand, never silent loss."""
     # Explicit keep markers: a partial restore, or an upgrade kept because it
     # couldn't be verified complete — never reap either.
-    if any((bp / marker).is_file() for marker in (
-            _PARTIAL_RESTORE_SENTINEL,
-            _UNVERIFIED_UPGRADE_SENTINEL,
-            _COMPANION_CARRY_INTENT_SENTINEL,
-            _COMPANION_CARRY_READY_SENTINEL,
-            _COMPANION_CARRY_COMMITTED_SENTINEL,
-    )):
+    if backup_keep_markers_present(bp):
         return False
     entries = _list_tree(bp)
     if entries is None:
@@ -9585,6 +9593,50 @@ def _dispose_retention_candidate(candidate, *, allow_smaller_audio=False):
     )
 
 
+def _views_are_byte_identical(replacement_view: Path, backup_view: Path) -> bool:
+    """Every payload file present at the origin with an identical digest."""
+    try:
+        checked = False
+        for source in backup_view.rglob("*"):
+            if not source.is_file() or source.name in _SIDECARS:
+                continue
+            destination = replacement_view / source.relative_to(backup_view)
+            if (
+                not destination.is_file()
+                or destination.stat().st_size != source.stat().st_size
+                or _file_digest(source) != _file_digest(destination)
+            ):
+                return False
+            checked = True
+        return checked
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def discard_redundant_backup(path) -> bool:
+    """Dispose one retained backup whose files are all byte-identical at
+    its recorded origin.
+
+    The age sweep's size proof deliberately cannot override a keep pin — a
+    same-path, same-or-larger origin file can hide a different rendition
+    whose original survives only in the backup. A user-requested removal
+    gets the stronger proof instead: exact digests on both sides, so
+    nothing distinct can ever be deleted."""
+    candidate = load_backup_result(Path(path))
+    if candidate is None or candidate.receipt is None:
+        return False
+    replacement = Path(candidate.receipt["origin"])
+    replacement_receipt = capture_album_source_receipt(replacement)
+    if replacement_receipt is None:
+        return False
+    return dispose_backup(
+        candidate,
+        replacement_path=replacement,
+        expected_replacement_receipt=replacement_receipt,
+        replacement_validator=_views_are_byte_identical,
+    )
+
+
 def cleanup_old_upgrade_backups(retention_days: int | None = None,
                                 force: bool = False) -> int:
     """Sweep upgrade-backup dir of anything older than retention_days.
@@ -9688,7 +9740,7 @@ def cleanup_old_upgrade_backups(retention_days: int | None = None,
                 # not back at it, unreadable, or an explicit keep marker), so it
                 # may be the only copy of the tracks it holds. Retention must
                 # never reap the last copy; keep it and let the web diagnostic
-                # surface it for the user to reconcile (restore or remove by hand).
+                # surface it for the user to reconcile (restore or remove).
                 log.info(fmt(C.YELLOW,
                     f"  ⚠  Keeping backup {entry.name!r} past retention — can't "
                     f"confirm its tracks are back in the original folder."))

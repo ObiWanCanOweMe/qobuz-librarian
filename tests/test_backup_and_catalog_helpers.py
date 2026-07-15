@@ -330,6 +330,36 @@ def test_backup_receipt_survives_ctime_only_metadata_drift(tmp_path, monkeypatch
     assert bkmod.load_backup_result(owned, expected_owner=owner) is None
 
 
+def test_discard_redundant_backup_requires_byte_identical_files(tmp_path, monkeypatch):
+    # The age sweep's size proof can't override a keep pin — a same-size
+    # origin file could still be a different rendition whose original
+    # survives only in the backup. The user-driven Remove must delete only
+    # after exact digests match on both sides, pin or no pin.
+    import qobuz_librarian.library.backup as bkmod
+    monkeypatch.setattr(bkmod.cfg, "UPGRADE_BACKUP_DIR", tmp_path)
+    monkeypatch.setattr(bkmod.cfg, "MUSIC_ROOT", tmp_path / "music")
+    origin = tmp_path / "music" / "Artist" / "Album (1969)"
+    origin.mkdir(parents=True)
+    (origin / "01.flac").write_bytes(b"x" * 40_000)
+    (origin / "cover.jpg").write_bytes(b"art")
+    backup = tmp_path / "kept"
+    backup.mkdir()
+    (backup / "01.flac").write_bytes(b"y" * 40_000)
+    (backup / "cover.jpg").write_bytes(b"art")
+    result = _seal_test_backup(bkmod, backup, origin, kind="upgrade")
+    assert bkmod.pin_unverified_upgrade_backup(result)
+    assert bkmod.backup_keep_markers_present(backup)
+
+    assert bkmod.discard_redundant_backup(backup) is False
+    assert (backup / "01.flac").read_bytes() == b"y" * 40_000
+
+    (origin / "01.flac").write_bytes(b"y" * 40_000)
+    assert bkmod.discard_redundant_backup(backup) is True
+    assert not backup.exists()
+    assert (origin / "01.flac").read_bytes() == b"y" * 40_000
+    assert (origin / "cover.jpg").read_bytes() == b"art"
+
+
 def test_restore_upgrade_backup_exdev_verifies_before_dropping_backup(tmp_path, monkeypatch):
     import qobuz_librarian.library.backup as bkmod
     monkeypatch.setattr(bkmod.cfg, "UPGRADE_BACKUP_DIR", tmp_path)

@@ -3682,6 +3682,55 @@ def test_restore_backup_moves_the_files_home(client, tmp_path, monkeypatch):
         _remove_job(job)
 
 
+def test_discard_backup_removes_a_redundant_backup(client, tmp_path, monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.library import backup as backup_mod
+    from qobuz_librarian.web import job_persistence
+
+    job_persistence._reset_for_tests()
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence.init()
+    monkeypatch.setattr(cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", tmp_path / "music")
+    origin = tmp_path / "music" / "Artist" / "Album (2020)"
+    origin.mkdir(parents=True)
+    (origin / "01 - Song.flac").write_bytes(b"data")
+    carried = backup_mod.backup_album_dir(origin)
+    assert carried is not None and carried.complete is True
+    origin.mkdir(parents=True)
+    (origin / "01 - Song.flac").write_bytes(b"data")
+    job = jm.Job(title="Repair needing recovery")
+    job.execute_kind = "repair"
+    job.status = jm.JobStatus.FAILED
+    job.finished_at = time.time()
+    job.attention = "recovery"
+    job.recoveries = [_repair_recovery_record(carried.path, carried.receipt)]
+    jm.registry.add(job)
+    try:
+        r = client.post("/backups/discard", data={"backup": carried.name})
+        assert r.status_code == 200
+        assert "Removed the backup" in r.text
+        assert not carried.exists()
+        assert (origin / "01 - Song.flac").read_bytes() == b"data"
+        assert job.recoveries == []
+        assert job.attention == ""
+
+        # A backup whose origin copy differs must survive the same request.
+        (origin / "02 - Other.flac").write_bytes(b"more")
+        kept = backup_mod.backup_album_dir(origin)
+        assert kept is not None and kept.complete is True
+        origin.mkdir(parents=True)
+        (origin / "01 - Song.flac").write_bytes(b"data")
+        (origin / "02 - Other.flac").write_bytes(b"MORE")
+        r = client.post("/backups/discard", data={"backup": kept.name})
+        assert r.status_code == 200
+        assert "byte-for-byte" in r.text
+        assert kept.exists()
+        assert (kept.path / "02 - Other.flac").read_bytes() == b"more"
+    finally:
+        _remove_job(job)
+
+
 def test_auth_loss_fires_the_hook_once_per_transition(monkeypatch):
     # Only the healthy→rejected edge should push a notification; the 401s
     # that follow are the same outage, and a recovery re-arms it.

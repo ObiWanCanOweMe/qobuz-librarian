@@ -8018,13 +8018,14 @@ def _diagnostics():
                       "removing anything.",
         })
     if orphans:
-        checks.append({"label": "Orphaned backups (only copy)", "ok": False,
+        checks.append({"label": "Backups needing review", "ok": False,
                        "detail": f"{plural(len(orphans), 'backup')} "
-                                 f"{'holds' if len(orphans) == 1 else 'hold'} "
-                                 "tracks missing "
-                                 f"from their album folder — restore them below."})
+                                 f"{'was' if len(orphans) == 1 else 'were'} "
+                                 "kept — restore or remove "
+                                 f"{'it' if len(orphans) == 1 else 'them'} "
+                                 "below."})
     else:
-        checks.append({"label": "Orphaned backups (only copy)", "ok": True,
+        checks.append({"label": "Backups needing review", "ok": True,
                        "detail": "none"})
     return checks
 
@@ -8389,7 +8390,10 @@ def _diagnostics_fragment(request: Request, checks: list | None = None) -> str:
             f'</div>'
         )
     try:
-        from qobuz_librarian.library.backup import find_only_copy_backups
+        from qobuz_librarian.library.backup import (
+            backup_keep_markers_present,
+            find_only_copy_backups,
+        )
         orphans = find_only_copy_backups()
     except Exception:
         orphans = []
@@ -8425,18 +8429,38 @@ def _diagnostics_fragment(request: Request, checks: list | None = None) -> str:
                 f'</div></div>'
             )
             continue
+        try:
+            pinned = backup_keep_markers_present(path)
+        except OSError:
+            pinned = False
+        reason = (
+            "Kept because an upgrade or restore couldn't be verified "
+            f"complete; its files may already be back at {dest}."
+            if pinned
+            else f"Holds files that aren't confirmed back at {dest}."
+        )
         rows.append(
             f'<div class="ql-diagnostic-row">'
             f'<span class="ql-diagnostic-status ql-diagnostic-status-error" aria-label="Needs attention">!</span>'
             f'<div class="min-w-0"><div class="ql-diagnostic-label">Backup: {name}</div>'
-            f'<div class="ql-diagnostic-detail">Holds files missing from {dest}.</div>'
-            f'<form hx-post="/backups/restore" hx-target="#diagnostics-list" class="mt-2">'
+            f'<div class="ql-diagnostic-detail">{reason}</div>'
+            f'<div class="mt-2 flex gap-2">'
+            f'<form hx-post="/backups/restore" hx-target="#diagnostics-list">'
             f'<input type="hidden" name="_csrf_token" value="{tok}">'
             f'<input type="hidden" name="backup" value="{name}">'
             f'<button type="submit" class="ql-btn ql-btn-sm" '
             f'data-confirm="Move these files back to {dest}?" '
             f'data-confirm-action="Restore">Restore</button>'
-            f'</form></div></div>'
+            f'</form>'
+            f'<form hx-post="/backups/discard" hx-target="#diagnostics-list">'
+            f'<input type="hidden" name="_csrf_token" value="{tok}">'
+            f'<input type="hidden" name="backup" value="{name}">'
+            f'<button type="submit" class="ql-btn ql-btn-sm" '
+            f'data-confirm="Remove this backup? It is deleted only after '
+            f'every file it holds is verified byte-for-byte back at {dest}." '
+            f'data-confirm-action="Remove">Remove</button>'
+            f'</form>'
+            f'</div></div></div>'
         )
     try:
         from qobuz_librarian.library.backup import list_undo_copies
@@ -8580,6 +8604,77 @@ async def restore_backup(request: Request, backup: str = Form("")):
     loop = asyncio.get_running_loop()
     return HTMLResponse(await loop.run_in_executor(
         None, _restore_backup_sync, request, backup))
+
+
+def _discard_backup_sync(request: Request, backup: str) -> str:
+    from qobuz_librarian.library.backup import (
+        discard_redundant_backup,
+        load_backup_result,
+    )
+    name = (backup or "").strip()
+    base = Path(str(cfg.UPGRADE_BACKUP_DIR))
+    target = base / name
+    if (not name or name != Path(name).name or name.startswith(".")
+            or not target.is_dir()):
+        return (_ql_notice_html("error", "That backup isn't there anymore — "
+                                "it may already be restored or cleaned up.")
+                + _diagnostics_fragment(request))
+    state, operation_token, lock = _begin_direct_library_operation(
+        "Backup removal")
+    if state == "paused":
+        return (_ql_notice_html(
+                    "warning", "Library writes were paused before Remove "
+                    "could start. Resume the web app, then try again.")
+                + _diagnostics_fragment(request))
+    if state == "busy":
+        return (_ql_notice_html("warning", "A job is working in the library "
+                                "right now — try again once it finishes.")
+                + _diagnostics_fragment(request))
+    try:
+        carried = load_backup_result(target)
+        if carried is None or carried.receipt is None:
+            note = _ql_notice_html(
+                "error", "This backup changed or its recovery record is "
+                "invalid, so it was left untouched.")
+        elif (
+            resolution_plan := job_mgr.prepare_recovery_resolution(
+                str(carried.path), carried.receipt)
+        ) is None:
+            note = _ql_notice_html(
+                "error", "The saved recovery records could not be checked, "
+                "so this backup was left untouched. Check that the data "
+                "volume is writable, then try again.")
+        elif discard_redundant_backup(target):
+            dest = html.escape(str(carried.receipt.get("origin", "")))
+            if job_mgr.resolve_recovery_resolution(resolution_plan):
+                note = _ql_notice_html(
+                    "success", "Removed the backup — every file it held is "
+                    f"verified present at {dest}.")
+            else:
+                note = _ql_notice_html(
+                    "error", "The backup was removed, but its saved recovery "
+                    "status could not be updated. History may keep flagging "
+                    "the recovery until the data volume has been checked.")
+        else:
+            note = _ql_notice_html(
+                "error", "Couldn't verify every file is back byte-for-byte, "
+                "so the backup was left untouched. Restore is the safe way "
+                "to bring its files home.")
+    finally:
+        lock.release()
+        job_mgr.end_library_operation(operation_token)
+    return note + _diagnostics_fragment(request)
+
+
+@app.post("/backups/discard", response_class=HTMLResponse)
+async def discard_backup(request: Request, backup: str = Form("")):
+    """Delete a kept backup once its files are verified home — the Remove button on the diagnostics list."""
+    busy = _lock_busy_response(request)
+    if busy is not None:
+        return busy
+    loop = asyncio.get_running_loop()
+    return HTMLResponse(await loop.run_in_executor(
+        None, _discard_backup_sync, request, backup))
 
 
 @app.get("/api/jobs/{job_id}/stream")
