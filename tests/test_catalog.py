@@ -156,7 +156,7 @@ def test_find_extras_flags_bonus_tracks_for_upgrade_safety():
 
 
 
-def test_album_year_handles_late_utc_release_correctly():
+def test_album_year_keeps_a_new_years_eve_release_in_its_year():
     assert album_year({"release_date_original": "2021-06-15"}) == "2021"
     ts = int(datetime(2019, 12, 31, 23, 0, 0, tzinfo=timezone.utc).timestamp())
     assert album_year({"released_at": ts}) == "2019"

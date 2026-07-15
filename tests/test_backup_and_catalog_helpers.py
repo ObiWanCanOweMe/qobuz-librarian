@@ -252,7 +252,7 @@ def test_backup_refuses_rather_than_leave_unprotected_sole_copy(tmp_path, monkey
 
 
 
-def test_cross_fs_restore_succeeds_with_backup_sidecars_present(tmp_path, monkeypatch):
+def test_cross_fs_restore_ignores_backup_sidecars(tmp_path, monkeypatch):
     # Every upgrade backup carries its origin and receipt sidecars, and a
     # failed upgrade adds pin markers. The staged cross-filesystem restore
     # copies only the music, so verifying the copy must not count the
@@ -479,7 +479,7 @@ def test_restore_upgrade_backup_exdev_verifies_before_dropping_backup(tmp_path, 
 
 
 
-def test_gap_fill_restore_handles_failure_partial_and_interrupt(tmp_path, monkeypatch):
+def test_gap_fill_restore_never_strands_the_originals(tmp_path, monkeypatch):
     import qobuz_librarian.library.backup as bkmod
     monkeypatch.setattr("qobuz_librarian.config.UPGRADE_BACKUP_DIR", tmp_path / "backups")
     monkeypatch.setattr("qobuz_librarian.config.MUSIC_ROOT", tmp_path)

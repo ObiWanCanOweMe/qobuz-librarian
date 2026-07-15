@@ -66,7 +66,7 @@ def test_strip_edition_suffix_preserves_distinct_versions():
     assert strip_edition_suffix("Song (with Beyoncé)") == "Song (with Beyoncé)"
 
 
-def test_strip_album_decorations_handles_year_prefixed_folders():
+def test_strip_album_decorations_drops_year_prefixes_and_edition_tags():
     # Beets path templates `[$year] $album` and `$year - $album` produce
     # folder names like "[1971] Hunky Dory" or "1971 - Hunky Dory".
     assert strip_album_decorations("[1971] Hunky Dory") == "Hunky Dory"
