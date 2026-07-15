@@ -140,7 +140,7 @@ Set `TZ` in `.env` (an IANA name like `America/Edmonton`) so exact timestamps in
 
 ## Notifications
 
-`POST_JOB_HOOK` runs a command of your choice every time a job finishes — downloads, scans, repairs, all of it. The job's final state arrives as JSON on stdin (`id`, `status`, `title`, `artist`, `error`, `finished_at`), and `POST_JOB_HOOK_TIMEOUT` (default 10s) caps a slow endpoint. The command runs inside the container, which bundles `curl` and Python for exactly this.
+`POST_JOB_HOOK` runs a command of your choice every time a job finishes: downloads, scans, repairs, all of it. The job's final state arrives as JSON on stdin (`id`, `status`, `title`, `artist`, `error`, `finished_at`), and `POST_JOB_HOOK_TIMEOUT` (default 10s) caps a slow endpoint. The command runs inside the container, which bundles `curl` and Python for exactly this.
 
 The hook must not run `beet` or otherwise edit its database while Qobuz Librarian is running.
 
@@ -162,14 +162,14 @@ print(line + (" (" + j["error"] + ")" if j.get("error") else ""))')
 curl -s -o /dev/null -H "Title: Qobuz Librarian" -d "$msg" https://ntfy.sh/your-topic
 ```
 
-The same shape works for a Discord webhook — build the JSON body and post it:
+The same shape works for a Discord webhook; build the JSON body and post it:
 
 ```sh
 #!/bin/sh
 python3 -c 'import json,sys
 j = json.load(sys.stdin)
 line = j["status"] + ": " + " - ".join(x for x in (j.get("artist"), j.get("title")) if x)
-print(json.dumps({"content": "Qobuz Librarian — " + line}))' \
+print(json.dumps({"content": "Qobuz Librarian: " + line}))' \
   | curl -s -o /dev/null -H "Content-Type: application/json" -d @- "https://discord.com/api/webhooks/YOUR/WEBHOOK"
 ```
 
@@ -179,11 +179,11 @@ The hook also fires once if the saved Qobuz token stops being accepted (`status`
 
 ## What the app does on its own
 
-On first run the Search page *offers* a one-time baseline scan (`AUTO_LIBRARY_SCAN`) rather than starting it for you. Once that baseline exists, periodic new-release checks (`NEW_RELEASE_CHECK_INTERVAL`) run on their own, read-only — on a background timer, so they keep to the interval even when nobody has the app open. Both park a review list; nothing is downloaded or changed until you act on it.
+On first run the Search page *offers* a one-time baseline scan (`AUTO_LIBRARY_SCAN`) rather than starting it for you. Once that baseline exists, periodic new-release checks (`NEW_RELEASE_CHECK_INTERVAL`) run on their own, read-only, on a background timer, so they keep to the interval even when nobody has the app open. Both park a review list; nothing is downloaded or changed until you act on it.
 
 - **Library gap-fill** can add missing albums or missing tracks after review; it does not overwrite existing tracks.
 - **After a download**, it re-checks the new album's track lengths against Qobuz and flags **Repair** if one is short. Read-only (a clean truncation can still decode).
-- **Upgrade** and **Downsample** change files only when you start them. Upgrade backs up the originals first (`UPGRADE_BACKUP_RETENTION_DAYS`); Downsample rewrites in place after verifying each file decodes — or, with *Keep originals when downsampling* set to keep (`DOWNSAMPLE_KEEP_ORIGINALS`; you're asked to choose keep or delete on your first downsample), parks the hi-res copies in the backup area first so the rewrite can be undone from Settings → Diagnostics until the retention window ends.
+- **Upgrade** and **Downsample** change files only when you start them. Upgrade backs up the originals first (`UPGRADE_BACKUP_RETENTION_DAYS`); Downsample rewrites in place after verifying each file decodes, or, with *Keep originals when downsampling* set to keep (`DOWNSAMPLE_KEEP_ORIGINALS`; you're asked to choose keep or delete on your first downsample), parks the hi-res copies in the backup area first so the rewrite can be undone from Settings → Diagnostics until the retention window ends.
 - **Lyrics** writes tags or `.lrc` sidecars, not the audio.
 - **Consolidation** (`CONSOLIDATE`, off) merges duplicate folders, CLI-only (it needs per-folder confirmation).
 - **`MIGRATE_MULTI_ARTIST`** (off) re-files `A, B/Album` under `A/Album` after import.

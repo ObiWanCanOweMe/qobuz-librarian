@@ -90,4 +90,4 @@ Review choices are remembered, so a large library can be handled over several se
 
 ## After the baseline
 
-One full scan is the setup step, not a routine. The app tracks everything it downloads on its own, so you normally never scan again. If music lands in the folders from outside the app, the small refresh icon in the Library header runs a quick pass (unchanged artist folders are skipped) and folds anything new into the review you already have open — your ticks stay put. "Force full rescan", for when you've reorganised things by hand, lives in Settings.
+One full scan is the setup step, not a routine. The app tracks everything it downloads on its own, so you normally never scan again. If music lands in the folders from outside the app, the small refresh icon in the Library header runs a quick pass (unchanged artist folders are skipped) and folds anything new into the review you already have open; your ticks stay put. "Force full rescan", for when you've reorganised things by hand, lives in Settings.
