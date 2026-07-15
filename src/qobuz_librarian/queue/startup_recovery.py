@@ -32,6 +32,7 @@ from qobuz_librarian.integrations.beets import (
 )
 from qobuz_librarian.integrations.staging import (
     StagingReferenceStatus,
+    bind_unclaimed_staging_run,
     discard_file_group,
     discard_group,
     inspect_staging_group_reference,
@@ -351,7 +352,7 @@ def _load_namespace(authority):
     return loads
 
 
-def _has_unclaimed_staging_run(journals) -> bool:
+def _unclaimed_staging_run_names(journals):
     staging = Path(os.path.abspath(os.fspath(cfg.STAGING_DIR)))
     claimed = set()
     for journal in journals:
@@ -363,7 +364,38 @@ def _has_unclaimed_staging_run(journals) -> bool:
                 candidate = Path(os.path.abspath(path))
                 if candidate.parent == staging:
                     claimed.add(candidate.name)
-    return any(name not in claimed for name in isolated_staging_run_names())
+    return tuple(
+        name for name in isolated_staging_run_names() if name not in claimed)
+
+
+def _retain_unclaimed_staging_runs(authority, names) -> bool:
+    """Park run roots no journal claims; the terminal lane leaves them behind.
+
+    The boot holder owns the run lock, so no live rip can be writing these.
+    A refusal (a stuck writer still holds a descriptor) falls back to the
+    attention stop instead of touching the tree.
+    """
+    settled = True
+    for name in names:
+        _require_authority(authority)
+        run = bind_unclaimed_staging_run(name)
+        try:
+            group = (
+                retain_staging_run(run, label="abandoned")
+                if run is not None else None
+            )
+        except OSError:
+            group = None
+        if group is None:
+            settled = False
+            continue
+        logging.getLogger("qobuz_librarian").warning(
+            "An unclaimed download folder %s was left in staging; it was "
+            "moved to %s for review.",
+            name,
+            group.path,
+        )
+    return settled
 
 
 def _staging_inspection(reference, owner):
@@ -1226,8 +1258,11 @@ def recover_startup_state(
             _require_authority(authority)
             if _recover_active_library_backups(authority, journals):
                 continue
-            if _has_unclaimed_staging_run(journals):
+            unclaimed = _unclaimed_staging_run_names(journals)
+            if unclaimed:
                 _require_authority(authority)
+                if _retain_unclaimed_staging_runs(authority, unclaimed):
+                    continue
                 return StartupRecoveryResult(
                     StartupRecoveryStatus.ATTENTION_REQUIRED,
                     reason="unclaimed-staging-run",

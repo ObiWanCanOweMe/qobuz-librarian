@@ -878,3 +878,64 @@ def test_user_discard_clears_the_blocked_download_operation(tmp_path, monkeypatc
     assert settled.status is startup_recovery.BlockedItemSettlementStatus.DISCARDED
     assert not retained.path.exists()
     assert journal.load_queue_journal(operation_id).status is journal.QueueLoadStatus.ABSENT
+
+
+def test_boot_retains_a_journal_less_staging_run_instead_of_wedging(
+    tmp_path,
+    monkeypatch,
+):
+    # A crashed or failed terminal-mode download leaves a .qobuz-run-* with no
+    # journal item behind it. Boot recovery used to stop on it with attention
+    # required — pausing every download — and nothing in the app could settle
+    # it. Park the leftover for review instead and let the boot come up clean.
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "run.lock")
+    monkeypatch.setattr(cfg, "STAGING_DIR", tmp_path / "staging")
+    monkeypatch.setattr(cfg, "QUEUE_JOURNAL_DIR", tmp_path / "journals")
+    run_dir = tmp_path / "staging" / f".qobuz-run-{'0' * 24}"
+    run_dir.mkdir(parents=True)
+    (run_dir / "cover.jpg").write_bytes(b"art")
+
+    authority = run_lock.acquire()
+    try:
+        result = startup_recovery.recover_startup_state(authority=authority)
+    finally:
+        authority.close()
+
+    assert result.status is startup_recovery.StartupRecoveryStatus.CLEAR
+    assert not run_dir.exists()
+    retained = sorted(
+        (tmp_path / "staging" / cfg.BEETS_RETRY_DIR).glob(
+            "*-abandoned-*/000-*/cover.jpg"
+        )
+    )
+    assert len(retained) == 1
+    assert retained[0].read_bytes() == b"art"
+
+
+def test_boot_still_stops_when_an_unclaimed_run_has_a_live_writer(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "run.lock")
+    monkeypatch.setattr(cfg, "STAGING_DIR", tmp_path / "staging")
+    monkeypatch.setattr(cfg, "QUEUE_JOURNAL_DIR", tmp_path / "journals")
+    run_dir = tmp_path / "staging" / f".qobuz-run-{'1' * 24}"
+    run_dir.mkdir(parents=True)
+    track = run_dir / "01 Track.flac"
+    track.write_bytes(b"partial audio")
+
+    descriptor = os.open(track, os.O_WRONLY)
+    try:
+        authority = run_lock.acquire()
+        try:
+            result = startup_recovery.recover_startup_state(
+                authority=authority)
+        finally:
+            authority.close()
+    finally:
+        os.close(descriptor)
+
+    assert result.status is (
+        startup_recovery.StartupRecoveryStatus.ATTENTION_REQUIRED)
+    assert result.reason == "unclaimed-staging-run"
+    assert track.read_bytes() == b"partial audio"

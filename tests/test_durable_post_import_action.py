@@ -97,8 +97,8 @@ def test_startup_retirement_uses_action_finalizer(monkeypatch):
     )
     monkeypatch.setattr(
         startup_recovery,
-        "_has_unclaimed_staging_run",
-        lambda *_args: False,
+        "_unclaimed_staging_run_names",
+        lambda *_args: (),
     )
     monkeypatch.setattr(
         startup_recovery,

@@ -768,6 +768,17 @@ def staging_run_from_record(value):
     return StagingRun(path, tuple(identity), owner)
 
 
+def bind_unclaimed_staging_run(name):
+    """Bind one journal-less run root so restart recovery can retain it."""
+    if not isinstance(name, str) or _RUN_DIR_RE.fullmatch(name) is None:
+        return None
+    staging = Path(os.path.abspath(os.fspath(cfg.STAGING_DIR)))
+    receipt = capture_tree(staging / name)
+    if receipt is None:
+        return None
+    return StagingRun(receipt.path, receipt.root_identity, None)
+
+
 def capture_staging_run(run):
     if isinstance(run, dict):
         run = staging_run_from_record(run)
