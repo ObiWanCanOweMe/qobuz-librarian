@@ -669,11 +669,11 @@ def _web_writes_paused() -> bool:
 def _unwritable_volumes() -> list[str]:
     """Live probe of the critical mounts; empty means writes may run.
 
-    Probed on every gated attempt rather than sealed at startup, so fixing
-    ownership on the host opens the gate without a container restart — the
-    Diagnostics page re-checks live, and the gate has to agree with it.
-    Opt-in via env so tests and dev runs without /staging or /music mounted
-    don't trip on it; the bundled compose sets it to 1."""
+    Probed on every gated attempt, so fixing ownership on the host opens
+    the gate without a container restart; the Diagnostics page re-checks
+    live, and the gate has to agree with it. Opt-in via env so tests and
+    dev runs without /staging or /music mounted don't trip on it; the
+    bundled compose sets it to 1."""
     if os.environ.get("QL_CHECK_VOLUMES") != "1":
         return []
     problems = []

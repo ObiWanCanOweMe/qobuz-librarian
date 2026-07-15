@@ -185,11 +185,9 @@ class _HeldRepairSource:
             if not stat.S_ISREG(os.fstat(self.descriptor).st_mode):
                 raise OSError("repair source is not a regular file")
             # A file the app user doesn't own can't carry a write lease
-            # (F_SETLEASE needs ownership or CAP_LEASE), which used to end
-            # its diagnosis as "unverified" — so a broken file on a
-            # mixed-ownership library was never flagged. Diagnosis is sound
-            # without the lease: the sealed receipt and every intact()
-            # recheck compare the full stat identity, so a concurrent write
+            # (F_SETLEASE needs ownership or CAP_LEASE). Diagnosis is sound
+            # without one: the sealed receipt and every intact() recheck
+            # compare the full stat identity, so a concurrent write
             # downgrades the verdict instead of standing behind it.
             self.exclusion = acquire_inode_write_exclusion(self.descriptor)
 

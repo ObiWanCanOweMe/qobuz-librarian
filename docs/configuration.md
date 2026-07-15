@@ -112,19 +112,19 @@ On boot, the container chowns the app-managed volumes (`config`, `data`, `stagin
 
 Operations that replace or remove an existing library file also require the share to flush file and directory changes reliably. If the mount cannot do that, Qobuz Librarian stops the destructive step and keeps the original.
 
-For a read-only music share, append `:ro` to the `/music` bind and set `QL_CHECK_VOLUMES=0` in `.env`; otherwise write endpoints, including scan starts, return 503 after the write check fails.
+For a read-only music share, append `:ro` to the `/music` bind and set `QL_CHECK_VOLUMES=0` in `.env`; otherwise write endpoints, including scan starts, return 503 while the write check fails. The check is live, so fixing the mount or its ownership takes effect without a restart.
+
+If the bind dirs were auto-created as root on a first `up`, chown them:
+
+```bash
+sudo chown -R 1000:1000 ./music ./staging ./upgrade_backups
+```
 
 To run as root, set `PUID=0` and `PGID=0` explicitly. A non-numeric typo makes the container refuse to start rather than silently falling back to root.
 
 ## Timezone
 
 Set `TZ` in `.env` (an IANA name like `America/Edmonton`) so exact timestamps in History and on job pages show your local time instead of UTC. Relative labels like "2 hr ago" are correct either way.
-
-If the bind dirs were auto-created as root on first `up`, chown them before enabling those settings:
-
-```bash
-sudo chown -R 1000:1000 ./music ./staging ./upgrade_backups
-```
 
 ## Deployment
 
