@@ -2,6 +2,22 @@
 
 All notable changes to Qobuz Librarian are recorded here, newest first. The project follows [semantic versioning](https://semver.org/); dates are when each version was tagged during local development.
 
+## [0.11.1] - 2026-07-15
+
+Fixes from driving every flow end to end against a live library — downloads, cancels, crashes, restarts, repairs.
+
+- Cancelling a download now discards the partial work and moves on; it used to leave a blocked queue item that paused every download until the container restarted.
+- A download that came back incomplete, or died in a crash, can be retried straight from its job page; before, the retry refused and only a restart or manual file surgery cleared it.
+- Parallel downloads no longer risk a clean album being quarantined because its tracks finished out of order, and a gap-fill that only re-downloaded cover art imports instead of reporting a false failure.
+- Backups survive restarts and permission fixes: the container no longer touches every file's ownership on boot, and saved backup records tolerate ownership or permission changes instead of refusing with "this backup changed".
+- Failed upgrades put the original album back again on Docker setups — the automatic restore compared its copy against the wrong file list and always gave up, leaving the album displaced into the backups folder.
+- A leftover download folder from a crashed terminal-mode session no longer freezes the whole app at startup; it's set aside for review and the app comes up normally.
+- Repair now diagnoses and fixes files the app user doesn't own (wrong PUID, NAS permissions) instead of silently skipping them, a verified repair is reported as repaired, and the originals' backup is cleaned up once every replacement is verified in place.
+- Settings → Diagnostics says why a backup was kept and gains a Remove button that deletes one only after checking, byte for byte, that everything it holds is already back in the library.
+- "Check new releases" moved next to the Library page's refresh icon, so it stays reachable while a review is parked.
+- Signing in uses new cookie names; you'll be asked to sign in once after upgrading.
+- Smaller fixes: an empty bookkeeping folder no longer keeps the staging-leftovers warning permanently lit.
+
 ## [0.11.0] - 2026-07-14
 
 A long reliability pass over everything that moves or deletes files.
