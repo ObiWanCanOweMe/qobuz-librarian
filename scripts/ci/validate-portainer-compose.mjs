@@ -5,19 +5,28 @@ import { fileURLToPath } from 'node:url';
 
 const VERSION_TOKEN = '${QOBUZ_LIBRARIAN_VERSION:?required}';
 const UNRESOLVED_VERSION = /\$\{QOBUZ_LIBRARIAN_VERSION[^}]*\}/;
-const IMAGE_REFERENCE = /^\s*image:\s*['"]?([^\s'"]+)['"]?\s*$/gm;
+const IMAGE_LINE = /^\s*image:\s*(.*?)\s*$/gm;
+const PRODUCTION_IMAGE = /^ghcr\.io\/obiwancanoweme\/qobuz-librarian:v\d+\.\d+\.\d+$/;
 const STABLE_RELEASE_TAG = /^v\d+\.\d+\.\d+$/;
 
 export function validatePortainerCompose({ composeText }) {
   if (/^\s*build\s*:/m.test(composeText)) {
     throw new Error('Portainer manifest must not contain build entries');
   }
-  for (const match of composeText.matchAll(IMAGE_REFERENCE)) {
-    const imageReference = match[1];
+  let hasProductionImage = false;
+  for (const match of composeText.matchAll(IMAGE_LINE)) {
+    const imageReference = match[1].replace(/^(['"])(.*)\1$/, '$2');
     const tag = imageReference.slice(imageReference.lastIndexOf(':') + 1);
     if (!STABLE_RELEASE_TAG.test(tag)) {
       throw new Error('Portainer manifest must use a stable release image tag; latest image tags are not allowed');
     }
+    if (!PRODUCTION_IMAGE.test(imageReference)) {
+      throw new Error('Portainer manifest must use the production image ghcr.io/obiwancanoweme/qobuz-librarian');
+    }
+    hasProductionImage = true;
+  }
+  if (!hasProductionImage) {
+    throw new Error('Portainer manifest must define the production image');
   }
   if (/\/migrate-source|\/migrate-dest/.test(composeText)) {
     throw new Error('Portainer manifest must not include migration-only mounts');

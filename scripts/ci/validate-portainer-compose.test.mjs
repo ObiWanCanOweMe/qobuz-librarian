@@ -18,6 +18,10 @@ test('renders the production Portainer manifest with the required image tag', as
   });
 
   assert.match(rendered, /ghcr\.io\/obiwancanoweme\/qobuz-librarian:v0\.11\.3/);
+  assert.match(
+    rendered,
+    /^\s*image:\s*ghcr\.io\/obiwancanoweme\/qobuz-librarian:v0\.11\.3\s*$/m,
+  );
   assert.match(rendered, /container_name: qobuz-librarian/);
   assert.match(rendered, /10\.20\.0\.9:\$\{WEB_PORT:-8666\}:8666/);
   assert.match(rendered, /\/mnt\/bowl\/media2\/qobuz-librarian:\/music/);
@@ -49,6 +53,25 @@ test('rejects non-release image tags', () => {
       `expected ${tag} to be rejected`,
     );
   }
+});
+
+test('requires the production image registry after rendering', () => {
+  assert.throws(
+    () => validatePortainerCompose({
+      composeText: 'services:\n  app:\n    image: docker.io/obiwancanoweme/qobuz-librarian:v0.11.3\n',
+    }),
+    /production image/i,
+  );
+});
+
+test('rejects branch image tags followed by comments', () => {
+  assert.throws(
+    () => validatePortainerCompose({
+      composeText:
+        'services:\n  app:\n    image: ghcr.io/obiwancanoweme/qobuz-librarian:main # temporary\n',
+    }),
+    /stable release image tag|production image/i,
+  );
 });
 
 test('requires QOBUZ_LIBRARIAN_VERSION before rendering', async () => {
