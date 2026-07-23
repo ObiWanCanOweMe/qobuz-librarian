@@ -63,6 +63,7 @@ test('probeHealth accepts the qobuz health endpoint', async () => {
 
 test('deployWithRollback restores the previous snapshot when health fails', async () => {
   const updates = [];
+  const healthStatuses = [500, 200];
   const client = {
     snapshotStack: async () => ({
       Env: [{ name: 'QOBUZ_LIBRARIAN_VERSION', value: 'v0.11.2' }],
@@ -79,10 +80,11 @@ test('deployWithRollback restores the previous snapshot when health fails', asyn
       healthUrl: 'http://example.test/healthz',
       attempts: 1,
       retryDelayMs: 0,
-      fetchImpl: async () => ({ status: 500, json: async () => ({}) }),
+      fetchImpl: async () => ({ status: healthStatuses.shift(), json: async () => ({}) }),
     }),
     DeploymentRolledBackError,
   );
+  assert.deepEqual(healthStatuses, []);
   assert.equal(updates.length, 2);
   assert.equal(updates[0].Env.find((entry) => entry.name === 'QOBUZ_LIBRARIAN_VERSION').value, 'v0.11.3');
   assert.equal(updates[1].StackFileContent, 'image: old\n');
