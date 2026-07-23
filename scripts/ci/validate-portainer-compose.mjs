@@ -6,8 +6,10 @@ import { fileURLToPath } from 'node:url';
 const VERSION_TOKEN = '${QOBUZ_LIBRARIAN_VERSION:?required}';
 const UNRESOLVED_VERSION = /\$\{QOBUZ_LIBRARIAN_VERSION[^}]*\}/;
 const IMAGE_LINE = /^\s*image:\s*(.*?)\s*$/gm;
-const PRODUCTION_IMAGE = /^ghcr\.io\/obiwancanoweme\/qobuz-librarian:v\d+\.\d+\.\d+$/;
-const STABLE_RELEASE_TAG = /^v\d+\.\d+\.\d+$/;
+const STABLE_RELEASE_TAG = /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
+const PRODUCTION_IMAGE = new RegExp(
+  `^ghcr\\.io/obiwancanoweme/qobuz-librarian:${STABLE_RELEASE_TAG.source.slice(1, -1)}$`,
+);
 
 export function validatePortainerCompose({ composeText }) {
   if (/^\s*build\s*:/m.test(composeText)) {

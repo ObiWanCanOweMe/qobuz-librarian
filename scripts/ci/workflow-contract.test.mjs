@@ -127,7 +127,10 @@ test('image scan workflow uploads SARIF and is report-only', async () => {
 test('scheduled image scans select only stable semver release tags', async () => {
   const text = await workflow('scan-images.yml');
   const resolveTag = jobBlock(text, 'resolve-tag');
-  assert.match(resolveTag, /grep -E '\^v\[0-9\]\+\\\.\[0-9\]\+\\\.\[0-9\]\+\$'/);
+  assert.match(
+    resolveTag,
+    /grep -E '\^v\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\$'/,
+  );
   assert.match(resolveTag, /grep -E[^\n]*\|\s*sort -Vr/);
 });
 

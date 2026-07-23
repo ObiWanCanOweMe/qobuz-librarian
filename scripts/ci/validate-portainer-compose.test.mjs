@@ -46,13 +46,20 @@ test('rejects mutable image tags and source-build manifests', () => {
 });
 
 test('rejects non-release image tags', () => {
-  for (const tag of ['main', 'latest', 'v0.11.3-rc.1', 'v0.11.3-fork']) {
+  for (const tag of ['main', 'latest', 'v0.11.3-rc.1', 'v0.11.3-fork', 'v01.2.5']) {
     assert.throws(
       () => validatePortainerCompose({ composeText: `services:\n  app:\n    image: ghcr.io/obiwancanoweme/qobuz-librarian:${tag}\n` }),
       /stable release image tag/i,
       `expected ${tag} to be rejected`,
     );
   }
+});
+
+test('accepts the zero release image tag', () => {
+  assert.doesNotThrow(() => validatePortainerCompose({
+    composeText:
+      'services:\n  app:\n    image: ghcr.io/obiwancanoweme/qobuz-librarian:v0.0.0\n    container_name: qobuz-librarian\n',
+  }));
 });
 
 test('requires the production image registry after rendering', () => {
