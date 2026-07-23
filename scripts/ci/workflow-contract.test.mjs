@@ -60,6 +60,15 @@ test('Docker workflow publishes immutable GHCR release tags with authenticated D
   assert.doesNotMatch(text, /type=raw,value=latest/);
 });
 
+test('Docker tag preflight fails closed unless GHCR reports the manifest is absent', async () => {
+  const text = await workflow('docker.yml');
+  const tagPreflight = jobBlock(text, 'tag-preflight');
+  assert.doesNotMatch(tagPreflight, /docker buildx imagetools inspect[^\n]*\|\|\s*true/);
+  assert.match(tagPreflight, /INSPECT_OUTPUT="\$\(docker buildx imagetools inspect "\$IMAGE_REF" 2>&1\)"/);
+  assert.match(tagPreflight, /grep -Eq?i?[^\n]*(manifest unknown|manifest.*not found)/i);
+  assert.match(tagPreflight, /Unable to prove image tag is absent/);
+});
+
 test('Docker workflow deploys only after verify, preflight, build, and scan', async () => {
   const text = await workflow('docker.yml');
   assert.match(text, /build-and-push:\s*\n\s+runs-on:[\s\S]*?needs: \[verify, tag-preflight\]/);
@@ -113,4 +122,24 @@ test('image scan workflow uploads SARIF and is report-only', async () => {
   assert.match(text, /exit-code: "0"/);
   assert.match(text, /workflow_call:/);
   assert.match(text, /schedule:/);
+});
+
+test('scheduled image scans select only stable semver release tags', async () => {
+  const text = await workflow('scan-images.yml');
+  const resolveTag = jobBlock(text, 'resolve-tag');
+  assert.match(resolveTag, /grep -E '\^v\[0-9\]\+\\\.\[0-9\]\+\\\.\[0-9\]\+\$'/);
+  assert.match(resolveTag, /grep -E[^\n]*\|\s*sort -Vr/);
+});
+
+test('image scan workflow scopes permissions to the minimum each job needs', async () => {
+  const text = await workflow('scan-images.yml');
+  assert.doesNotMatch(text, /^permissions:/m);
+
+  const resolveTag = jobBlock(text, 'resolve-tag');
+  assert.match(resolveTag, /permissions:\s*\n\s+contents: read/);
+  assert.doesNotMatch(resolveTag, /packages: read/);
+  assert.doesNotMatch(resolveTag, /security-events: write/);
+
+  const scan = jobBlock(text, 'scan');
+  assert.match(scan, /permissions:\s*\n\s+contents: read\s*\n\s+packages: read\s*\n\s+security-events: write/);
 });

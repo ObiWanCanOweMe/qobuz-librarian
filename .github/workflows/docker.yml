@@ -91,11 +91,20 @@ jobs:
         env:
           IMAGE_REF: ghcr.io/obiwancanoweme/qobuz-librarian:${{ github.event.release.tag_name }}
         run: |
-          if docker buildx imagetools inspect "$IMAGE_REF" >/dev/null 2>&1; then
+          INSPECT_OUTPUT=""
+          if INSPECT_OUTPUT="$(docker buildx imagetools inspect "$IMAGE_REF" 2>&1)"; then
             echo "Image tag already exists: $IMAGE_REF" >&2
             exit 1
           fi
-          echo "Image tag is absent: $IMAGE_REF"
+
+          if printf '%s\n' "$INSPECT_OUTPUT" | grep -Eqi 'manifest unknown|manifest.*not found|not found.*manifest'; then
+            echo "Image tag is absent: $IMAGE_REF"
+            exit 0
+          fi
+
+          echo "Unable to prove image tag is absent: $IMAGE_REF" >&2
+          printf '%s\n' "$INSPECT_OUTPUT" >&2
+          exit 1
 
   build-and-push:
     runs-on: ubuntu-latest
