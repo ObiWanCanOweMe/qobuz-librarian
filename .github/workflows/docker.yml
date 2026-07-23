@@ -97,7 +97,7 @@ jobs:
             exit 1
           fi
 
-          if printf '%s\n' "$INSPECT_OUTPUT" | grep -Eqi 'manifest unknown|manifest.*not found|not found.*manifest'; then
+          if printf '%s\n' "$INSPECT_OUTPUT" | grep -Eqi 'manifest unknown|manifest.*not found|not found.*manifest|: not found$'; then
             echo "Image tag is absent: $IMAGE_REF"
             exit 0
           fi

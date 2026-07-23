@@ -66,6 +66,7 @@ test('Docker tag preflight fails closed unless GHCR reports the manifest is abse
   assert.doesNotMatch(tagPreflight, /docker buildx imagetools inspect[^\n]*\|\|\s*true/);
   assert.match(tagPreflight, /INSPECT_OUTPUT="\$\(docker buildx imagetools inspect "\$IMAGE_REF" 2>&1\)"/);
   assert.match(tagPreflight, /grep -Eq?i?[^\n]*(manifest unknown|manifest.*not found)/i);
+  assert.match(tagPreflight, /:\s*not found/);
   assert.match(tagPreflight, /Unable to prove image tag is absent/);
 });
 
