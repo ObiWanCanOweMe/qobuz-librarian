@@ -41,6 +41,16 @@ test('rejects mutable image tags and source-build manifests', () => {
   );
 });
 
+test('rejects non-release image tags', () => {
+  for (const tag of ['main', 'latest', 'v0.11.3-rc.1', 'v0.11.3-fork']) {
+    assert.throws(
+      () => validatePortainerCompose({ composeText: `services:\n  app:\n    image: ghcr.io/obiwancanoweme/qobuz-librarian:${tag}\n` }),
+      /stable release image tag/i,
+      `expected ${tag} to be rejected`,
+    );
+  }
+});
+
 test('requires QOBUZ_LIBRARIAN_VERSION before rendering', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'qobuz-compose-'));
   const composePath = join(dir, 'compose.yml');

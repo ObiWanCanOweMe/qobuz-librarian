@@ -5,13 +5,19 @@ import { fileURLToPath } from 'node:url';
 
 const VERSION_TOKEN = '${QOBUZ_LIBRARIAN_VERSION:?required}';
 const UNRESOLVED_VERSION = /\$\{QOBUZ_LIBRARIAN_VERSION[^}]*\}/;
+const IMAGE_REFERENCE = /^\s*image:\s*['"]?([^\s'"]+)['"]?\s*$/gm;
+const STABLE_RELEASE_TAG = /^v\d+\.\d+\.\d+$/;
 
 export function validatePortainerCompose({ composeText }) {
   if (/^\s*build\s*:/m.test(composeText)) {
     throw new Error('Portainer manifest must not contain build entries');
   }
-  if (/qobuz-librarian:latest|dinkeyes\/qobuz-librarian:latest/.test(composeText)) {
-    throw new Error('Portainer manifest must not use a latest image');
+  for (const match of composeText.matchAll(IMAGE_REFERENCE)) {
+    const imageReference = match[1];
+    const tag = imageReference.slice(imageReference.lastIndexOf(':') + 1);
+    if (!STABLE_RELEASE_TAG.test(tag)) {
+      throw new Error('Portainer manifest must use a stable release image tag; latest image tags are not allowed');
+    }
   }
   if (/\/migrate-source|\/migrate-dest/.test(composeText)) {
     throw new Error('Portainer manifest must not include migration-only mounts');
