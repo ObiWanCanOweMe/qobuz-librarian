@@ -4,33 +4,45 @@ on:
   release:
     types: [published]
 
-# Reads the repo, writes to Docker Hub via secrets — no GitHub Packages
-# writes here, so contents: read is enough.
 permissions:
   contents: read
 
-# Run the bundled JS actions on Node 24 (the pinned majors still ship
-# Node 20, which GitHub deprecates mid-2026). This is GitHub's documented
-# opt-in and avoids chasing per-action major bumps.
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-# Serialise publishes so two runs never race to overwrite :latest; don't cancel
-# an in-flight build, so a tagged image always finishes pushing.
 concurrency:
-  group: docker-release
+  group: docker-release-${{ github.event.release.tag_name }}
   cancel-in-progress: false
 
 jobs:
-  # Release gate. docker.yml is a separate workflow from test.yml, so a
-  # cross-workflow `needs:` isn't possible — the checks live here and
-  # build-and-push depends on them. This closes the gap where a published
-  # release built and pushed an image with no test, lint, or smoke gate, so a
-  # broken build/route/missing-tool could ship straight to users.
   verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify release commit is reachable from main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Published release tag commit must be reachable from origin/main." >&2
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Validate release tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: node -e "import('./scripts/release/qobuz-tag.mjs').then(({ parseQobuzTag }) => parseQobuzTag(process.env.RELEASE_TAG))"
+
+      - name: Build CSS assets and run deployment contracts
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+          npm run test:deployment-contract
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -52,10 +64,6 @@ jobs:
       - name: Image smoke test (builds the image, boots it, checks routes + bundled tools)
         run: bash scripts/smoke_test.sh
 
-      # The publish below ships linux/arm64 too, but nothing else in CI ever
-      # compiles the dependency set on arm — a pin with no arm wheel would
-      # surface for the first time in the middle of the release build. Build
-      # (not push) the arm64 image here so it fails the gate instead.
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
 
@@ -65,69 +73,113 @@ jobs:
       - name: Cross-build the arm64 image
         run: docker buildx build --platform linux/arm64 .
 
-  build-and-push:
-    runs-on: ubuntu-latest
+  tag-preflight:
     needs: [verify]
-
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Docker Hub
+      - name: Authenticate to GHCR
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Decide whether this release should move :latest. metadata-action's
-      # latest=auto only checks the tag has no prerelease suffix — it does NOT
-      # compare against other tags, so backfilling an old release (publishing
-      # v0.5.1 after v0.7.0) would still clobber :latest with old code. Tag
-      # :latest only when this release is the highest stable semver in the repo.
-      - name: Is this the newest release?
-        id: newest
+      - name: Prove the exact release tag is absent
         env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          TAG: ${{ github.event.release.tag_name }}
-          PRERELEASE: ${{ github.event.release.prerelease }}
+          IMAGE_REF: ghcr.io/obiwancanoweme/qobuz-librarian:${{ github.event.release.tag_name }}
         run: |
-          # `|| true` so a repo with no stable vX.Y.Z tag yet (e.g. the first
-          # release is a prerelease) doesn't abort the step under pipefail.
-          highest=$(gh api --paginate "repos/$REPO/tags" --jq '.[].name' \
-            | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -1)
-          if [ "$PRERELEASE" != 'true' ] && [ "$TAG" = "$highest" ]; then
-            echo "is_latest=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_latest=false" >> "$GITHUB_OUTPUT"
+          INSPECT_OUTPUT=""
+          if INSPECT_OUTPUT="$(docker buildx imagetools inspect "$IMAGE_REF" 2>&1)"; then
+            echo "Image tag already exists: $IMAGE_REF" >&2
+            exit 1
           fi
-          echo "tag=$TAG highest=$highest prerelease=$PRERELEASE"
 
-      - name: Extract version tag
-        id: meta
-        uses: docker/metadata-action@v6
+          if printf '%s\n' "$INSPECT_OUTPUT" | grep -Eqi 'manifest unknown|manifest.*not found|not found.*manifest'; then
+            echo "Image tag is absent: $IMAGE_REF"
+            exit 0
+          fi
+
+          echo "Unable to prove image tag is absent: $IMAGE_REF" >&2
+          printf '%s\n' "$INSPECT_OUTPUT" >&2
+          exit 1
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: [verify, tag-preflight]
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
         with:
-          images: dinkeyes/qobuz-librarian
-          flavor: |
-            latest=false
-          tags: |
-            type=semver,pattern={{version}}
-            type=raw,value=latest,enable=${{ steps.newest.outputs.is_latest == 'true' }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          # Signed build provenance + a software bill of materials, attached to
-          # the image on Docker Hub so a deployer can verify what they're running.
+          tags: ghcr.io/obiwancanoweme/qobuz-librarian:${{ github.event.release.tag_name }}
+          labels: |
+            org.opencontainers.image.version=${{ github.event.release.tag_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
           provenance: true
           sbom: true
+
+      - name: Record immutable image digest
+        run: |
+          echo '### Published image' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Image: `ghcr.io/obiwancanoweme/qobuz-librarian`' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Tag: `${{ github.event.release.tag_name }}`' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Digest: `${{ steps.build.outputs.digest }}`' >> "$GITHUB_STEP_SUMMARY"
+
+  scan-image:
+    needs: [verify, tag-preflight, build-and-push]
+    uses: ./.github/workflows/scan-images.yml
+    with:
+      release_tag: ${{ github.event.release.tag_name }}
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+
+  deploy-production:
+    needs: [verify, tag-preflight, build-and-push, scan-image]
+    runs-on: [self-hosted, ark]
+    permissions:
+      contents: read
+    environment: production
+    concurrency:
+      group: qobuz-librarian-production
+      cancel-in-progress: false
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Deploy immutable release through Portainer
+        run: node scripts/deploy/portainer-release.mjs
+        env:
+          PORTAINER_URL: ${{ vars.PORTAINER_URL }}
+          PORTAINER_API_KEY: ${{ secrets.PORTAINER_API_KEY }}
+          PORTAINER_STACK_ID: ${{ vars.PORTAINER_STACK_ID }}
+          PORTAINER_ENDPOINT_ID: ${{ vars.PORTAINER_ENDPOINT_ID }}
+          QOBUZ_LIBRARIAN_VERSION: ${{ github.event.release.tag_name }}
+          QOBUZ_HEALTH_URL: ${{ vars.QOBUZ_HEALTH_URL }}

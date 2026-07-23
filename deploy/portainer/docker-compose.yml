@@ -1,0 +1,108 @@
+services:
+  qobuz-librarian:
+    image: ghcr.io/obiwancanoweme/qobuz-librarian:${QOBUZ_LIBRARIAN_VERSION:?required}
+    container_name: qobuz-librarian
+    restart: unless-stopped
+    init: true
+    mem_limit: ${QL_MEM_LIMIT:-16g}
+    pids_limit: 256
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
+    ports:
+      - "10.20.0.9:${WEB_PORT:-8666}:8666"
+    environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      TZ: "${TZ:-}"
+      QOBUZ_USER_AUTH_TOKEN: "${QOBUZ_USER_AUTH_TOKEN:-}"
+      QOBUZ_USER_ID: "${QOBUZ_USER_ID:-}"
+      QOBUZ_USER_AUTH_TOKEN_FILE: "${QOBUZ_USER_AUTH_TOKEN_FILE:-}"
+      MUSIC_ROOT: /music
+      STAGING_DIR: /staging
+      DATA_DIR: /data
+      UPGRADE_BACKUP_DIR: /upgrade_backups
+      MIGRATE_SRC: ""
+      MIGRATE_DEST: ""
+      BEETS_CONFIG_DIR: /config/beets
+      BEETS_DB_PATH: /config/beets/musiclibrary.db
+      BEETS_PATH_DEFAULT: "${BEETS_PATH_DEFAULT:-}"
+      BEETS_PATH_SINGLETON: "${BEETS_PATH_SINGLETON:-}"
+      BEETS_PATH_COMP: "${BEETS_PATH_COMP:-}"
+      BEETS_PLUGINS: "${BEETS_PLUGINS:-}"
+      STREAMRIP_CONFIG: /config/streamrip/config.toml
+      WEB_HOST: "0.0.0.0"
+      WEB_PORT: "8666"
+      WEB_AUTH: "${WEB_AUTH:-}"
+      WEB_AUTH_USER: "${WEB_AUTH_USER:-}"
+      WEB_AUTH_PASSWORD: "${WEB_AUTH_PASSWORD:-}"
+      WEB_AUTH_PASSWORD_FILE: "${WEB_AUTH_PASSWORD_FILE:-}"
+      FORWARDED_ALLOW_IPS: "${FORWARDED_ALLOW_IPS:-127.0.0.1}"
+      QL_CHECK_VOLUMES: "${QL_CHECK_VOLUMES:-1}"
+      QL_CLI_ONLY: "${QL_CLI_ONLY:-}"
+      QOBUZ_API_BASE: https://www.qobuz.com/api.json/0.2
+      QOBUZ_APP_ID: "798273057"
+      RIP_TIMEOUT: "${RIP_TIMEOUT:-900}"
+      DELAY_BETWEEN: "${DELAY_BETWEEN:-1.0}"
+      ARTIST_API_DELAY: "${ARTIST_API_DELAY:-0.0}"
+      ARTIST_SCAN_WORKERS: "${ARTIST_SCAN_WORKERS:-4}"
+      SEARCH_LIMIT: "${SEARCH_LIMIT:-25}"
+      ARTIST_CATALOG_LIMIT: "${ARTIST_CATALOG_LIMIT:-1000}"
+      MISSING_ALBUMS_MIN_TRACKS: "${MISSING_ALBUMS_MIN_TRACKS:-4}"
+      STREAMRIP_QUALITY: "${STREAMRIP_QUALITY:-4}"
+      LYRICS_ENABLED: "${LYRICS_ENABLED:-true}"
+      LYRICS_FORMAT: "${LYRICS_FORMAT:-embed}"
+      LYRICS_PROVIDERS: "${LYRICS_PROVIDERS:-}"
+      PREFER_HIRES: "${PREFER_HIRES:-true}"
+      CONSOLIDATE: "${CONSOLIDATE:-false}"
+      MIGRATE_MULTI_ARTIST: "${MIGRATE_MULTI_ARTIST:-false}"
+      ARTWORK: "${ARTWORK:-sidecar}"
+      AUTO_LIBRARY_SCAN: "${AUTO_LIBRARY_SCAN:-true}"
+      NEW_RELEASE_CHECK_INTERVAL: "${NEW_RELEASE_CHECK_INTERVAL:-86400}"
+      NEW_RELEASE_MAX_AGE_DAYS: "${NEW_RELEASE_MAX_AGE_DAYS:-365}"
+      ARTIST_CATALOG_CACHE_TTL: "${ARTIST_CATALOG_CACHE_TTL:-604800}"
+      UPGRADE_SCAN_ENABLED: "${UPGRADE_SCAN_ENABLED:-true}"
+      AUTO_UPGRADE_ENABLED: "${AUTO_UPGRADE_ENABLED:-false}"
+      UPGRADE_BACKUP_RETENTION_DAYS: "${UPGRADE_BACKUP_RETENTION_DAYS:-7}"
+      UPGRADE_SINGLES_ENABLED: "${UPGRADE_SINGLES_ENABLED:-false}"
+      CAPPED_RETENTION_DAYS: "${CAPPED_RETENTION_DAYS:-90}"
+      DOWNSAMPLE_HIRES_ENABLED: "${DOWNSAMPLE_HIRES_ENABLED:-false}"
+      DOWNSAMPLE_KEEP_ORIGINALS: "${DOWNSAMPLE_KEEP_ORIGINALS:-}"
+      FUZZY_DIR_THRESH: "${FUZZY_DIR_THRESH:-0.78}"
+      ARTIST_NAME_THRESH: "${ARTIST_NAME_THRESH:-0.85}"
+      ARTIST_DIR_MATCH_THRESH: "${ARTIST_DIR_MATCH_THRESH:-0.65}"
+      CONSOLIDATE_THRESH: "${CONSOLIDATE_THRESH:-0.70}"
+      AUTO_SAFE_TITLE_SIM_THRESH: "${AUTO_SAFE_TITLE_SIM_THRESH:-0.85}"
+      BEETS_TIMEOUT: "${BEETS_TIMEOUT:-600}"
+      BEETS_MAX_ATTEMPTS: "${BEETS_MAX_ATTEMPTS:-2}"
+      BEETS_RETRY_PAUSE: "${BEETS_RETRY_PAUSE:-30}"
+      RATE_LIMIT_COOLDOWN: "${RATE_LIMIT_COOLDOWN:-30}"
+      RESAMPLE_WORKERS: "${RESAMPLE_WORKERS:-4}"
+      MIN_FREE_STAGING_MB: "${MIN_FREE_STAGING_MB:-500}"
+      REPAIR_LOOKUP_MIN_INTERVAL: "${REPAIR_LOOKUP_MIN_INTERVAL:-0.05}"
+      REPAIR_CACHE_ENABLED: "${REPAIR_CACHE_ENABLED:-true}"
+      REPAIR_CACHE_TTL_DAYS: "${REPAIR_CACHE_TTL_DAYS:-30}"
+      EXCLUDE_LIVE_ALBUMS: "${EXCLUDE_LIVE_ALBUMS:-false}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      POST_JOB_HOOK: "${POST_JOB_HOOK:-}"
+      POST_JOB_HOOK_TIMEOUT: "${POST_JOB_HOOK_TIMEOUT:-10}"
+      QL_WEB_FETCH_TIMEOUT: "${QL_WEB_FETCH_TIMEOUT:-12.0}"
+      QL_WEB_TEST_AUTH_TIMEOUT: "${QL_WEB_TEST_AUTH_TIMEOUT:-8.0}"
+    volumes:
+      - /mnt/bowl/media2/qobuz-librarian:/music
+      - /mnt/NVMe/container-data/qobuz-librarian/staging:/staging
+      - /mnt/NVMe/container-data/qobuz-librarian/config:/config
+      - /mnt/NVMe/container-data/qobuz-librarian/data:/data
+      - /mnt/NVMe/container-data/qobuz-librarian/upgrade_backups:/upgrade_backups
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

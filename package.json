@@ -4,7 +4,8 @@
   "description": "Web UI assets for Qobuz Librarian.",
   "scripts": {
     "build": "tailwindcss -i src/qobuz_librarian/web/static/src/app.css -o src/qobuz_librarian/web/static/dist/app.css --minify",
-    "watch": "tailwindcss -i src/qobuz_librarian/web/static/src/app.css -o src/qobuz_librarian/web/static/dist/app.css --watch"
+    "watch": "tailwindcss -i src/qobuz_librarian/web/static/src/app.css -o src/qobuz_librarian/web/static/dist/app.css --watch",
+    "test:deployment-contract": "node --test scripts/release/*.test.mjs scripts/ci/*.test.mjs scripts/deploy/*.test.mjs"
   },
   "devDependencies": {
     "@tailwindcss/cli": "^4.3.0",
