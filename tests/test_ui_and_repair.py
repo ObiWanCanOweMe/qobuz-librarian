@@ -198,7 +198,7 @@ def _repair_relocation_dirs(tmp_path, monkeypatch):
     monkeypatch.setattr(repair.cfg, "MUSIC_ROOT", music_root)
     monkeypatch.setattr(repair.cfg, "BEETS_DB_PATH", tmp_path / "missing.db")
     monkeypatch.setattr(
-        repair, "_read_repair_isrc", lambda _fd: "GBCFB1300101")
+        repair, "_read_repair_isrcs", lambda _fd: {"GBCFB1300101"})
     return repair, album_dir, landed_dir
 
 
@@ -270,7 +270,7 @@ def test_repair_relocation_refuses_a_symlinked_refill_folder(
     monkeypatch.setattr(repair.cfg, "MUSIC_ROOT", music_root)
     monkeypatch.setattr(repair.cfg, "BEETS_DB_PATH", tmp_path / "missing.db")
     monkeypatch.setattr(
-        repair, "_read_repair_isrc", lambda _fd: "GBCFB1300101")
+        repair, "_read_repair_isrcs", lambda _fd: {"GBCFB1300101"})
 
     with pytest.raises(repair._RepairRelocationUncertain):
         repair._relocate_refilled_into_album_dir(
@@ -438,7 +438,7 @@ def _call_repair_album_dir(tmp_path, monkeypatch, *, n_ok, n_fail, imported,
 
     if retire is not None:
         monkeypatch.setattr(repair_mod, "retire_verified_repair_backup",
-                            lambda _backup: retire)
+                            lambda _backup, **_kwargs: retire)
 
     album_dir = tmp_path / "Artist" / "Album (2020)"
     album_dir.mkdir(parents=True)
@@ -734,8 +734,8 @@ def test_refill_gates_require_refills_on_top_of_the_baseline(tmp_path, monkeypat
     baseline = Counter({"USRC11111111": 1})
 
     # Only the healthy twin is on disk; the refill is absent.
-    monkeypatch.setattr(repair, "read_album_dir",
-                        lambda d: [{"isrc": "USRC11111111"}])
+    monkeypatch.setattr(repair, "_repair_album_isrc_counts",
+                        lambda d, walk_errors=None: Counter({"USRC11111111": 1}))
     assert repair._refills_present_in(tmp_path, wanted, baseline) is False
     monkeypatch.setattr(repair, "scan_dir_for_isrc_repairs",
                         lambda *a, **k: {"verified_ok_isrcs":
@@ -743,9 +743,8 @@ def test_refill_gates_require_refills_on_top_of_the_baseline(tmp_path, monkeypat
     assert repair._refills_intact(tmp_path, wanted, "tok", baseline) is False
 
     # Twin plus the returned refill: both gates clear.
-    monkeypatch.setattr(repair, "read_album_dir",
-                        lambda d: [{"isrc": "USRC11111111"},
-                                   {"isrc": "USRC11111111"}])
+    monkeypatch.setattr(repair, "_repair_album_isrc_counts",
+                        lambda d, walk_errors=None: Counter({"USRC11111111": 2}))
     assert repair._refills_present_in(tmp_path, wanted, baseline) is True
     monkeypatch.setattr(repair, "scan_dir_for_isrc_repairs",
                         lambda *a, **k: {"verified_ok_isrcs":
@@ -754,6 +753,67 @@ def test_refill_gates_require_refills_on_top_of_the_baseline(tmp_path, monkeypat
 
     assert repair._refills_present_in(tmp_path, wanted, None) is False
     assert repair._refills_intact(tmp_path, wanted, "tok", None) is False
+
+
+def test_refill_gates_count_multi_isrc_tags(tmp_path, monkeypatch):
+    # Some sources pack multiple ISRC identities into one tag value. Repair is
+    # targeting one of those exact identities, so the final presence/intact
+    # proof must split the tag instead of treating "A;B" as a third identity.
+    from collections import Counter
+
+    from qobuz_librarian.modes import repair
+    wanted = Counter({"NLA506201548": 1})
+    baseline = Counter()
+
+    monkeypatch.setattr(
+        repair, "_repair_album_isrc_counts",
+        lambda d, walk_errors=None: Counter({
+            "NLA506201548": 1,
+            "NLA506201549": 1,
+        }),
+    )
+    assert repair._refills_present_in(tmp_path, wanted, baseline) is True
+
+    monkeypatch.setattr(
+        repair, "scan_dir_for_isrc_repairs",
+        lambda *a, **k: {
+            "verified_ok_isrcs": Counter({"NLA506201548;NLA506201549": 1})
+        },
+    )
+    assert repair._refills_intact(tmp_path, wanted, "tok", baseline) is True
+
+
+def test_repair_scanner_splits_separate_isrc_tag_values():
+    from qobuz_librarian.repair_log import _split_repair_isrc_values
+
+    assert _split_repair_isrc_values([
+        "GBCEE0300031",
+        "GBCEE9200011; GBCEE9200012",
+    ]) == {"GBCEE0300031", "GBCEE9200011", "GBCEE9200012"}
+
+
+def test_backup_sources_index_all_original_isrc_aliases(tmp_path):
+    from qobuz_librarian.modes import repair
+
+    album = tmp_path / "Album"
+    bk = tmp_path / "bk"
+    bk.mkdir()
+    original = bk / "01 - Song.flac"
+    original.write_bytes(b"a")
+    vt = [{
+        "isrc": "GBUM71103324",
+        "isrcs": ["GBCEG7800003", "GBUM71103324"],
+        "path": str(album / "01 - Song.flac"),
+    }]
+
+    assert repair._backup_source_by_isrc(vt, album, bk) == {
+        "GBCEG7800003": [original],
+        "GBUM71103324": [original],
+    }
+    assert repair._target_relatives_by_isrc(vt, album) == {
+        "GBCEG7800003": [("01 - Song.flac",)],
+        "GBUM71103324": [("01 - Song.flac",)],
+    }
 
 
 def test_backup_sources_keep_both_same_isrc_originals(tmp_path):
@@ -778,7 +838,7 @@ def test_backup_sources_keep_both_same_isrc_originals(tmp_path):
 
 def test_retag_marks_an_unconsumed_twin_source_failed(tmp_path, monkeypatch):
     # Two same-ISRC originals but only one refill surfaced in staging: one
-    # original's tags/art never landed anywhere, so the ISRC must read as
+    # original's tags/art never landed anywhere, so the source must read as
     # failed and the backup (their only copy) kept.
     from qobuz_librarian.modes import repair
 
@@ -791,7 +851,29 @@ def test_retag_marks_an_unconsumed_twin_source_failed(tmp_path, monkeypatch):
 
     sources = {"USRC11111111": [tmp_path / "a.flac", tmp_path / "b.flac"]}
     failed = repair._retag_refills_in_staging([staged], sources)
-    assert failed == {"USRC11111111"}
+    assert failed == {str(tmp_path / "b.flac")}
+
+
+def test_retag_aliases_do_not_count_one_source_multiple_times(tmp_path, monkeypatch):
+    # A single original can have multiple ISRC aliases. Matching one alias and
+    # carrying that source's tags must clear the source once, not leave the
+    # sibling alias key behind as a fake failed refill.
+    from qobuz_librarian.modes import repair
+
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    (staged / "01 - Song.flac").write_bytes(b"x")
+    source = tmp_path / "01 - Song.flac"
+    source.write_bytes(b"original")
+    monkeypatch.setattr(repair, "_FLAC", lambda fp: {"isrc": ["GBCEG7800003"]})
+    monkeypatch.setattr(repair, "_snapshot_flac_metadata", lambda src: {"of": str(src)})
+    monkeypatch.setattr(repair, "_restore_flac_metadata", lambda fp, snap: True)
+
+    sources = {
+        "GBCEG7800003": [source],
+        "GBUM71103324": [source],
+    }
+    assert repair._retag_refills_in_staging([staged], sources) == set()
 
 
 def test_retag_callback_records_total_failure_on_exception(monkeypatch):
@@ -813,7 +895,7 @@ def test_retag_callback_records_total_failure_on_exception(monkeypatch):
     cb = repair._make_retag_callback(sources, failed)
     with pytest.raises(RuntimeError):
         cb([Path("/staged")])
-    assert failed == {"ISRC1", "ISRC2"}
+    assert failed == {"/x", "/y"}
 
 
 def test_repair_pins_the_backup_when_the_tag_carry_fails(tmp_path, monkeypatch):

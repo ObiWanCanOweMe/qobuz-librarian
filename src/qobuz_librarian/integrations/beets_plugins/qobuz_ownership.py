@@ -160,6 +160,8 @@ class QobuzOwnershipPlugin(BeetsPlugin):
         self._created = {}
         self._source_item = None
         self._source_items = []
+        self._diagnostic_events = []
+        self._diagnostic_last_reason = None
         managed_ready = (
             self._mode_valid
             and (not self._managed or bool(self._managed_intent))
@@ -181,6 +183,73 @@ class QobuzOwnershipPlugin(BeetsPlugin):
             self.register_listener("item_moved", self._item_moved)
             self.register_listener("item_copied", self._item_copied)
             self.register_listener("cli_exit", self._seal)
+
+    @staticmethod
+    def _diagnostic_text(value, limit=240):
+        try:
+            text = os.fsdecode(value)
+        except (TypeError, UnicodeError, ValueError):
+            text = str(value)
+        if len(text) > limit:
+            return text[: limit - 3] + "..."
+        return text
+
+    def _remember_locked(self, reason, **details):
+        """Keep bounded failure breadcrumbs inside the one-run manifest."""
+        try:
+            event = {"reason": self._diagnostic_text(reason, 120)}
+            for key, value in details.items():
+                if value is None:
+                    continue
+                if isinstance(value, (str, bytes, os.PathLike)):
+                    event[key] = self._diagnostic_text(value)
+                elif isinstance(value, (int, bool)):
+                    event[key] = value
+                elif isinstance(value, (list, tuple)):
+                    event[key] = [
+                        self._diagnostic_text(part, 120)
+                        if isinstance(part, (str, bytes, os.PathLike))
+                        else part
+                        for part in value[:8]
+                    ]
+                else:
+                    event[key] = self._diagnostic_text(value, 160)
+            self._diagnostic_last_reason = event["reason"]
+            self._diagnostic_events.append(event)
+            del self._diagnostic_events[:-12]
+        except Exception:
+            self._diagnostic_last_reason = self._diagnostic_text(reason, 120)
+
+    def _diagnostic_payload_locked(self, *, sealed, items):
+        try:
+            source_items = self._source_items_locked()
+        except Exception:
+            source_items = []
+        prepared = len(source_items)
+        proven = sum(
+            1 for selected in source_items
+            if selected.get("move_proven") is True
+        )
+        pending = sum(
+            1 for selected in source_items
+            if selected.get("pending_move") is not None
+        )
+        return {
+            "last_reason": self._diagnostic_last_reason,
+            "events": list(self._diagnostic_events),
+            "source_roots": [
+                self._diagnostic_text(root, 160)
+                for root in self._source_roots[:8]
+            ],
+            "prepared_sources": prepared,
+            "proven_moves": proven,
+            "pending_moves": pending,
+            "selected_items": prepared,
+            "manifest_items": len(items) if isinstance(items, list) else 0,
+            "created_directories": len(self._created),
+            "sealed_attempt": sealed is True,
+            "managed": bool(getattr(self, "_managed", False)),
+        }
 
     def _managed_intent_is_current(self):
         if not self._managed or not self._managed_intent:
@@ -323,6 +392,19 @@ class QobuzOwnershipPlugin(BeetsPlugin):
             pass
         return None, None
 
+    def _source_path_is_in_scope_locked(self, source_path):
+        return self._source_root_for_path_locked(source_path) is not None
+
+    def _source_root_for_path_locked(self, source_path):
+        try:
+            path = os.path.abspath(os.fsencode(source_path))
+            for root in self._source_roots:
+                if path != root and os.path.commonpath((root, path)) == root:
+                    return root
+        except (OSError, TypeError, ValueError):
+            pass
+        return None
+
     def _begin(self, session):
         with self._lock:
             root_chain = ()
@@ -340,11 +422,17 @@ class QobuzOwnershipPlugin(BeetsPlugin):
                     or manifest_stat.st_mode & 0o077
                     or list(plugins.find_plugins())[-1] is not self
                 ):
+                    self._remember_locked(
+                        "ownership gate changed at import begin",
+                        manifest_uid=int(getattr(manifest_stat, "st_uid", -1)),
+                        manifest_mode=int(stat.S_IMODE(manifest_stat.st_mode)),
+                    )
                     if getattr(self, "_managed", False):
                         raise OSError("managed ownership gate changed")
                     return
                 root = os.path.abspath(os.fsencode(session.lib.directory))
                 if root == os.path.dirname(root):
+                    self._remember_locked("unsafe library root at import begin")
                     if getattr(self, "_managed", False):
                         raise OSError("managed library root is unsafe")
                     return
@@ -373,10 +461,12 @@ class QobuzOwnershipPlugin(BeetsPlugin):
                     int(root_stat.st_ino),
                 )
                 if not self._root_chain_is_named_locked():
+                    self._remember_locked("library root changed before import")
                     raise OSError("library root changed before import")
                 self._enabled = True
                 self._write_locked(sealed=False, items=[])
             except BaseException as exc:
+                self._remember_locked("import begin failed", error=exc)
                 self._close_locked()
                 if getattr(self, "_managed", False) or not isinstance(
                     exc, Exception
@@ -393,6 +483,7 @@ class QobuzOwnershipPlugin(BeetsPlugin):
         del session
         with self._lock:
             if not self._enabled:
+                self._remember_locked("destination preparation ran before ownership begin")
                 if getattr(self, "_managed", False):
                     raise OSError("managed ownership gate is not active")
                 return
@@ -400,6 +491,10 @@ class QobuzOwnershipPlugin(BeetsPlugin):
                 for item in task.imported_items():
                     root, source_path = self._source_item_path(item)
                     if source_path is None:
+                        self._remember_locked(
+                            "imported item source was outside staged roots",
+                            item_path=getattr(item, "path", None),
+                        )
                         if getattr(self, "_managed", False):
                             raise ValueError(
                                 "managed import contains an undeclared source")
@@ -408,6 +503,10 @@ class QobuzOwnershipPlugin(BeetsPlugin):
                         selected["source_path"] == source_path
                         for selected in self._source_items
                     ):
+                        self._remember_locked(
+                            "duplicate staged source in import task",
+                            source=source_path,
+                        )
                         raise ValueError("ownership import contains a duplicate item")
                     source_parent_fd = None
                     source_fd = None
@@ -423,15 +522,29 @@ class QobuzOwnershipPlugin(BeetsPlugin):
                             or _staged_identity(os.fstat(source_fd))
                             != tuple(declaration["identity"])
                         ):
+                            self._remember_locked(
+                                "managed import source changed",
+                                source=source_path,
+                            )
                             raise ValueError("managed import source changed")
                         destination = item.destination(
                             relative_to_libdir=True)
                         parts = _ownership_relative_parts(
                             os.fsdecode(destination))
                         if not parts:
+                            self._remember_locked(
+                                "unsafe ownership destination",
+                                source=source_path,
+                                destination=destination,
+                            )
                             raise ValueError("unsafe ownership destination")
                         album_scope = _album_scope_parts(item, parts)
                         if album_scope is None:
+                            self._remember_locked(
+                                "ownership album scope is unavailable",
+                                source=source_path,
+                                destination=destination,
+                            )
                             raise ValueError(
                                 "ownership album scope is unavailable")
                         selected = {
@@ -475,9 +588,11 @@ class QobuzOwnershipPlugin(BeetsPlugin):
                         self._authorise_art_locked(
                             task, parts[:-1], selected)
                 if self._source_item is None:
+                    self._remember_locked("ownership source was not found")
                     raise ValueError("ownership source was not found")
                 self._write_locked(sealed=False, items=[])
             except BaseException as exc:
+                self._remember_locked("destination preparation failed", error=exc)
                 cleanup_error = None
                 try:
                     self._close_locked()
@@ -841,12 +956,35 @@ class QobuzOwnershipPlugin(BeetsPlugin):
                 else selected.get("item") is item
             )
         ]
+        if (
+            not matches
+            and not getattr(self, "_managed", False)
+            and source_path is not None
+            and self._source_path_is_in_scope_locked(source_path)
+        ):
+            matches = [
+                selected
+                for selected in self._source_items_locked()
+                if selected.get("item") is item
+            ]
+            if len(matches) == 1:
+                self._remember_locked(
+                    "ownership matched move by item object",
+                    event_source=source_path,
+                    prepared_source=matches[0].get("source_path"),
+                )
         return matches[0] if len(matches) == 1 else None
 
     def _before_item_moved(self, item, source, destination):
         with self._lock:
             selected = self._select_source_item_locked(item, source)
             if not self._enabled or selected is None:
+                self._remember_locked(
+                    "move event had no owned source",
+                    source=source,
+                    destination=destination,
+                    enabled=bool(self._enabled),
+                )
                 if getattr(self, "_managed", False):
                     raise OSError("managed move is not owned")
                 return
@@ -859,8 +997,42 @@ class QobuzOwnershipPlugin(BeetsPlugin):
                     raise OSError("library root changed before move")
                 source_path = os.path.abspath(os.fsencode(source))
                 destination_path = os.path.abspath(os.fsencode(destination))
-                if source_path != selected["source_path"]:
+                if (
+                    source_path != selected["source_path"]
+                    and not self._source_path_is_in_scope_locked(source_path)
+                ):
+                    self._remember_locked(
+                        "ownership source path changed outside staged roots",
+                        event_source=source_path,
+                        prepared_source=selected["source_path"],
+                    )
                     raise ValueError("ownership source path changed")
+                if source_path != selected["source_path"]:
+                    event_root = self._source_root_for_path_locked(source_path)
+                    event_parent_fd = None
+                    event_source_fd = None
+                    try:
+                        (
+                            event_parent_fd,
+                            _event_source_name,
+                            event_source_fd,
+                        ) = self._hold_source_leaf_locked(event_root, source_path)
+                        if not self._stable_regular_files_equal(
+                            selected["source_fd"], event_source_fd
+                        ):
+                            self._remember_locked(
+                                "ownership alternate event source differed",
+                                event_source=source_path,
+                                prepared_source=selected["source_path"],
+                            )
+                            raise ValueError("ownership source path changed")
+                    finally:
+                        for descriptor in (event_source_fd, event_parent_fd):
+                            if descriptor is not None:
+                                try:
+                                    os.close(descriptor)
+                                except OSError:
+                                    pass
                 named_source = os.stat(
                     selected["source_name"],
                     dir_fd=selected["source_parent_fd"],
@@ -871,13 +1043,31 @@ class QobuzOwnershipPlugin(BeetsPlugin):
                     not stat.S_ISREG(named_source.st_mode)
                     or _ownership_identity(named_source) != _ownership_identity(held_source)
                 ):
+                    self._remember_locked(
+                        "ownership source changed before move",
+                        source=selected["source_path"],
+                    )
                     raise ValueError("ownership source changed before move")
                 relative = os.path.relpath(destination_path, self._root)
                 parts = _ownership_relative_parts(os.fsdecode(relative))
                 if not parts or parts[:-1] != selected["destination_parent"]:
+                    self._remember_locked(
+                        "ownership destination parent changed",
+                        source=source_path,
+                        destination=destination_path,
+                        expected_parent=[
+                            os.fsdecode(part)
+                            for part in selected["destination_parent"]
+                        ],
+                    )
                     raise ValueError("ownership destination changed")
                 selected["pending_move"] = (source_path, destination_path)
             except (OSError, TypeError, ValueError):
+                self._remember_locked(
+                    "before move proof failed",
+                    source=source,
+                    destination=destination,
+                )
                 selected["pending_move"] = None
                 if getattr(self, "_managed", False):
                     raise
@@ -886,6 +1076,12 @@ class QobuzOwnershipPlugin(BeetsPlugin):
         with self._lock:
             selected = self._select_source_item_locked(item, source)
             if not self._enabled or selected is None:
+                self._remember_locked(
+                    "moved event had no owned source",
+                    source=source,
+                    destination=destination,
+                    enabled=bool(self._enabled),
+                )
                 if getattr(self, "_managed", False):
                     raise OSError("managed move result is not owned")
                 return
@@ -898,6 +1094,12 @@ class QobuzOwnershipPlugin(BeetsPlugin):
                     os.path.abspath(os.fsencode(destination)),
                 )
                 if transition != selected["pending_move"]:
+                    self._remember_locked(
+                        "ownership move event changed",
+                        source=transition[0],
+                        destination=transition[1],
+                        pending=selected["pending_move"],
+                    )
                     raise ValueError("ownership move event changed")
                 relative = os.path.relpath(transition[1], self._root)
                 _, destination_fd, destination_stat, _scope = (
@@ -912,6 +1114,11 @@ class QobuzOwnershipPlugin(BeetsPlugin):
                         selected["source_fd"], destination_fd
                     )
                 ):
+                    self._remember_locked(
+                        "ownership move did not copy the source",
+                        source=transition[0],
+                        destination=transition[1],
+                    )
                     raise ValueError("ownership move did not copy the source")
 
                 # The byte proof above is against held descriptors. Confirm
@@ -924,6 +1131,10 @@ class QobuzOwnershipPlugin(BeetsPlugin):
                     or _ownership_identity(held_destination)
                     != destination_identity
                 ):
+                    self._remember_locked(
+                        "ownership destination changed",
+                        destination=transition[1],
+                    )
                     raise ValueError("ownership destination changed")
                 current = self._open_relative_leaf_locked(relative)
                 if (
@@ -932,11 +1143,21 @@ class QobuzOwnershipPlugin(BeetsPlugin):
                     != destination_identity
                     or not self._root_chain_is_named_locked()
                 ):
+                    self._remember_locked(
+                        "ownership destination path changed",
+                        destination=transition[1],
+                    )
                     raise ValueError("ownership destination path changed")
                 selected["destination"] = transition[1]
                 selected["destination_identity"] = destination_identity
+                selected["pending_move"] = None
                 selected["move_proven"] = True
             except (OSError, TypeError, ValueError):
+                self._remember_locked(
+                    "move result proof failed",
+                    source=source,
+                    destination=destination,
+                )
                 selected["destination"] = None
                 selected["destination_identity"] = None
                 selected["move_proven"] = False
@@ -954,6 +1175,7 @@ class QobuzOwnershipPlugin(BeetsPlugin):
         with self._lock:
             selected = self._select_source_item_locked(item, source)
             if selected is None:
+                self._remember_locked("copy event had no owned source", source=source)
                 if getattr(self, "_managed", False):
                     raise OSError("managed copy result is not owned")
                 return
@@ -965,6 +1187,10 @@ class QobuzOwnershipPlugin(BeetsPlugin):
             except (TypeError, ValueError):
                 same_source = False
             if same_source or selected["item"] is item:
+                self._remember_locked(
+                    "ownership import copied instead of moving",
+                    source=source,
+                )
                 selected["destination"] = None
                 selected["destination_identity"] = None
                 selected["move_proven"] = False
@@ -1168,20 +1394,45 @@ class QobuzOwnershipPlugin(BeetsPlugin):
         companion_tasks = set()
         for selected in self._source_items_locked():
             if selected.get("move_proven") is not True:
+                self._remember_locked(
+                    "source move was not proven before seal",
+                    source=selected.get("source_path"),
+                    pending=selected.get("pending_move"),
+                    destination=selected.get("destination"),
+                )
                 return []
             try:
                 item_id = int(selected["item"].id)
             except (AttributeError, TypeError, ValueError):
+                self._remember_locked(
+                    "imported beets item has no stable id",
+                    source=selected.get("source_path"),
+                )
                 return []
             item = lib.get_item(item_id)
             if item is None:
+                self._remember_locked(
+                    "imported beets item was missing from library",
+                    source=selected.get("source_path"),
+                    item_id=item_id,
+                )
                 return []
             path = os.path.abspath(os.fsencode(item.path))
             if path != selected.get("destination"):
+                self._remember_locked(
+                    "library item path differed from proven destination",
+                    source=selected.get("source_path"),
+                    library_path=path,
+                    destination=selected.get("destination"),
+                )
                 return []
             try:
                 relative = os.path.relpath(path, self._root)
             except (TypeError, ValueError):
+                self._remember_locked(
+                    "proven destination is outside library root",
+                    destination=path,
+                )
                 return []
             leaf_fd = None
             try:
@@ -1189,15 +1440,42 @@ class QobuzOwnershipPlugin(BeetsPlugin):
                     self._hold_relative_leaf_locked(
                         relative,
                         album_scope_parts=selected.get("album_scope_parts"),
-                        expected_leaf_identity=selected.get(
-                            "destination_identity"
-                        ),
                     )
                 )
-            except (OSError, TypeError, ValueError):
+            except (OSError, TypeError, ValueError) as exc:
+                self._remember_locked(
+                    "proven destination could not be reopened",
+                    destination=path,
+                    error=exc,
+                )
                 return []
             try:
+                current_source_identity = _ownership_identity(
+                    os.fstat(selected["source_fd"]))
+                current_leaf_identity = _ownership_identity(leaf)
+                if current_leaf_identity != current_source_identity:
+                    if getattr(self, "_managed", False):
+                        self._remember_locked(
+                            "proven destination no longer names the held source",
+                            source=selected.get("source_path"),
+                            destination=path,
+                        )
+                        return []
+                    # Beets can write tags by replacing the moved file after
+                    # item_moved. For non-managed repair imports, the proven
+                    # move plus the final library item path is the ownership
+                    # evidence; record the rewritten destination identity.
+                    self._remember_locked(
+                        "proven destination was rewritten after move",
+                        source=selected.get("source_path"),
+                        destination=path,
+                    )
+                selected["destination_identity"] = current_leaf_identity
                 if album_scope is None:
+                    self._remember_locked(
+                        "proven destination lost album scope",
+                        destination=path,
+                    )
                     return []
                 created_directories = self._created_for_item_locked(
                     parts[:-1])
@@ -1213,6 +1491,10 @@ class QobuzOwnershipPlugin(BeetsPlugin):
                 if getattr(self, "_managed", False):
                     declaration = selected.get("managed_declaration")
                     if declaration is None:
+                        self._remember_locked(
+                            "managed declaration missing at seal",
+                            source=selected.get("source_path"),
+                        )
                         return []
                     records.append({
                         "slot": declaration["slot"],
@@ -1223,14 +1505,14 @@ class QobuzOwnershipPlugin(BeetsPlugin):
                         "destination": {
                             "path": os.fsdecode(
                                 os.fsencode(os.sep).join(parts)),
-                            "identity": _ownership_identity(leaf),
+                            "identity": current_leaf_identity,
                         },
                     })
                 else:
                     records.append({
                         "relative": os.fsdecode(
                             os.fsencode(os.sep).join(parts)),
-                        "file": _ownership_identity(leaf),
+                        "file": current_leaf_identity,
                         "album_scope": album_scope,
                         "created_directories": created_directories,
                         "companions": companions,
@@ -1322,10 +1604,15 @@ class QobuzOwnershipPlugin(BeetsPlugin):
         with self._lock:
             try:
                 if not self._enabled or self._root_fd is None:
+                    self._remember_locked(
+                        "ownership seal ran before gate was active",
+                        enabled=bool(self._enabled),
+                    )
                     if getattr(self, "_managed", False):
                         raise OSError("managed ownership gate did not start")
                     return
                 if not self._root_chain_is_named_locked():
+                    self._remember_locked("library root changed before seal")
                     if getattr(self, "_managed", False):
                         raise OSError("managed library root changed")
                     return
@@ -1334,19 +1621,24 @@ class QobuzOwnershipPlugin(BeetsPlugin):
                     int(root_stat.st_dev),
                     int(root_stat.st_ino),
                 ) != self._root_device_inode:
+                    self._remember_locked("library root identity changed before seal")
                     if getattr(self, "_managed", False):
                         raise OSError("managed library root identity changed")
                     return
-                if not self._materialise_items_locked(lib):
+                initial_items = self._materialise_items_locked(lib)
+                if not initial_items:
+                    self._remember_locked("import result had no materialised ownership items")
                     if getattr(self, "_managed", False):
                         raise OSError("managed import result is incomplete")
                     return
                 if not self._remove_markers_locked():
+                    self._remember_locked("ownership directory cleanup is incomplete")
                     if getattr(self, "_managed", False):
                         raise OSError("managed directory cleanup is incomplete")
                     return
                 items = self._materialise_items_locked(lib)
                 if not items:
+                    self._remember_locked("import result changed during ownership cleanup")
                     if getattr(self, "_managed", False):
                         raise OSError("managed import has no proven results")
                     return
@@ -1354,14 +1646,21 @@ class QobuzOwnershipPlugin(BeetsPlugin):
                     getattr(self, "_managed", False)
                     and len(items) != len(self._managed_intent)
                 ):
+                    self._remember_locked(
+                        "managed import result count changed",
+                        expected=len(self._managed_intent),
+                        actual=len(items),
+                    )
                     raise OSError("managed import result count changed")
                 if not self._root_chain_is_named_locked():
+                    self._remember_locked("library root changed before sealed write")
                     if getattr(self, "_managed", False):
                         raise OSError("managed library root changed")
                     return
                 self._write_locked(sealed=True, items=items)
                 self._preserve_created = True
-            except (OSError, TypeError, ValueError):
+            except (OSError, TypeError, ValueError) as exc:
+                self._remember_locked("ownership seal failed", error=exc)
                 if getattr(self, "_managed", False):
                     raise
                 return
@@ -1418,6 +1717,10 @@ class QobuzOwnershipPlugin(BeetsPlugin):
             "sealed": sealed is True,
             "items": items,
             "cleanup_directories": self._created_payload_locked(),
+            "diagnostic": self._diagnostic_payload_locked(
+                sealed=sealed,
+                items=items,
+            ),
         }
         encoded = json.dumps(
             payload,

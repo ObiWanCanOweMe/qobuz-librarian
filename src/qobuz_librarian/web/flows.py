@@ -1862,7 +1862,7 @@ def _scan_repair_artist(artist_dir, token, job, beat=None):
     sweep."""
     name = artist_dir.name
     agg = {"verified_ok": 0, "unverified": 0, "failed": 0, "checked": 0,
-           "specs": []}
+           "specs": [], "warnings": 0}
     for album_dir in list_artist_album_dirs(artist_dir):
         if job.cancel_requested:
             break
@@ -1872,7 +1872,9 @@ def _scan_repair_artist(artist_dir, token, job, beat=None):
         agg["failed"] += outcome.get("failed", 0)
         agg["checked"] += 1
         agg["specs"].extend(outcome.get("specs", []))
-        for w in outcome.get("warns", []):
+        warns = outcome.get("warns", [])
+        agg["warnings"] += len(warns)
+        for w in warns:
             log.info(w)
         if beat is not None:
             _emit_repair_heartbeat(beat, job, name)
@@ -1936,6 +1938,7 @@ def scan_repairs(job, token):
     n_verified = 0      # ISRC'd FLACs that actually decoded clean this run
     n_unverified = 0    # couldn't decode-check (flac tool absent)
     n_failed = 0        # albums that errored mid-scan (surfaced, not hidden)
+    n_warnings = 0      # damaged files surfaced for hand-check, not candidates
     if cp:
         for c in cp["candidates"]:
             _readd_candidate(job, c)
@@ -2003,6 +2006,7 @@ def scan_repairs(job, token):
             n_verified += agg["verified_ok"]
             n_unverified += agg["unverified"]
             n_failed += agg["failed"]
+            n_warnings += agg.get("warnings", 0)
             for spec in agg["specs"]:
                 job.add_candidate(**spec)
                 total += 1
@@ -2034,14 +2038,21 @@ def scan_repairs(job, token):
              f"({unver_reason})." if n_unverified else "")
     fail = (f" {plural(n_failed, 'album')} couldn't be scanned; re-run to retry."
             if n_failed else "")
+    warn = (f" {plural(n_warnings, 'damaged file')} need hand-check because "
+            "they could not be matched to a Qobuz album automatically."
+            if n_warnings else "")
     if total:
         job.summary = (f"{plural(total, 'album')} flagged with damaged files. "
                        f"{plural(n_verified, 'track')} decode-verified clean."
-                       + unver + fail)
+                       + warn + unver + fail)
     else:
-        job.summary = (f"No damaged files found. "
+        prefix = (
+            "No automatically repairable damaged files found."
+            if n_warnings else "No damaged files found."
+        )
+        job.summary = (f"{prefix} "
                        f"{plural(n_verified, 'track')} decode-verified intact."
-                       + unver + fail)
+                       + warn + unver + fail)
     log.info(job.summary)
 
 
@@ -2178,7 +2189,9 @@ def _redownload_damaged_album(payload, token, *, recovery_checkpoint=None):
             carried = _carry_non_audio_from_backup(
                 full, album_dir, backup)
             if carried is not None:
-                if retire_verified_repair_backup(backup):
+                retirement_diagnostic = []
+                if retire_verified_repair_backup(
+                        backup, diagnostic=retirement_diagnostic):
                     checkpoint_recovery(
                         "resolved",
                         "The re-download verified, so the original album's "
@@ -2194,6 +2207,10 @@ def _redownload_damaged_album(payload, token, *, recovery_checkpoint=None):
                     log.info("  Re-download verified, but the original "
                              "album's backup couldn't be proven redundant; "
                              f"keeping it at {backup}.")
+                    if retirement_diagnostic:
+                        log.info(
+                            "     Diagnostic: "
+                            + "; ".join(retirement_diagnostic[:3]))
                     checkpoint_recovery(
                         "verification",
                         "The re-download verified, but the original album's "

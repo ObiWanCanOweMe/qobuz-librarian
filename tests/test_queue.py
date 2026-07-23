@@ -565,6 +565,52 @@ def test_executor_keeps_only_failed_downloads_for_retry(monkeypatch, tmp_path):
     assert saves                   # progress persisted as the item dropped
 
 
+def test_import_with_required_ownership_rejects_missing_receipt(monkeypatch):
+    from qobuz_librarian.queue import executor
+
+    monkeypatch.setattr(
+        executor, "beets_import_albums", lambda _dirs, **_kwargs: "ok"
+    )
+    ownership = {}
+
+    assert executor._import_album_with_retry(
+        [Path("/staging/album")], ownership_out=ownership
+    ) is False
+    assert ownership == {}
+
+    lines = []
+
+    def import_with_diagnostic(_dirs, *, ownership_out):
+        ownership_out["_diagnostic"] = "ownership plugin manifest was not sealed (0 item(s))"
+        return "ok"
+
+    monkeypatch.setattr(executor, "beets_import_albums", import_with_diagnostic)
+    monkeypatch.setattr(executor.log, "info", lines.append)
+    assert executor._import_album_with_retry(
+        [Path("/staging/album")], ownership_out=ownership
+    ) is False
+    assert any("manifest was not sealed" in line for line in lines)
+
+    receipt = {"version": 1, "sealed": True, "root": "/music", "items": []}
+
+    def import_with_receipt(_dirs, *, ownership_out):
+        ownership_out["result"] = receipt
+        return "ok"
+
+    monkeypatch.setattr(executor, "beets_import_albums", import_with_receipt)
+    assert executor._import_album_with_retry(
+        [Path("/staging/album")], ownership_out=ownership
+    ) is True
+    assert ownership == {"result": receipt}
+
+    monkeypatch.setattr(
+        executor, "beets_import_albums", lambda _dirs: "ok"
+    )
+    assert executor._import_album_with_retry(
+        [Path("/staging/album")]
+    ) is True
+
+
 def test_executor_stops_when_queue_progress_cannot_be_persisted(
         monkeypatch, tmp_path):
     """A failed journal commit must stop before the next album starts."""
@@ -893,5 +939,3 @@ def test_executor_upgrade_backup_kept_when_companion_carry_fails(monkeypatch, tm
 
     assert bp.exists()
     assert (bp / "booklet.pdf").read_bytes() == b"the-only-booklet"
-
-

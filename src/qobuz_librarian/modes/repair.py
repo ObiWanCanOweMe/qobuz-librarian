@@ -1,11 +1,13 @@
 """Album repair mode — ISRC-anchored refill of truncated FLACs."""
 import errno
+import gc
 import json
 import os
 import secrets
 import sqlite3
 import stat
 import sys
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -49,9 +51,9 @@ from qobuz_librarian.library.catalog import (
 from qobuz_librarian.library.discovery import resolve_artist_dir
 from qobuz_librarian.library.scanner import (
     clear_scan_caches,
+    iter_tree_no_symlinks,
     list_artist_album_dirs,
     list_library_artists,
-    read_album_dir,
 )
 from qobuz_librarian.library.sqlite_atomic import AtomicSQLiteWrite
 from qobuz_librarian.queue.builder import _build_queue_item
@@ -179,9 +181,9 @@ def _backup_source_by_isrc(verified_truncated, album_dir, backup_path):
     """
     out = {}
     for b in verified_truncated:
-        isrc = _norm_isrc(b.get("isrc"))
         src = b.get("path") or ""
-        if not isrc or not src:
+        isrcs = _repair_entry_isrcs(b)
+        if not isrcs or not src:
             continue
         try:
             rel = Path(src).relative_to(album_dir)
@@ -189,9 +191,29 @@ def _backup_source_by_isrc(verified_truncated, album_dir, backup_path):
             rel = Path(Path(src).name)
         cand = backup_path / rel
         if cand.exists():
-            out.setdefault(isrc, []).append(cand)
+            for isrc in isrcs:
+                out.setdefault(isrc, []).append(cand)
     for paths in out.values():
         paths.sort()
+    return out
+
+
+def _target_relatives_by_isrc(verified_truncated, album_dir):
+    """Album-relative destinations sealed by the repair scan, keyed by ISRC."""
+    out = {}
+    for b in verified_truncated:
+        src = b.get("path") or ""
+        isrcs = _repair_entry_isrcs(b)
+        if not isrcs or not src:
+            continue
+        try:
+            rel = Path(src).relative_to(album_dir)
+        except ValueError:
+            rel = Path(Path(src).name)
+        for isrc in isrcs:
+            out.setdefault(isrc, []).append(tuple(rel.parts))
+    for relatives in out.values():
+        relatives.sort()
     return out
 
 
@@ -203,30 +225,47 @@ def _retag_refills_in_staging(staged_dirs, source_by_isrc):
     album it files that ISRC under; without this the refill would import as
     the compilation, contradicting the folder it lives in.
     """
+    source_tokens = {
+        os.fspath(path)
+        for paths in source_by_isrc.values()
+        for path in paths
+    }
     if _FLAC is None:
-        return set(source_by_isrc)
+        return set(source_tokens)
     if not source_by_isrc:
         return set()
     failed = set()
-    remaining = {isrc: list(paths) for isrc, paths in source_by_isrc.items()}
+    remaining = {token: Path(token) for token in source_tokens}
+    by_isrc = {
+        isrc: [os.fspath(path) for path in paths]
+        for isrc, paths in source_by_isrc.items()
+    }
     for d in staged_dirs:
         for fp in sorted(Path(d).rglob("*.flac")):
             try:
-                isrc = _norm_isrc((_FLAC(fp).get("isrc") or [""])[0])
+                isrcs = _split_repair_isrc_values(_FLAC(fp).get("isrc") or [])
             except Exception:
                 continue
-            srcs = remaining.get(isrc)
-            if not srcs:
+            source_token = ""
+            for isrc in sorted(isrcs):
+                source_token = next(
+                    (token for token in by_isrc.get(isrc, ())
+                     if token in remaining),
+                    "",
+                )
+                if source_token:
+                    break
+            if not source_token:
                 continue
-            src = srcs.pop(0)
+            src = remaining.pop(source_token)
             snap = _snapshot_flac_metadata(src)
             if snap and _restore_flac_metadata(fp, snap):
                 log.info(fmt(C.GRAY,
                     f"  ⤷  Kept original tags on refilled "
                     f"{truncate(fp.name, 40)}"))
             else:
-                failed.add(isrc)
-    failed.update(isrc for isrc, srcs in remaining.items() if srcs)
+                failed.add(source_token)
+    failed.update(remaining)
     return failed
 
 
@@ -239,9 +278,13 @@ def _make_retag_callback(retag_sources, retag_failed):
     after. Without that, the backup resolution would read the empty set as
     "all tags carried" and delete the only copy of the originals' metadata."""
     def _retag_callback(staged_dirs):
-        retag_failed.update(retag_sources)
-        done = _retag_refills_in_staging(staged_dirs, retag_sources)
-        retag_failed.intersection_update(done)
+        retag_failed.update(
+            os.fspath(path)
+            for paths in retag_sources.values()
+            for path in paths
+        )
+        failed = _retag_refills_in_staging(staged_dirs, retag_sources)
+        retag_failed.intersection_update(failed)
     return _retag_callback
 
 
@@ -475,15 +518,70 @@ def _require_repair_anchors(*chains):
             "repair directories changed during relocation")
 
 
-def _read_repair_isrc(file_fd):
+def _split_repair_isrc_values(values):
+    isrcs = set()
+    for value in values or []:
+        if isinstance(value, (list, tuple, set)):
+            isrcs.update(_split_repair_isrc_values(value))
+            continue
+        text = str(value or "")
+        for delimiter in (";", ",", "\n", "\r", "\t"):
+            text = text.replace(delimiter, " ")
+        for part in text.split():
+            isrc = _norm_isrc(part)
+            if isrc:
+                isrcs.add(isrc)
+    return isrcs
+
+
+def _read_repair_isrcs(file_fd):
     if _FLAC is None:
-        return ""
+        return set()
     try:
         with os.fdopen(os.dup(file_fd), "rb") as stream:
-            value = (_FLAC(stream).get("isrc") or [""])[0]
+            values = _FLAC(stream).get("isrc") or []
     except Exception:
-        return ""
-    return _norm_isrc(value)
+        return set()
+    return _split_repair_isrc_values(values)
+
+
+def _format_repair_isrcs(isrcs):
+    if not isrcs:
+        return "''"
+    return repr(";".join(sorted(isrcs)))
+
+
+def _repair_entry_isrcs(entry):
+    return _split_repair_isrc_values(
+        [entry.get("isrcs"), entry.get("isrc")])
+
+
+def _repair_album_isrc_counts(album_dir, walk_errors=None):
+    if _FLAC is None:
+        if walk_errors is not None:
+            walk_errors.append("mutagen FLAC support is unavailable")
+        return None
+    counts = Counter()
+    try:
+        paths = [
+            path for path in iter_tree_no_symlinks(Path(album_dir), errors=walk_errors)
+            if path.suffix.lower() == ".flac" and path.is_file()
+        ]
+    except OSError as exc:
+        if walk_errors is not None:
+            walk_errors.append(f"{album_dir}: {exc}")
+            return None
+        raise
+    for path in paths:
+        try:
+            for isrc in _split_repair_isrc_values(_FLAC(path).get("isrc") or []):
+                counts[isrc] += 1
+        except Exception as exc:
+            if walk_errors is not None:
+                walk_errors.append(f"{path}: {exc}")
+                return None
+            raise
+    return counts
 
 
 def _walk_held_repair_tree(landed, visit, directory_fd=None, relative=(),
@@ -614,11 +712,72 @@ def _repair_receipt_parts(value):
     return tuple(relative.parts)
 
 
+def _repair_receipt_diagnostic(root, receipt, expected_refills):
+    if not isinstance(receipt, dict):
+        return f"receipt={type(receipt).__name__}"
+    parts = [
+        f"keys={','.join(sorted(str(key) for key in receipt.keys()))}",
+        f"version={receipt.get('version')!r}",
+        f"sealed={receipt.get('sealed')!r}",
+        f"root={receipt.get('root')!r}",
+        f"expected_root={str(root.path)!r}",
+    ]
+    if expected_refills is not None:
+        parts.append(f"expected_refills={expected_refills}")
+    items = receipt.get("items")
+    if isinstance(items, list):
+        parts.append(f"items={len(items)}")
+        samples = []
+        for item in items[:5]:
+            if isinstance(item, dict):
+                scope = item.get("album_scope")
+                scope_relative = (
+                    scope.get("relative")
+                    if isinstance(scope, dict)
+                    else None
+                )
+                samples.append(
+                    "relative="
+                    + repr(item.get("relative"))
+                    + ", scope="
+                    + repr(scope_relative)
+                )
+            else:
+                samples.append(type(item).__name__)
+        if samples:
+            parts.append("sample_items=[" + "; ".join(samples) + "]")
+    else:
+        parts.append(f"items={type(items).__name__}")
+    return "; ".join(parts)
+
+
+def _repair_receipt_identity_diagnostic(identity):
+    try:
+        device, inode, size, modified_ns, changed_ns, entry_mode = identity
+    except (TypeError, ValueError):
+        return repr(identity)
+    mode = "dir" if entry_mode == stat.S_IFDIR else "file"
+    return (
+        f"dev={device},ino={inode},size={size},mtime_ns={modified_ns},"
+        f"ctime_ns={changed_ns},type={mode}"
+    )
+
+
+def _repair_receipt_item_path(item):
+    try:
+        return "/".join(str(part) for part in item["relative"])
+    except (KeyError, TypeError):
+        return "?"
+
+
 def _repair_receipt_items(root, receipt, expected_refills):
     try:
         receipt_root = Path(os.path.abspath(os.fspath(receipt["root"])))
     except (KeyError, OSError, TypeError, ValueError) as exc:
-        raise OSError("repair import receipt has an invalid root") from exc
+        raise OSError(
+            "repair import receipt has an invalid root "
+            f"({_repair_receipt_diagnostic(root, receipt, expected_refills)})"
+        ) from exc
     if (
         not isinstance(receipt, dict)
         or receipt.get("version") != 1
@@ -626,12 +785,18 @@ def _repair_receipt_items(root, receipt, expected_refills):
         or receipt_root != root.path
         or not root.matches()
     ):
-        raise OSError("repair import receipt is not sealed for this library")
+        raise OSError(
+            "repair import receipt is not sealed for this library "
+            f"({_repair_receipt_diagnostic(root, receipt, expected_refills)})"
+        )
     root_identity = _repair_receipt_identity(
         receipt.get("root_identity"), entry_mode=stat.S_IFDIR)
     current_root = _migration_entry_record(os.fstat(root.fd))
     if root_identity[:2] != current_root[:2]:
-        raise OSError("repair import receipt names a different library")
+        raise OSError(
+            "repair import receipt names a different library "
+            f"({_repair_receipt_diagnostic(root, receipt, expected_refills)})"
+        )
     items = receipt.get("items")
     if (
         not isinstance(items, list)
@@ -641,7 +806,10 @@ def _repair_receipt_items(root, receipt, expected_refills):
             and len(items) != expected_refills
         )
     ):
-        raise OSError("repair import receipt does not cover every refill")
+        raise OSError(
+            "repair import receipt does not cover every refill "
+            f"({_repair_receipt_diagnostic(root, receipt, expected_refills)})"
+        )
 
     parsed = []
     created_directories = {}
@@ -712,10 +880,15 @@ def _repair_receipt_items(root, receipt, expected_refills):
 
 
 def _discover_refill_files(root, receipt, wanted_isrcs, before_names,
-                           expected_refills=None):
+                           expected_refills=None,
+                           target_relatives_by_isrc=None):
     records = []
     landed = {}
     created = {}
+    target_relatives = {
+        isrc: list(relatives)
+        for isrc, relatives in (target_relatives_by_isrc or {}).items()
+    }
     try:
         items, created_receipts = _repair_receipt_items(
             root, receipt, expected_refills)
@@ -750,21 +923,58 @@ def _discover_refill_files(root, receipt, wanted_isrcs, before_names,
             try:
                 source = _HeldRepairDirectory(root, item["source_parts"])
                 file_fd = _open_migration_entry(source.fd, name)
-                if (
-                    not source.matches()
-                    or not scope.matches()
-                    or not _migration_named_entry_matches(
-                        source.fd, name, file_fd)
-                    or _migration_entry_record(os.fstat(file_fd))
-                        != item["identity"]
-                    or _read_repair_isrc(file_fd) not in wanted_isrcs
-                    or _migration_entry_record(os.fstat(file_fd))
-                        != item["identity"]
-                ):
+                item_path = _repair_receipt_item_path(item)
+                expected_identity = item["identity"]
+                if not source.matches():
                     raise _RepairAnchorChanged(
-                        "receipt-owned refill changed while it was selected")
+                        "receipt-owned refill source directory changed while "
+                        f"selected: {truncate(item_path, 120)}")
+                if not scope.matches():
+                    raise _RepairAnchorChanged(
+                        "receipt-owned refill album scope changed while "
+                        f"selected: {truncate(item_path, 120)}")
+                if not _migration_named_entry_matches(
+                        source.fd, name, file_fd):
+                    raise _RepairAnchorChanged(
+                        "receipt-owned refill file name no longer points to "
+                        f"the sealed file: {truncate(item_path, 120)}")
+                current_identity = _migration_entry_record(os.fstat(file_fd))
+                if current_identity != expected_identity:
+                    raise _RepairAnchorChanged(
+                        "receipt-owned refill identity changed before ISRC "
+                        f"read: {truncate(item_path, 120)}; "
+                        "expected="
+                        f"{_repair_receipt_identity_diagnostic(expected_identity)}; "
+                        "current="
+                        f"{_repair_receipt_identity_diagnostic(current_identity)}")
+                isrcs = _read_repair_isrcs(file_fd)
+                after_isrc_identity = _migration_entry_record(os.fstat(file_fd))
+                if after_isrc_identity != expected_identity:
+                    raise _RepairAnchorChanged(
+                        "receipt-owned refill identity changed while ISRC was "
+                        f"read: {truncate(item_path, 120)}; "
+                        "expected="
+                        f"{_repair_receipt_identity_diagnostic(expected_identity)}; "
+                        "current="
+                        f"{_repair_receipt_identity_diagnostic(after_isrc_identity)}; "
+                        f"isrc={_format_repair_isrcs(isrcs)}")
+                if not isrcs.intersection(wanted_isrcs):
+                    wanted = ",".join(sorted(str(value)
+                                             for value in wanted_isrcs))
+                    raise _RepairAnchorChanged(
+                        "receipt-owned refill has an unrequested ISRC: "
+                        f"{truncate(item_path, 120)}; "
+                        f"isrc={_format_repair_isrcs(isrcs)}; "
+                        f"wanted={truncate(wanted, 160)}")
+                target_relative = item["relative"]
+                for target_isrc in sorted(isrcs.intersection(wanted_isrcs)):
+                    candidates = target_relatives.get(target_isrc)
+                    if candidates:
+                        target_relative = candidates.pop(0)
+                        break
                 records.append({
-                    "relative": item["relative"],
+                    "relative": target_relative,
+                    "source_name": name,
                     "source": source,
                     "file_fd": file_fd,
                     "identity": item["identity"],
@@ -852,6 +1062,240 @@ def _repair_item_rows_match(connection, columns, rows):
         return False
 
 
+def _repair_sqlite_retryable(exc):
+    return (
+        isinstance(exc, OSError)
+        and (
+            exc.errno in {errno.EACCES, errno.EAGAIN, errno.EBUSY}
+            or "lease could not be acquired" in str(exc)
+            or "SQLite database is busy" in str(exc)
+        )
+    )
+
+
+def _repair_sqlite_retry_deadline(timeout):
+    # Beets can briefly keep the library DB open after import returns. Repair
+    # has already moved files under anchored proof here, so give the handoff a
+    # real grace window instead of treating a few seconds of lease contention as
+    # placement failure.
+    return time.monotonic() + max(10.0, min(float(timeout or 5.0) * 12.0, 90.0))
+
+
+def _repair_proc_cmdline(proc):
+    try:
+        return (
+            (proc / "cmdline").read_bytes()
+            .replace(b"\x00", b" ")
+            .decode("utf-8", "replace")
+            .strip()
+        )
+    except OSError:
+        return ""
+
+
+def _repair_sqlite_holder_diagnostic(database_anchor):
+    if (
+        database_anchor is None
+        or database_anchor.get("descriptor") is None
+    ):
+        return "database=unbound"
+    try:
+        db_stat = os.fstat(database_anchor["descriptor"])
+        parent_stat = os.fstat(database_anchor["parent_chain"][-1])
+        watched = {
+            (int(db_stat.st_dev), int(db_stat.st_ino)): "database",
+            (int(parent_stat.st_dev), int(parent_stat.st_ino)): "parent",
+        }
+        watched_maps = {
+            (os.major(int(db_stat.st_dev)),
+             os.minor(int(db_stat.st_dev)),
+             int(db_stat.st_ino)): "database",
+            (os.major(int(parent_stat.st_dev)),
+             os.minor(int(parent_stat.st_dev)),
+             int(parent_stat.st_ino)): "parent",
+        }
+        try:
+            child_stat = os.stat(
+                ".qobuz-librarian-beets.lock",
+                dir_fd=database_anchor["parent_chain"][-1],
+                follow_symlinks=False,
+            )
+            watched[(int(child_stat.st_dev), int(child_stat.st_ino))] = (
+                "child-lock")
+            watched_maps[(
+                os.major(int(child_stat.st_dev)),
+                os.minor(int(child_stat.st_dev)),
+                int(child_stat.st_ino),
+            )] = "child-lock"
+        except OSError:
+            pass
+        holders = []
+        for proc in Path("/proc").iterdir():
+            if not proc.name.isdecimal():
+                continue
+            fd_dir = proc / "fd"
+            try:
+                entries = list(fd_dir.iterdir())
+            except OSError:
+                entries = []
+            cmdline = _repair_proc_cmdline(proc)
+            for entry in entries:
+                try:
+                    stat_result = entry.stat()
+                except OSError:
+                    continue
+                role = watched.get((
+                    int(stat_result.st_dev),
+                    int(stat_result.st_ino),
+                ))
+                if role is None:
+                    continue
+                try:
+                    target = os.readlink(entry)
+                except OSError:
+                    target = "?"
+                holders.append(
+                    f"pid={proc.name},fd={entry.name},role={role},"
+                    f"target={truncate(target, 80)},"
+                    f"cmd={truncate(cmdline, 100)}"
+                )
+                if len(holders) >= 12:
+                    return "; ".join(holders)
+            maps_file = proc / "maps"
+            try:
+                maps_lines = maps_file.read_text(errors="replace").splitlines()
+            except OSError:
+                continue
+            for line in maps_lines:
+                fields = line.split(None, 5)
+                if len(fields) < 5:
+                    continue
+                device = fields[3]
+                inode = fields[4]
+                if ":" not in device or not inode.isdecimal():
+                    continue
+                major_text, minor_text = device.split(":", 1)
+                try:
+                    key = (
+                        int(major_text, 16),
+                        int(minor_text, 16),
+                        int(inode),
+                    )
+                except ValueError:
+                    continue
+                role = watched_maps.get(key)
+                if role is None:
+                    continue
+                target = fields[5] if len(fields) > 5 else ""
+                holders.append(
+                    f"pid={proc.name},map={role},addr={fields[0]},"
+                    f"target={truncate(target, 80)},"
+                    f"cmd={truncate(cmdline, 100)}"
+                )
+                if len(holders) >= 12:
+                    return "; ".join(holders)
+        return "holders=none"
+    except (OSError, TypeError, ValueError) as exc:
+        return f"holders=unavailable:{truncate(str(exc), 120)}"
+
+
+def _open_repair_sqlite_transaction(
+        database_anchor, anchors_match, *, timeout, label,
+        require_source_lease=True):
+    deadline = _repair_sqlite_retry_deadline(timeout)
+    delay = 0.15
+    announced = False
+    while True:
+        transaction = None
+        try:
+            if not anchors_match():
+                raise _RepairAnchorChanged(
+                    f"repair paths changed before {label}")
+            transaction = AtomicSQLiteWrite(
+                database_anchor,
+                _migration_database_anchor_matches,
+                connect=sqlite3.connect,
+                timeout=timeout,
+                require_source_lease=require_source_lease,
+            )
+            connection = transaction.open()
+            return transaction, connection
+        except BaseException as exc:
+            if transaction is not None:
+                try:
+                    transaction.close()
+                except BaseException as cleanup_exc:
+                    if hasattr(exc, "add_note"):
+                        exc.add_note(
+                            f"SQLite transaction cleanup also failed: "
+                            f"{cleanup_exc}")
+            if (
+                not _repair_sqlite_retryable(exc)
+                or time.monotonic() >= deadline
+                or not anchors_match()
+            ):
+                if announced and _repair_sqlite_retryable(exc):
+                    log.info(fmt(
+                        C.GRAY,
+                        f"  · SQLite lease still busy after waiting during "
+                        f"{label}; "
+                        f"{_repair_sqlite_holder_diagnostic(database_anchor)}",
+                    ))
+                raise
+            if not announced:
+                log.info(fmt(
+                    C.GRAY,
+                    f"  · SQLite lease busy after beets during {label}; "
+                    "waiting briefly before retry.",
+                ))
+                announced = True
+            gc.collect()
+            time.sleep(delay)
+            delay = min(delay * 1.7, 1.0)
+
+
+def _retry_repair_sqlite_call(
+        label, anchors_match, call, *, timeout=None, retry_when=None,
+        diagnostic=None):
+    deadline = _repair_sqlite_retry_deadline(timeout)
+    delay = 0.15
+    announced = False
+    while True:
+        try:
+            if not anchors_match():
+                raise _RepairAnchorChanged(
+                    f"repair paths changed before {label}")
+            return call()
+        except BaseException as exc:
+            if (
+                not _repair_sqlite_retryable(exc)
+                or (retry_when is not None and not retry_when(exc))
+                or time.monotonic() >= deadline
+                or not anchors_match()
+            ):
+                if (
+                    announced
+                    and _repair_sqlite_retryable(exc)
+                    and diagnostic is not None
+                ):
+                    log.info(fmt(
+                        C.GRAY,
+                        f"  · SQLite lease still busy after waiting during "
+                        f"{label}; {diagnostic()}",
+                    ))
+                raise
+            if not announced:
+                log.info(fmt(
+                    C.GRAY,
+                    f"  · SQLite lease busy after beets during {label}; "
+                    "waiting briefly before retry.",
+                ))
+                announced = True
+            gc.collect()
+            time.sleep(delay)
+            delay = min(delay * 1.7, 1.0)
+
+
 def _compensate_repair_item_rows(database_anchor, columns, original_rows,
                                   expected_rows, anchors_match):
     """Restore exact rows and report the state after every commit outcome."""
@@ -869,13 +1313,12 @@ def _compensate_repair_item_rows(database_anchor, columns, original_rows,
                 "repair paths changed before database compensation")
         timeout = getattr(cfg, "BEETS_TIMEOUT", 5)
         timeout = float(timeout) if timeout and timeout > 0 else 5.0
-        transaction = AtomicSQLiteWrite(
+        transaction, connection = _open_repair_sqlite_transaction(
             database_anchor,
-            _migration_database_anchor_matches,
-            connect=sqlite3.connect,
+            anchors_match,
             timeout=timeout,
+            label="database compensation",
         )
-        connection = transaction.open()
         connection.execute("BEGIN IMMEDIATE")
         if not anchors_match():
             raise _RepairAnchorChanged(
@@ -991,13 +1434,13 @@ def _sync_repair_beets_row(old_relative, new_relative, anchors_match, state,
             return
         timeout = getattr(cfg, "BEETS_TIMEOUT", 5)
         timeout = float(timeout) if timeout and timeout > 0 else 5.0
-        transaction = AtomicSQLiteWrite(
+        transaction, connection = _open_repair_sqlite_transaction(
             database_anchor,
-            _migration_database_anchor_matches,
-            connect=sqlite3.connect,
+            current_anchors_match,
             timeout=timeout,
+            label="database sync",
+            require_source_lease=False,
         )
-        connection = transaction.open()
         if not current_anchors_match():
             raise _RepairAnchorChanged(
                 "repair paths changed during database sync")
@@ -1161,6 +1604,7 @@ def _move_refill_file(root, album_parts, album, record, database_anchor):
     file_fd = record["file_fd"]
     relative = record["relative"]
     name = relative[-1]
+    source_name = record.get("source_name", name)
     destination = None
     created = []
     private_name = None
@@ -1178,7 +1622,7 @@ def _move_refill_file(root, album_parts, album, record, database_anchor):
             root, album_parts, relative[:-1], source, album, created)
         _require_repair_anchors(source, album, destination)
         if (
-            not _migration_named_entry_matches(source.fd, name, file_fd)
+            not _migration_named_entry_matches(source.fd, source_name, file_fd)
             or _migration_entry_record(os.fstat(file_fd))
                 != record["identity"]
         ):
@@ -1191,9 +1635,9 @@ def _move_refill_file(root, album_parts, album, record, database_anchor):
         private_name = _reserve_repair_source_name(source)
         quarantine_started = True
         _rename_noreplace_at(
-            source.fd, name, source.fd, private_name)
+            source.fd, source_name, source.fd, private_name)
         quarantine_state = _repair_source_quarantine_state(
-            source, name, private_name, file_fd)
+            source, source_name, private_name, file_fd)
         if quarantine_state != "quarantined":
             raise _RepairAnchorChanged(
                 "refill source changed while it was quarantined")
@@ -1205,7 +1649,7 @@ def _move_refill_file(root, album_parts, album, record, database_anchor):
             or not destination.matches()
             or not _migration_named_entry_matches(
                 source.fd, private_name, file_fd)
-            or not _migration_name_missing(source.fd, name)
+            or not _migration_name_missing(source.fd, source_name)
         ):
             raise _RepairAnchorChanged(
                 "refill source changed during quarantine")
@@ -1220,7 +1664,7 @@ def _move_refill_file(root, album_parts, album, record, database_anchor):
             not source.matches()
             or not album.matches()
             or not destination.matches()
-            or not _migration_name_missing(source.fd, name)
+            or not _migration_name_missing(source.fd, source_name)
             or not _migration_name_missing(source.fd, private_name)
             or not _migration_named_entry_matches(
                 destination.fd, name, file_fd)
@@ -1237,7 +1681,7 @@ def _move_refill_file(root, album_parts, album, record, database_anchor):
                 and album.matches()
                 and destination.matches()
                 and _migration_database_anchor_matches(database_anchor)
-                and _migration_name_missing(source.fd, name)
+                and _migration_name_missing(source.fd, source_name)
                 and _migration_name_missing(source.fd, private_name)
                 and _migration_named_entry_matches(
                     destination.fd, name, file_fd)
@@ -1248,18 +1692,41 @@ def _move_refill_file(root, album_parts, album, record, database_anchor):
         if not moved_anchors_match():
             raise _RepairAnchorChanged(
                 "repair paths changed during relocation")
-        _sync_repair_beets_row(
-            (*source.parts, name),
-            (*destination.parts, name),
+        timeout = getattr(cfg, "BEETS_TIMEOUT", 5)
+        timeout = float(timeout) if timeout and timeout > 0 else 5.0
+
+        def sync_after_move():
+            database_state.update({
+                "forward_authoritative": False,
+                "rollback_safe": True,
+                "uncertain": False,
+            })
+            _sync_repair_beets_row(
+                (*source.parts, source_name),
+                (*destination.parts, name),
+                moved_anchors_match,
+                database_state,
+                database_anchor,
+            )
+
+        _retry_repair_sqlite_call(
+            "refill database sync",
             moved_anchors_match,
-            database_state,
-            database_anchor,
+            sync_after_move,
+            timeout=timeout,
+            retry_when=lambda _exc: not (
+                database_state["forward_authoritative"]
+                or database_state["uncertain"]
+                or not database_state["rollback_safe"]
+            ),
+            diagnostic=lambda: _repair_sqlite_holder_diagnostic(
+                database_anchor),
         )
         return True
     except BaseException as exc:
         if quarantine_started and not quarantined and not renamed:
             quarantine_state = _repair_source_quarantine_state(
-                source, name, private_name, file_fd)
+                source, source_name, private_name, file_fd)
             if quarantine_state == "quarantined":
                 quarantined = True
             elif quarantine_state not in ("source", "foreign-restored"):
@@ -1297,7 +1764,7 @@ def _move_refill_file(root, album_parts, album, record, database_anchor):
         if renamed and not preserve_forward:
             restored = _rollback_migration_rename(
                 source.fd,
-                name,
+                source_name,
                 destination.fd,
                 name,
                 file_fd,
@@ -1308,13 +1775,13 @@ def _move_refill_file(root, album_parts, album, record, database_anchor):
                 and album.matches()
                 and destination.matches()
                 and _migration_named_entry_matches(
-                    source.fd, name, file_fd)
+                    source.fd, source_name, file_fd)
                 and _migration_name_missing(destination.fd, name)
             )
         elif quarantined and not preserve_forward:
             restored = _rollback_migration_rename(
                 source.fd,
-                name,
+                source_name,
                 source.fd,
                 private_name,
                 file_fd,
@@ -1324,7 +1791,7 @@ def _move_refill_file(root, album_parts, album, record, database_anchor):
                 and source.matches()
                 and album.matches()
                 and _migration_named_entry_matches(
-                    source.fd, name, file_fd)
+                    source.fd, source_name, file_fd)
                 and _migration_name_missing(source.fd, private_name)
             )
         if restored and not preserve_forward:
@@ -1369,7 +1836,7 @@ def _remove_exact_empty_landed_dir(landed):
 def _relocate_refilled_into_album_dir(
         album_dir, landed_dir, wanted_isrcs, before_names, *,
         ownership_receipt=None, expected_refills=None,
-        held_root=None, held_album=None):
+        target_relatives_by_isrc=None, held_root=None, held_album=None):
     """Move only exact files named by the sealed Beets import receipt."""
     del landed_dir  # The sealed receipt, not a cache/path guess, owns sources.
     root = held_root
@@ -1400,6 +1867,7 @@ def _relocate_refilled_into_album_dir(
             wanted_isrcs,
             before_names,
             expected_refills,
+            target_relatives_by_isrc,
         )
 
         def preflight_anchors_match():
@@ -1415,7 +1883,7 @@ def _relocate_refilled_into_album_dir(
                     record["source"].matches()
                     and _migration_named_entry_matches(
                         record["source"].fd,
-                        record["relative"][-1],
+                        record["source_name"],
                         record["file_fd"],
                     )
                     and _migration_entry_record(
@@ -1425,8 +1893,17 @@ def _relocate_refilled_into_album_dir(
             )
 
         database_anchor = _open_migration_database_anchor()
-        _preflight_migration_database_anchor(
-            database_anchor, preflight_anchors_match)
+        timeout = getattr(cfg, "BEETS_TIMEOUT", 5)
+        timeout = float(timeout) if timeout and timeout > 0 else 5.0
+        _retry_repair_sqlite_call(
+            "database preflight",
+            preflight_anchors_match,
+            lambda: _preflight_migration_database_anchor(
+                database_anchor, preflight_anchors_match),
+            timeout=timeout,
+            diagnostic=lambda: _repair_sqlite_holder_diagnostic(
+                database_anchor),
+        )
         _prepare_migration_database_transaction_name(database_anchor)
         if not preflight_anchors_match():
             raise _RepairAnchorChanged(
@@ -1486,7 +1963,9 @@ def _refills_present_in(album_dir, wanted_counts, baseline_counts):
         return True
     if baseline_counts is None:
         return False
-    present = Counter(_norm_isrc(et.get("isrc")) for et in read_album_dir(album_dir))
+    present = _repair_album_isrc_counts(album_dir, [])
+    if present is None:
+        return False
     return all(present.get(isrc, 0) >= baseline_counts.get(isrc, 0) + n
                for isrc, n in wanted_counts.items())
 
@@ -1517,7 +1996,8 @@ def _refills_intact(album_dir, wanted_counts, token, baseline_counts):
     # the refill is still short.
     verified_ok = Counter()
     for isrc, n in dict(scan.get("verified_ok_isrcs") or {}).items():
-        verified_ok[_norm_isrc(isrc)] += n
+        for value in _split_repair_isrc_values([isrc]):
+            verified_ok[value] += n
     return all(verified_ok.get(isrc, 0) >= baseline_counts.get(isrc, 0) + n
                for isrc, n in wanted_counts.items())
 
@@ -1702,12 +2182,18 @@ def repair_album_dir(album_dir, verified_truncated, artist_name, args, token,
         # rather than stranding the only copies in the backup dir.
         wanted_isrcs = {_norm_isrc(b.get("isrc")) for b in verified_truncated}
         wanted_isrcs.discard("")
+        wanted_alias_isrcs = set(wanted_isrcs)
+        for entry in verified_truncated:
+            wanted_alias_isrcs.update(_repair_entry_isrcs(entry))
+        wanted_alias_isrcs.discard("")
         # Per-ISRC counts of the originals going to backup — the presence gate
         # needs the multiset, not just the set, so two same-ISRC truncated files
         # (a .1.flac collision pair, or the same recording on two discs) aren't
         # treated as repaired when only one refill lands.
         wanted_counts = Counter(_norm_isrc(b.get("isrc")) for b in verified_truncated)
         wanted_counts.pop("", None)
+        target_relatives = _target_relatives_by_isrc(
+            verified_truncated, album_dir)
 
         album = _resolve_parent_album(album_dir, artist_name,
                                       verified_truncated, wanted_isrcs, token)
@@ -1920,11 +2406,11 @@ def repair_album_dir(album_dir, verified_truncated, artist_name, args, token,
         # against baseline + wanted, so a healthy PRE-EXISTING file sharing a
         # refill's ISRC can't vouch for a refill that never came back.
         _bl_errs = []
-        baseline_counts = Counter(
-            _norm_isrc(et.get("isrc"))
-            for et in read_album_dir(album_dir, walk_errors=_bl_errs))
-        baseline_counts.pop("", None)
-        if _bl_errs:
+        baseline_counts = _repair_album_isrc_counts(
+            album_dir, walk_errors=_bl_errs)
+        if baseline_counts is not None:
+            baseline_counts.pop("", None)
+        else:
             baseline_counts = None
 
         # Carry the truncated originals' own tags + art onto the refills
@@ -2010,10 +2496,11 @@ def repair_album_dir(album_dir, verified_truncated, artist_name, args, token,
             _relocate_refilled_into_album_dir(
                 album_dir,
                 landed_post_path,
-                wanted_isrcs,
+                wanted_alias_isrcs,
                 before_names,
                 ownership_receipt=qi.get("_import_ownership"),
                 expected_refills=qi.get("n_ok", 0),
+                target_relatives_by_isrc=target_relatives,
                 held_root=held_root,
                 held_album=held_album,
             )
@@ -2132,7 +2619,9 @@ def repair_album_dir(album_dir, verified_truncated, artist_name, args, token,
                     "tags or artwork could not be carried onto it.",
                 )
             elif repaired:
-                if retire_verified_repair_backup(backup_path):
+                retirement_diagnostic = []
+                if retire_verified_repair_backup(
+                        backup_path, diagnostic=retirement_diagnostic):
                     resolve_recovery(
                         backup_path,
                         "The replacement tracks verified, so the truncated "
@@ -2151,6 +2640,10 @@ def repair_album_dir(album_dir, verified_truncated, artist_name, args, token,
                         "  ⚠  Replacement tracks verified, but the originals' "
                         "backup couldn't be proven redundant — keeping it:\n"
                         f"     {backup_path}"))
+                    if retirement_diagnostic:
+                        log.info(fmt(C.YELLOW,
+                            "     Diagnostic: "
+                            + "; ".join(retirement_diagnostic[:3])))
                     checkpoint_recovery(
                         backup_path,
                         "verification",

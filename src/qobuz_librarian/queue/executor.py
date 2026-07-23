@@ -1029,8 +1029,18 @@ def _import_album_with_retry(
         if kind == "ok":
             if ownership_out is not None:
                 result = attempt_capture.get("result")
-                if isinstance(result, dict):
-                    ownership_out["result"] = result
+                if not isinstance(result, dict):
+                    diagnostic = attempt_capture.get("_diagnostic")
+                    log.info(fmt(
+                        C.RED,
+                        "  ✗  beets moved the refill but did not produce "
+                        "the required sealed import ownership receipt; "
+                        "the import was not accepted.",
+                    ))
+                    if isinstance(diagnostic, str) and diagnostic:
+                        log.info(fmt(C.GRAY, f"     {diagnostic}."))
+                    return False
+                ownership_out["result"] = result
             return True
         if kind == "timeout" and attempt < max_attempts:
             log.info(fmt(C.YELLOW,

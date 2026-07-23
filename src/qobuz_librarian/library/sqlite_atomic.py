@@ -66,6 +66,20 @@ _EARLY_PRIVATE_NAMES = frozenset({
 })
 
 
+def _lease_type_label(lease_type):
+    if lease_type == fcntl.F_RDLCK:
+        return "read"
+    if lease_type == fcntl.F_WRLCK:
+        return "write"
+    return str(lease_type)
+
+
+def _lease_errno_label(value):
+    if value is None:
+        return "unknown"
+    return errno.errorcode.get(value, str(value))
+
+
 class SQLitePublicationUncertain(OSError):
     """The exact database published at the configured leaf is unknown."""
 
@@ -909,7 +923,11 @@ class _FileLeases:
                         record["unlock_pending"] = False
                     raise OSError(
                         exc.errno,
-                        f"SQLite {record['role']} lease could not be acquired",
+                        "SQLite "
+                        f"{record['role']} lease could not be acquired "
+                        f"(lease={_lease_type_label(record['lease_type'])}, "
+                        f"errno={_lease_errno_label(exc.errno)}, "
+                        f"pid={os.getpid()}, uid={os.geteuid()})",
                     ) from exc
                 if fcntl.fcntl(
                         descriptor, fcntl.F_GETLEASE) != record["lease_type"]:
@@ -1394,13 +1412,14 @@ class AtomicSQLiteWrite:
 
     def __init__(
             self, anchor, anchor_matches, *, connect=sqlite3.connect,
-            timeout=5.0):
+            timeout=5.0, require_source_lease=True):
         if anchor is None or anchor.get("descriptor") is None:
             raise OSError("a bound SQLite database is required")
         self.anchor = anchor
         self.anchor_matches = anchor_matches
         self.connect = connect
         self.timeout = timeout
+        self.require_source_lease = require_source_lease
         self.parent_fd = anchor["parent_chain"][-1]
         self.original_descriptor = anchor["descriptor"]
         self._database_exclusion = _SQLiteDatabaseExclusion()
@@ -1831,18 +1850,18 @@ class AtomicSQLiteWrite:
         self._close_source_reservation()
 
         leases = _FileLeases()
-        lease_requests = (
-            (
+        lease_requests = []
+        if self.require_source_lease:
+            lease_requests.append((
                 self.original_descriptor,
                 fcntl.F_RDLCK,
                 _SOURCE_LEASE,
-            ),
-            (
-                self.work_descriptor,
-                fcntl.F_WRLCK,
-                _WORK_LEASE,
-            ),
-        )
+            ))
+        lease_requests.append((
+            self.work_descriptor,
+            fcntl.F_WRLCK,
+            _WORK_LEASE,
+        ))
         caught = None
         classification_error = None
         release_error = None
@@ -1854,7 +1873,11 @@ class AtomicSQLiteWrite:
                 leases.acquire()
                 prepared = self._prepared_layout_matches()
                 work_pending = leases.pending(_WORK_LEASE)
-                source_pending = leases.pending(_SOURCE_LEASE)
+                source_pending = (
+                    leases.pending(_SOURCE_LEASE)
+                    if self.require_source_lease
+                    else False
+                )
                 if work_pending:
                     self.uncertain = True
                     raise OSError(

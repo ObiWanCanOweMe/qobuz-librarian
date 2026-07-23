@@ -55,7 +55,7 @@ from qobuz_librarian.recovery import (
     decode_recovery_json,
     normalise_recovery_owner,
 )
-from qobuz_librarian.ui_cli.colors import C, fmt
+from qobuz_librarian.ui_cli.colors import C, fmt, truncate
 from qobuz_librarian.ui_cli.errors import EXIT_GENERAL, die
 from qobuz_librarian.ui_cli.logging import (
     log,
@@ -5038,6 +5038,65 @@ def _read_ownership_manifest(capture):
     return payload
 
 
+def _ownership_payload_diagnostic(payload):
+    if payload is None:
+        return "ownership plugin produced no readable manifest"
+    diagnostic = payload.get("diagnostic")
+    diagnostic_bits = []
+    if isinstance(diagnostic, dict):
+        last_reason = diagnostic.get("last_reason")
+        if isinstance(last_reason, str) and last_reason:
+            diagnostic_bits.append(f"last={last_reason}")
+        for key in (
+            "prepared_sources",
+            "proven_moves",
+            "pending_moves",
+            "manifest_items",
+            "created_directories",
+        ):
+            value = diagnostic.get(key)
+            if type(value) is int:
+                diagnostic_bits.append(f"{key}={value}")
+        events = diagnostic.get("events")
+        if isinstance(events, list) and events:
+            event_bits = []
+            for event in events[-4:]:
+                if not isinstance(event, dict):
+                    continue
+                reason = event.get("reason")
+                if not isinstance(reason, str) or not reason:
+                    continue
+                details = []
+                for key in (
+                    "source",
+                    "destination",
+                    "item_path",
+                    "library_path",
+                    "event_source",
+                    "prepared_source",
+                    "error",
+                ):
+                    value = event.get(key)
+                    if isinstance(value, str) and value:
+                        details.append(f"{key}={truncate(value, 80)}")
+                    elif isinstance(value, int):
+                        details.append(f"{key}={value}")
+                event_bits.append(
+                    reason + (f" ({', '.join(details)})" if details else "")
+                )
+            if event_bits:
+                diagnostic_bits.append("events=" + " -> ".join(event_bits))
+    suffix = f"; {'; '.join(diagnostic_bits)}" if diagnostic_bits else ""
+    if payload.get("sealed") is not True:
+        items = payload.get("items")
+        count = len(items) if isinstance(items, list) else "unknown"
+        return f"ownership plugin manifest was not sealed ({count} item(s)){suffix}"
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        return f"ownership plugin sealed an empty manifest{suffix}"
+    return f"ownership plugin manifest was rejected{suffix}"
+
+
 def _reclaim_ownership_capture(capture, payload=None):
     """Reclaim exact empty plug-in directories after an unaccepted run."""
     payload = payload or _read_ownership_payload(capture)
@@ -6351,6 +6410,13 @@ def _beets_direct_guarded(
         if ownership_payload is not None and ownership_payload.get("sealed") is True
         else None
     )
+    if (
+        ownership_result is None
+        and isinstance(ownership_capture, dict)
+        and ownership_capture
+    ):
+        ownership_capture["_diagnostic"] = _ownership_payload_diagnostic(
+            ownership_payload)
     managed_result = (
         _read_managed_ownership_evidence(
             managed_capture,

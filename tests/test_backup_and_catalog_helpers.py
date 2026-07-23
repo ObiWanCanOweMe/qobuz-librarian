@@ -362,7 +362,11 @@ def test_retire_verified_repair_backup_needs_superseding_tracks(tmp_path, monkey
     shutil.copyfile(kept / "01.flac", orphan / "02.flac")
     unmatched = _seal_test_backup(bkmod, orphan, album, kind="gap-fill")
 
-    assert bkmod.retire_verified_repair_backup(unmatched) is False
+    diagnostic = []
+    assert bkmod.retire_verified_repair_backup(
+        unmatched, diagnostic=diagnostic) is False
+    assert any("replacement is missing 02.flac" in item
+               for item in diagnostic)
     assert (orphan / "02.flac").exists()
 
     assert bkmod.retire_verified_repair_backup(superseded) is True
