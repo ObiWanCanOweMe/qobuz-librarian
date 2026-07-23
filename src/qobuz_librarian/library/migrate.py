@@ -409,9 +409,18 @@ def _album_key(meta: dict) -> tuple:
 _RENAME_NOREPLACE = 1
 _AT_EMPTY_PATH = 0x1000
 _AT_SYMLINK_NOFOLLOW = 0x100
-_STATX_BASIC_STATS = 0x07FF
+_STATX_TYPE = 0x0001
+_STATX_MODE = 0x0002
+_STATX_INO = 0x0100
 _STATX_BTIME = 0x0800
 _STATX_MNT_ID = 0x1000
+_STATX_DIRECTORY_IDENTITY_MASK = (
+    _STATX_TYPE
+    | _STATX_MODE
+    | _STATX_INO
+    | _STATX_BTIME
+    | _STATX_MNT_ID
+)
 _STATX_FUNCTION = None
 
 
@@ -479,12 +488,15 @@ def _statx_directory_identity(descriptor, path, flags) -> list:
     ctypes.set_errno(0)
     if statx(
             int(descriptor), os.fsencode(path), flags,
-            _STATX_BASIC_STATS | _STATX_BTIME | _STATX_MNT_ID,
+            _STATX_DIRECTORY_IDENTITY_MASK,
             ctypes.byref(value)):
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
-    required = _STATX_BASIC_STATS | _STATX_BTIME | _STATX_MNT_ID
-    if value.mask & required != required or value.btime.tv_nsec >= 1_000_000_000:
+    if (
+        value.mask & _STATX_DIRECTORY_IDENTITY_MASK
+        != _STATX_DIRECTORY_IDENTITY_MASK
+        or value.btime.tv_nsec >= 1_000_000_000
+    ):
         raise OSError("filesystem cannot prove directory incarnation safely")
     device = os.makedev(value.dev_major, value.dev_minor)
     identity = [

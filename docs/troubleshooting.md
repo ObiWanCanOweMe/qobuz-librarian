@@ -16,3 +16,15 @@
 | Upgrade fails with `Permission denied` backing up an album | An earlier `docker exec … beet …` ran as root, leaving root-owned files `PUID 1000` cannot move. Rerun with `docker exec --user 1000:1000 …`, or `sudo chown -R 1000:1000 ./music`. |
 | Files vanished from `/music` after a manual `beet` command | `beet -d /config/beets …` reads `-d` as the destination, so with `move: yes` it relocates the library into the config volume. The container already exports `BEETSDIR`; run `beet …` with no `-d`. |
 | `curl` / `cp` / `mkdir` misbehave on Windows | PowerShell's `curl` is an alias for `Invoke-WebRequest` with different flags, and chained commands do not behave the same. Run the setup in WSL or Git Bash. |
+# Large migration previews
+
+Migration reviews store detailed per-file safety receipts in `/data/jobs.db`
+and keep only compact album references in the ordinary job record. This keeps
+large previews restart-safe without constructing a multi-gigabyte SQLite
+field. Keep `/data` on durable, writable storage for the entire review and
+migration.
+
+If a review reports that its saved preview details are missing or unreadable,
+run the scan again. Qobuz Librarian deliberately refuses to reconstruct
+execution authority from paths or the human-readable CSV manifest. Raising the
+container memory limit does not repair missing or corrupt durable payload rows.

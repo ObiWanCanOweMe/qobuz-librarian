@@ -1,7 +1,11 @@
 """Library migration: placement correctness and the copy-safety guarantees."""
 import csv
+import ctypes
 import json
+import stat
 from pathlib import Path
+
+import pytest
 
 from qobuz_librarian.library import migrate as m
 
@@ -29,7 +33,72 @@ def test_normalize_tags_parses_slashed_track_and_disc_and_year():
     assert meta["year"] == 2008
 
 
-# ── destination path ──────────────────────────────────────────────────────────
+# ── sealed filesystem evidence ───────────────────────────────────────────
+
+_DIRECTORY_IDENTITY_MASK = 0x0001 | 0x0002 | 0x0100 | 0x0800 | 0x1000
+
+
+def _fake_directory_statx(returned_mask, requested_masks):
+    def statx(descriptor, path, flags, requested_mask, result):
+        requested_masks.append(requested_mask)
+        value = ctypes.cast(result, ctypes.POINTER(m._Statx)).contents
+        value.mask = returned_mask
+        value.mode = stat.S_IFDIR | 0o755
+        value.ino = 42
+        value.btime.tv_sec = 1_700_000_000
+        value.btime.tv_nsec = 123
+        value.dev_major = 8
+        value.dev_minor = 1
+        value.mnt_id = 99
+        return 0
+
+    return statx
+
+
+def test_statx_directory_identity_accepts_missing_atime(monkeypatch):
+    requested_masks = []
+    monkeypatch.setattr(
+        m,
+        "_statx_function",
+        lambda: _fake_directory_statx(
+            _DIRECTORY_IDENTITY_MASK,
+            requested_masks,
+        ),
+    )
+
+    identity = m._statx_directory_identity(7, b"", m._AT_EMPTY_PATH)
+
+    assert requested_masks == [_DIRECTORY_IDENTITY_MASK]
+    assert identity == [
+        stat.S_IFDIR,
+        m.os.makedev(8, 1),
+        42,
+        stat.S_IFDIR | 0o755,
+        1_700_000_000,
+        123,
+        99,
+    ]
+
+
+@pytest.mark.parametrize("missing", [m._STATX_BTIME, m._STATX_MNT_ID])
+def test_statx_directory_identity_rejects_missing_proof_field(
+        monkeypatch, missing):
+    monkeypatch.setattr(
+        m,
+        "_statx_function",
+        lambda: _fake_directory_statx(
+            _DIRECTORY_IDENTITY_MASK & ~missing,
+            [],
+        ),
+    )
+
+    with pytest.raises(
+            OSError,
+            match="filesystem cannot prove directory incarnation safely"):
+        m._statx_directory_identity(7, b"", m._AT_EMPTY_PATH)
+
+
+# ── destination path ─────────────────────────────────────────────────────────────────────────
 
 def test_destination_matches_beets_layout(tmp_path):
     source = tmp_path / "source"
@@ -244,6 +313,92 @@ def _sealed_web_choice(files, dest):
         "companion_receipts": plan.companion_receipts,
     }}]
 
+
+def _stub_migration_scan(monkeypatch, tmp_path, receipt_marker="receipt"):
+    source = tmp_path / "source" / "Album" / "a.flac"
+    entry = m.PlanEntry(
+        source=source,
+        status=m.PLACE,
+        dest_rel=Path("Artist/Album (2026)/01 - A.flac"),
+        source_receipt={"relative": ["Album", "a.flac"],
+                        "marker": receipt_marker},
+        destination_path_receipt={"missing": ["Artist", "Album (2026)"],
+                                  "marker": receipt_marker},
+    )
+    plan = m.MigrationPlan(
+        dest_root=tmp_path / "dest",
+        entries=[entry],
+        source_root=tmp_path / "source",
+        source_root_receipt={"source": receipt_marker},
+        dest_root_receipt={"dest": receipt_marker},
+        destination_name_semantics={"case_sensitive": True},
+    )
+    monkeypatch.setattr(m, "collect_items", lambda *_a, **_k: [object()])
+    monkeypatch.setattr(m, "build_plan", lambda *_a, **_k: plan)
+    monkeypatch.setattr(m, "verified_resume_entries", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        m, "write_manifest",
+        lambda *_a, **_k: {
+            "path": str(tmp_path / "dest" / "manifest.csv"),
+            "receipt": {"marker": receipt_marker},
+        },
+    )
+    monkeypatch.setattr(m, "space_estimate", lambda *_a, **_k: (1, 10))
+    return plan
+
+
+def test_compact_migration_scan_payload_is_disk_backed(
+        tmp_path, monkeypatch):
+    from qobuz_librarian.web import flows, job_persistence
+    from qobuz_librarian.web import jobs as jm
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+    marker = "full-receipt-" + ("x" * 20_000)
+    _stub_migration_scan(monkeypatch, tmp_path, marker)
+    job = jm.Job(title="Migration", kind="scan")
+
+    flows.scan_migration(job, tmp_path / "source", tmp_path / "dest",
+                         use_acoustid=False)
+
+    assert len(job.candidates) == 1
+    candidate = job.candidates[0]
+    assert candidate["payload"] == {
+        "migration_payload_ref": {"version": 1},
+    }
+    assert marker not in json.dumps(job.candidates)
+    stored = job_persistence.load_migration_candidate_payload(
+        job.id, candidate["cid"]
+    )
+    assert stored["entries"][0][2]["marker"] == marker
+    assert stored["manifest_artifact"]["receipt"]["marker"] == marker
+
+
+def test_migration_scan_payload_write_failure_is_not_actionable(
+        tmp_path, monkeypatch):
+    from qobuz_librarian.web import flows, job_persistence
+    from qobuz_librarian.web import jobs as jm
+
+    _stub_migration_scan(monkeypatch, tmp_path)
+    deleted = []
+    monkeypatch.setattr(
+        job_persistence, "persist_migration_candidate_payload",
+        lambda *_a, **_k: False,
+    )
+    monkeypatch.setattr(
+        job_persistence, "delete_migration_payloads", deleted.append,
+    )
+    job = jm.Job(title="Migration", kind="scan")
+
+    flows.scan_migration(job, tmp_path / "source", tmp_path / "dest",
+                         use_acoustid=False)
+
+    assert job.candidates == []
+    assert job.error and "saved safely" in job.error
+    assert job.summary == job.error
+    assert deleted == [job.id]
+
 def test_execute_migration_copies_selected_and_keeps_originals(tmp_path):
     from qobuz_librarian.web import flows
     from qobuz_librarian.web import jobs as jm
@@ -262,6 +417,75 @@ def test_execute_migration_copies_selected_and_keeps_originals(tmp_path):
     assert f1.exists() and f2.exists()             # copy mode: originals intact
     assert "2 files copied" in job.summary
     assert list(dest.glob("migration-results-*.csv"))
+
+
+def test_referenced_migration_payload_executes_after_persistence_reload(
+        tmp_path, monkeypatch):
+    from qobuz_librarian.web import flows, job_persistence
+    from qobuz_librarian.web import jobs as jm
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+    src = tmp_path / "src"
+    src.mkdir()
+    source = src / "x.flac"
+    source.write_bytes(b"one")
+    dest = tmp_path / "dest"
+    inline = _sealed_web_choice((source,), dest)[0]["payload"]
+    inline["resume_entries"] = []
+    job = jm.Job(title="Migration", kind="scan")
+    assert job_persistence.persist_migration_candidate_payload(
+        job.id, "c0", inline
+    )
+    chosen = [{
+        "cid": "c0", "kind": "migrate", "title": "Album",
+        "artist": "Artist", "detail": "1 track", "selected": True,
+        "payload": job_persistence.migration_payload_reference(),
+    }]
+    job_persistence._conn.close()
+    job_persistence._conn = None
+    job_persistence.init()
+
+    flows.execute_migration(job, chosen, str(dest), in_place=False)
+
+    copied = list((dest / "Artist/Album (2017)").glob("*.flac"))
+    assert [path.read_bytes() for path in copied] == [b"one"]
+    assert source.exists()
+    assert not job.error
+
+
+@pytest.mark.parametrize("chosen", [
+    [{"cid": "missing", "payload": {
+        "migration_payload_ref": {"version": 1}}}],
+    [{"cid": "future", "payload": {
+        "migration_payload_ref": {"version": 2}}}],
+    [
+        {"cid": "c0", "payload": {
+            "migration_payload_ref": {"version": 1}}},
+        {"cid": "legacy", "payload": {"entries": [],
+                                         "manifest_artifact": {}}},
+    ],
+])
+def test_referenced_migration_payload_failure_stops_before_mutation(
+        tmp_path, monkeypatch, chosen):
+    from qobuz_librarian.library import migrate as engine
+    from qobuz_librarian.web import flows
+    from qobuz_librarian.web import jobs as jm
+
+    touched = []
+    monkeypatch.setattr(
+        engine, "verify_audit_artifact",
+        lambda *_a, **_k: touched.append(True),
+    )
+    job = jm.Job(title="Migration", kind="scan")
+
+    flows.execute_migration(job, chosen, str(tmp_path / "dest"),
+                            in_place=False)
+
+    assert job.error and "saved preview details" in job.error
+    assert touched == []
+    assert not (tmp_path / "dest").exists()
 
 
 def test_execute_migration_blocks_low_space_in_place_move(tmp_path, monkeypatch):
