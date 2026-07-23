@@ -6,8 +6,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
-  security-events: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -21,6 +19,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify release commit is reachable from main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Published release tag commit must be reachable from origin/main." >&2
+            exit 1
+          fi
 
       - uses: actions/setup-node@v4
         with:
@@ -30,6 +37,12 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: node -e "import('./scripts/release/qobuz-tag.mjs').then(({ parseQobuzTag }) => parseQobuzTag(process.env.RELEASE_TAG))"
+
+      - name: Build CSS assets and run deployment contracts
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+          npm run test:deployment-contract
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -63,22 +76,33 @@ jobs:
   tag-preflight:
     needs: [verify]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-node@v4
+      - name: Authenticate to GHCR
+        uses: docker/login-action@v3
         with:
-          node-version: "24"
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Prove the exact release tag is absent
         env:
           IMAGE_REF: ghcr.io/obiwancanoweme/qobuz-librarian:${{ github.event.release.tag_name }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: node scripts/ci/assert-image-tag-absent.mjs "$IMAGE_REF"
+        run: |
+          if docker buildx imagetools inspect "$IMAGE_REF" >/dev/null 2>&1; then
+            echo "Image tag already exists: $IMAGE_REF" >&2
+            exit 1
+          fi
+          echo "Image tag is absent: $IMAGE_REF"
 
   build-and-push:
     runs-on: ubuntu-latest
     needs: [verify, tag-preflight]
+    permissions:
+      contents: read
+      packages: write
     outputs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
@@ -126,7 +150,9 @@ jobs:
 
   deploy-production:
     needs: [verify, tag-preflight, build-and-push, scan-image]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ark]
+    permissions:
+      contents: read
     environment: production
     concurrency:
       group: qobuz-librarian-production

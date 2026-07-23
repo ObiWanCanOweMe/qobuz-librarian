@@ -64,11 +64,16 @@ test('probeHealth accepts the qobuz health endpoint', async () => {
 test('deployWithRollback restores the previous snapshot when health fails', async () => {
   const updates = [];
   const healthStatuses = [500, 200];
+  const snapshot = {
+    Env: [
+      { name: 'QOBUZ_LIBRARIAN_VERSION', value: 'v0.11.2' },
+      { name: 'TZ', value: 'America/New_York' },
+      { name: 'WEB_AUTH', value: 'enabled' },
+    ],
+    StackFileContent: 'image: old\n',
+  };
   const client = {
-    snapshotStack: async () => ({
-      Env: [{ name: 'QOBUZ_LIBRARIAN_VERSION', value: 'v0.11.2' }],
-      StackFileContent: 'image: old\n',
-    }),
+    snapshotStack: async () => snapshot,
     updateStack: async (snapshot) => updates.push(snapshot),
   };
 
@@ -87,5 +92,29 @@ test('deployWithRollback restores the previous snapshot when health fails', asyn
   assert.deepEqual(healthStatuses, []);
   assert.equal(updates.length, 2);
   assert.equal(updates[0].Env.find((entry) => entry.name === 'QOBUZ_LIBRARIAN_VERSION').value, 'v0.11.3');
-  assert.equal(updates[1].StackFileContent, 'image: old\n');
+  assert.deepEqual(updates[1], snapshot);
+});
+
+test('deployWithRollback keeps the target deployment when health succeeds', async () => {
+  const updates = [];
+  const client = {
+    snapshotStack: async () => ({
+      Env: [{ name: 'QOBUZ_LIBRARIAN_VERSION', value: 'v0.11.2' }],
+      StackFileContent: 'image: old\n',
+    }),
+    updateStack: async (snapshot) => updates.push(snapshot),
+  };
+
+  const result = await deployWithRollback({
+    client,
+    manifest: 'image: ${QOBUZ_LIBRARIAN_VERSION:?required}\n',
+    targetVersion: 'v0.11.3',
+    healthUrl: 'http://example.test/healthz',
+    attempts: 1,
+    fetchImpl: async () => ({ status: 200, json: async () => ({}) }),
+  });
+
+  assert.deepEqual(result, { targetVersion: 'v0.11.3', previousVersion: 'v0.11.2' });
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].Env.find((entry) => entry.name === 'QOBUZ_LIBRARIAN_VERSION').value, 'v0.11.3');
 });
