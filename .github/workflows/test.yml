@@ -68,3 +68,19 @@ jobs:
         run: |
           npm ci --no-audit --no-fund
           npm run build
+
+  deployment-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Run deployment contract tests
+        run: npm run test:deployment-contract
+
+      - name: Render Portainer Compose configuration
+        run: |
+          QOBUZ_LIBRARIAN_VERSION=v0.11.3 docker compose -f deploy/portainer/docker-compose.yml config --quiet
