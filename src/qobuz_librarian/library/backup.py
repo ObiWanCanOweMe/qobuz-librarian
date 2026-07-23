@@ -1372,6 +1372,48 @@ def _tree_copy_fidelity_matches(source, destination) -> bool:
     return True
 
 
+def _tree_copy_fidelity_diagnostic(source, destination) -> str:
+    if source is None:
+        return "source metadata snapshot is unavailable"
+    if destination is None:
+        return "copied metadata snapshot is unavailable"
+    source_dirs = source.get("directories", {})
+    destination_dirs = destination.get("directories", {})
+    if source_dirs != destination_dirs:
+        return (
+            "directory metadata differs "
+            f"(source={len(source_dirs)}, copied={len(destination_dirs)})"
+        )
+    source_files = source.get("files", {})
+    destination_files = destination.get("files", {})
+    if set(source_files) != set(destination_files):
+        missing = sorted(set(source_files) - set(destination_files))
+        extra = sorted(set(destination_files) - set(source_files))
+        details = []
+        if missing:
+            details.append(f"missing={missing[:3]}")
+        if extra:
+            details.append(f"extra={extra[:3]}")
+        return "file set differs" + (f" ({'; '.join(details)})" if details else "")
+    for relative, expected in source_files.items():
+        copied = destination_files[relative]
+        if copied.get("links") != 1:
+            return f"{relative}: copied hardlink count is {copied.get('links')}"
+        copied_without_links = {
+            key: value for key, value in copied.items() if key != "links"
+        }
+        expected_without_links = {
+            key: value for key, value in expected.items() if key != "links"
+        }
+        if copied_without_links != expected_without_links:
+            changed = sorted(
+                key for key in set(copied_without_links) | set(expected_without_links)
+                if copied_without_links.get(key) != expected_without_links.get(key)
+            )
+            return f"{relative}: metadata differs ({', '.join(changed[:6])})"
+    return "metadata comparison failed for an unknown reason"
+
+
 def _copy_tree_directory_fidelity(source_root_fd, destination_root_fd) -> bool:
     snapshot = _exact_tree_snapshot(source_root_fd)
     if snapshot is None:
@@ -1394,6 +1436,43 @@ def _copy_tree_directory_fidelity(source_root_fd, destination_root_fd) -> bool:
                 if not _fsync_directory_fds(destination_fd):
                     return False
             finally:
+                _close_descriptors(destination_parents)
+                _close_descriptors(source_parents)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _copy_tree_file_fidelity(source_root_fd, destination_root_fd) -> bool:
+    snapshot = _exact_tree_snapshot(source_root_fd)
+    if snapshot is None:
+        return False
+    try:
+        for relative_text in sorted(snapshot["files"]):
+            relative = tuple(PurePosixPath(relative_text).parts)
+            source_parents = []
+            destination_parents = []
+            source_fd = None
+            destination_fd = None
+            try:
+                source_parents = _open_relative_directories(
+                    source_root_fd, relative[:-1], create=False)
+                source_parent_fd = (
+                    source_parents[-1] if source_parents else source_root_fd)
+                destination_parents = _open_relative_directories(
+                    destination_root_fd, relative[:-1], create=False)
+                destination_parent_fd = (
+                    destination_parents[-1]
+                    if destination_parents else destination_root_fd)
+                source_fd = _open_regular_file_at(source_parent_fd, relative[-1])
+                destination_fd = _open_regular_file_at(
+                    destination_parent_fd, relative[-1])
+                _copy_fidelity_fd(source_fd, destination_fd)
+            finally:
+                if destination_fd is not None:
+                    os.close(destination_fd)
+                if source_fd is not None:
+                    os.close(source_fd)
                 _close_descriptors(destination_parents)
                 _close_descriptors(source_parents)
         return True
@@ -6717,17 +6796,57 @@ def backup_album_dir(album_dir: Path, *, expected_receipt=None, owner=None,
             partial_fd = _open_backup_directory(
                 partial_name, dir_fd=backup_root_fd)
             held_partial = _held_directory_path(partial_fd)
+            directory_fidelity_copied = _copy_tree_directory_fidelity(
+                source_fd, partial_fd)
+            file_fidelity_copied = _copy_tree_file_fidelity(
+                source_fd, partial_fd)
+            copied_digest = _tree_digest(held_partial)
+            source_digest_after_copy = _tree_digest(held_source)
             copied_fidelity = _tree_fidelity_snapshot(partial_fd)
+            source_fidelity_after_copy = _tree_fidelity_snapshot(source_fd)
+            copied_fidelity_matches = _tree_copy_fidelity_matches(
+                source_fidelity, copied_fidelity)
+            held_files_intact = _held_snapshot_files_intact(
+                source_fd, source_snapshot, held_source_files)
             if (
-                _tree_digest(held_partial) != src_digest
-                or _tree_digest(held_source) != src_digest
-                or _tree_fidelity_snapshot(source_fd) != source_fidelity
-                or not _tree_copy_fidelity_matches(
-                    source_fidelity, copied_fidelity)
-                or not _held_snapshot_files_intact(
-                    source_fd, source_snapshot, held_source_files)
+                not directory_fidelity_copied
+                or not file_fidelity_copied
+                or copied_digest != src_digest
+                or source_digest_after_copy != src_digest
+                or source_fidelity_after_copy != source_fidelity
+                or not copied_fidelity_matches
+                or not held_files_intact
             ):
-                raise OSError("backup copy did not match the held source")
+                mismatch_reasons = []
+                if not directory_fidelity_copied:
+                    mismatch_reasons.append(
+                        "copied directory metadata could not be normalized")
+                if not file_fidelity_copied:
+                    mismatch_reasons.append(
+                        "copied file metadata could not be normalized")
+                if copied_digest != src_digest:
+                    mismatch_reasons.append(
+                        "copied file bytes differ from source snapshot")
+                if source_digest_after_copy != src_digest:
+                    mismatch_reasons.append(
+                        "source file bytes changed during copy")
+                if source_fidelity_after_copy != source_fidelity:
+                    mismatch_reasons.append(
+                        "source metadata changed during copy")
+                if not copied_fidelity_matches:
+                    mismatch_reasons.append(
+                        _tree_copy_fidelity_diagnostic(
+                            source_fidelity, copied_fidelity))
+                if not held_files_intact:
+                    mismatch_reasons.append(
+                        "held source file identity changed during copy")
+                details = "; ".join(mismatch_reasons)
+                log.info(fmt(
+                    C.GRAY,
+                    f"  ⤷  Backup copy mismatch detail: {details}."))
+                raise OSError(
+                    "backup copy did not match the held source"
+                    + (f" ({details})" if details else ""))
             committed_payload_snapshot = _exact_tree_snapshot(partial_fd)
             if committed_payload_snapshot is None:
                 raise OSError("backup copy could not be snapshotted")
@@ -9564,11 +9683,17 @@ def _audio_duration_seconds(path: Path):
         return None
 
 
+def _backup_retention_diagnostic(diagnostic, message) -> None:
+    if diagnostic is not None:
+        diagnostic.append(message)
+
+
 def _retention_view_is_redundant(
         replacement_view: Path,
         backup_view: Path,
         *,
         allow_smaller_audio=False,
+        diagnostic=None,
 ) -> bool:
     """Semantic retention proof over descriptor-bound private views."""
     try:
@@ -9578,51 +9703,100 @@ def _retention_view_is_redundant(
             relative = source.relative_to(backup_view)
             destination = replacement_view / relative
             if not destination.is_file():
+                _backup_retention_diagnostic(
+                    diagnostic, f"replacement is missing {relative}")
                 return False
             if source.suffix.lower() in cfg.AUDIO_EXTS:
                 source_duration = _audio_duration_seconds(source)
                 destination_duration = _audio_duration_seconds(destination)
+                if source_duration is None:
+                    _backup_retention_diagnostic(
+                        diagnostic,
+                        f"backup audio duration unreadable for {relative}")
+                    return False
+                if destination_duration is None:
+                    _backup_retention_diagnostic(
+                        diagnostic,
+                        f"replacement audio duration unreadable for {relative}")
+                    return False
                 if (
-                    source_duration is None
-                    or destination_duration is None
-                    or destination_duration
-                        + max(2.0, source_duration * 0.01)
-                        < source_duration
-                    or destination.suffix.lower() == ".flac"
+                    destination_duration
+                    + max(2.0, source_duration * 0.01)
+                    < source_duration
+                ):
+                    _backup_retention_diagnostic(
+                        diagnostic,
+                        f"replacement is shorter than backup for {relative} "
+                        f"({destination_duration:.2f}s < {source_duration:.2f}s)")
+                    return False
+                if (
+                    destination.suffix.lower() == ".flac"
                     and flac_audio_ok(destination) is not True
-                    or not allow_smaller_audio
+                ):
+                    _backup_retention_diagnostic(
+                        diagnostic,
+                        f"replacement FLAC decode check failed for {relative}")
+                    return False
+                if (
+                    not allow_smaller_audio
                     and destination.stat().st_size < source.stat().st_size
                 ):
+                    _backup_retention_diagnostic(
+                        diagnostic,
+                        f"replacement is smaller than backup for {relative}")
                     return False
             elif _file_digest(source) != _file_digest(destination):
+                _backup_retention_diagnostic(
+                    diagnostic, f"replacement digest differs for {relative}")
                 return False
         return True
-    except (OSError, TypeError, ValueError):
+    except (OSError, TypeError, ValueError) as exc:
+        _backup_retention_diagnostic(
+            diagnostic, f"retention proof errored: {exc}")
         return False
 
 
-def _dispose_retention_candidate(candidate, *, allow_smaller_audio=False):
+def _dispose_retention_candidate(
+        candidate, *, allow_smaller_audio=False, diagnostic=None):
     if not isinstance(candidate, BackupResult) or candidate.receipt is None:
+        _backup_retention_diagnostic(
+            diagnostic, "backup handle is not a complete BackupResult")
         return False
     replacement = Path(candidate.receipt["origin"])
     replacement_receipt = capture_album_source_receipt(replacement)
     if replacement_receipt is None:
+        _backup_retention_diagnostic(
+            diagnostic,
+            f"replacement receipt could not be captured for {replacement}")
         return False
-    return dispose_backup(
+    validator_called = False
+
+    def validator(replacement_view, backup_view):
+        nonlocal validator_called
+        validator_called = True
+        return _retention_view_is_redundant(
+            replacement_view,
+            backup_view,
+            allow_smaller_audio=allow_smaller_audio,
+            diagnostic=diagnostic,
+        )
+
+    ok = dispose_backup(
         candidate,
         replacement_path=replacement,
         expected_replacement_receipt=replacement_receipt,
-        replacement_validator=lambda replacement_view, backup_view: (
-            _retention_view_is_redundant(
-                replacement_view,
-                backup_view,
-                allow_smaller_audio=allow_smaller_audio,
-            )
-        ),
+        replacement_validator=validator,
     )
+    if not ok and diagnostic is not None and not diagnostic:
+        if validator_called:
+            diagnostic.append("semantic redundancy check failed without detail")
+        else:
+            diagnostic.append(
+                "backup disposal proof was rejected before semantic comparison")
+    return ok
 
 
-def retire_verified_repair_backup(backup) -> bool:
+def retire_verified_repair_backup(backup, *, diagnostic=None) -> bool:
     """Dispose a repair's originals once each is verifiably superseded.
 
     The same proof the age sweep applies: every file the backup holds must
@@ -9633,8 +9807,11 @@ def retire_verified_repair_backup(backup) -> bool:
         or not isinstance(backup.receipt, dict)
         or not backup.receipt.get("origin")
     ):
+        _backup_retention_diagnostic(
+            diagnostic, "backup receipt is missing its replacement origin")
         return False
-    return _dispose_retention_candidate(backup, allow_smaller_audio=True)
+    return _dispose_retention_candidate(
+        backup, allow_smaller_audio=True, diagnostic=diagnostic)
 
 
 def _views_are_byte_identical(replacement_view: Path, backup_view: Path) -> bool:

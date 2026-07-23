@@ -328,6 +328,63 @@ def _pair_upgrade_tracks_for_disposal(originals, replacements):
     return pairs
 
 
+def _track_debug_label(track):
+    title = str(track.get("title") or "<untitled>")
+    slot = _known_track_slot(track)
+    isrc = _recording_identity(track, "isrc")
+    mbid = _recording_identity(track, "mb_trackid")
+    bits, sample_rate = _track_quality(track)
+    return (
+        f"{truncate(title, 44)}"
+        f" slot={slot if slot is not None else '?'}"
+        f" isrc={isrc or '-'}"
+        f" mbid={mbid or '-'}"
+        f" quality={bits or '?'}-bit/{(sample_rate or 0) / 1000:g}kHz"
+    )
+
+
+def _upgrade_track_pairing_diagnostic(originals, replacements):
+    replacement_slots = [
+        slot for track in replacements
+        if (slot := _known_track_slot(track)) is not None
+    ]
+    duplicate_slots = sorted({
+        slot for slot in replacement_slots
+        if replacement_slots.count(slot) > 1
+    })
+    if duplicate_slots:
+        return f"replacement has duplicate disc/track slots: {duplicate_slots[:5]}"
+
+    claimed = set()
+    for original in originals:
+        candidates = [
+            index for index, replacement in enumerate(replacements)
+            if _upgrade_track_identity_matches(original, replacement)
+        ]
+        if len(candidates) == 0:
+            sample = ", ".join(
+                _track_debug_label(track)
+                for track in replacements[:3]
+            )
+            return (
+                "no unique replacement matched original "
+                f"{_track_debug_label(original)}"
+                + (f"; first replacement candidates: {sample}" if sample else "")
+            )
+        if len(candidates) > 1:
+            return (
+                "multiple replacements matched original "
+                f"{_track_debug_label(original)}: {candidates[:5]}"
+            )
+        if candidates[0] in claimed:
+            return (
+                "replacement was claimed by more than one original: "
+                f"{_track_debug_label(replacements[candidates[0]])}"
+            )
+        claimed.add(candidates[0])
+    return "pairing failed for an unknown reason"
+
+
 def _track_identity_conflicts(original, replacement):
     for field in ("isrc", "mb_trackid"):
         old_value = _recording_identity(original, field)
@@ -392,9 +449,11 @@ def _upgrade_trees_verified(post_dir, backup_path):
     # Every original must have one identity-paired replacement.
     pairs = _pair_upgrade_tracks_for_disposal(old_tracks, new_tracks)
     if pairs is None:
+        diagnostic = _upgrade_track_pairing_diagnostic(old_tracks, new_tracks)
         log.info(fmt(C.YELLOW,
             "  ⚠  Couldn't prove one unique replacement for every original "
             "track — keeping the backup."))
+        log.info(fmt(C.GRAY, f"     Pairing detail: {diagnostic}."))
         return False
     for ot, nt in pairs:
         oq, nq = _track_quality(ot), _track_quality(nt)

@@ -69,6 +69,26 @@ def _qobuz_track_by_isrc(isrc, token):
     return qt
 
 
+def _norm_repair_isrc(value):
+    return str(value or "").replace("-", "").upper().strip()
+
+
+def _split_repair_isrc_values(values):
+    isrcs = set()
+    for value in values or []:
+        if isinstance(value, (list, tuple, set)):
+            isrcs.update(_split_repair_isrc_values(value))
+            continue
+        text = str(value or "")
+        for delimiter in (";", ",", "\n", "\r", "\t"):
+            text = text.replace(delimiter, " ")
+        for part in text.split():
+            isrc = _norm_repair_isrc(part)
+            if isrc:
+                isrcs.add(isrc)
+    return isrcs
+
+
 def truncated_tracks_after_download(album_dir, token):
     """Re-verify a freshly downloaded album's track lengths against Qobuz and
     return the tracks that came up short. The download already drops files that
@@ -338,13 +358,19 @@ def _read_held_audio_meta(source):
         value = tags.get(key) if tags else None
         return value[0] if value and isinstance(value, list) else ""
 
+    def all_values(key):
+        value = tags.get(key) if tags else None
+        if isinstance(value, list):
+            return value
+        return [value] if value else []
+
     title = first("title")
     if not title:
         return _fallback_held_meta(source)
     info = parsed.info
     return {
         "title": title,
-        "isrc": first("isrc").strip().replace("-", "").upper(),
+        "isrc": all_values("isrc"),
         "tracknumber": parse_track_num(first("tracknumber")),
         "discnumber": parse_track_num(first("discnumber")) or 1,
         "bits": getattr(info, "bits_per_sample", 0) if info else 0,
@@ -373,13 +399,18 @@ def _append_verified_truncated(report, source, entry):
     report["verified_truncated"].append(entry)
 
 
-def _append_verified_ok(report, source, isrc, *, record_isrc=True):
+def _append_verified_ok(report, source, isrcs, *, record_isrc=True,
+                        only_isrcs=None):
     if not source.intact():
         report["unverified"] += 1
         return
     report["verified_ok"] += 1
     if record_isrc:
-        report["verified_ok_isrcs"][isrc] += 1
+        recorded = set(isrcs or ())
+        if only_isrcs is not None:
+            recorded &= set(only_isrcs)
+        for isrc in recorded:
+            report["verified_ok_isrcs"][isrc] += 1
 
 
 def _scan_held_repair_source(
@@ -390,13 +421,13 @@ def _scan_held_repair_source(
     path = str(source.path)
     title = et.get("title") or source.path.stem
     isrc_raw = et.get("isrc") or ""
-    isrc = isrc_raw.replace("-", "").upper().strip()
+    isrcs = _split_repair_isrc_values([isrc_raw])
     try:
         flen = float(et.get("length") or 0)
     except (TypeError, ValueError):
         flen = 0.0
 
-    if not isrc:
+    if not isrcs:
         entry = {"path": path, "title": title, "size_bytes": source.size}
         if source.size < 50_000:
             entry["diagnostic"] = (
@@ -428,22 +459,35 @@ def _scan_held_repair_source(
     if not deep and not looks_byte_short:
         dec = flac_audio_ok(Path(path), descriptor=source.descriptor)
         if dec is True:
-            _append_verified_ok(report, source, isrc)
+            _append_verified_ok(
+                report, source, isrcs, only_isrcs=only_isrcs)
             return
         if dec is None:
             report["unverified"] += 1
             return
 
-    if only_isrcs is not None and isrc not in only_isrcs:
-        _append_verified_ok(report, source, isrc, record_isrc=False)
+    if only_isrcs is not None and not isrcs.intersection(only_isrcs):
+        _append_verified_ok(
+            report, source, isrcs, record_isrc=False,
+            only_isrcs=only_isrcs)
         return
 
-    qt = _qobuz_track_by_isrc(isrc, token)
+    lookup_order = sorted(
+        isrcs.intersection(only_isrcs)
+        if only_isrcs is not None else isrcs)
+    matched_isrc = lookup_order[0] if lookup_order else sorted(isrcs)[0]
+    qt = None
+    for candidate_isrc in lookup_order or [matched_isrc]:
+        qt = _qobuz_track_by_isrc(candidate_isrc, token)
+        if qt is not None:
+            matched_isrc = candidate_isrc
+            break
     if not source.intact():
         report["unverified"] += 1
         return
     if qt is None:
-        entry = {"path": path, "title": title, "isrc": isrc}
+        entry = {"path": path, "title": title,
+                 "isrc": ";".join(sorted(isrcs))}
         if not _flac_decode_ok(path, descriptor=source.descriptor):
             entry["diagnostic"] = (
                 "won't decode (frame-CRC or mid-file damage); "
@@ -467,7 +511,8 @@ def _scan_held_repair_source(
         "file_length": flen,
         "qobuz_track": qt,
         "qobuz_duration": qdur,
-        "isrc": isrc,
+        "isrc": matched_isrc,
+        "isrcs": sorted(isrcs),
         "title": qt.get("title") or title,
         "track_number": qt.get("track_number") or et.get("tracknumber") or 0,
     }
@@ -476,7 +521,8 @@ def _scan_held_repair_source(
             entry["reason"] = "decode_failed"
             _append_verified_truncated(report, source, entry)
         else:
-            _append_verified_ok(report, source, isrc)
+            _append_verified_ok(
+                report, source, isrcs, only_isrcs=only_isrcs)
         return
 
     if sample_rate > 0 and bits > 0 and audio_size > 0:
@@ -499,7 +545,7 @@ def _scan_held_repair_source(
         _append_verified_truncated(report, source, entry)
         return
 
-    _append_verified_ok(report, source, isrc)
+    _append_verified_ok(report, source, isrcs, only_isrcs=only_isrcs)
 
 
 def scan_dir_for_isrc_repairs(album_dir, token,

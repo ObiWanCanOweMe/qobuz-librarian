@@ -211,13 +211,110 @@ def _capture_file_identities(paths, context_tracks):
     return {str(Path(path)): _file_track_identity(path, context_tracks) for path in paths}
 
 
-def _pair_files_to_tracks(paths, tracks, identities, context_tracks):
+def _staged_audio_diagnostic_records(paths, identities):
+    records = []
+    for path in paths:
+        try:
+            p = Path(path)
+        except (TypeError, ValueError):
+            records.append({"path": str(path), "error": "invalid-path"})
+            continue
+        identity = identities.get(str(p)) or {}
+        position = identity.get("position")
+        records.append(
+            {
+                "path": str(p),
+                "name": p.name,
+                "isrc": identity.get("isrc") or "",
+                "disc": position[0] if position else None,
+                "track": identity.get("track"),
+                "title": identity.get("title") or "",
+                "conflicted": bool(identity.get("conflicted")),
+            }
+        )
+    return records
+
+
+def _format_staged_audio_diagnostics(records, *, label, limit=8):
+    if not isinstance(records, list) or not records:
+        return ""
+    bits = []
+    for record in records[:limit]:
+        if not isinstance(record, dict):
+            continue
+        name = record.get("name") or record.get("path") or "?"
+        details = []
+        if record.get("disc") is not None:
+            details.append(f"disc={record.get('disc')}")
+        if record.get("track") is not None:
+            details.append(f"track={record.get('track')}")
+        if record.get("isrc"):
+            details.append(f"isrc={record.get('isrc')}")
+        if record.get("title"):
+            details.append(f"title={truncate(record.get('title'), 48)}")
+        if record.get("conflicted"):
+            details.append("conflicted-id")
+        path = record.get("path")
+        if path:
+            details.append(f"path={path}")
+        bits.append(f"{name}" + (f" ({', '.join(details)})" if details else ""))
+    omitted = len(records) - len(bits)
+    if omitted > 0:
+        bits.append(f"... {omitted} more")
+    return f"{label}: " + "; ".join(bits)
+
+
+def _download_staging_diagnostic(result):
+    if not isinstance(result, dict):
+        return "download result was unavailable"
+    parts = []
+    unmatched = _format_staged_audio_diagnostics(
+        result.get("_unmatched_staged_audio"),
+        label="unmatched staged audio",
+    )
+    if unmatched:
+        parts.append(unmatched)
+    rejected = _format_staged_audio_diagnostics(
+        result.get("_rejected_staged_audio"),
+        label="rejected staged audio",
+        limit=5,
+    )
+    if rejected:
+        parts.append(rejected)
+    clean = _format_staged_audio_diagnostics(
+        result.get("_clean_staged_audio"),
+        label="clean matched staged audio",
+        limit=5,
+    )
+    if clean:
+        parts.append(clean)
+    failed = result.get("failed_tracks")
+    if isinstance(failed, list) and failed:
+        parts.append(
+            "failed target tracks: "
+            + "; ".join(str(track) for track in failed[:8])
+            + (f"; ... {len(failed) - 8} more" if len(failed) > 8 else "")
+        )
+    return " | ".join(parts) or "no staged-audio details were captured"
+
+
+def _pair_files_to_tracks(
+    paths,
+    tracks,
+    identities,
+    context_tracks,
+    *,
+    prefer_requested_isrc=False,
+    target_track_ids=None,
+):
     """Pair downloaded files to Qobuz tracks without guessing at twins.
 
     Strong identity locks a file: an explicit disc/track that names another
     album slot cannot fall through to a convenient title match. Weaker track
     number and title matching is allowed only when that key is unique across
-    the complete Qobuz context.
+    the complete Qobuz context. Repair's forced per-track path can opt into
+    two narrower exact identities: the requested track URL that produced a
+    single file, and an ISRC that is unique among the requested repair targets.
     """
     paths = list(paths)
     tracks = list(tracks)
@@ -255,6 +352,55 @@ def _pair_files_to_tracks(paths, tracks, identities, context_tracks):
     remaining_files = set(range(len(paths)))
     remaining_tracks = set(range(len(tracks)))
     pairs = []
+
+    target_track_ids = target_track_ids or {}
+    track_index_by_id = {id(track): index for index, track in enumerate(tracks)}
+    target_groups = {}
+    for index in remaining_files:
+        target_id = target_track_ids.get(str(Path(paths[index])))
+        if target_id is not None:
+            target_groups.setdefault(target_id, []).append(index)
+    for target_id, file_group in target_groups.items():
+        track_index = track_index_by_id.get(target_id)
+        if track_index is None or len(file_group) != 1:
+            continue
+        file_index = file_group[0]
+        if file_index not in remaining_files or track_index not in remaining_tracks:
+            continue
+        remaining_files.remove(file_index)
+        remaining_tracks.remove(track_index)
+        pairs.append((paths[file_index], tracks[track_index]))
+
+    if prefer_requested_isrc:
+        requested_isrc_counts = Counter(
+            identity.get("isrc") for identity in track_ids if identity.get("isrc")
+        )
+        file_groups = {}
+        track_groups = {}
+        for index in remaining_files:
+            identity = file_ids[index]
+            isrc = identity.get("isrc")
+            if isrc and not identity.get("conflicted"):
+                file_groups.setdefault(isrc, []).append(index)
+        for index in remaining_tracks:
+            isrc = track_ids[index].get("isrc")
+            if isrc:
+                track_groups.setdefault(isrc, []).append(index)
+        for isrc, file_group in file_groups.items():
+            track_group = track_groups.get(isrc, [])
+            if (
+                requested_isrc_counts.get(isrc, 0) != 1
+                or len(file_group) != 1
+                or len(track_group) != 1
+            ):
+                continue
+            file_index, track_index = file_group[0], track_group[0]
+            if file_index not in remaining_files or track_index not in remaining_tracks:
+                continue
+            remaining_files.remove(file_index)
+            remaining_tracks.remove(track_index)
+            pairs.append((paths[file_index], tracks[track_index]))
+
     for layer in ("isrc", "position", "track", "title"):
         file_groups = {}
         track_groups = {}
@@ -685,7 +831,10 @@ def download_staged_files(result, *, clean_only=False):
 def validated_staged_album_dirs(result):
     """Return import roots only when every staged audio file is exact and owned."""
     if result.get("_unmatched_audio") != 0:
-        raise OSError("downloaded audio included an unclassified Qobuz track")
+        raise OSError(
+            "downloaded audio included an unclassified Qobuz track "
+            f"({_download_staging_diagnostic(result)})"
+        )
     run = staging_run_from_record(result.get("_staging_run"))
     current_run = capture_staging_run(run)
     clean = download_staged_files(result, clean_only=True)
@@ -720,7 +869,30 @@ def validated_staged_album_dirs(result):
             if path == directory or directory in path.parents
         }
         if current_audio != expected_audio:
-            raise OSError("staged album contains changed or unclassified audio")
+            extra = sorted(str(path) for path in set(current_audio) - set(expected_audio))
+            missing = sorted(str(path) for path in set(expected_audio) - set(current_audio))
+            changed = sorted(
+                str(path)
+                for path in set(current_audio) & set(expected_audio)
+                if current_audio[path] != expected_audio[path]
+            )
+            details = []
+            if extra:
+                details.append("extra=" + "; ".join(extra[:8]))
+            if missing:
+                details.append("missing=" + "; ".join(missing[:8]))
+            if changed:
+                details.append("changed=" + "; ".join(changed[:8]))
+            if len(extra) > 8:
+                details.append(f"extra_omitted={len(extra) - 8}")
+            if len(missing) > 8:
+                details.append(f"missing_omitted={len(missing) - 8}")
+            if len(changed) > 8:
+                details.append(f"changed_omitted={len(changed) - 8}")
+            raise OSError(
+                "staged album contains changed or unclassified audio"
+                + (f" ({' | '.join(details)})" if details else "")
+            )
     return sorted(album_dirs)
 
 
@@ -833,6 +1005,7 @@ def run_album_download(
     # Keep failed tracks as their Qobuz objects. Titles are display text, not
     # identity: two requested tracks can share one across discs or versions.
     failed_track_objs = []
+    targeted_track_ids = {}
     full_album_rc = None
     rate_limited = False
 
@@ -961,6 +1134,7 @@ def run_album_download(
         for i, t in enumerate(missing, 1):
             if is_cancel_requested():
                 break
+            track_snapshot = snapshot_staging() if force_track_by_track else None
             tid = t.get("id")
             # Show the version + track number so an EP of same-titled remixes
             # doesn't render as N identical lines that look like a dup-download.
@@ -1001,6 +1175,14 @@ def run_album_download(
                 else:
                     log.info(fmt(C.RED, f"    ✗ rip exit {rc}"))
                     log.info(fmt(C.GRAY, "      " + out[-200:].replace("\n", " ")))
+            if force_track_by_track and track_snapshot is not None:
+                track_audio = [
+                    f
+                    for f in _run_files_since(track_snapshot)
+                    if f.suffix.lower() in cfg.AUDIO_EXTS
+                ]
+                if len(track_audio) == 1:
+                    targeted_track_ids[str(Path(track_audio[0]))] = id(t)
             # Qobuz throttles sustained per-track pulls; when the last rip shows
             # throttle signals, pause longer before the next so we stop pounding
             # the limit (set RATE_LIMIT_COOLDOWN=0 to disable).
@@ -1033,6 +1215,7 @@ def run_album_download(
         )
     n_ok = len(kept)
     attempted_tracks = qobuz_tracks if download_full_album else missing
+    repair_exact_pairing = bool(force_track_by_track and not download_full_album)
     retried_clean_targets = set()
 
     # Both reject kinds get one per-track retry: a broken FLAC is usually a
@@ -1042,7 +1225,12 @@ def run_album_download(
     resolved_rejects = []
     if discarded and attempted_tracks and not is_cancel_requested():
         retry_pairs = _pair_files_to_tracks(
-            discarded, attempted_tracks, file_identities, qobuz_tracks
+            discarded,
+            attempted_tracks,
+            file_identities,
+            qobuz_tracks,
+            prefer_requested_isrc=repair_exact_pairing,
+            target_track_ids=targeted_track_ids if repair_exact_pairing else None,
         )
         if retry_pairs:
             log.info(
@@ -1075,6 +1263,11 @@ def run_album_download(
                     for f in _run_files_since(retry_snapshot)
                     if f.suffix.lower() in cfg.AUDIO_EXTS
                 ]
+                retry_target_ids = (
+                    {str(Path(retry_audio[0])): id(t)}
+                    if repair_exact_pairing and len(retry_audio) == 1
+                    else {}
+                )
                 retry_identities = _capture_file_identities(retry_audio, qobuz_tracks)
                 if recovery_owner is None:
                     retry_kept, _, _ = cleanup_lossy(retry_audio)
@@ -1084,7 +1277,14 @@ def run_album_download(
                         owner=recovery_owner,
                         on_intent=recovery_checkpoint,
                     )
-                matches = _pair_files_to_tracks(retry_kept, [t], retry_identities, qobuz_tracks)
+                matches = _pair_files_to_tracks(
+                    retry_kept,
+                    [t],
+                    retry_identities,
+                    qobuz_tracks,
+                    prefer_requested_isrc=repair_exact_pairing,
+                    target_track_ids=retry_target_ids if repair_exact_pairing else None,
+                )
                 if not matches:
                     continue
                 recovered_path, _ = matches[0]
@@ -1094,6 +1294,7 @@ def run_album_download(
                 resolved_rejects.append(rejected)
                 kept.append(recovered_path)
                 file_identities.update(retry_identities)
+                targeted_track_ids.update(retry_target_ids)
                 retried_clean_targets.add(id(t))
                 recovered += 1
             if recovered:
@@ -1109,13 +1310,23 @@ def run_album_download(
         clean_failed_ids = {
             id(track)
             for _, track in _pair_files_to_tracks(
-                kept, failed_track_objs, file_identities, qobuz_tracks
+                kept,
+                failed_track_objs,
+                file_identities,
+                qobuz_tracks,
+                prefer_requested_isrc=repair_exact_pairing,
+                target_track_ids=targeted_track_ids if repair_exact_pairing else None,
             )
         }
         rejected_failed_ids = {
             id(track)
             for _, track in _pair_files_to_tracks(
-                lossy + broken, failed_track_objs, file_identities, qobuz_tracks
+                lossy + broken,
+                failed_track_objs,
+                file_identities,
+                qobuz_tracks,
+                prefer_requested_isrc=repair_exact_pairing,
+                target_track_ids=targeted_track_ids if repair_exact_pairing else None,
             )
         }
         hard_targets = [
@@ -1151,6 +1362,11 @@ def run_album_download(
                 hard_audio = [
                     f for f in _run_files_since(hard_snapshot) if f.suffix.lower() in cfg.AUDIO_EXTS
                 ]
+                hard_target_ids = (
+                    {str(Path(hard_audio[0])): id(t)}
+                    if repair_exact_pairing and len(hard_audio) == 1
+                    else {}
+                )
                 hard_identities = _capture_file_identities(hard_audio, qobuz_tracks)
                 if recovery_owner is None:
                     hard_kept, hard_lossy, hard_broken = cleanup_lossy(hard_audio)
@@ -1160,22 +1376,36 @@ def run_album_download(
                         owner=recovery_owner,
                         on_intent=recovery_checkpoint,
                     )
-                matches = _pair_files_to_tracks(hard_kept, [t], hard_identities, qobuz_tracks)
+                matches = _pair_files_to_tracks(
+                    hard_kept,
+                    [t],
+                    hard_identities,
+                    qobuz_tracks,
+                    prefer_requested_isrc=repair_exact_pairing,
+                    target_track_ids=hard_target_ids if repair_exact_pairing else None,
+                )
                 if matches:
                     kept.append(matches[0][0])
                     file_identities.update(hard_identities)
+                    targeted_track_ids.update(hard_target_ids)
                     retried_clean_targets.add(id(t))
                     recovered += 1
                     continue
                 # Preserve an exact reject from the hard retry in the right
                 # summary bucket. Unexpected or ambiguous files prove nothing.
                 reject_matches = _pair_files_to_tracks(
-                    hard_lossy + hard_broken, [t], hard_identities, qobuz_tracks
+                    hard_lossy + hard_broken,
+                    [t],
+                    hard_identities,
+                    qobuz_tracks,
+                    prefer_requested_isrc=repair_exact_pairing,
+                    target_track_ids=hard_target_ids if repair_exact_pairing else None,
                 )
                 if reject_matches:
                     rejected_path = reject_matches[0][0]
                     (lossy if rejected_path in hard_lossy else broken).append(rejected_path)
                     file_identities.update(hard_identities)
+                    targeted_track_ids.update(hard_target_ids)
             if recovered:
                 n_ok = len(kept)
                 log.info(fmt(C.GREEN, f"  ✓  Retry recovered {recovered} failed download(s)"))
@@ -1183,14 +1413,27 @@ def run_album_download(
     # Reconcile completeness by unique Qobuz track identity, never by the raw
     # number of audio names that appeared.
     lossy_tracks = lossy + broken
-    clean_pairs = _pair_files_to_tracks(kept, attempted_tracks, file_identities, qobuz_tracks)
+    clean_pairs = _pair_files_to_tracks(
+        kept,
+        attempted_tracks,
+        file_identities,
+        qobuz_tracks,
+        prefer_requested_isrc=repair_exact_pairing,
+        target_track_ids=targeted_track_ids if repair_exact_pairing else None,
+    )
     clean_target_ids = {id(track) for _, track in clean_pairs}
     clean_paths = {Path(path) for path, _ in clean_pairs}
     unmatched_clean = [path for path in kept if Path(path) not in clean_paths]
+    rejected_paths = list(dict.fromkeys(Path(path) for path in lossy_tracks))
     rejected_target_ids = {
         id(track)
         for _, track in _pair_files_to_tracks(
-            lossy_tracks, attempted_tracks, file_identities, qobuz_tracks
+            lossy_tracks,
+            attempted_tracks,
+            file_identities,
+            qobuz_tracks,
+            prefer_requested_isrc=repair_exact_pairing,
+            target_track_ids=targeted_track_ids if repair_exact_pairing else None,
         )
     } - clean_target_ids
     expected_target_ids = {id(track) for track in attempted_tracks}
@@ -1314,6 +1557,18 @@ def run_album_download(
             "_retained_rejects": retained_rejects,
             "_clean_staged_files": _receipt_records([path for path, _ in clean_pairs]),
             "_all_staged_audio": _receipt_records(kept),
+            "_clean_staged_audio": _staged_audio_diagnostic_records(
+                [path for path, _ in clean_pairs],
+                file_identities,
+            ),
+            "_unmatched_staged_audio": _staged_audio_diagnostic_records(
+                unmatched_clean,
+                file_identities,
+            ),
+            "_rejected_staged_audio": _staged_audio_diagnostic_records(
+                rejected_paths,
+                file_identities,
+            ),
             "_staged_track_bindings": _staged_binding_records(
                 clean_pairs, keys_by_object, album_keys
             ),
