@@ -47,7 +47,7 @@ from qobuz_librarian.quality import upgrade_state
 from qobuz_librarian.ui_cli.colors import format_size
 from qobuz_librarian.ui_cli.errors import plural
 from qobuz_librarian.ui_cli.logging import log
-from qobuz_librarian.web import review_badges
+from qobuz_librarian.web import job_persistence, review_badges
 
 
 def build_args():
@@ -2586,6 +2586,7 @@ def scan_migration(job, src, dest, *, use_acoustid, in_place=False):
             group = groups.setdefault(
                 key, {"entries": [], "resume_entries": []})
             group[kind].append(entry)
+    migration_candidate_ids = []
     for (artist, album), group in sorted(groups.items()):
         entries = group["entries"]
         resumes = group["resume_entries"]
@@ -2624,13 +2625,37 @@ def scan_migration(job, src, dest, *, use_acoustid, in_place=False):
                 if tuple(receipt.get("relative", ())[:-1]) in source_folders
             ],
         }
-        job.add_candidate(
+        cid = job.add_candidate(
             kind="migrate",
             title=album,
             artist=artist,
             detail=detail,
-            payload=payload,
+            payload=job_persistence.migration_payload_reference(),
         )
+        if (
+            cid is None
+            or not job_persistence.persist_migration_candidate_payload(
+                job.id, cid, payload,
+            )
+        ):
+            job_persistence.delete_migration_payloads(job.id)
+            created = set(migration_candidate_ids)
+            if cid is not None:
+                created.add(cid)
+            with job._lock:
+                job.candidates = [
+                    candidate for candidate in job.candidates
+                    if candidate.get("cid") not in created
+                ]
+            job.error = (
+                "The migration preview could not be saved safely, so nothing "
+                "can be approved. Check that the data folder is writable and "
+                "scan again."
+            )
+            job.summary = job.error
+            log.info(job.error)
+            return
+        migration_candidate_ids.append(cid)
 
     s = plan.summary()
     verb = "move" if in_place else "copy"
@@ -2667,6 +2692,16 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
                       allow_low_space=False):
     """Copy (or move) the files behind the approved albums into the layout."""
     from qobuz_librarian.library import migrate as engine
+
+    chosen = job_persistence.resolve_migration_candidates(job.id, chosen)
+    if chosen is None:
+        job.error = (
+            "This migration review is missing the saved preview details "
+            "needed to verify its files. Nothing was changed; scan again "
+            "before moving or copying files."
+        )
+        job.summary = job.error
+        return
 
     dest = Path(dest)
     entries = []

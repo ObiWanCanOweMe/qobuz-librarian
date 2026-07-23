@@ -190,7 +190,45 @@ CREATE TABLE IF NOT EXISTS post_import_relocation_handoffs (
 """
 
 
-_SCHEMA_VERSION = 4
+_MIGRATION_CANDIDATE_PAYLOAD_SCHEMA = """
+CREATE TABLE IF NOT EXISTS migration_candidate_payloads (
+    job_id                     TEXT NOT NULL,
+    candidate_id               TEXT NOT NULL,
+    source_root                TEXT,
+    source_root_receipt        TEXT NOT NULL,
+    dest_root_receipt          TEXT NOT NULL,
+    destination_name_semantics TEXT NOT NULL,
+    manifest_artifact          TEXT NOT NULL,
+    PRIMARY KEY (job_id, candidate_id)
+)
+"""
+
+
+_MIGRATION_REVIEW_ARTIFACT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS migration_review_artifacts (
+    job_id            TEXT PRIMARY KEY,
+    manifest_artifact TEXT NOT NULL
+)
+"""
+
+
+_MIGRATION_CANDIDATE_ENTRY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS migration_candidate_entries (
+    job_id              TEXT NOT NULL,
+    candidate_id        TEXT NOT NULL,
+    entry_kind          TEXT NOT NULL
+                        CHECK (entry_kind IN ('entry', 'resume', 'companion')),
+    ordinal             INTEGER NOT NULL CHECK (ordinal >= 0),
+    source              TEXT,
+    destination         TEXT,
+    source_receipt      TEXT NOT NULL,
+    destination_receipt TEXT,
+    PRIMARY KEY (job_id, candidate_id, entry_kind, ordinal)
+)
+"""
+
+
+_SCHEMA_VERSION = 6
 
 
 def init() -> None:
@@ -203,6 +241,14 @@ def init() -> None:
             conn.execute(_SCHEMA)
             conn.execute(_DURABLE_COMPLETION_SCHEMA)
             conn.execute(_POST_IMPORT_RELOCATION_HANDOFF_SCHEMA)
+            conn.execute(_MIGRATION_REVIEW_ARTIFACT_SCHEMA)
+            conn.execute(_MIGRATION_CANDIDATE_PAYLOAD_SCHEMA)
+            conn.execute(_MIGRATION_CANDIDATE_ENTRY_SCHEMA)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_migration_candidate_entries "
+                "ON migration_candidate_entries(job_id, candidate_id, "
+                "entry_kind, ordinal)"
+            )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_durable_job_completion_album "
                 "ON durable_job_completions(job_id, job_created_at, album_id)"
@@ -386,6 +432,325 @@ def persist_preserving_single(job) -> bool:
     """Save job state without changing an indeterminate durable Undo record."""
     with job._lock:
         return _persist_preserving_single_locked(job)
+
+
+_MIGRATION_PAYLOAD_KEYS = {
+    "entries", "resume_entries", "source_root", "source_root_receipt",
+    "dest_root_receipt", "destination_name_semantics", "manifest_artifact",
+    "companion_receipts",
+}
+
+
+def migration_payload_reference() -> dict:
+    """Return a fresh compact reference for one durable migration payload."""
+    return {"migration_payload_ref": {"version": 1}}
+
+
+_MIGRATION_ARTIFACT_REFERENCE = {
+    "migration_artifact_ref": {"version": 1},
+}
+
+
+def _migration_json_dump(value) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _migration_json_load(value):
+    if type(value) is not str:
+        raise TypeError("migration payload JSON is not text")
+    return json.loads(value)
+
+
+def _migration_payload_rows(payload: dict) -> tuple[tuple, list[tuple]]:
+    if type(payload) is not dict or set(payload) != _MIGRATION_PAYLOAD_KEYS:
+        raise ValueError("migration payload fields are malformed")
+    source_root = payload["source_root"]
+    if source_root is not None and type(source_root) is not str:
+        raise TypeError("migration source root is malformed")
+    parent = (
+        source_root,
+        _migration_json_dump(payload["source_root_receipt"]),
+        _migration_json_dump(payload["dest_root_receipt"]),
+        _migration_json_dump(payload["destination_name_semantics"]),
+        _migration_json_dump(payload["manifest_artifact"]),
+    )
+    rows = []
+    for key, kind in (("entries", "entry"),
+                      ("resume_entries", "resume")):
+        values = payload[key]
+        if type(values) not in (list, tuple):
+            raise TypeError(f"migration {key} are malformed")
+        for ordinal, entry in enumerate(values):
+            if type(entry) not in (list, tuple) or len(entry) != 4:
+                raise ValueError(f"migration {kind} row is malformed")
+            source, destination, source_receipt, destination_receipt = entry
+            if type(source) is not str or type(destination) is not str:
+                raise TypeError(f"migration {kind} paths are malformed")
+            rows.append((
+                kind, ordinal, source, destination,
+                _migration_json_dump(source_receipt),
+                _migration_json_dump(destination_receipt),
+            ))
+    companions = payload["companion_receipts"]
+    if type(companions) not in (list, tuple):
+        raise TypeError("migration companion receipts are malformed")
+    for ordinal, receipt in enumerate(companions):
+        rows.append((
+            "companion", ordinal, None, None,
+            _migration_json_dump(receipt), None,
+        ))
+    return parent, rows
+
+
+def persist_migration_candidate_payload(
+        job_id: str, candidate_id: str, payload: dict) -> bool:
+    """Durably replace one migration candidate's normalized safety payload."""
+    if not job_id or type(job_id) is not str:
+        return False
+    if not candidate_id or type(candidate_id) is not str:
+        return False
+    try:
+        parent, rows = _migration_payload_rows(payload)
+    except (KeyError, TypeError, ValueError) as exc:
+        _note_write_failure("serialize migration candidate payload", exc)
+        return False
+    with _lock:
+        conn = _get_conn()
+        if conn is None:
+            return False
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            artifact_json = parent[-1]
+            existing_artifact = conn.execute(
+                "SELECT manifest_artifact FROM migration_review_artifacts "
+                "WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
+            if existing_artifact is None:
+                conn.execute(
+                    "INSERT INTO migration_review_artifacts "
+                    "(job_id, manifest_artifact) VALUES (?,?)",
+                    (job_id, artifact_json),
+                )
+            elif existing_artifact[0] != artifact_json:
+                raise ValueError(
+                    "migration candidates have inconsistent preview artifacts"
+                )
+            conn.execute(
+                "DELETE FROM migration_candidate_entries "
+                "WHERE job_id=? AND candidate_id=?",
+                (job_id, candidate_id),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO migration_candidate_payloads "
+                "(job_id, candidate_id, source_root, source_root_receipt, "
+                "dest_root_receipt, destination_name_semantics, "
+                "manifest_artifact) VALUES (?,?,?,?,?,?,?)",
+                (
+                    job_id, candidate_id, *parent[:-1],
+                    _migration_json_dump(_MIGRATION_ARTIFACT_REFERENCE),
+                ),
+            )
+            conn.executemany(
+                "INSERT INTO migration_candidate_entries "
+                "(job_id, candidate_id, entry_kind, ordinal, source, "
+                "destination, source_receipt, destination_receipt) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                [(job_id, candidate_id, *row) for row in rows],
+            )
+            conn.commit()
+            return True
+        except (OverflowError, ValueError, sqlite3.Error) as exc:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            _note_write_failure("persist migration candidate payload", exc)
+            return False
+
+
+_UNSET_MIGRATION_ARTIFACT = object()
+
+
+def load_migration_candidate_payload(
+        job_id: str, candidate_id: str, *,
+        _shared_artifact=_UNSET_MIGRATION_ARTIFACT) -> dict | None:
+    """Load and validate one normalized migration payload by exact owner."""
+    if not job_id or type(job_id) is not str:
+        return None
+    if not candidate_id or type(candidate_id) is not str:
+        return None
+    with _lock:
+        conn = _get_conn()
+        if conn is None:
+            return None
+        try:
+            parent = conn.execute(
+                "SELECT source_root, source_root_receipt, dest_root_receipt, "
+                "destination_name_semantics, manifest_artifact "
+                "FROM migration_candidate_payloads "
+                "WHERE job_id=? AND candidate_id=?",
+                (job_id, candidate_id),
+            ).fetchone()
+            rows = conn.execute(
+                "SELECT entry_kind, ordinal, source, destination, "
+                "source_receipt, destination_receipt "
+                "FROM migration_candidate_entries "
+                "WHERE job_id=? AND candidate_id=? "
+                "ORDER BY entry_kind, ordinal",
+                (job_id, candidate_id),
+            ).fetchall()
+        except sqlite3.Error:
+            return None
+    if parent is None:
+        return None
+    try:
+        source_root = parent[0]
+        if source_root is not None and type(source_root) is not str:
+            return None
+        stored_artifact = _migration_json_load(parent[4])
+        if stored_artifact == _MIGRATION_ARTIFACT_REFERENCE:
+            if _shared_artifact is _UNSET_MIGRATION_ARTIFACT:
+                with _lock:
+                    conn = _get_conn()
+                    if conn is None:
+                        return None
+                    artifact_row = conn.execute(
+                        "SELECT manifest_artifact "
+                        "FROM migration_review_artifacts WHERE job_id=?",
+                        (job_id,),
+                    ).fetchone()
+                if artifact_row is None:
+                    return None
+                _shared_artifact = _migration_json_load(artifact_row[0])
+            if type(_shared_artifact) is not dict:
+                return None
+            manifest_artifact = _shared_artifact
+        else:
+            manifest_artifact = stored_artifact
+        payload = {
+            "entries": [],
+            "resume_entries": [],
+            "source_root": source_root,
+            "source_root_receipt": _migration_json_load(parent[1]),
+            "dest_root_receipt": _migration_json_load(parent[2]),
+            "destination_name_semantics": _migration_json_load(parent[3]),
+            "manifest_artifact": manifest_artifact,
+            "companion_receipts": [],
+        }
+        expected = {"entry": 0, "resume": 0, "companion": 0}
+        for kind, ordinal, source, destination, source_json, dest_json in rows:
+            if kind not in expected or ordinal != expected[kind]:
+                return None
+            expected[kind] += 1
+            source_receipt = _migration_json_load(source_json)
+            if kind == "companion":
+                if source is not None or destination is not None or dest_json is not None:
+                    return None
+                payload["companion_receipts"].append(source_receipt)
+                continue
+            if type(source) is not str or type(destination) is not str:
+                return None
+            destination_receipt = _migration_json_load(dest_json)
+            target = "entries" if kind == "entry" else "resume_entries"
+            payload[target].append([
+                source, destination, source_receipt, destination_receipt,
+            ])
+        return payload
+    except (TypeError, ValueError):
+        return None
+
+
+def resolve_migration_candidates(
+        job_id: str, candidates: list[dict]) -> list[dict] | None:
+    """Hydrate one selected review format without trusting payload ownership."""
+    if type(job_id) is not str or not job_id or type(candidates) is not list:
+        return None
+    formats = []
+    for candidate in candidates:
+        if type(candidate) is not dict or type(candidate.get("payload")) is not dict:
+            return None
+        payload = candidate["payload"]
+        reference = payload.get("migration_payload_ref")
+        if reference is None:
+            formats.append("inline")
+        elif (
+            set(payload) == {"migration_payload_ref"}
+            and type(reference) is dict
+            and set(reference) == {"version"}
+            and reference.get("version") == 1
+        ):
+            formats.append("reference")
+        else:
+            return None
+    if len(set(formats)) > 1:
+        return None
+    if not formats or formats[0] == "inline":
+        return [dict(candidate) for candidate in candidates]
+    shared_artifact = _UNSET_MIGRATION_ARTIFACT
+    with _lock:
+        conn = _get_conn()
+        if conn is None:
+            return None
+        try:
+            artifact_row = conn.execute(
+                "SELECT manifest_artifact FROM migration_review_artifacts "
+                "WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+    if artifact_row is not None:
+        try:
+            shared_artifact = _migration_json_load(artifact_row[0])
+        except (TypeError, ValueError):
+            return None
+    resolved = []
+    for candidate in candidates:
+        candidate_id = candidate.get("cid")
+        if type(candidate_id) is not str or not candidate_id:
+            return None
+        payload = load_migration_candidate_payload(
+            job_id, candidate_id, _shared_artifact=shared_artifact,
+        )
+        if payload is None:
+            return None
+        hydrated = dict(candidate)
+        hydrated["payload"] = payload
+        resolved.append(hydrated)
+    return resolved
+
+
+def delete_migration_payloads(job_id: str) -> None:
+    """Best-effort removal of every migration payload owned by one job."""
+    if type(job_id) is not str or not job_id:
+        return
+    with _lock:
+        conn = _get_conn()
+        if conn is None:
+            return
+        try:
+            conn.execute(
+                "DELETE FROM migration_candidate_entries WHERE job_id=?",
+                (job_id,),
+            )
+            conn.execute(
+                "DELETE FROM migration_candidate_payloads WHERE job_id=?",
+                (job_id,),
+            )
+            conn.execute(
+                "DELETE FROM migration_review_artifacts WHERE job_id=?",
+                (job_id,),
+            )
+            conn.commit()
+        except sqlite3.Error:
+            pass
 
 
 def admit(job) -> bool:
@@ -959,6 +1324,18 @@ def delete(job_id: str) -> None:
         if conn is None:
             return
         try:
+            conn.execute(
+                "DELETE FROM migration_candidate_entries WHERE job_id=?",
+                (job_id,),
+            )
+            conn.execute(
+                "DELETE FROM migration_candidate_payloads WHERE job_id=?",
+                (job_id,),
+            )
+            conn.execute(
+                "DELETE FROM migration_review_artifacts WHERE job_id=?",
+                (job_id,),
+            )
             conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
             conn.execute(
                 "DELETE FROM durable_job_completions WHERE job_id=?",
@@ -1050,6 +1427,21 @@ def prune_finished(keep: int, *, retain_job_id: str | None = None) -> None:
                 "DELETE FROM post_import_relocation_handoffs "
                 "WHERE NOT EXISTS (SELECT 1 FROM jobs "
                 "WHERE jobs.id=post_import_relocation_handoffs.job_id)"
+            )
+            conn.execute(
+                "DELETE FROM migration_candidate_entries "
+                "WHERE NOT EXISTS (SELECT 1 FROM jobs "
+                "WHERE jobs.id=migration_candidate_entries.job_id)"
+            )
+            conn.execute(
+                "DELETE FROM migration_candidate_payloads "
+                "WHERE NOT EXISTS (SELECT 1 FROM jobs "
+                "WHERE jobs.id=migration_candidate_payloads.job_id)"
+            )
+            conn.execute(
+                "DELETE FROM migration_review_artifacts "
+                "WHERE NOT EXISTS (SELECT 1 FROM jobs "
+                "WHERE jobs.id=migration_review_artifacts.job_id)"
             )
             conn.commit()
         except sqlite3.Error as e:
@@ -1248,6 +1640,21 @@ def clear_history(*, retain_job_id: str | None = None) -> None:
                 "DELETE FROM post_import_relocation_handoffs "
                 "WHERE NOT EXISTS (SELECT 1 FROM jobs "
                 "WHERE jobs.id=post_import_relocation_handoffs.job_id)"
+            )
+            conn.execute(
+                "DELETE FROM migration_candidate_entries "
+                "WHERE NOT EXISTS (SELECT 1 FROM jobs "
+                "WHERE jobs.id=migration_candidate_entries.job_id)"
+            )
+            conn.execute(
+                "DELETE FROM migration_candidate_payloads "
+                "WHERE NOT EXISTS (SELECT 1 FROM jobs "
+                "WHERE jobs.id=migration_candidate_payloads.job_id)"
+            )
+            conn.execute(
+                "DELETE FROM migration_review_artifacts "
+                "WHERE NOT EXISTS (SELECT 1 FROM jobs "
+                "WHERE jobs.id=migration_review_artifacts.job_id)"
             )
             conn.commit()
         except sqlite3.Error as e:

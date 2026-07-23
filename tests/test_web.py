@@ -1799,6 +1799,277 @@ def test_archived_job_page_keeps_retry_and_undo(client, monkeypatch):
     assert f'action="/jobs/{single.id}/undo"' in r.text
 
 
+def test_migration_payload_schema_round_trips_normalized_rows(monkeypatch):
+    from qobuz_librarian.web import job_persistence
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+    payload = {
+        "entries": [["/src/a.flac", "Artist/Album/a.flac",
+                     {"relative": ["a.flac"]}, {"missing": ["a.flac"]}]],
+        "resume_entries": [["/src/b.flac", "Artist/Album/b.flac",
+                            {"relative": ["b.flac"]}, {"size": 7}]],
+        "source_root": "/src",
+        "source_root_receipt": {"path": "/src", "identity": [1, 2]},
+        "dest_root_receipt": {"path": "/dest", "identity": [3, 4]},
+        "destination_name_semantics": {"case_sensitive": True},
+        "manifest_artifact": {"path": "/dest/manifest.csv",
+                              "receipt": {"size": 123}},
+        "companion_receipts": [
+            {"relative": ["Artist", "cover.jpg"], "file": {"size": 9}},
+        ],
+    }
+
+    assert job_persistence.migration_payload_reference() == {
+        "migration_payload_ref": {"version": 1},
+    }
+    assert job_persistence.persist_migration_candidate_payload(
+        "job-a", "c7", payload
+    )
+    assert job_persistence.load_migration_candidate_payload(
+        "job-a", "c7"
+    ) == payload
+
+    conn = job_persistence._get_conn()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM migration_candidate_payloads"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT entry_kind, ordinal FROM migration_candidate_entries "
+        "ORDER BY entry_kind, ordinal"
+    ).fetchall() == [("companion", 0), ("entry", 0), ("resume", 0)]
+
+
+def test_migration_payload_stores_and_hydrates_one_shared_artifact(monkeypatch):
+    from qobuz_librarian.web import job_persistence
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+    shared_artifact = {
+        "path": "/dest/manifest.csv",
+        "context": {"companion_receipts": [{"marker": "x" * 4096}]},
+    }
+    payload = {
+        "entries": [], "resume_entries": [], "source_root": "/src",
+        "source_root_receipt": {}, "dest_root_receipt": {},
+        "destination_name_semantics": {},
+        "manifest_artifact": shared_artifact,
+        "companion_receipts": [],
+    }
+    for candidate_id in ("c0", "c1"):
+        assert job_persistence.persist_migration_candidate_payload(
+            "owner", candidate_id, payload
+        )
+
+    conn = job_persistence._get_conn()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM migration_review_artifacts WHERE job_id='owner'"
+    ).fetchone()[0] == 1
+    stored = conn.execute(
+        "SELECT manifest_artifact FROM migration_candidate_payloads "
+        "WHERE job_id='owner' ORDER BY candidate_id"
+    ).fetchall()
+    assert stored == [
+        ('{"migration_artifact_ref":{"version":1}}',),
+        ('{"migration_artifact_ref":{"version":1}}',),
+    ]
+
+    candidates = [
+        {"cid": candidate_id,
+         "payload": job_persistence.migration_payload_reference()}
+        for candidate_id in ("c0", "c1")
+    ]
+    resolved = job_persistence.resolve_migration_candidates(
+        "owner", candidates
+    )
+    assert resolved[0]["payload"]["manifest_artifact"] == shared_artifact
+    assert (resolved[0]["payload"]["manifest_artifact"]
+            is resolved[1]["payload"]["manifest_artifact"])
+
+    conn.execute(
+        "DELETE FROM migration_review_artifacts WHERE job_id='owner'"
+    )
+    conn.commit()
+    assert job_persistence.resolve_migration_candidates(
+        "owner", candidates
+    ) is None
+
+
+def test_delete_job_removes_migration_payload_rows(monkeypatch):
+    from qobuz_librarian.web import job_persistence
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+    job = jm.Job(title="Migration", kind="scan")
+    assert job_persistence.persist(job)
+    payload = {
+        "entries": [], "resume_entries": [], "source_root": "/src",
+        "source_root_receipt": {}, "dest_root_receipt": {},
+        "destination_name_semantics": {}, "manifest_artifact": {},
+        "companion_receipts": [],
+    }
+    assert job_persistence.persist_migration_candidate_payload(
+        job.id, "c0", payload
+    )
+
+    job_persistence.delete(job.id)
+
+    conn = job_persistence._get_conn()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM migration_candidate_payloads"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM migration_candidate_entries"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM migration_review_artifacts"
+    ).fetchone()[0] == 0
+
+
+def test_resolve_migration_candidates_rejects_wrong_owner_and_corruption(
+        monkeypatch):
+    from qobuz_librarian.web import job_persistence
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+    payload = {
+        "entries": [
+            ["/src/a", "Artist/Album/a", {"n": 1}, {"n": 2}],
+            ["/src/b", "Artist/Album/b", {"n": 3}, {"n": 4}],
+        ],
+        "resume_entries": [], "source_root": "/src",
+        "source_root_receipt": {}, "dest_root_receipt": {},
+        "destination_name_semantics": {}, "manifest_artifact": {},
+        "companion_receipts": [],
+    }
+    assert job_persistence.persist_migration_candidate_payload(
+        "owner", "c0", payload
+    )
+    candidate = {
+        "cid": "c0", "title": "Album", "payload":
+        job_persistence.migration_payload_reference(),
+    }
+    assert job_persistence.resolve_migration_candidates(
+        "other", [candidate]
+    ) is None
+
+    conn = job_persistence._get_conn()
+    conn.execute(
+        "DELETE FROM migration_candidate_entries "
+        "WHERE job_id='owner' AND candidate_id='c0' "
+        "AND entry_kind='entry' AND ordinal=0"
+    )
+    conn.commit()
+    assert job_persistence.resolve_migration_candidates(
+        "owner", [candidate]
+    ) is None
+
+    assert job_persistence.persist_migration_candidate_payload(
+        "owner", "c0", payload
+    )
+    conn.execute(
+        "UPDATE migration_candidate_payloads "
+        "SET manifest_artifact='not-json' "
+        "WHERE job_id='owner' AND candidate_id='c0'"
+    )
+    conn.commit()
+    assert job_persistence.resolve_migration_candidates(
+        "owner", [candidate]
+    ) is None
+
+
+def test_resolve_migration_candidates_preserves_display_and_legacy(
+        monkeypatch):
+    from qobuz_librarian.web import job_persistence
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+    payload = {
+        "entries": [], "resume_entries": [], "source_root": "/src",
+        "source_root_receipt": {}, "dest_root_receipt": {},
+        "destination_name_semantics": {}, "manifest_artifact": {},
+        "companion_receipts": [],
+    }
+    assert job_persistence.persist_migration_candidate_payload(
+        "owner", "c0", payload
+    )
+    candidate = {
+        "cid": "c0", "title": "Album", "artist": "Artist",
+        "payload": job_persistence.migration_payload_reference(),
+    }
+
+    resolved = job_persistence.resolve_migration_candidates(
+        "owner", [candidate]
+    )
+
+    assert resolved[0]["title"] == "Album"
+    assert resolved[0]["artist"] == "Artist"
+    assert resolved[0]["payload"] == payload
+    assert candidate["payload"] == job_persistence.migration_payload_reference()
+    legacy = [{"cid": "old", "payload": {"entries": [],
+                                             "manifest_artifact": {}}}]
+    assert job_persistence.resolve_migration_candidates(
+        "owner", legacy
+    ) == legacy
+
+
+def test_migration_payload_scale_keeps_job_snapshot_bounded(monkeypatch):
+    from qobuz_librarian.web import job_persistence
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+    job = jm.Job(title="Large migration", kind="scan")
+    marker = "receipt-data-" + ("x" * 1_024)
+    album_count = 20
+    tracks_per_album = 50
+    for album in range(album_count):
+        cid = job.add_candidate(
+            "migrate", f"Album {album}", "Artist", "50 tracks",
+            job_persistence.migration_payload_reference(),
+        )
+        payload = {
+            "entries": [
+                [f"/src/{album}/{track}.flac",
+                 f"Artist/Album {album}/{track}.flac",
+                 {"track": track, "marker": marker},
+                 {"track": track, "marker": marker}]
+                for track in range(tracks_per_album)
+            ],
+            "resume_entries": [], "source_root": "/src",
+            "source_root_receipt": {"marker": marker},
+            "dest_root_receipt": {"marker": marker},
+            "destination_name_semantics": {"case_sensitive": True},
+            "manifest_artifact": {"path": "/dest/manifest.csv"},
+            "companion_receipts": [],
+        }
+        assert job_persistence.persist_migration_candidate_payload(
+            job.id, cid, payload
+        )
+    assert job_persistence.persist(job)
+
+    conn = job_persistence._get_conn()
+    candidates_json = conn.execute(
+        "SELECT candidates FROM jobs WHERE id=?", (job.id,)
+    ).fetchone()[0]
+    assert len(candidates_json) < 10_000
+    assert marker not in candidates_json
+    assert conn.execute(
+        "SELECT COUNT(*) FROM migration_candidate_entries WHERE job_id=?",
+        (job.id,),
+    ).fetchone()[0] == album_count * tracks_per_album
+    selected = job_persistence.resolve_migration_candidates(
+        job.id, [job.candidates[-1]]
+    )
+    assert len(selected[0]["payload"]["entries"]) == tracks_per_album
+    assert selected[0]["payload"]["entries"][0][2]["marker"] == marker
+
+
 def test_retry_rebuilds_archived_failed_download(client, monkeypatch):
     from qobuz_librarian.web import app as webapp
     from qobuz_librarian.web import job_persistence
