@@ -2,6 +2,14 @@
 
 All notable changes to Qobuz Librarian are recorded here, newest first. The project follows [semantic versioning](https://semver.org/); dates are when each version was tagged during local development.
 
+## [0.12.1](https://github.com/ObiWanCanOweMe/qobuz-librarian/compare/v0.12.0...v0.12.1) (2026-07-23)
+
+
+### Bug Fixes
+
+* accept ghcr not found preflight output ([7f7905d](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/7f7905d501851a61fad6c5dd91eac6d8ab67566f))
+* accept GHCR not found preflight output ([5eee043](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/5eee0432392018fbcae4ddce5be55d96a6c95367))
+
 ## [0.12.0](https://github.com/ObiWanCanOweMe/qobuz-librarian/compare/v0.11.2...v0.12.0) (2026-07-23)
 
 
