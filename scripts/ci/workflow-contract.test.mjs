@@ -77,7 +77,8 @@ test('Docker workflow deploys only after verify, preflight, build, and scan', as
   assert.match(text, /deploy-production:\s*\n\s+needs: \[verify, tag-preflight, build-and-push, scan-image\]/);
   assert.match(text, /environment: production/);
   const deploy = jobBlock(text, 'deploy-production');
-  assert.match(deploy, /runs-on: \[self-hosted, ark\]/);
+  assert.match(deploy, /runs-on: ubuntu-latest/);
+  assert.doesNotMatch(deploy, /self-hosted|ark/);
   assert.match(deploy, /QOBUZ_HEALTH_URL: \$\{\{ vars\.QOBUZ_HEALTH_URL \}\}/);
 });
 

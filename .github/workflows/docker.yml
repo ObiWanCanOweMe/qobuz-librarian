@@ -159,7 +159,7 @@ jobs:
 
   deploy-production:
     needs: [verify, tag-preflight, build-and-push, scan-image]
-    runs-on: [self-hosted, ark]
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     environment: production
