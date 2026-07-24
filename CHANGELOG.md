@@ -2,6 +2,24 @@
 
 All notable changes to Qobuz Librarian are recorded here, newest first. The project follows [semantic versioning](https://semver.org/); dates are when each version was tagged during local development.
 
+## [0.13.0](https://github.com/ObiWanCanOweMe/qobuz-librarian/compare/v0.12.2...v0.13.0) (2026-07-24)
+
+
+### Features
+
+* add portainer release client ([45cc891](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/45cc891ba974d725c7752238b8ca54d7f173c850))
+
+
+### Bug Fixes
+
+* accept ghcr not found preflight output ([7f7905d](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/7f7905d501851a61fad6c5dd91eac6d8ab67566f))
+* accept GHCR not found preflight output ([5eee043](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/5eee0432392018fbcae4ddce5be55d96a6c95367))
+* align stable image tag validation ([b4fb542](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/b4fb542006efbbc759d6e892cc45ac76605a2186))
+* enforce exact portainer production image ([585e90d](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/585e90de460501a6f92936402da9d8c859db3777))
+* harden image scan release checks ([c35d18a](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/c35d18a0ca315ac2e16f8f753fe0cdba28b9c2a8))
+* harden release deployment workflow ([1da54fd](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/1da54fd173d716862b71ec19d881a76a0d0e82f2))
+* require stable portainer image tags ([fd146e0](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/fd146e05f8c71292e413cc24f66df1e719c28060))
+
 ## [0.12.2](https://github.com/ObiWanCanOweMe/qobuz-librarian/compare/v0.12.1...v0.12.2) (2026-07-23)
 
 
