@@ -2,6 +2,13 @@
 
 All notable changes to Qobuz Librarian are recorded here, newest first. The project follows [semantic versioning](https://semver.org/); dates are when each version was tagged during local development.
 
+## [0.12.2](https://github.com/ObiWanCanOweMe/qobuz-librarian/compare/v0.12.1...v0.12.2) (2026-07-23)
+
+
+### Bug Fixes
+
+* deploy production from GitHub-hosted runners ([2e87e35](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/2e87e35d2821d201f1da51a7439e22d0f1690d34))
+
 ## [0.12.1](https://github.com/ObiWanCanOweMe/qobuz-librarian/compare/v0.12.0...v0.12.1) (2026-07-23)
 
 
