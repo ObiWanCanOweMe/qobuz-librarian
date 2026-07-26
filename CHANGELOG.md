@@ -2,6 +2,22 @@
 
 All notable changes to Qobuz Librarian are recorded here, newest first. The project follows [semantic versioning](https://semver.org/); dates are when each version was tagged during local development.
 
+## [0.13.1](https://github.com/ObiWanCanOweMe/qobuz-librarian/compare/v0.13.0...v0.13.1) (2026-07-26)
+
+
+### Bug Fixes
+
+* close AppleDouble migration and repair gaps ([032edf8](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/032edf86d333307338a7922ad03524704e620d8a))
+* ignore AppleDouble files during migration ([018481d](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/018481d8495173a89aa19db74af2f8355ef81aa1))
+* ignore AppleDouble files during migration and repair ([43efc4a](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/43efc4a286aeb132a7bf519893d80474ed94806a))
+* ignore AppleDouble files during repair ([e493071](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/e493071e2c58a9c6e265b57c992f8d50583b4e3c))
+
+
+### Documentation
+
+* design AppleDouble scan exclusions ([c5bb340](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/c5bb340f1bc08aec32c6297823d1ff28d11eb6f5))
+* plan AppleDouble scan exclusions ([3e78085](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/3e78085c24fcfd45b370d45d220e3489bdf28bb7))
+
 ## [0.13.0](https://github.com/ObiWanCanOweMe/qobuz-librarian/compare/v0.12.2...v0.13.0) (2026-07-24)
 
 
