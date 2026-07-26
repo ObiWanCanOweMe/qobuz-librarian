@@ -1754,6 +1754,8 @@ def _capture_companion_receipts(binding, entries) -> list:
             ]
             for encoded_name in before_names:
                 name = os.fsdecode(encoded_name)
+                if name.startswith("._"):
+                    continue
                 if Path(name).suffix.lower() not in _COMPANION_EXTS:
                     continue
                 value = os.stat(
