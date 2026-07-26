@@ -46,6 +46,30 @@ def test_scan_isrc_repairs_truncation_gates(tmp_path):
         assert len(scan_dir_for_isrc_repairs(tmp_path, "token")["verified_truncated"]) == 1
 
 
+def test_repair_scan_ignores_appledouble_flacs(tmp_path):
+    source = tmp_path / "track.flac"
+    source.write_bytes(b"held source")
+    (tmp_path / "._track.flac").write_bytes(b"AppleDouble sidecar")
+    track = _track(length=10.0, path=str(source))
+    qobuz_track = {
+        "duration": 0,
+        "title": "Track",
+        "track_number": 1,
+    }
+
+    with patch(
+            "qobuz_librarian.repair_log._read_held_audio_meta",
+            return_value=track), patch(
+            "qobuz_librarian.repair_log._qobuz_track_by_isrc",
+            return_value=qobuz_track), patch(
+            "qobuz_librarian.repair_log._flac_decode_ok",
+            return_value=True):
+        report = scan_dir_for_isrc_repairs(tmp_path, "token")
+
+    assert report["verified_ok"] == 1
+    assert report["unverified"] == 0
+
+
 # ── Repair scan: resume from an interrupted sweep ──────────────────────
 
 def test_repair_scan_resumes_from_checkpoint(tmp_path, monkeypatch):
