@@ -242,6 +242,8 @@ def _retag_refills_in_staging(staged_dirs, source_by_isrc):
     }
     for d in staged_dirs:
         for fp in sorted(Path(d).rglob("*.flac")):
+            if fp.name.startswith("._"):
+                continue
             try:
                 isrcs = _split_repair_isrc_values(_FLAC(fp).get("isrc") or [])
             except Exception:
@@ -565,7 +567,11 @@ def _repair_album_isrc_counts(album_dir, walk_errors=None):
     try:
         paths = [
             path for path in iter_tree_no_symlinks(Path(album_dir), errors=walk_errors)
-            if path.suffix.lower() == ".flac" and path.is_file()
+            if (
+                not path.name.startswith("._")
+                and path.suffix.lower() == ".flac"
+                and path.is_file()
+            )
         ]
     except OSError as exc:
         if walk_errors is not None:

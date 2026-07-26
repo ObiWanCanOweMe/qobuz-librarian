@@ -385,7 +385,7 @@ def _read_held_audio_meta(source):
 def _repair_flac_paths(album_dir):
     paths = []
     for path in iter_tree_no_symlinks(Path(album_dir)):
-        if path.suffix.lower() == ".flac":
+        if not path.name.startswith("._") and path.suffix.lower() == ".flac":
             paths.append(path)
     return sorted(paths)
 

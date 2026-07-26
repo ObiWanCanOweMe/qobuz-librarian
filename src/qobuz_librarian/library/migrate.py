@@ -1754,6 +1754,8 @@ def _capture_companion_receipts(binding, entries) -> list:
             ]
             for encoded_name in before_names:
                 name = os.fsdecode(encoded_name)
+                if name.startswith("._"):
+                    continue
                 if Path(name).suffix.lower() not in _COMPANION_EXTS:
                     continue
                 value = os.stat(
@@ -2294,6 +2296,8 @@ def _enumerate_source_descriptors(binding, *, cancel_check=None,
                 finally:
                     os.close(child_fd)
             elif stat.S_ISREG(value.st_mode):
+                if name.startswith("._"):
+                    continue
                 suffix = Path(name).suffix.lower()
                 if suffix not in audio_exts and suffix not in _COMPANION_EXTS:
                     continue

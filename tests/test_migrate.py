@@ -112,6 +112,144 @@ def test_destination_matches_beets_layout(tmp_path):
     assert plan.placed[0].dest_rel == Path("Artist/Album (2017)/04 - Hey.flac")
 
 
+def test_migration_enumeration_ignores_appledouble_audio_and_companions(
+        tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    for name in ("track.flac", "._track.flac", "cover.jpg", "._cover.jpg"):
+        (source / name).write_bytes(name.encode())
+
+    class Binding:
+        path = source
+        root_fd = m.os.open(source, m.os.O_RDONLY | m.os.O_DIRECTORY)
+
+        def matches_public(self):
+            return True
+
+    def seal(_binding, _parent_fd, _parents, relative, *, read_tags=False):
+        path = source.joinpath(*relative)
+        receipt = {"relative": list(relative)}
+        return path, _meta() if read_tags else None, receipt
+
+    binding = Binding()
+    monkeypatch.setattr(m, "_scan_file_from_descriptor", seal)
+    monkeypatch.setattr(
+        m, "_sealed_directory_chain_matches", lambda *_args: True)
+    try:
+        audio, companions = m._enumerate_source_descriptors(binding)
+    finally:
+        m.os.close(binding.root_fd)
+
+    assert [path.name for path, _meta_value, _receipt in audio] == [
+        "track.flac"]
+    assert [receipt["relative"][-1] for receipt in companions] == ["cover.jpg"]
+
+
+def test_migration_plan_fallback_does_not_copy_appledouble_companion(
+        tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    source = tmp_path / "source"
+    source.mkdir()
+    track = source / "track.flac"
+    track.write_bytes(b"audio")
+    appledouble = source / "._cover.jpg"
+    appledouble.write_bytes(b"AppleDouble sidecar")
+    destination = tmp_path / "destination"
+
+    source_receipt = {
+        "path": str(source),
+        "mount_coordinate": {},
+    }
+    items = m.CollectedItems(source, source_receipt)
+    items.append((
+        track,
+        _meta(),
+        "tags",
+        {"relative": [track.name]},
+    ))
+
+    class Binding:
+        path = source
+
+        def __init__(self):
+            self.root_fd = m.os.open(
+                source, m.os.O_RDONLY | m.os.O_DIRECTORY)
+
+        def close(self):
+            m.os.close(self.root_fd)
+
+        def matches_public(self):
+            return True
+
+    monkeypatch.setattr(
+        m,
+        "_capture_root_receipt",
+        lambda path, **_kwargs: {
+            "path": str(Path(path)),
+            "mount_coordinate": {},
+        },
+    )
+    monkeypatch.setattr(m, "_require_separate_root_receipts", lambda *_a: None)
+    monkeypatch.setattr(
+        m,
+        "_probe_destination_name_semantics",
+        lambda _path: {
+            "case_sensitive": True,
+            "normalization_sensitive": True,
+        },
+    )
+    monkeypatch.setattr(m, "_open_root_receipt", lambda *_a, **_k: Binding())
+    monkeypatch.setattr(
+        m,
+        "_destination_state",
+        lambda *_a: (
+            False,
+            None,
+            {"relative": ["Artist", "Album (2017)", "01 - Song.flac"]},
+            "",
+        ),
+    )
+    monkeypatch.setattr(
+        m,
+        "_scan_file_from_descriptor",
+        lambda _binding, _parent_fd, _parents, relative: (
+            source.joinpath(*relative),
+            None,
+            {"relative": list(relative)},
+        ),
+    )
+
+    plan = m.build_plan(items, destination)
+    entry = plan.placed[0]
+    result = m.ExecResult(outcomes=[
+        (entry.source, entry.dest_rel, m.COPIED, ""),
+    ])
+
+    def copy_companion(_opened, _receipt, _binding, relative):
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(appledouble.read_bytes())
+
+    monkeypatch.setattr(
+        m,
+        "_open_file_receipt",
+        lambda *_a: SimpleNamespace(close=lambda: None),
+    )
+    monkeypatch.setattr(m, "_stream_copy_noreplace", copy_companion)
+    m._carry_companion_files(
+        plan,
+        result,
+        entry_map={m._plan_entry_key(entry.source, entry.dest_rel): entry},
+        source_root_binding=SimpleNamespace(path=source),
+        destination_root_binding=object(),
+    )
+
+    assert plan.companion_receipts == []
+    assert result.companions == 0
+    assert not (destination / entry.dest_rel.parent / appledouble.name).exists()
+
+
 # ── classification ─────────────────────────────────────────────────────────────
 
 def test_missing_artist_or_album_is_unplaceable_not_guessed(tmp_path):

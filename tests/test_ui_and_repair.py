@@ -46,6 +46,30 @@ def test_scan_isrc_repairs_truncation_gates(tmp_path):
         assert len(scan_dir_for_isrc_repairs(tmp_path, "token")["verified_truncated"]) == 1
 
 
+def test_repair_scan_ignores_appledouble_flacs(tmp_path):
+    source = tmp_path / "track.flac"
+    source.write_bytes(b"held source")
+    (tmp_path / "._track.flac").write_bytes(b"AppleDouble sidecar")
+    track = _track(length=10.0, path=str(source))
+    qobuz_track = {
+        "duration": 0,
+        "title": "Track",
+        "track_number": 1,
+    }
+
+    with patch(
+            "qobuz_librarian.repair_log._read_held_audio_meta",
+            return_value=track), patch(
+            "qobuz_librarian.repair_log._qobuz_track_by_isrc",
+            return_value=qobuz_track), patch(
+            "qobuz_librarian.repair_log._flac_decode_ok",
+            return_value=True):
+        report = scan_dir_for_isrc_repairs(tmp_path, "token")
+
+    assert report["verified_ok"] == 1
+    assert report["unverified"] == 0
+
+
 # ── Repair scan: resume from an interrupted sweep ──────────────────────
 
 def test_repair_scan_resumes_from_checkpoint(tmp_path, monkeypatch):
@@ -755,6 +779,37 @@ def test_refill_gates_require_refills_on_top_of_the_baseline(tmp_path, monkeypat
     assert repair._refills_intact(tmp_path, wanted, "tok", None) is False
 
 
+def test_repair_album_isrc_counts_never_opens_appledouble_flacs(
+        tmp_path, monkeypatch):
+    from collections import Counter
+
+    from qobuz_librarian.modes import repair
+
+    album = tmp_path / "Album"
+    nested = album / "Disc 1"
+    appledouble_ancestor = album / "._metadata"
+    nested.mkdir(parents=True)
+    appledouble_ancestor.mkdir()
+    control = nested / "01 - Song.flac"
+    sidecar = nested / "._01 - Song.flac"
+    descendant = appledouble_ancestor / "02 - Song.flac"
+    for path in (control, sidecar, descendant):
+        path.write_bytes(path.name.encode())
+
+    opened = []
+
+    def fake_flac(path):
+        opened.append(path)
+        return {"isrc": ["USRC11111111"]}
+
+    monkeypatch.setattr(repair, "_FLAC", fake_flac)
+
+    counts = repair._repair_album_isrc_counts(album)
+
+    assert counts == Counter({"USRC11111111": 2})
+    assert opened == [control, descendant]
+
+
 def test_refill_gates_count_multi_isrc_tags(tmp_path, monkeypatch):
     # Some sources pack multiple ISRC identities into one tag value. Repair is
     # targeting one of those exact identities, so the final presence/intact
@@ -852,6 +907,44 @@ def test_retag_marks_an_unconsumed_twin_source_failed(tmp_path, monkeypatch):
     sources = {"USRC11111111": [tmp_path / "a.flac", tmp_path / "b.flac"]}
     failed = repair._retag_refills_in_staging([staged], sources)
     assert failed == {str(tmp_path / "b.flac")}
+
+
+def test_retag_refills_never_opens_appledouble_flacs(tmp_path, monkeypatch):
+    from qobuz_librarian.modes import repair
+
+    staged = tmp_path / "staged"
+    nested = staged / "Disc 1"
+    appledouble_ancestor = staged / "._metadata"
+    nested.mkdir(parents=True)
+    appledouble_ancestor.mkdir()
+    control = nested / "01 - Song.flac"
+    sidecar = nested / "._01 - Song.flac"
+    descendant = appledouble_ancestor / "02 - Other.flac"
+    for path in (control, sidecar, descendant):
+        path.write_bytes(path.name.encode())
+    source = tmp_path / "original.flac"
+    source.write_bytes(b"original")
+    opened = []
+
+    def fake_flac(path):
+        opened.append(path)
+        if path == control:
+            return {"isrc": ["USRC11111111"]}
+        return {"isrc": ["OTHER11111111"]}
+
+    monkeypatch.setattr(repair, "_FLAC", fake_flac)
+    monkeypatch.setattr(
+        repair, "_snapshot_flac_metadata", lambda _source: {"tags": {}})
+    monkeypatch.setattr(
+        repair, "_restore_flac_metadata", lambda _path, _snapshot: True)
+
+    failed = repair._retag_refills_in_staging(
+        [staged],
+        {"USRC11111111": [source]},
+    )
+
+    assert failed == set()
+    assert opened == [descendant, control]
 
 
 def test_retag_aliases_do_not_count_one_source_multiple_times(tmp_path, monkeypatch):
