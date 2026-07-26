@@ -2294,6 +2294,8 @@ def _enumerate_source_descriptors(binding, *, cancel_check=None,
                 finally:
                     os.close(child_fd)
             elif stat.S_ISREG(value.st_mode):
+                if name.startswith("._"):
+                    continue
                 suffix = Path(name).suffix.lower()
                 if suffix not in audio_exts and suffix not in _COMPANION_EXTS:
                     continue

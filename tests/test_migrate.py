@@ -112,6 +112,39 @@ def test_destination_matches_beets_layout(tmp_path):
     assert plan.placed[0].dest_rel == Path("Artist/Album (2017)/04 - Hey.flac")
 
 
+def test_migration_enumeration_ignores_appledouble_audio_and_companions(
+        tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    for name in ("track.flac", "._track.flac", "cover.jpg", "._cover.jpg"):
+        (source / name).write_bytes(name.encode())
+
+    class Binding:
+        path = source
+        root_fd = m.os.open(source, m.os.O_RDONLY | m.os.O_DIRECTORY)
+
+        def matches_public(self):
+            return True
+
+    def seal(_binding, _parent_fd, _parents, relative, *, read_tags=False):
+        path = source.joinpath(*relative)
+        receipt = {"relative": list(relative)}
+        return path, _meta() if read_tags else None, receipt
+
+    binding = Binding()
+    monkeypatch.setattr(m, "_scan_file_from_descriptor", seal)
+    monkeypatch.setattr(
+        m, "_sealed_directory_chain_matches", lambda *_args: True)
+    try:
+        audio, companions = m._enumerate_source_descriptors(binding)
+    finally:
+        m.os.close(binding.root_fd)
+
+    assert [path.name for path, _meta_value, _receipt in audio] == [
+        "track.flac"]
+    assert [receipt["relative"][-1] for receipt in companions] == ["cover.jpg"]
+
+
 # ── classification ─────────────────────────────────────────────────────────────
 
 def test_missing_artist_or_album_is_unplaceable_not_guessed(tmp_path):
