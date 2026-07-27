@@ -271,6 +271,7 @@ REPAIR_LOG_PATH      = DATA_DIR / ".qobuz_replaced_tracks.log"
 CAPPED_FILE          = DATA_DIR / ".qobuz_upgrade_capped.json"
 UPGRADE_STATE_FILE   = DATA_DIR / ".qobuz_upgrade_state.json"
 DOWNSAMPLE_STATE_FILE = DATA_DIR / ".qobuz_downsample_state.json"
+LIBRARY_CENSUS_FILE = DATA_DIR / ".qobuz_library_census.json"
 LIBRARY_SCAN_STATE_FILE = DATA_DIR / ".qobuz_library_scan_state.json"
 REVIEW_BADGE_STATE_FILE = DATA_DIR / ".qobuz_review_badges.json"
 # Albums the user dismissed from the bulk library/upgrade walks so they stop
