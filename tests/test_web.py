@@ -4596,3 +4596,53 @@ def test_approve_rechecks_the_write_pause_after_awaits(client, monkeypatch):
     assert r.status_code in (200, 303, 503)
     assert job.status == job_mgr.JobStatus.AWAITING_REVIEW
     assert any(c.get("selected") for c in job.candidates)
+
+
+def _raw_census(total):
+    return {
+        "version": 1,
+        "tiers": {
+            "cd": [total, total * 10],
+            "hires96": [0, 0],
+            "hires192": [0, 0],
+            "unknown": [0, 0],
+        },
+        "total_tracks": total,
+        "total_bytes": total * 10,
+        "top_hires_artists": [],
+        "reclaim_bytes": 0,
+    }
+
+
+def test_census_view_prefers_exact_snapshot(monkeypatch):
+    from qobuz_librarian.library import census as library_census
+    from qobuz_librarian.library import flac_cache
+    from qobuz_librarian.web import app as webapp
+
+    webapp._census_cache = None
+    monkeypatch.setattr(library_census, "load", lambda: _raw_census(44477))
+    monkeypatch.setattr(
+        flac_cache,
+        "census",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("legacy cache fallback must not run"),
+        ),
+    )
+
+    view = webapp._census_view()
+
+    assert view["total"].startswith("44,477 tracks")
+
+
+def test_census_view_falls_back_to_tag_cache_before_first_snapshot(monkeypatch):
+    from qobuz_librarian.library import census as library_census
+    from qobuz_librarian.library import flac_cache
+    from qobuz_librarian.web import app as webapp
+
+    webapp._census_cache = None
+    monkeypatch.setattr(library_census, "load", lambda: None)
+    monkeypatch.setattr(flac_cache, "census", lambda: _raw_census(28116))
+
+    view = webapp._census_view()
+
+    assert view["total"].startswith("28,116 tracks")
