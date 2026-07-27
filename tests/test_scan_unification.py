@@ -1083,3 +1083,99 @@ def test_scan_signature_covers_candidate_shaping_settings(monkeypatch):
         with monkeypatch.context() as mctx:
             mctx.setattr(cfg, name, int(getattr(cfg, name)) + 1)
             assert lss.quality_signature() != base, name
+
+
+def test_refresh_library_census_publishes_only_complete_inventory(monkeypatch):
+    from qobuz_librarian.library import census
+    from qobuz_librarian.web import flows
+
+    payload = {
+        "version": 1,
+        "tiers": {"cd": [1, 10], "hires96": [0, 0],
+                  "hires192": [0, 0], "unknown": [0, 0]},
+        "total_tracks": 1,
+        "total_bytes": 10,
+        "top_hires_artists": [],
+        "reclaim_bytes": 0,
+    }
+    saved = []
+    monkeypatch.setattr(
+        flows.library_census,
+        "build",
+        lambda **kwargs: census.InventoryResult(payload, True, 1, []),
+    )
+    monkeypatch.setattr(
+        flows.library_census, "save", lambda data: saved.append(data) or True)
+
+    result = flows._refresh_library_census(jm.Job(title="scan"))
+
+    assert result.complete is True
+    assert saved == [payload]
+
+
+def test_refresh_library_census_preserves_snapshot_on_cancel(monkeypatch):
+    from qobuz_librarian.library import census
+    from qobuz_librarian.web import flows
+
+    job = jm.Job(title="scan")
+    job.cancel_requested = True
+    monkeypatch.setattr(
+        flows.library_census,
+        "build",
+        lambda **kwargs: census.InventoryResult(None, False, 0, [], True),
+    )
+    monkeypatch.setattr(
+        flows.library_census,
+        "save",
+        lambda _data: (_ for _ in ()).throw(
+            AssertionError("cancelled census must not be saved")),
+    )
+
+    result = flows._refresh_library_census(job)
+
+    assert result.cancelled is True
+
+
+def test_scan_library_refreshes_census_before_qobuz_artist_scan(
+        tmp_path, monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.library import downsample_state
+    from qobuz_librarian.web import flows
+
+    artist = tmp_path / "Artist"
+    artist.mkdir()
+    order = []
+    monkeypatch.setattr(cfg, "UPGRADE_SCAN_ENABLED", False)
+    monkeypatch.setattr(
+        cfg, "LIBRARY_SCAN_STATE_FILE", tmp_path / "library_scan.json")
+    monkeypatch.setattr(flows, "list_library_artists", lambda: [artist])
+    monkeypatch.setattr(
+        flows,
+        "_refresh_library_census",
+        lambda _job: order.append("census"),
+    )
+    monkeypatch.setattr(
+        flows.downsample_state,
+        "refresh_for_artists",
+        lambda *_a, **_k: downsample_state.RefreshResult(
+            [], ["Artist"], {}, True),
+    )
+    monkeypatch.setattr(flows.scan_checkpoint, "load", lambda _kind: None)
+    monkeypatch.setattr(flows.scan_checkpoint, "save", lambda *a, **k: None)
+    monkeypatch.setattr(flows.scan_checkpoint, "clear", lambda _kind: None)
+    monkeypatch.setattr(flows, "_record_last_scan", lambda: None)
+    monkeypatch.setattr(flows, "_flag_new_since_last_scan", lambda *a, **k: None)
+    monkeypatch.setattr(flows, "flush_resolve_cache", lambda: None)
+    monkeypatch.setattr(flows.new_releases_mod, "is_baseline_complete", lambda: True)
+    monkeypatch.setattr(
+        flows,
+        "_scan_library_artist",
+        lambda ad, *_a, **_k: (
+            order.append("qobuz") or
+            (ad.name, ad.name, [], "artist-id", [])
+        ),
+    )
+
+    flows.scan_library(jm.Job(title="scan"), "token")
+
+    assert order[:2] == ["census", "qobuz"]

@@ -15,6 +15,7 @@ from pathlib import Path
 from qobuz_librarian import config as cfg
 from qobuz_librarian.api.auth import AuthLost, QobuzUnavailable, load_qobuz_token
 from qobuz_librarian.api.search import get_album
+from qobuz_librarian.library import census as library_census
 from qobuz_librarian.library import (
     downsample_state,
     library_scan_state,
@@ -769,6 +770,34 @@ _CHECKPOINT_EVERY = 15  # artists between progress saves (resume granularity)
 _REPAIR_HEARTBEAT_SECS = 2
 
 
+def _refresh_library_census(job):
+    last_tick = {"processed": 0}
+
+    def on_file(processed, path):
+        if processed - last_tick["processed"] >= 250:
+            last_tick["processed"] = processed
+            job.push_progress(
+                "Inventorying audio files",
+                processed,
+                0,
+                path.name,
+                unit="track",
+            )
+
+    result = library_census.build(
+        cancel_check=lambda: bool(job.cancel_requested),
+        on_file=on_file,
+    )
+    if result.complete and result.data is not None:
+        if not library_census.save(result.data):
+            log.info("  Exact library census could not be saved; keeping the previous snapshot.")
+    elif result.errors:
+        log.info(
+            f"  Exact library census incomplete after {result.processed} files; "
+            "keeping the previous snapshot.")
+    return result
+
+
 def scan_library(job, token, partial_only=False, force_full=False):
     clear_scan_caches()
     # Drop the Various-Artists folder: it has no single Qobuz artist catalog
@@ -777,6 +806,10 @@ def scan_library(job, token, partial_only=False, force_full=False):
                if normalize(d.name) not in VA_NORMALIZED]
     if not artists:
         _set_empty_library_summary(job)
+        return
+    _refresh_library_census(job)
+    if job.cancel_requested:
+        job.summary = "Stopped during the read-only library inventory."
         return
     kind = "partial" if partial_only else "missing"
     # Resume an interrupted scan of this kind: skip the artists already done and
