@@ -38,6 +38,7 @@ def _isolate_data_dir():
     cfg.LYRIC_RETRY_FILE     = tmp_root / ".qobuz_lyric_retry.json"
     cfg.REPAIR_LOG_PATH      = tmp_root / ".qobuz_replaced_tracks.log"
     cfg.CAPPED_FILE          = tmp_root / ".qobuz_upgrade_capped.json"
+    cfg.LIBRARY_CENSUS_FILE  = tmp_root / ".qobuz_library_census.json"
     cfg.LIBRARY_SCAN_STATE_FILE = tmp_root / ".qobuz_library_scan_state.json"
     cfg.HIDDEN_FILE          = tmp_root / ".qobuz_hidden.json"
     cfg.REVIEW_BADGE_STATE_FILE = tmp_root / ".qobuz_review_badges.json"

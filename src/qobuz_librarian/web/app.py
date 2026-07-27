@@ -5781,24 +5781,31 @@ _CENSUS_TTL = 300.0
 
 
 def _census_view():
-    """Quality-census context for the Library page, shaped from the scan
-    cache. One table walk over every cached tag row — cheap, but not
-    per-request cheap on a big library, so the shaped result is memoized for
-    a few minutes. None hides the panel (cache off, or nothing scanned yet)."""
+    """Quality-census context for the Library page.
+
+    A completed exact inventory is loaded on each request. Before one exists,
+    the legacy tag-cache census is memoized because its SQLite walk can be
+    expensive. None hides the panel when neither source has data.
+    """
     global _census_cache
-    now = time.time()
-    if _census_cache is not None and now - _census_cache[0] < _CENSUS_TTL:
-        return _census_cache[1]
+    from qobuz_librarian.library import census as library_census
     from qobuz_librarian.library import flac_cache
     from qobuz_librarian.ui_cli.colors import format_size
-    raw = flac_cache.census()
+
+    raw = library_census.load()
+    using_legacy = raw is None
+    if using_legacy:
+        now = time.time()
+        if _census_cache is not None and now - _census_cache[0] < _CENSUS_TTL:
+            return _census_cache[1]
+        raw = flac_cache.census()
     view = None
     if raw:
         labels = {
             "cd": "CD quality (16-bit / 44.1–48 kHz)",
             "hires96": "Hi-res up to 96 kHz",
             "hires192": "Hi-res up to 192 kHz",
-            "unknown": "Other formats",
+            "unknown": "Other / unknown",
         }
         seg = {"cd": "cd", "hires96": "h96", "hires192": "h192",
                "unknown": "other"}
@@ -5824,7 +5831,10 @@ def _census_view():
             "reclaim": (format_size(raw["reclaim_bytes"])
                         if raw["reclaim_bytes"] >= 100 * 1024 * 1024 else ""),
         }
-    _census_cache = (now, view)
+    if using_legacy:
+        _census_cache = (now, view)
+    else:
+        _census_cache = None
     return view
 
 
