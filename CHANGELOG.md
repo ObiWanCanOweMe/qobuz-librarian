@@ -2,6 +2,28 @@
 
 All notable changes to Qobuz Librarian are recorded here, newest first. The project follows [semantic versioning](https://semver.org/); dates are when each version was tagged during local development.
 
+## [0.14.0](https://github.com/ObiWanCanOweMe/qobuz-librarian/compare/v0.13.1...v0.14.0) (2026-07-27)
+
+
+### Features
+
+* add exact read-only library census ([9674ec5](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/9674ec51fe41d9c233ea29a49e6b9d4c803e885e))
+
+
+### Bug Fixes
+
+* classify invalid census metadata as unknown ([2e26a08](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/2e26a08c47621f0497c90b84ce52423e13c9cea7))
+* close exact census review findings ([9fdf2a3](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/9fdf2a3f8d5f856f29d6dd98eb62bf0381527b2f))
+* inventory every track during library scans ([c670544](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/c6705443dd8a85a1aac58c70cd1fab5d8f32d2c4))
+* make library census exact and read-only ([0415195](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/041519568537f6a17008c57dd3951187c3cc26d6))
+* show exact completed library census ([b15883b](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/b15883b98b8e7b9d8804ffec7e42ebc58fc74338))
+
+
+### Documentation
+
+* design exact read-only library census ([5c979d3](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/5c979d3bc1442c303edf852fc954547aaeab0df5))
+* plan exact read-only library census ([72781c5](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/72781c5e15f37c5995ebeb99006d5b108b2b899a))
+
 ## [0.13.1](https://github.com/ObiWanCanOweMe/qobuz-librarian/compare/v0.13.0...v0.13.1) (2026-07-26)
 
 
