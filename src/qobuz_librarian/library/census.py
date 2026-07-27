@@ -42,7 +42,7 @@ def _empty():
 def _tier(meta):
     bits = int((meta or {}).get("bits") or 0)
     sample_rate = int((meta or {}).get("sample_rate") or 0)
-    if not bits or not sample_rate:
+    if bits <= 0 or sample_rate <= 0:
         return "unknown", bits, sample_rate
     if bits <= 16:
         return "cd", bits, sample_rate

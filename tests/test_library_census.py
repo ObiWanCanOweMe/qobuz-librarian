@@ -92,6 +92,23 @@ def test_build_reads_media_without_changing_content_or_mtime(tmp_path, monkeypat
     assert after == before
 
 
+def test_build_counts_negative_audio_metadata_as_unknown(tmp_path, monkeypatch):
+    """A corrupt negative tag must not turn a supported file into hi-res/CD."""
+    from qobuz_librarian.library import census
+
+    root = tmp_path / "music"
+    track = root / "Artist" / "Album" / "track.flac"
+    track.parent.mkdir(parents=True)
+    track.write_bytes(b"audio")
+    monkeypatch.setattr(
+        census.scanner, "read_audio_meta", lambda _path: _meta(-24, 96000, 5))
+
+    result = census.build(root)
+
+    assert result.complete is True
+    assert result.data["tiers"]["unknown"] == [1, 5]
+
+
 def test_save_load_is_versioned_and_atomic(tmp_path, monkeypatch):
     from qobuz_librarian import config as cfg
     from qobuz_librarian.library import census
