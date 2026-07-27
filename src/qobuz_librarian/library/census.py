@@ -143,7 +143,7 @@ def save(data):
 def load():
     try:
         data = json.loads(cfg.LIBRARY_CENSUS_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     if not isinstance(data, dict) or data.get("version") != STATE_VERSION:
         return None

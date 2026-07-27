@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from qobuz_librarian.library.downsample import DownsampleCandidate
 from qobuz_librarian.web import jobs as jm
 
@@ -1118,11 +1120,19 @@ def test_refresh_library_census_preserves_snapshot_on_cancel(monkeypatch):
     from qobuz_librarian.web import flows
 
     job = jm.Job(title="scan")
-    job.cancel_requested = True
+    captured = {}
+
+    def cancel_during_build(**kwargs):
+        captured["cancel_check"] = kwargs["cancel_check"]
+        assert captured["cancel_check"]() is False
+        job.cancel_requested = True
+        assert captured["cancel_check"]() is True
+        return census.InventoryResult(None, False, 0, [], True)
+
     monkeypatch.setattr(
         flows.library_census,
         "build",
-        lambda **kwargs: census.InventoryResult(None, False, 0, [], True),
+        cancel_during_build,
     )
     monkeypatch.setattr(
         flows.library_census,
@@ -1134,6 +1144,7 @@ def test_refresh_library_census_preserves_snapshot_on_cancel(monkeypatch):
     result = flows._refresh_library_census(job)
 
     assert result.cancelled is True
+    assert captured["cancel_check"]() is job.cancel_requested
 
 
 def test_scan_library_refreshes_census_before_qobuz_artist_scan(
@@ -1179,3 +1190,85 @@ def test_scan_library_refreshes_census_before_qobuz_artist_scan(
     flows.scan_library(jm.Job(title="scan"), "token")
 
     assert order[:2] == ["census", "qobuz"]
+
+
+def test_scan_library_replaces_stale_census_when_last_artist_disappears(
+        tmp_path, monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.library import census
+    from qobuz_librarian.web import flows
+
+    root = tmp_path / "music"
+    root.mkdir()
+    snapshot = tmp_path / "census.json"
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", root)
+    monkeypatch.setattr(cfg, "LIBRARY_CENSUS_FILE", snapshot)
+    assert census.save({
+        "version": census.STATE_VERSION,
+        "tiers": {
+            "cd": [3, 30],
+            "hires96": [0, 0],
+            "hires192": [0, 0],
+            "unknown": [0, 0],
+        },
+        "total_tracks": 3,
+        "total_bytes": 30,
+        "top_hires_artists": [],
+        "reclaim_bytes": 0,
+    })
+    monkeypatch.setattr(
+        flows,
+        "_scan_library_artist",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("an empty library must not enter Qobuz matching"),
+        ),
+    )
+
+    flows.scan_library(jm.Job(title="scan"), "token")
+
+    assert census.load()["total_tracks"] == 0
+
+
+@pytest.mark.parametrize(
+    "relative_track",
+    [
+        Path("root-level.flac"),
+        Path("Various Artists") / "Compilation" / "track.flac",
+    ],
+)
+def test_scan_library_inventories_audio_without_qobuz_eligible_artist(
+        tmp_path, monkeypatch, relative_track):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.library import census
+    from qobuz_librarian.web import flows
+
+    root = tmp_path / "music"
+    track = root / relative_track
+    track.parent.mkdir(parents=True, exist_ok=True)
+    track.write_bytes(b"audio")
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", root)
+    monkeypatch.setattr(
+        cfg, "LIBRARY_CENSUS_FILE", tmp_path / "census.json")
+    monkeypatch.setattr(
+        census.scanner,
+        "read_audio_meta",
+        lambda _path: {
+            "bits": 16,
+            "sample_rate": 44100,
+            "size": len(b"audio"),
+            "path": "",
+        },
+    )
+    monkeypatch.setattr(
+        flows,
+        "_scan_library_artist",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("non-artist audio must not enter Qobuz matching"),
+        ),
+    )
+
+    flows.scan_library(jm.Job(title="scan"), "token")
+
+    snapshot = census.load()
+    assert snapshot["total_tracks"] == 1
+    assert snapshot["tiers"]["cd"] == [1, len(b"audio")]

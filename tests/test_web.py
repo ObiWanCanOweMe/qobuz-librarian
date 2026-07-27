@@ -4619,7 +4619,7 @@ def test_census_view_prefers_exact_snapshot(monkeypatch):
     from qobuz_librarian.library import flac_cache
     from qobuz_librarian.web import app as webapp
 
-    webapp._census_cache = None
+    monkeypatch.setattr(webapp, "_census_cache", None)
     monkeypatch.setattr(library_census, "load", lambda: _raw_census(44477))
     monkeypatch.setattr(
         flac_cache,
@@ -4634,15 +4634,57 @@ def test_census_view_prefers_exact_snapshot(monkeypatch):
     assert view["total"].startswith("44,477 tracks")
 
 
+def test_census_view_exact_snapshot_evicts_fresh_legacy_cache(monkeypatch):
+    from qobuz_librarian.library import census as library_census
+    from qobuz_librarian.library import flac_cache
+    from qobuz_librarian.web import app as webapp
+
+    legacy_view = {"total": "28,116 tracks · stale"}
+    monkeypatch.setattr(
+        webapp, "_census_cache", (time.time(), legacy_view))
+    monkeypatch.setattr(library_census, "load", lambda: _raw_census(44477))
+    monkeypatch.setattr(
+        flac_cache,
+        "census",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("fresh legacy cache must not mask exact census"),
+        ),
+    )
+
+    view = webapp._census_view()
+
+    assert view["total"].startswith("44,477 tracks")
+    assert webapp._census_cache is None
+
+
 def test_census_view_falls_back_to_tag_cache_before_first_snapshot(monkeypatch):
     from qobuz_librarian.library import census as library_census
     from qobuz_librarian.library import flac_cache
     from qobuz_librarian.web import app as webapp
 
-    webapp._census_cache = None
+    monkeypatch.setattr(webapp, "_census_cache", None)
     monkeypatch.setattr(library_census, "load", lambda: None)
     monkeypatch.setattr(flac_cache, "census", lambda: _raw_census(28116))
 
+    view = webapp._census_view()
+
+    assert view["total"].startswith("28,116 tracks")
+
+
+def test_census_view_invalid_utf8_snapshot_falls_back_to_tag_cache(
+        tmp_path, monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.library import census as library_census
+    from qobuz_librarian.library import flac_cache
+    from qobuz_librarian.web import app as webapp
+
+    snapshot = tmp_path / "census.json"
+    snapshot.write_bytes(b"\xff")
+    monkeypatch.setattr(cfg, "LIBRARY_CENSUS_FILE", snapshot)
+    monkeypatch.setattr(webapp, "_census_cache", None)
+    monkeypatch.setattr(flac_cache, "census", lambda: _raw_census(28116))
+
+    assert library_census.load() is None
     view = webapp._census_view()
 
     assert view["total"].startswith("28,116 tracks")

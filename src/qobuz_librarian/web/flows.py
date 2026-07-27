@@ -800,16 +800,16 @@ def _refresh_library_census(job):
 
 def scan_library(job, token, partial_only=False, force_full=False):
     clear_scan_caches()
+    _refresh_library_census(job)
+    if job.cancel_requested:
+        job.summary = "Stopped during the read-only library inventory."
+        return
     # Drop the Various-Artists folder: it has no single Qobuz artist catalog
     # to diff against, so a gap scan can only mis-resolve it.
     artists = [d for d in list_library_artists()
                if normalize(d.name) not in VA_NORMALIZED]
     if not artists:
         _set_empty_library_summary(job)
-        return
-    _refresh_library_census(job)
-    if job.cancel_requested:
-        job.summary = "Stopped during the read-only library inventory."
         return
     kind = "partial" if partial_only else "missing"
     # Resume an interrupted scan of this kind: skip the artists already done and

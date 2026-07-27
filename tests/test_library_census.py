@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 
 def _meta(bits, sample_rate, size):
     return {
@@ -102,6 +104,28 @@ def test_build_counts_negative_audio_metadata_as_unknown(tmp_path, monkeypatch):
     track.write_bytes(b"audio")
     monkeypatch.setattr(
         census.scanner, "read_audio_meta", lambda _path: _meta(-24, 96000, 5))
+
+    result = census.build(root)
+
+    assert result.complete is True
+    assert result.data["tiers"]["unknown"] == [1, 5]
+
+
+@pytest.mark.parametrize("sample_rate", [0, -96000])
+def test_build_counts_non_positive_sample_rate_as_unknown(
+        tmp_path, monkeypatch, sample_rate):
+    """A non-positive sample rate must not classify high-bit audio as hi-res."""
+    from qobuz_librarian.library import census
+
+    root = tmp_path / "music"
+    track = root / "Artist" / "Album" / "track.flac"
+    track.parent.mkdir(parents=True)
+    track.write_bytes(b"audio")
+    monkeypatch.setattr(
+        census.scanner,
+        "read_audio_meta",
+        lambda _path: _meta(24, sample_rate, 5),
+    )
 
     result = census.build(root)
 
