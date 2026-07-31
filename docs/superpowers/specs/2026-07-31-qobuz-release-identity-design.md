@@ -32,6 +32,9 @@ IDs into every ordinary album path.
   `._*` files.
 - Preserve the manifest deliberately through Qobuz Librarian-owned album
   moves, backups, exports, and restores.
+- Indicate the exact Qobuz edition in both Missing Albums and Gap Fill when
+  multiple releases could otherwise be confused, without adding noise to
+  unambiguous album rows.
 
 ## Non-goals
 
@@ -244,7 +247,53 @@ Ordinary scans and imports retain their current paths. Logs and review output
 refer to the friendly album label and show the Qobuz release ID where editions
 must be distinguished.
 
-Review reasons are stable and actionable, including:
+### Library edition badges
+
+Missing Albums and Gap Fill use the same edition-family calculation. An
+edition family is keyed by normalized album artist, edition-stripped album
+title, and original-release year. It contains only distinct normalized Qobuz
+release IDs. This keeps unrelated same-titled albums from being grouped while
+recognizing standard, deluxe, anniversary, and remastered releases of the same
+work.
+
+When the fetched artist catalogue contains two or more releases in one family,
+every displayed candidate from that family receives a compact visible edition
+badge. An album with no competing known release receives no badge. A partial
+Gap Fill still receives the badge when its selected release belongs to a
+multi-release family, even if the other releases are not themselves Gap Fill
+candidates.
+
+The badge always includes the complete Qobuz release ID. Its human label is
+derived from the title decoration when possible, such as `Deluxe Edition`,
+`20th Anniversary`, or `2011 Remaster`. The undecorated member is labeled
+`Standard Edition`. If two releases produce the same human label, the minimum
+additional differentiators needed to make the badges distinct are appended in
+this order: original-release year, track count, then quality. The release ID
+remains visible regardless of whether those fallbacks are needed.
+
+Examples include:
+
+```text
+Standard Edition · Qobuz 100
+Deluxe Edition · Qobuz 200
+2011 Remaster · Qobuz 300
+Standard Edition · 24-bit/96kHz · Qobuz 400
+```
+
+Discovery attaches the final display string as `edition_badge` in the saved
+review-candidate payload. The shared review-row template renders that payload
+the same way on the Missing Albums and Gap Fill tabs. The badge is purely
+informational: it does not alter selection, grouping, download scope, or the
+release ID submitted for execution. Saved reviews and scan checkpoints retain
+the badge so it does not disappear after a restart.
+
+An incomplete or failed catalogue fetch never invents competing editions. A
+badge is shown only from the distinct releases actually validated in a
+trustworthy catalogue response. Existing identity-attention cards remain
+separate and non-actionable when Qobuz Librarian cannot select an edition at
+all.
+
+Identity review reasons are stable and explanatory, including:
 
 - legacy folder matches multiple Qobuz releases;
 - manifest is invalid or unsupported;
@@ -299,6 +348,17 @@ Tests will prove that:
 13. Long friendly names are truncated without truncating or changing the ID
     suffix.
 14. The full test suite passes with unchanged paths for non-colliding albums.
+15. Missing Albums shows a visible human edition label and complete Qobuz ID
+    for every member of a multi-release edition family.
+16. Gap Fill shows the same badge when the owned release has competing
+    catalogue editions, even if only that release has missing tracks.
+17. A single-release family shows no edition badge, and unrelated same-titled
+    albums from different original-release years are not grouped.
+18. Duplicate human labels gain only the year, track-count, or quality detail
+    required to distinguish them, while retaining the complete release ID.
+19. Saved review and checkpoint round trips preserve `edition_badge`, and the
+    shared row template renders it on both Library tabs without changing the
+    selected album ID.
 
 ## Deployment and Compatibility
 
