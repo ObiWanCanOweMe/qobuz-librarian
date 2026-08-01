@@ -2373,14 +2373,15 @@ def _materialize_album_candidates(candidates, token):
 
 def find_qobuz_album_candidates_for_dir(
         album_dir, artist_name, token, *, prefer_hires=False, catalog=None,
-        target_dir=None) -> list[dict]:
+        target_dir=None, ignore_manifest=False) -> list[dict]:
     """Return fully materialized Qobuz release candidates in ranked order.
 
-    A valid on-disk release manifest is authoritative. Legacy folders retain
-    every distinct normalized release ID that passes the existing title,
-    artist, lossless, year, and optional target-path gates.
+    A valid on-disk release manifest is authoritative unless
+    ``ignore_manifest`` is explicitly requested for invalid-manifest review.
+    Legacy folders retain every distinct normalized release ID that passes the
+    existing title, artist, lossless, year, and optional target-path gates.
     """
-    if album_dir.is_dir():
+    if not ignore_manifest and album_dir.is_dir():
         identity = read_release_identity(album_dir)
         if identity is not None:
             result = _materialize_album_candidates(

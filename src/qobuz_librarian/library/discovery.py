@@ -457,6 +457,17 @@ def _legacy_identity_invalid(album_dir, candidates, existing):
                     candidate_releases=list(candidates))
 
 
+def _candidates_for_invalid_manifest(album_dir, artist_name, token, catalog,
+                                     prefer_hires):
+    """Derive review evidence without ever consuming a malformed manifest."""
+    try:
+        return find_qobuz_album_candidates_for_dir(
+            album_dir, artist_name, token, prefer_hires=prefer_hires,
+            catalog=catalog, target_dir=album_dir, ignore_manifest=True)
+    except (ReleaseManifestError, OSError):
+        return []
+
+
 def _compare_matched_album(album_dir, album, existing, candidates=()):
     tracks = (album.get("tracks") or {}).get("items") or []
     if not tracks:
@@ -490,14 +501,18 @@ def match_album_dir(album_dir, artist_name, token, *, catalog, prefer_hires):
     try:
         identity = read_release_identity(album_dir)
     except (ReleaseManifestError, OSError):
-        return _legacy_identity_invalid(album_dir, [], [])
+        candidates = _candidates_for_invalid_manifest(
+            album_dir, artist_name, token, catalog, prefer_hires)
+        return _legacy_identity_invalid(album_dir, candidates, [])
 
     try:
         candidates = find_qobuz_album_candidates_for_dir(
             album_dir, artist_name, token, prefer_hires=prefer_hires,
             catalog=catalog, target_dir=album_dir)
     except (ReleaseManifestError, OSError):
-        return _legacy_identity_invalid(album_dir, [], [])
+        candidates = _candidates_for_invalid_manifest(
+            album_dir, artist_name, token, catalog, prefer_hires)
+        return _legacy_identity_invalid(album_dir, candidates, [])
     if not candidates:
         return DirMatch("no_match", album_dir)
 

@@ -229,6 +229,49 @@ def test_shared_standard_tracks_leave_legacy_folder_ambiguous(monkeypatch, tmp_p
     assert not (folder / MANIFEST_NAME).exists()
 
 
+def test_invalid_manifest_keeps_candidate_releases_for_review(monkeypatch, tmp_path):
+    standard = _album("100", "Album", "Artist", 2020,
+                      [_qt("one", "A"), _qt("two", "B")])
+    deluxe = _album("200", "Album (Deluxe Edition)", "Artist", 2020,
+                    [_qt("one", "A"), _qt("two", "B"), _qt("bonus", "C")])
+    _library(monkeypatch, tmp_path,
+             {"Artist": {"Album (2020)": [_et("one", "A")]}})
+    folder = tmp_path / "Artist" / "Album (2020)"
+    manifest = folder / MANIFEST_NAME
+    malformed = '{"schema_version":1,"provider":"qobuz","release_id":"100","extra":true}'
+    manifest.write_text(malformed, encoding="utf-8")
+    FakeQobuz(
+        artists=[{"name": "Artist", "id": "artist", "albums_count": 2}],
+        catalog=[standard, deluxe],
+    ).install(monkeypatch)
+    real_existing_tracks = discovery.find_existing_tracks
+
+    def reviewed_tracks_only(album, *, album_dir=None):
+        if album_dir is None:
+            return [], None
+        return real_existing_tracks(album, album_dir=album_dir)
+
+    # The catalog pass must rely on the IDs classified from the invalid folder,
+    # rather than resolving its path or hiding it by its owned title.
+    monkeypatch.setattr(discovery, "find_existing_tracks", reviewed_tracks_only)
+    monkeypatch.setattr(discovery, "_owned_by_name", lambda *_args: False)
+
+    result = find_missing_for_artist(
+        "Artist", token="tok", opts=DiscoveryOpts(prefer_hires=False),
+        artist_dir=tmp_path / "Artist")
+
+    assert result.gaps == []
+    assert result.skipped == [{
+        "dir": folder,
+        "reason": "identity_invalid",
+        "candidate_releases": [
+            {"id": "100", "title": "Album"},
+            {"id": "200", "title": "Album (Deluxe Edition)"},
+        ],
+    }]
+    assert manifest.read_text(encoding="utf-8") == malformed
+
+
 def test_deluxe_edition_gap_measured_against_the_owned_edition(monkeypatch, tmp_path, beatles_search):
     # The folder is an anniversary edition; the gap must be computed against the
     # edition that folder actually is (14 tracks), not the standard release.
