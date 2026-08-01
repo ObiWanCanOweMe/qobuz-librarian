@@ -45,6 +45,7 @@ from qobuz_librarian.completion import (
     RecoveryOwner,
 )
 from qobuz_librarian.file_exclusion import acquire_inode_write_exclusion
+from qobuz_librarian.library.release_identity import is_release_manifest_name
 from qobuz_librarian.library.scanner import clear_scan_caches
 from qobuz_librarian.library.sqlite_atomic import (
     AtomicSQLiteWrite,
@@ -4643,6 +4644,8 @@ def _prepare_for_beets_run(roots=None, ownership_out=None, source_files_out=None
                     if path.is_file() and (explicit_roots or not _under_retry_dir(path))
                 )
             for path in candidates:
+                if is_release_manifest_name(path.name):
+                    continue
                 receipt = capture_file(path)
                 if receipt is not None:
                     source_files_out.append(receipt)

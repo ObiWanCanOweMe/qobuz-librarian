@@ -46,6 +46,9 @@ def test_build_counts_every_supported_file_and_excludes_appledouble_and_symlinks
     for name in files:
         (album / name).write_bytes(b"audio")
     (album / "._ghost.flac").write_bytes(b"AppleDouble")
+    (album / ".qobuz-librarian-release.json").write_text(
+        '{"schema_version":1,"provider":"qobuz","release_id":"123"}'
+    )
     (album / "cover.jpg").write_bytes(b"image")
     outside = tmp_path / "outside"
     outside.mkdir()

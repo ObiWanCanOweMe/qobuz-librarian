@@ -32,6 +32,7 @@ from qobuz_librarian.file_exclusion import (
 )
 from qobuz_librarian.integrations.rip import flac_audio_offset, flac_audio_ok
 from qobuz_librarian.library import repair_cache, scanner
+from qobuz_librarian.library.release_identity import is_ignored_library_artifact
 from qobuz_librarian.library.scanner import iter_tree_no_symlinks, parse_track_num
 from qobuz_librarian.ui_cli.colors import C, fmt
 from qobuz_librarian.ui_cli.logging import log
@@ -385,7 +386,10 @@ def _read_held_audio_meta(source):
 def _repair_flac_paths(album_dir):
     paths = []
     for path in iter_tree_no_symlinks(Path(album_dir)):
-        if not path.name.startswith("._") and path.suffix.lower() == ".flac":
+        if (
+            not is_ignored_library_artifact(path.name)
+            and path.suffix.lower() == ".flac"
+        ):
             paths.append(path)
     return sorted(paths)
 

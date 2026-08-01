@@ -398,6 +398,53 @@ def test_beets_pruning_stays_bound_to_the_captured_staging_roots(monkeypatch, tm
 # ── beets: staging tag prep (quarantine, never delete) ────────────────────
 
 
+def test_beets_source_capture_omits_release_manifest(tmp_path, monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.integrations import beets
+
+    staging = tmp_path / "staging"
+    album = staging / "Artist" / "Album"
+    album.mkdir(parents=True)
+    (album / "01 - Track.flac").write_bytes(b"audio")
+    (album / "cover.json").write_text("{}")
+    (album / ".qobuz-librarian-release.json").write_text(
+        '{"schema_version":1,"provider":"qobuz","release_id":"123"}'
+    )
+    config_dir = tmp_path / "beets-config"
+    config_dir.mkdir()
+    (config_dir / "config.yaml").write_text("{}")
+    monkeypatch.setattr(cfg, "STAGING_DIR", staging)
+    monkeypatch.setattr(cfg, "BEETS_CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cfg, "BEETS_DB_PATH", tmp_path / "beets" / "library.db")
+    monkeypatch.setattr(beets, "_resolve_beets_runtime", lambda: object())
+    monkeypatch.setattr(
+        beets,
+        "_configured_beets_plugins",
+        lambda _runtime: {
+            "plugins": [],
+            "plugin_paths": [],
+            "musicbrainz_enabled": False,
+            "disabled": [],
+        },
+    )
+    monkeypatch.setattr(beets, "_prepare_staging_tags", lambda roots=None: None)
+
+    prepared_sources = []
+    _override, cleanup, _runtime = beets._prepare_for_beets_run(
+        roots=[album], source_files_out=prepared_sources
+    )
+    try:
+        assert all(
+            receipt.path.name != ".qobuz-librarian-release.json"
+            for receipt in prepared_sources
+        )
+        assert {receipt.path.name for receipt in prepared_sources} == {
+            "01 - Track.flac", "cover.json"}
+    finally:
+        if cleanup is not None:
+            cleanup()
+
+
 def test_prepare_staging_tags_sets_aside_untagged_keeps_tagged(tmp_path, monkeypatch, _need_ffmpeg):
     # A cancelled/crashed rip leaves untagged FLACs beets would file under
     # '/_/'. They're moved out of the import set — but set aside, never deleted.

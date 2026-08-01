@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Optional
 
 from qobuz_librarian import config
+from qobuz_librarian.library.release_identity import is_ignored_library_artifact
 from qobuz_librarian.library.tags import (
     VA_NORMALIZED,
     beets_sanitize,
@@ -2296,7 +2297,7 @@ def _enumerate_source_descriptors(binding, *, cancel_check=None,
                 finally:
                     os.close(child_fd)
             elif stat.S_ISREG(value.st_mode):
-                if name.startswith("._"):
+                if is_ignored_library_artifact(name):
                     continue
                 suffix = Path(name).suffix.lower()
                 if suffix not in audio_exts and suffix not in _COMPANION_EXTS:

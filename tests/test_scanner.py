@@ -3,6 +3,7 @@ and the FLAC tag cache."""
 from unittest.mock import patch
 
 from qobuz_librarian.library.scanner import (
+    iter_tree_no_symlinks,
     list_library_artists,
     parse_track_num,
     read_album_dir,
@@ -13,6 +14,20 @@ def test_parse_track_num():
     assert parse_track_num("5") == 5
     assert parse_track_num("1/12") == 1
     assert parse_track_num("abc") == 0
+
+
+def test_iter_tree_omits_release_manifest_and_keeps_user_sidecars(tmp_path):
+    album = tmp_path / "Album"
+    album.mkdir()
+    (album / ".qobuz-librarian-release.json").write_text(
+        '{"schema_version":1,"provider":"qobuz","release_id":"123"}'
+    )
+    (album / "cover.json").write_text("{}")
+
+    names = [path.name for path in iter_tree_no_symlinks(album)]
+
+    assert ".qobuz-librarian-release.json" not in names
+    assert "cover.json" in names
 
 
 def _seed_artist(root, name):

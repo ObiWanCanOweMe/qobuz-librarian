@@ -50,6 +50,9 @@ def test_repair_scan_ignores_appledouble_flacs(tmp_path):
     source = tmp_path / "track.flac"
     source.write_bytes(b"held source")
     (tmp_path / "._track.flac").write_bytes(b"AppleDouble sidecar")
+    (tmp_path / ".qobuz-librarian-release.json").write_text(
+        '{"schema_version":1,"provider":"qobuz","release_id":"123"}'
+    )
     track = _track(length=10.0, path=str(source))
     qobuz_track = {
         "duration": 0,

@@ -118,6 +118,9 @@ def test_migration_enumeration_ignores_appledouble_audio_and_companions(
     source.mkdir()
     for name in ("track.flac", "._track.flac", "cover.jpg", "._cover.jpg"):
         (source / name).write_bytes(name.encode())
+    (source / ".qobuz-librarian-release.json").write_text(
+        '{"schema_version":1,"provider":"qobuz","release_id":"123"}'
+    )
 
     class Binding:
         path = source
@@ -143,6 +146,9 @@ def test_migration_enumeration_ignores_appledouble_audio_and_companions(
     assert [path.name for path, _meta_value, _receipt in audio] == [
         "track.flac"]
     assert [receipt["relative"][-1] for receipt in companions] == ["cover.jpg"]
+    assert ".qobuz-librarian-release.json" not in [
+        receipt["relative"][-1] for receipt in companions
+    ]
 
 
 def test_migration_plan_fallback_does_not_copy_appledouble_companion(
