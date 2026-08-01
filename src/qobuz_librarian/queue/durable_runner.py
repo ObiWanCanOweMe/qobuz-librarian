@@ -1309,6 +1309,7 @@ def execute_durable_new_album(
             item_id,
             authority=authority,
             acknowledge_completion=acknowledge_completion,
+            cancel_check=is_cancel_requested,
         )
         _require_authority(authority)
     except (OSError, ValueError, queue_state.QueueJournalError):

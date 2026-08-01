@@ -54,12 +54,16 @@ def test_carrier_retirement_publishes_identity_before_acknowledgement(
         final_path="/music/a",
     )
     saved = SimpleNamespace(retirements=(retirement,))
-    settled_retirement = SimpleNamespace(
+    committed_retirement = SimpleNamespace(
         item_id=item_id,
-        action=None,
+        action=SimpleNamespace(phase=journal.PostImportActionPhase.COMMITTED),
         final_path="/music/a",
     )
-    settled = SimpleNamespace(retirements=(settled_retirement,))
+    committed = SimpleNamespace(retirements=(committed_retirement,))
+    cleared_retirement = SimpleNamespace(
+        item_id=item_id, action=None, final_path="/music/a",
+    )
+    cleared = SimpleNamespace(retirements=(cleared_retirement,))
     events = []
 
     authority_checks = []
@@ -68,11 +72,11 @@ def test_carrier_retirement_publishes_identity_before_acknowledgement(
         "_require_authority",
         lambda _a: authority_checks.append("check"),
     )
-    monkeypatch.setattr(
-        post_import_finalizer,
-        "_settle_action",
-        lambda *_args: events.append("settle") or settled,
-    )
+    def settle(current, *_args):
+        events.append("settle")
+        return committed if current is saved else cleared
+
+    monkeypatch.setattr(post_import_finalizer, "_settle_action", settle)
     monkeypatch.setattr(
         post_import_finalizer,
         "_publish_retirement_identity",
@@ -99,7 +103,9 @@ def test_carrier_retirement_publishes_identity_before_acknowledgement(
         acknowledge_completion=None,
     )
 
-    assert events == ["settle", "identity", "acknowledge", "carrier"]
+    assert events == [
+        "settle", "identity", "settle", "acknowledge", "carrier",
+    ]
 
 
 def test_identity_publication_failure_preserves_retirement_evidence(monkeypatch):
@@ -437,6 +443,92 @@ def test_current_identity_inventory_rejects_extra_and_replaced_audio(tmp_path):
     assert not post_import_finalizer._current_inventory_matches(
         evidence, str(final_dir), relocated=False
     )
+
+
+def test_split_relocation_noop_keeps_action_and_refuses_publication(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "music" / "Other" / "Album"
+    destination = tmp_path / "music" / "Artist" / "Album"
+    source.mkdir(parents=True)
+    destination.mkdir(parents=True)
+    (source / "01.flac").write_bytes(b"source recording")
+    (destination / "01.flac").write_bytes(b"contradictory recording")
+    action = SimpleNamespace(
+        action_id="c" * 64,
+        kind=post_import_finalizer.RelocationKind.SPLIT_GAP_FILL.value,
+        source=str(source),
+        destination=str(destination),
+        expectation={"exact": True},
+        phase=journal.PostImportActionPhase.PLANNED,
+    )
+    retirement = SimpleNamespace(
+        item_id="b" * 64,
+        action=action,
+        final_path=action.destination,
+    )
+    saved = SimpleNamespace(retirements=(retirement,))
+    monkeypatch.setattr(post_import_finalizer, "_require_authority", lambda _a: None)
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "relocate_post_import_album",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            changed=False,
+            operation_id=None,
+            ownership_receipt=None,
+            published_files=0,
+            destination=Path(action.destination),
+            reason="all destination names already exist",
+        ),
+    )
+
+    with pytest.raises(OSError, match="no exact move"):
+        post_import_finalizer._settle_action(saved, retirement, object())
+    assert saved.retirements[0].action is action
+    assert (source / "01.flac").read_bytes() == b"source recording"
+    assert not (destination / MANIFEST_NAME).exists()
+
+
+def test_late_cancel_refuses_durable_identity_publication(monkeypatch):
+    item_id = "b" * 64
+    planned = SimpleNamespace(phase=journal.PostImportActionPhase.PLANNED)
+    committed = SimpleNamespace(phase=journal.PostImportActionPhase.COMMITTED)
+    retirement = SimpleNamespace(
+        item_id=item_id,
+        action=planned,
+        final_path="/music/Artist/Album",
+    )
+    saved = SimpleNamespace(retirements=(retirement,))
+    settled_retirement = SimpleNamespace(
+        item_id=item_id,
+        action=committed,
+        final_path="/music/Artist/Album",
+    )
+    settled = SimpleNamespace(retirements=(settled_retirement,))
+    events = []
+    monkeypatch.setattr(post_import_finalizer, "_require_authority", lambda _a: None)
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "_publish_retirement_identity",
+        lambda *_args, **_kwargs: events.append("identity"),
+    )
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "_settle_action",
+        lambda *_args: events.append("settle") or settled,
+    )
+    checks = iter((False, True))
+
+    with pytest.raises(OSError, match="cancelled"):
+        post_import_finalizer.finalize_carrier_retirement(
+            saved,
+            item_id,
+            authority=object(),
+            acknowledge_completion=None,
+            cancel_check=lambda: next(checks),
+        )
+    assert events == ["settle"]
+    assert settled.retirements[0].action is committed
 
 
 def test_new_durable_item_freezes_multi_artist_filing_policy(monkeypatch):

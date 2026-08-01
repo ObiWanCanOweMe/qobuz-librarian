@@ -154,6 +154,8 @@ def _settle_action(journal, retirement, authority):
             and result.ownership_receipt is None
             and result.published_files == 0
             and str(result.destination) == retirement.final_path
+            and action.kind == RelocationKind.WHOLE_ALBUM.value
+            and result.reason == "there is nothing to relocate"
         ):
             return queue_state.clear_planned_noop_post_import_action(
                 journal,
@@ -354,7 +356,9 @@ def _current_inventory_matches(evidence, final_path: str, *, relocated: bool) ->
     return True
 
 
-def _publish_retirement_identity(journal, retirement, *, authority) -> bool:
+def _publish_retirement_identity(
+    journal, retirement, *, authority, cancel_check=None
+) -> bool:
     """Publish only from the retained exact completion and destination proof."""
     if (
         retirement.planned is None
@@ -473,6 +477,10 @@ def _publish_retirement_identity(journal, retirement, *, authority) -> bool:
         evidence, final_path, relocated=committed_whole_album
     ):
         raise ReleaseManifestError("release destination audio inventory changed")
+    if cancel_check is not None and cancel_check():
+        raise PostImportFinalizationUnavailable(
+            errno.ECANCELED, "queue finalisation was cancelled"
+        )
     _require_authority(authority)
     changed = publish_release_identity(
         Path(final_path),
@@ -493,9 +501,14 @@ def finalize_carrier_retirement(
     *,
     authority: RunLockLease,
     acknowledge_completion,
+    cancel_check=None,
 ):
     """Settle action, external owner, then the exact managed carrier."""
     _require_authority(authority)
+    if cancel_check is not None and cancel_check():
+        raise PostImportFinalizationUnavailable(
+            errno.ECANCELED, "queue finalisation was cancelled"
+        )
     action_was_pending = _retirement(journal, item_id).action is not None
     for _unused in range(4):
         retirement = _retirement(journal, item_id)
@@ -506,6 +519,10 @@ def finalize_carrier_retirement(
         ):
             break
         journal = _settle_action(journal, retirement, authority)
+        if cancel_check is not None and cancel_check():
+            raise PostImportFinalizationUnavailable(
+                errno.ECANCELED, "queue finalisation was cancelled"
+            )
     retirement = _retirement(journal, item_id)
     if (
         retirement.action is not None
@@ -520,7 +537,16 @@ def finalize_carrier_retirement(
 
         clear_scan_caches()
 
-    _publish_retirement_identity(journal, retirement, authority=authority)
+    if cancel_check is not None and cancel_check():
+        raise PostImportFinalizationUnavailable(
+            errno.ECANCELED, "queue finalisation was cancelled"
+        )
+    _publish_retirement_identity(
+        journal,
+        retirement,
+        authority=authority,
+        cancel_check=cancel_check,
+    )
     if retirement.action is not None:
         journal = _settle_action(journal, retirement, authority)
         retirement = _retirement(journal, item_id)
