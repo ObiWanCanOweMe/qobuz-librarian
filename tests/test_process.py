@@ -200,15 +200,31 @@ def test_treat_as_new_downloads_an_owned_album_as_a_separate_edition(monkeypatch
     consolidate_seen = []
     monkeypatch.setattr(proc, "validated_staged_album_dirs",
                         lambda _result: [staging])
+    monkeypatch.setattr(
+        proc,
+        "resolve_album_import_placement",
+        lambda _album, _token: SimpleNamespace(suffix=" [qobuz-ED99]"),
+    )
     monkeypatch.setattr(proc, "beets_import_paths",
-                        lambda *a, **k: consolidate_seen.append(k.get("consolidate")) or True)
+                        lambda *a, **k: consolidate_seen.append((
+                            k.get("consolidate"), k.get("album_path_suffix"))) or True)
 
     assert proc.process_album(album, _args(), token="tok")["result"] == "already_complete"
     assert consolidate_seen == []
 
     result = proc.process_album(album, _args(), token="tok", treat_as_new=True)
     assert result.get("imported") is True
-    assert consolidate_seen == [False]
+    assert consolidate_seen == [(False, " [qobuz-ED99]")]
+
+    def ambiguous(_album, _token):
+        raise proc.AlbumImportIdentityAmbiguous(
+            "identity_ambiguous: friendly path matches multiple Qobuz releases")
+
+    monkeypatch.setattr(proc, "resolve_album_import_placement", ambiguous)
+    result = proc.process_album(album, _args(), token="tok", treat_as_new=True)
+    assert result["result"] == "identity_ambiguous"
+    assert result["imported"] is False
+    assert consolidate_seen == [(False, " [qobuz-ED99]")]
 
 
 def test_auto_downsample_marks_imported_folder_when_album_resolver_misses(

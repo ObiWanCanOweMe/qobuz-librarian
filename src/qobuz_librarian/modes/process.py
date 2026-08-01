@@ -12,7 +12,13 @@ from qobuz_librarian.download import (
     run_album_download,
     validated_staged_album_dirs,
 )
-from qobuz_librarian.integrations.beets import beets_import_paths, staging_preflight
+from qobuz_librarian.integrations.beets import (
+    AlbumImportIdentityAmbiguous,
+    AlbumPlacementAttention,
+    beets_import_paths,
+    resolve_album_import_placement,
+    staging_preflight,
+)
 from qobuz_librarian.integrations.lyrics import (
     _record_post_import_lyric_retry,
     _resolve_signatures_to_paths,
@@ -1178,12 +1184,33 @@ def process_album(album, args, *, allow_force=True, label=None,
             log.info(fmt(C.YELLOW, "\n  Skipping beets import — nothing succeeded."))
         else:
             log.info("")
+            try:
+                placement = resolve_album_import_placement(album, token)
+            except AlbumImportIdentityAmbiguous as exc:
+                log.info(fmt(C.RED, f"  ✗  identity-review: {exc}"))
+                return {
+                    "result": "identity_ambiguous",
+                    "imported": False,
+                    "n_ok": n_ok,
+                    "n_fail": n_fail,
+                    "n_lossy": n_lossy,
+                }
+            except AlbumPlacementAttention as exc:
+                log.info(fmt(C.RED, f"  ✗  identity-review: {exc}"))
+                return {
+                    "result": "identity_attention",
+                    "imported": False,
+                    "n_ok": n_ok,
+                    "n_fail": n_fail,
+                    "n_lossy": n_lossy,
+                }
             # A brand-new album (no folder found on disk) lands in a fresh
             # directory, so it can't split an existing beets album into
             # duplicate rows — skip the full-library de-dup scan for it.
             imported = beets_import_paths(
                 consolidate=album_dir is not None,
                 album_dirs=staged_dirs_for_import,
+                album_path_suffix=placement.suffix,
             )
             if (
                 imported

@@ -27,8 +27,11 @@ from qobuz_librarian.download import (
     validated_staged_album_dirs,
 )
 from qobuz_librarian.integrations.beets import (
+    AlbumImportIdentityAmbiguous,
+    AlbumPlacementAttention,
     _consolidate_duplicate_albums,
     beets_import_albums,
+    resolve_album_import_placement,
     staging_preflight,
 )
 from qobuz_librarian.integrations.downsample_engine import HAVE_DOWNSAMPLE, downsample_dir
@@ -1004,7 +1007,8 @@ def _pre_import_staging_hooks(args, album_dirs=None):
 
 
 def _import_album_with_retry(
-        album_dirs, *, ownership_out=None, source_receipts=None):
+        album_dirs, *, ownership_out=None, source_receipts=None,
+        album_path_suffix: str = ""):
     """Run beets import on ``album_dirs`` with up to ``BEETS_MAX_ATTEMPTS``
     attempts, retrying only on idle-timeout (other failures aren't transient).
     Returns True on import success, False on permanent failure."""
@@ -1018,14 +1022,20 @@ def _import_album_with_retry(
                 tree_matches(receipt) for receipt in source_receipts):
             return False
         if ownership_out is None:
-            kind = beets_import_albums(album_dirs)
+            if album_path_suffix:
+                kind = beets_import_albums(
+                    album_dirs,
+                    album_path_suffix=album_path_suffix,
+                )
+            else:
+                kind = beets_import_albums(album_dirs)
             attempt_capture = None
         else:
             attempt_capture = {}
-            kind = beets_import_albums(
-                album_dirs,
-                ownership_out=attempt_capture,
-            )
+            import_kwargs = {"ownership_out": attempt_capture}
+            if album_path_suffix:
+                import_kwargs["album_path_suffix"] = album_path_suffix
+            kind = beets_import_albums(album_dirs, **import_kwargs)
         if kind == "ok":
             if ownership_out is not None:
                 result = attempt_capture.get("result")
@@ -1142,6 +1152,7 @@ def _reimport_parked_albums():
 _RETRYABLE_STOP_RESULTS = {
     "cancelled", "interrupted", "auth_lost", "disk_full", "io_error",
     "upgrade_aborted_backup_failed", "import_failed",
+    "identity_ambiguous", "identity_attention",
 }
 
 
@@ -1783,7 +1794,7 @@ def _resolve_queue_item(item, args, imported_globally, *, authority=None):
     _stop = item.get("result")
     if _stop in (
             "cancelled", "disk_full", "io_error", "auth_lost",
-            "import_failed"):
+            "import_failed", "identity_ambiguous", "identity_attention"):
         status = _stop
     elif n_ok and n_fail:
         status = "partial"
@@ -2370,7 +2381,25 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
     for idx, item in enumerate(items, 1):
         _require_executor_authority(authority)
         requires_library_backup = queue_item_may_create_library_backup(item)
+        initial_identity_review = None
+        initial_placement = None
+        if not args.no_import:
+            try:
+                initial_placement = resolve_album_import_placement(
+                    item["album"], token)
+            except AlbumImportIdentityAmbiguous as exc:
+                initial_identity_review = ("identity_ambiguous", exc)
+            except AlbumPlacementAttention as exc:
+                initial_identity_review = ("identity_attention", exc)
         plan = plan_durable_new_album(item, args)
+        if (
+            initial_identity_review is not None
+            or (initial_placement is not None and initial_placement.suffix)
+        ):
+            # Managed durable imports intentionally keep their stable ordinary
+            # override. Collision editions use the per-album legacy lane whose
+            # one-shot YAML carries this album's suffix.
+            plan = None
         if plan is not None and not _durable_plan_allowed(
             items,
             item,
@@ -2502,6 +2531,16 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
             raise DurableAlbumUnavailable(
                 "the saved queue item is not yet supported by safe recovery"
             )
+        if initial_identity_review is not None:
+            item["result"] = initial_identity_review[0]
+            log.info(fmt(
+                C.RED,
+                f"  ✗  identity-review: {initial_identity_review[1]}",
+            ))
+            results.append(_resolve_queue_item(
+                item, args, False, authority=authority))
+            _persist()
+            continue
         if requires_library_backup and plan is None:
             raise DurableAlbumUnavailable(
                 "this library-changing queue item is not yet supported by "
@@ -2543,11 +2582,17 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
 
         if plan is not None:
             def _prepare_staged(album_dirs, checkpoint_sources):
-                return _run_pre_import_hooks_for_dirs(
+                prepared = _run_pre_import_hooks_for_dirs(
                     album_dirs,
                     args,
                     on_sources_changed=checkpoint_sources,
                 )
+                current_placement = resolve_album_import_placement(album, token)
+                if current_placement.suffix:
+                    raise AlbumPlacementAttention(
+                        "collision routing changed during durable preparation"
+                    )
+                return prepared
 
             outcome = execute_durable_new_album(
                 queue,
@@ -2769,6 +2814,18 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
                         item, args, False, authority=authority))
                     continue
 
+                identity_review_result = None
+                try:
+                    placement = resolve_album_import_placement(album, token)
+                except AlbumImportIdentityAmbiguous as exc:
+                    identity_review_result = "identity_ambiguous"
+                    placement = None
+                    log.info(fmt(C.RED, f"  ✗  identity-review: {exc}"))
+                except AlbumPlacementAttention as exc:
+                    identity_review_result = "identity_attention"
+                    placement = None
+                    log.info(fmt(C.RED, f"  ✗  identity-review: {exc}"))
+
                 parking_receipts = tuple(
                     capture_tree(directory) for directory in album_dirs)
                 if any(receipt is None for receipt in parking_receipts):
@@ -2778,12 +2835,23 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
                         {} if item.get("_capture_import_ownership") is True
                         else None
                     )
-                    if ownership_capture is None:
-                        item_imported = _import_album_with_retry(album_dirs)
+                    if placement is None:
+                        item_imported = False
+                    elif ownership_capture is None:
+                        if placement.suffix:
+                            item_imported = _import_album_with_retry(
+                                album_dirs,
+                                album_path_suffix=placement.suffix,
+                            )
+                        else:
+                            item_imported = _import_album_with_retry(album_dirs)
                     else:
+                        import_kwargs = {"ownership_out": ownership_capture}
+                        if placement.suffix:
+                            import_kwargs["album_path_suffix"] = placement.suffix
                         item_imported = _import_album_with_retry(
                             album_dirs,
-                            ownership_out=ownership_capture,
+                            **import_kwargs,
                         )
                     if item_imported and ownership_capture is not None:
                         ownership_result = ownership_capture.get("result")
@@ -2814,19 +2882,40 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
                             "after beets; the import was not accepted.",
                         ))
                     item_imported = False
-                    item["result"] = "import_failed"
+                    item["result"] = identity_review_result or "import_failed"
                     retained = retain_download_staging(
-                        item, label="beets-incomplete")
+                        item,
+                        label=(
+                            "identity-review"
+                            if identity_review_result
+                            else "beets-incomplete"
+                        ),
+                    )
                     if retained:
-                        log.info(fmt(
-                            C.YELLOW,
-                            "  ⚠  Kept the exact residual download run in "
-                            "private staging recovery; the queue item remains "
-                            "pending.",
-                        ))
+                        detail = (
+                            "for identity review"
+                            if identity_review_result
+                            else "after the incomplete Beets import"
+                        )
+                        log.info(fmt(C.YELLOW,
+                            "  ⚠  Kept the exact download run in private "
+                            f"staging recovery {detail}; the queue item remains "
+                            "pending."))
                     else:
-                        _move_to_beets_retry(
-                            album_dirs, title, expected=parking_receipts)
+                        route_specific = (
+                            identity_review_result is not None
+                            or (placement is not None and bool(placement.suffix))
+                        )
+                        if route_specific:
+                            log.info(fmt(
+                                C.YELLOW,
+                                "  ⚠  The route-specific staged album was "
+                                "left in place for identity review; it will not "
+                                "enter the ordinary Beets replay batch.",
+                            ))
+                        else:
+                            _move_to_beets_retry(
+                                album_dirs, title, expected=parking_receipts)
         elif args.no_import:
             log.info(fmt(C.YELLOW,
                 f"  --no-import: skipping beets. Files in {cfg.STAGING_DIR}/"))

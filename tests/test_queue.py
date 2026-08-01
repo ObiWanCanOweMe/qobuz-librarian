@@ -4,6 +4,7 @@ import json
 from argparse import Namespace
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,7 +22,7 @@ from qobuz_librarian.queue.persistence import (
 
 def _qitem(title="Test", **overrides):
     defaults = dict(
-        album={"id": "1", "title": title},
+        album={"id": "1", "title": title, "artist": {"name": "Artist"}},
         album_dir=Path(f"/music/{title.lower()}"),
         label=title, missing=[], present=[],
         upgrade_only=False, auto_upgrade=False,
@@ -471,13 +472,24 @@ def test_executor_per_album_isolation_one_album_failure_keeps_others(monkeypatch
     by_label = {"A": "ok", "B": "error", "C": "ok"}
     seen = []
 
-    def fake_import(album_dirs):
+    def fake_import(album_dirs, *, album_path_suffix=""):
         # Map back to the item by its album-dir grandparent name ("Artist-X").
         artist = album_dirs[0].parent.name.split("-")[-1]
-        seen.append(artist)
+        seen.append((artist, album_path_suffix))
         return by_label[artist]
 
     monkeypatch.setattr(executor, "beets_import_albums", fake_import)
+    monkeypatch.setattr(
+        executor,
+        "resolve_album_import_placement",
+        lambda album, _token: SimpleNamespace(
+            suffix=" [qobuz-B]" if album["id"] == "B" else ""),
+    )
+    monkeypatch.setattr(
+        executor,
+        "plan_durable_new_album",
+        lambda item, _args: object() if item["album"]["id"] == "B" else None,
+    )
     monkeypatch.setattr(
         executor, "retire_empty_download_staging", lambda _item: True)
     monkeypatch.setattr(
@@ -497,17 +509,17 @@ def test_executor_per_album_isolation_one_album_failure_keeps_others(monkeypatch
                      consolidate=False)
     results, drained = executor._execute_download_queue(items, args, token=None)
 
-    assert seen == ["A", "B", "C"]
+    assert seen == [("A", ""), ("B", " [qobuz-B]"), ("C", "")]
     assert [r["imported"] for r in results] == [True, False, True]
-    # B's staged folder got parked; A and C's are still where the test left
-    # them (beets would have moved them in real life, but we stubbed it out).
-    assert not (staging / "Artist-B" / "Album B").exists()
+    # A route-specific failure stays attached to its queue item and never enters
+    # the generic unsuffixed replay batch.
+    assert (staging / "Artist-B" / "Album B").exists()
     from qobuz_librarian.integrations.staging import list_groups
     parked = [
         tree for group in list_groups(kind="beets") for tree in group.trees
         if tree.original_relative.endswith("Album B")
     ]
-    assert len(parked) == 1
+    assert parked == []
     assert [item["label"] for item in items] == ["B"]
     assert drained is False
 
@@ -609,6 +621,64 @@ def test_import_with_required_ownership_rejects_missing_receipt(monkeypatch):
     assert executor._import_album_with_retry(
         [Path("/staging/album")]
     ) is True
+
+
+def test_import_retry_keeps_one_album_collision_suffix(monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.queue import executor
+
+    monkeypatch.setattr(cfg, "BEETS_MAX_ATTEMPTS", 2)
+    monkeypatch.setattr(cfg, "BEETS_RETRY_PAUSE", 0)
+    seen = []
+
+    def import_album(_dirs, *, album_path_suffix=""):
+        seen.append(album_path_suffix)
+        return "timeout" if len(seen) == 1 else "ok"
+
+    monkeypatch.setattr(executor, "beets_import_albums", import_album)
+
+    assert executor._import_album_with_retry(
+        [Path("/staging/album")],
+        album_path_suffix=" [qobuz-200]",
+    ) is True
+    assert seen == [" [qobuz-200]", " [qobuz-200]"]
+
+
+def test_executor_ambiguous_identity_stops_before_download_or_beets(monkeypatch):
+    from qobuz_librarian.queue import executor
+
+    item = _qitem("Ambiguous", album_dir=None)
+    queue = [item]
+    started = []
+
+    def ambiguous(_album, _token):
+        raise executor.AlbumImportIdentityAmbiguous(
+            "identity_ambiguous: friendly path matches multiple Qobuz releases")
+
+    monkeypatch.setattr(executor, "resolve_album_import_placement", ambiguous)
+    monkeypatch.setattr(executor, "staging_preflight", lambda _args: None)
+    monkeypatch.setattr(executor, "_reimport_parked_albums", lambda: (False, []))
+    monkeypatch.setattr(
+        executor, "_download_for_queue_item", lambda _item: started.append("download"))
+    monkeypatch.setattr(
+        executor, "beets_import_albums", lambda *_args, **_kwargs: started.append("beets"))
+    monkeypatch.setattr(
+        executor,
+        "_resolve_queue_item",
+        lambda current, _args, imported, *, authority=None: {
+            "result": current["result"],
+            "imported": imported,
+        },
+    )
+
+    args = Namespace(
+        dry_run=False, no_import=False, no_downsample=True, consolidate=False)
+    results, drained = executor._execute_download_queue(queue, args, token="tok")
+
+    assert results == [{"result": "identity_ambiguous", "imported": False}]
+    assert started == []
+    assert queue == [item]
+    assert drained is False
 
 
 def test_executor_stops_when_queue_progress_cannot_be_persisted(

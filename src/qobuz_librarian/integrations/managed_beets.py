@@ -70,6 +70,10 @@ def _inspect_config():
         "musicbrainz_enabled": (
             resolved["musicbrainz"].flatten().get("enabled")
         ),
+        "paths": {
+            key: resolved["paths"][key].as_str()
+            for key in ("default", "comp", "singleton")
+        },
     }
     encoded = json.dumps(
         payload,
