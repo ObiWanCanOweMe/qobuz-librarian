@@ -5780,9 +5780,14 @@ def _resume_companion_carry(backup, replacement_path,
         ):
             return None
         supplied = _canonical_receipt(expected_replacement_receipt)
-        if supplied != intent["pre_receipt"] and (
-            committed is None
-            or supplied != committed["post_receipt"]
+        # A durable rename can make an uncommitted READY transaction differ
+        # from PRE.  Admit only that case to the READY-bound partial-tree proof
+        # below; committed transactions still accept only PRE or POST.
+        resuming_partial = (
+            committed is None and supplied != intent["pre_receipt"])
+        if committed is not None and (
+            supplied != intent["pre_receipt"]
+            and supplied != committed["post_receipt"]
         ):
             return None
 
@@ -5870,6 +5875,10 @@ def _resume_companion_carry(backup, replacement_path,
                 ready,
                 public_relatives,
                 include_directory_mtime=False,
+        ):
+            return None
+        if resuming_partial and (
+            _album_source_receipt_from_opened(*album_opened) != supplied
         ):
             return None
 
@@ -6181,7 +6190,9 @@ def carry_backup_companions(
                 return None
         elif _canonical_receipt(expected_replacement_receipt) != (
                 intent["pre_receipt"]):
-            if not ready_present or committed is None or (
+            if not ready_present:
+                return None
+            if committed is not None and (
                     _canonical_receipt(expected_replacement_receipt)
                     != committed["post_receipt"]):
                 return None
