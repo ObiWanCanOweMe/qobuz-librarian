@@ -33,8 +33,10 @@ from qobuz_librarian.library.post_import_relocation import (
 )
 from qobuz_librarian.library.release_identity import (
     ReleaseManifestError,
+    capture_directory_path_receipt,
+    directory_path_receipt_matches,
     publish_release_identity,
-    read_release_identity,
+    read_release_identity_with_receipt,
 )
 from qobuz_librarian.queue import journal as queue_state
 from qobuz_librarian.run_lock import RunLockLease
@@ -303,9 +305,17 @@ def _acknowledge_completion(journal, retirement, acknowledge_completion):
     )
 
 
-def _current_inventory_matches(evidence, final_path: str, *, relocated: bool) -> bool:
+def _current_inventory_matches(
+    evidence,
+    final_path: str,
+    *,
+    relocated: bool,
+    path_receipt=None,
+) -> bool:
     """Recheck exact audio bytes at the settled path immediately before publish."""
     inventory = evidence.inventory
+    if path_receipt is not None and not directory_path_receipt_matches(path_receipt):
+        return False
     if inventory is None or inventory.path != evidence.album_path:
         return False
     album_parts = PurePosixPath(evidence.album_path).parts
@@ -359,7 +369,10 @@ def _current_inventory_matches(evidence, final_path: str, *, relocated: bool) ->
             or (not relocated and identity != receipt.identity)
         ):
             return False
-    return True
+    return (
+        path_receipt is None
+        or directory_path_receipt_matches(path_receipt)
+    )
 
 
 def _publish_retirement_identity(
@@ -434,26 +447,31 @@ def _publish_retirement_identity(
             errno.EINVAL, "the settled release path does not match relocation"
         )
     try:
-        directory = os.lstat(final_path)
-    except OSError as exc:
+        path_receipt = capture_directory_path_receipt(Path(final_path))
+    except (ReleaseManifestError, OSError) as exc:
         raise ReleaseManifestError("release destination is unavailable") from exc
-    if not stat.S_ISDIR(directory.st_mode) or stat.S_ISLNK(directory.st_mode):
+    directory_identity = path_receipt.directory_identity
+    if not path_receipt.exists or directory_identity is None:
         raise ReleaseManifestError(
             "release destination does not match completed album identity"
         )
     relocated_after_publication = action is None and final_path != completion_path
     if relocated_after_publication:
-        if not _current_inventory_matches(evidence, final_path, relocated=True):
+        if not _current_inventory_matches(
+            evidence,
+            final_path,
+            relocated=True,
+            path_receipt=path_receipt,
+        ):
             raise ReleaseManifestError("release destination audio inventory changed")
         _require_authority(authority)
-        existing = read_release_identity(Path(final_path))
-        after_read = os.lstat(final_path)
+        existing, identity_receipt = read_release_identity_with_receipt(
+            Path(final_path)
+        )
         if (
-            existing != completion_input.release_identity
-            or not stat.S_ISDIR(after_read.st_mode)
-            or stat.S_ISLNK(after_read.st_mode)
-            or (after_read.st_dev, after_read.st_ino)
-            != (directory.st_dev, directory.st_ino)
+            not directory_path_receipt_matches(path_receipt)
+            or identity_receipt != path_receipt
+            or existing != completion_input.release_identity
         ):
             # A committed whole-album relocation can clear its retained receipt
             # only after publication. Once cleared, the held same-directory
@@ -465,8 +483,7 @@ def _publish_retirement_identity(
         _require_authority(authority)
         return False
     node_matches_completion = (
-        (directory.st_dev, directory.st_ino)
-        == evidence.album_identity[:2]
+        directory_identity == evidence.album_identity[:2]
     )
     committed_whole_album = (
         action is not None
@@ -480,7 +497,10 @@ def _publish_retirement_identity(
             "release destination does not match completed album identity"
         )
     if not _current_inventory_matches(
-        evidence, final_path, relocated=committed_whole_album
+        evidence,
+        final_path,
+        relocated=committed_whole_album,
+        path_receipt=path_receipt,
     ):
         raise ReleaseManifestError("release destination audio inventory changed")
     if cancel_check is not None and cancel_check():
@@ -491,11 +511,15 @@ def _publish_retirement_identity(
     changed = publish_release_identity(
         Path(final_path),
         completion_input.release_identity,
-        expected_directory=(directory.st_dev, directory.st_ino),
+        expected_directory=directory_identity,
+        expected_path_receipt=path_receipt,
     )
     _require_authority(authority)
     if not _current_inventory_matches(
-        evidence, final_path, relocated=committed_whole_album
+        evidence,
+        final_path,
+        relocated=committed_whole_album,
+        path_receipt=path_receipt,
     ):
         raise ReleaseManifestError("release destination audio inventory changed")
     return changed

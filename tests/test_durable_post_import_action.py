@@ -408,7 +408,49 @@ def test_committed_whole_album_relocation_publishes_at_new_directory_identity(
     assert not post_import_finalizer._publish_retirement_identity(
         saved, retirement, authority=object()
     )
-    assert authority_checks == ["check", "check", "check", "check"]
+
+    # A retry must bind the identity read to the same public path receipt.
+    # Swap a manifested B into A for the read, then restore unmarked A before
+    # the final pathname check: comparing only the identity and old receipt
+    # would acknowledge B's identity as though it had been read from A.
+    (destination / MANIFEST_NAME).unlink()
+    alternate = tmp_path / "alternate"
+    held_destination = tmp_path / "held-destination"
+    alternate.mkdir()
+    publish_release_identity(alternate, identity)
+    real_receipt_matches = (
+        post_import_finalizer.directory_path_receipt_matches
+    )
+
+    def swap_for_identity_read(*_args, **_kwargs):
+        destination.rename(held_destination)
+        alternate.rename(destination)
+        return True
+
+    def restore_then_match(receipt):
+        destination.rename(alternate)
+        held_destination.rename(destination)
+        return real_receipt_matches(receipt)
+
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "_current_inventory_matches",
+        swap_for_identity_read,
+    )
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "directory_path_receipt_matches",
+        restore_then_match,
+    )
+
+    with pytest.raises(ReleaseManifestError, match="unavailable after publication"):
+        post_import_finalizer._publish_retirement_identity(
+            saved, retirement, authority=object()
+        )
+
+    assert read_release_identity(destination) is None
+    assert read_release_identity(alternate) == identity
+    assert authority_checks == ["check"] * 5
 
 
 def test_current_identity_inventory_rejects_extra_and_replaced_audio(tmp_path):

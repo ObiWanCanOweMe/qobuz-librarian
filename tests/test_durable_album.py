@@ -8,7 +8,8 @@ from qobuz_librarian.completion import (
     RecoveryOwner,
     StagedBinding,
 )
-from qobuz_librarian.library.release_identity import ReleaseIdentity
+from qobuz_librarian.library.album_placement import resolve_album_placement
+from qobuz_librarian.library.release_identity import ReleaseIdentity, publish_release_identity
 from qobuz_librarian.queue.durable_album import (
     completion_input_from_download,
     initial_completion_input,
@@ -68,21 +69,28 @@ def test_durable_new_album_plan_refuses_existing_or_partial_work():
     ) is None
 
 
-def test_durable_new_album_plan_freezes_collision_suffix():
+def test_durable_new_album_plan_freezes_collision_suffix(tmp_path):
     album = _album()
+    friendly = tmp_path / "music" / "Artist" / "Album"
+    friendly.mkdir(parents=True)
+    publish_release_identity(friendly, ReleaseIdentity("qobuz", "100"))
+    placement = resolve_album_placement(
+        friendly, ReleaseIdentity("qobuz", "42"))
 
     plan = plan_durable_new_album(
         _item(album),
         Namespace(no_import=False),
-        album_path_suffix=" [qobuz-200]",
-        release_identity=ReleaseIdentity("qobuz", "42"),
-        placement_destination="/music/Artist/Album [qobuz-42]",
+        album_path_suffix=placement.suffix,
+        release_identity=placement.identity,
+        placement_destination=placement.destination,
+        placement=placement,
     )
 
     assert plan is not None
-    assert plan.album_path_suffix == " [qobuz-200]"
+    assert plan.album_path_suffix == " [qobuz-42]"
     assert plan.release_identity == ReleaseIdentity("qobuz", "42")
-    assert plan.placement_destination == "/music/Artist/Album [qobuz-42]"
+    assert plan.placement_destination == str(placement.destination)
+    assert plan.placement == placement
     assert initial_completion_input(
         plan,
         RecoveryOwner("a" * 64, "b" * 64),

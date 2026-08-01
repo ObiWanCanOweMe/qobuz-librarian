@@ -23,6 +23,10 @@ from qobuz_librarian.completion import (
     normalise_album_id,
 )
 from qobuz_librarian.download import album_track_slots
+from qobuz_librarian.library.album_placement import (
+    AlbumPlacement,
+    album_placement_is_current,
+)
 from qobuz_librarian.library.catalog import is_lossless_album
 from qobuz_librarian.library.release_identity import ReleaseIdentity
 from qobuz_librarian.quality.decision import album_max_quality
@@ -38,6 +42,7 @@ class DurableNewAlbumPlan:
     album_path_suffix: str = ""
     release_identity: ReleaseIdentity | None = None
     placement_destination: str | None = None
+    placement: AlbumPlacement | None = None
 
 
 def _full_album_gap_fill(item, tracks) -> bool:
@@ -97,7 +102,8 @@ def queue_item_may_create_library_backup(item) -> bool:
 def plan_durable_new_album(
         item, args, *, album_path_suffix: str = "",
         release_identity: ReleaseIdentity | None = None,
-        placement_destination=None) -> DurableNewAlbumPlan | None:
+        placement_destination=None,
+        placement: AlbumPlacement | None = None) -> DurableNewAlbumPlan | None:
     """Freeze one full-album lane the live completion proof can authorise."""
     if (
         type(item) is not dict
@@ -159,6 +165,16 @@ def plan_durable_new_album(
             != placement_destination
         ):
             return None
+        if placement is not None and (
+            not isinstance(placement, AlbumPlacement)
+            or not album_placement_is_current(placement)
+            or placement.suffix != album_path_suffix
+            or placement.identity != release_identity
+            or os.fspath(placement.destination) != placement_destination
+        ):
+            return None
+    elif placement is not None:
+        return None
     if effective_tier not in (2, 3, 4):
         return None
     bits, rate = album_max_quality(album, effective_tier)
@@ -186,6 +202,7 @@ def plan_durable_new_album(
         album_path_suffix,
         release_identity,
         placement_destination,
+        placement,
     )
 
 

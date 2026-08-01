@@ -30,8 +30,10 @@ from qobuz_librarian.integrations.staging import (
     StagingReferenceInspection,
     StagingReferenceStatus,
 )
+from qobuz_librarian.library.album_placement import resolve_album_placement
 from qobuz_librarian.library.release_identity import (
     ReleaseIdentity,
+    publish_release_identity,
     read_release_identity,
 )
 from qobuz_librarian.queue import durable_runner
@@ -70,6 +72,84 @@ def _single_track_item(label):
         auto_upgrade=False,
         quality=4,
     )
+
+
+def test_durable_import_refuses_a_changed_planned_path_before_mutation(
+        tmp_path, monkeypatch, authority):
+    from qobuz_librarian.queue.durable_runner import DurableAlbumUnavailable
+
+    monkeypatch.setattr(cfg, "QUEUE_JOURNAL_DIR", tmp_path / "journals")
+    item = _single_track_item("Bound Album")
+    args = Namespace(no_import=False)
+    friendly = tmp_path / "music" / "Artist" / "Bound Album"
+    friendly.parent.mkdir(parents=True)
+    placement = resolve_album_placement(
+        friendly, ReleaseIdentity("qobuz", "42"))
+    plan = plan_durable_new_album(
+        item,
+        args,
+        album_path_suffix=placement.suffix,
+        release_identity=placement.identity,
+        placement_destination=placement.destination,
+        placement=placement,
+    )
+    assert plan is not None
+
+    friendly.mkdir()
+    publish_release_identity(friendly, placement.identity)
+    started = []
+    monkeypatch.setattr(
+        durable_runner, "snapshot_staging", lambda: started.append("snapshot"))
+
+    with pytest.raises(DurableAlbumUnavailable, match="path binding changed"):
+        durable_runner.execute_durable_new_album(
+            [item],
+            item,
+            args,
+            plan=plan,
+            origin=CompletionOrigin(CompletionOriginKind.CLI, "album queue"),
+            mode="cli:album",
+            authority=authority,
+        )
+
+    assert started == []
+    assert queue_state.list_queue_journals() == ()
+
+
+def test_durable_upgrade_rebinds_placement_after_owned_source_retirement(
+        tmp_path):
+    item = _single_track_item("Upgrade Album")
+    args = Namespace(no_import=False)
+    friendly = tmp_path / "music" / "Artist" / "Upgrade Album"
+    friendly.mkdir(parents=True)
+    identity = ReleaseIdentity("qobuz", "42")
+    publish_release_identity(friendly, identity)
+    placement = resolve_album_placement(friendly, identity)
+    item["album_dir"] = friendly
+    item["auto_upgrade"] = True
+    plan = plan_durable_new_album(
+        item,
+        args,
+        album_path_suffix=placement.suffix,
+        release_identity=placement.identity,
+        placement_destination=placement.destination,
+        placement=placement,
+    )
+    assert plan is not None
+    assert plan.library_backup_kind == "upgrade"
+
+    friendly.rename(tmp_path / "owned-upgrade-backup")
+    refreshed = durable_runner._refresh_plan_after_upgrade_backup(
+        item,
+        args,
+        plan,
+    )
+
+    assert refreshed.placement is not None
+    assert refreshed.placement.destination == friendly
+    assert refreshed.placement.destination_receipt is not None
+    assert refreshed.placement.destination_receipt.exists is False
+    durable_runner._require_current_plan(item, args, refreshed)
 
 
 def test_download_quarantine_checkpoint_is_persisted_before_error_propagates(
@@ -302,8 +382,12 @@ def test_durable_collision_suffix_reaches_managed_import_with_completion_proof(
     monkeypatch.setattr(cfg, "QUEUE_JOURNAL_DIR", tmp_path / "journals")
     monkeypatch.setattr(cfg, "BEETS_DB_PATH", beets_dir / "library.db")
     monkeypatch.setattr(cfg, "MUSIC_ROOT", tmp_path / "music")
-    final_dir = tmp_path / "music" / "Artist" / "Safe Album [qobuz-42]"
-    final_dir.mkdir(parents=True)
+    friendly = tmp_path / "music" / "Artist" / "Safe Album"
+    friendly.mkdir(parents=True)
+    publish_release_identity(friendly, ReleaseIdentity("qobuz", "100"))
+    placement = resolve_album_placement(
+        friendly, ReleaseIdentity("qobuz", "42"))
+    final_dir = placement.destination
 
     item = _single_track_item("Safe Album")
     queue = [item]
@@ -311,9 +395,10 @@ def test_durable_collision_suffix_reaches_managed_import_with_completion_proof(
     plan = plan_durable_new_album(
         item,
         args,
-        album_path_suffix=" [qobuz-42]",
-        release_identity=ReleaseIdentity("qobuz", "42"),
-        placement_destination=final_dir,
+        album_path_suffix=placement.suffix,
+        release_identity=placement.identity,
+        placement_destination=placement.destination,
+        placement=placement,
     )
     assert plan is not None
 
@@ -392,6 +477,7 @@ def test_durable_collision_suffix_reaches_managed_import_with_completion_proof(
     ):
         observed["album_path_suffix"] = album_path_suffix
         authority_check()
+        final_dir.mkdir()
         reservation = {
             "version": 1,
             "path": str(beets_dir / f".qobuz-managed-beets-{nonce}.jsonl"),

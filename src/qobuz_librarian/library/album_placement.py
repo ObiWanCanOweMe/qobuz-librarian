@@ -9,9 +9,11 @@ from pathlib import Path
 
 from qobuz_librarian.library.migrate import _truncate_component
 from qobuz_librarian.library.release_identity import (
+    DirectoryPathReceipt,
     ReleaseIdentity,
     ReleaseManifestError,
-    read_release_identity,
+    capture_directory_path_receipt,
+    read_release_identity_with_receipt,
 )
 
 
@@ -29,6 +31,8 @@ class AlbumPlacement:
     destination: Path
     disposition: PlacementDisposition
     suffix: str
+    friendly_receipt: DirectoryPathReceipt | None = None
+    destination_receipt: DirectoryPathReceipt | None = None
 
 
 class AlbumPlacementAttention(OSError):
@@ -67,17 +71,20 @@ def collision_album_path(friendly_path: Path, identity: ReleaseIdentity) -> Path
     return friendly_path.with_name(stem + suffix)
 
 
-def _path_is_occupied(path: Path) -> bool:
+def _path_receipt(path: Path, *, role: str) -> DirectoryPathReceipt:
     try:
-        path.lstat()
-    except FileNotFoundError:
-        return False
-    return True
+        return capture_directory_path_receipt(path)
+    except (ReleaseManifestError, OSError) as exc:
+        raise AlbumPlacementAttention(
+            f"{role} path occupancy could not be examined"
+        ) from exc
 
 
-def _manifest_identity(path: Path, *, role: str) -> ReleaseIdentity | None:
+def _manifest_identity(
+    path: Path, *, role: str
+) -> tuple[ReleaseIdentity | None, DirectoryPathReceipt]:
     try:
-        return read_release_identity(path)
+        return read_release_identity_with_receipt(path)
     except (ReleaseManifestError, OSError) as exc:
         raise AlbumPlacementAttention(
             f"{role} path is occupied but cannot provide a valid release manifest"
@@ -89,9 +96,19 @@ def _placement(
     friendly_path: Path,
     destination: Path,
     disposition: PlacementDisposition,
+    friendly_receipt: DirectoryPathReceipt,
+    destination_receipt: DirectoryPathReceipt,
 ) -> AlbumPlacement:
     suffix = "" if destination == friendly_path else qobuz_collision_suffix(identity)
-    return AlbumPlacement(identity, friendly_path, destination, disposition, suffix)
+    return AlbumPlacement(
+        identity,
+        friendly_path,
+        destination,
+        disposition,
+        suffix,
+        friendly_receipt,
+        destination_receipt,
+    )
 
 
 def resolve_album_placement(
@@ -106,15 +123,19 @@ def resolve_album_placement(
     is reusable only with the exact adoption proof supplied by discovery.
     """
     friendly_path = Path(friendly_path)
-    if not _path_is_occupied(friendly_path):
+    friendly_receipt = _path_receipt(friendly_path, role="friendly")
+    if not friendly_receipt.exists:
         return _placement(
             identity,
             friendly_path,
             friendly_path,
             PlacementDisposition.NEW,
+            friendly_receipt,
+            friendly_receipt,
         )
 
-    friendly_identity = _manifest_identity(friendly_path, role="friendly")
+    friendly_identity, friendly_receipt = _manifest_identity(
+        friendly_path, role="friendly")
     if friendly_identity is None:
         if adopted_identity == identity:
             return _placement(
@@ -122,6 +143,8 @@ def resolve_album_placement(
                 friendly_path,
                 friendly_path,
                 PlacementDisposition.ADOPTED,
+                friendly_receipt,
+                friendly_receipt,
             )
         raise AlbumPlacementAttention("friendly path is occupied and unmarked")
     if friendly_identity == identity:
@@ -130,23 +153,83 @@ def resolve_album_placement(
             friendly_path,
             friendly_path,
             PlacementDisposition.SAME_RELEASE,
+            friendly_receipt,
+            friendly_receipt,
         )
 
     destination = collision_album_path(friendly_path, identity)
-    if not _path_is_occupied(destination):
+    destination_receipt = _path_receipt(destination, role="collision")
+    if not destination_receipt.exists:
         return _placement(
             identity,
             friendly_path,
             destination,
             PlacementDisposition.COLLISION,
+            friendly_receipt,
+            destination_receipt,
         )
 
-    destination_identity = _manifest_identity(destination, role="collision")
+    destination_identity, destination_receipt = _manifest_identity(
+        destination, role="collision")
     if destination_identity == identity:
         return _placement(
             identity,
             friendly_path,
             destination,
             PlacementDisposition.COLLISION,
+            friendly_receipt,
+            destination_receipt,
         )
     raise AlbumPlacementAttention("collision path is occupied by another release")
+
+
+def album_placement_is_current(placement: AlbumPlacement) -> bool:
+    """Re-resolve and compare the exact path bindings carried by *placement*."""
+    if (
+        not isinstance(placement, AlbumPlacement)
+        or placement.friendly_receipt is None
+        or placement.destination_receipt is None
+    ):
+        return False
+    adopted = (
+        placement.identity
+        if placement.disposition is PlacementDisposition.ADOPTED
+        else None
+    )
+    try:
+        current = resolve_album_placement(
+            placement.friendly_path,
+            placement.identity,
+            adopted_identity=adopted,
+        )
+    except (AlbumPlacementAttention, OSError, ValueError):
+        return False
+    return (
+        current.identity == placement.identity
+        and current.friendly_path == placement.friendly_path
+        and current.destination == placement.destination
+        and current.suffix == placement.suffix
+        and current.friendly_receipt == placement.friendly_receipt
+        and current.destination_receipt == placement.destination_receipt
+    )
+
+
+def require_album_placement_current(placement: AlbumPlacement) -> None:
+    """Fail closed unless the exact reviewed placement still names its paths."""
+    if not album_placement_is_current(placement):
+        raise AlbumPlacementAttention(
+            "release placement path binding changed before import"
+        )
+
+
+def album_placement_requires_publication(placement: AlbumPlacement) -> bool:
+    """Whether safe completion must publish the destination's first manifest."""
+    if (
+        not isinstance(placement, AlbumPlacement)
+        or placement.destination_receipt is None
+    ):
+        return False
+    return (
+        not placement.destination_receipt.exists
+        or placement.disposition is PlacementDisposition.ADOPTED
+    )

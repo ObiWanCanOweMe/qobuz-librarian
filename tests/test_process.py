@@ -6,8 +6,7 @@ import pytest
 from qobuz_librarian import config as cfg
 from qobuz_librarian import run_lock
 from qobuz_librarian.library.album_placement import (
-    AlbumPlacement,
-    PlacementDisposition,
+    resolve_album_placement,
 )
 from qobuz_librarian.library.release_identity import (
     MANIFEST_NAME,
@@ -41,13 +40,12 @@ def _patch_download_receipts(monkeypatch, download, added, run_root):
     monkeypatch.setattr(download, "create_staging_run", lambda: run)
 
 
-def _adopted_placement(album_dir):
-    return AlbumPlacement(
-        identity=ReleaseIdentity("qobuz", "ALB"),
-        friendly_path=album_dir,
-        destination=album_dir,
-        disposition=PlacementDisposition.ADOPTED,
-        suffix="",
+def _adopted_placement(album_dir, release_id="ALB"):
+    identity = ReleaseIdentity("qobuz", release_id)
+    return resolve_album_placement(
+        album_dir,
+        identity,
+        adopted_identity=identity,
     )
 
 
@@ -313,7 +311,7 @@ def test_process_publishes_identity_only_after_exact_import_proof(
     monkeypatch.setattr(proc, "find_album_dir_filesystem", lambda _album: None)
     monkeypatch.setattr(proc, "staging_preflight", lambda _args: None)
     monkeypatch.setattr(proc, "snapshot_staging", lambda: set())
-    state = {"imported": False}
+    state = {"imported": False, "placement_revalidated": False}
     monkeypatch.setattr(
         proc,
         "is_cancel_requested",
@@ -349,7 +347,13 @@ def test_process_publishes_identity_only_after_exact_import_proof(
     monkeypatch.setattr(
         proc,
         "resolve_album_import_placement",
-        lambda _album, _token: SimpleNamespace(suffix="", destination=final_dir),
+        lambda _album, _token: _adopted_placement(final_dir, "200"),
+    )
+    monkeypatch.setattr(
+        proc,
+        "require_album_placement_current",
+        lambda _placement: state.update(placement_revalidated=True),
+        raising=False,
     )
     monkeypatch.setattr(proc, "write_post_import_sidecars", lambda _dirs: None)
     monkeypatch.setattr(proc, "sweep_staging_artwork", lambda: None)
@@ -391,6 +395,7 @@ def test_process_publishes_identity_only_after_exact_import_proof(
 
     def import_album(*_args, **_kwargs):
         assert not (final_dir / MANIFEST_NAME).exists()
+        assert state["placement_revalidated"] is True
         state["imported"] = beets_succeeds
         return beets_succeeds
 

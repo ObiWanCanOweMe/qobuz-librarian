@@ -52,6 +52,11 @@ from qobuz_librarian.integrations.staging import (
     reconcile_imported_group,
     tree_matches,
 )
+from qobuz_librarian.library.album_placement import (
+    AlbumPlacement,
+    album_placement_requires_publication,
+    require_album_placement_current,
+)
 from qobuz_librarian.library.backup import (
     backup_album_dir,
     capture_album_source_receipt,
@@ -2400,6 +2405,7 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
                 album_path_suffix=initial_placement.suffix,
                 release_identity=initial_placement.identity,
                 placement_destination=initial_placement.destination,
+                placement=initial_placement,
             )
         else:
             plan = plan_durable_new_album(item, args)
@@ -2410,6 +2416,24 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
             web_album_id=web_album_id,
         ):
             plan = None
+        tracks = (
+            (item.get("album") or {}).get("tracks") or {}
+        ).get("items")
+        if (
+            initial_identity_review is None
+            and plan is None
+            and isinstance(initial_placement, AlbumPlacement)
+            and isinstance(tracks, list)
+            and bool(tracks)
+            and album_placement_requires_publication(initial_placement)
+        ):
+            initial_identity_review = (
+                "identity_attention",
+                AlbumPlacementAttention(
+                    "release identity finalization is unavailable for this "
+                    "non-durable queue import; the queue item was retained"
+                ),
+            )
 
         recovered_completion = {}
 
@@ -2596,10 +2620,16 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
                     or current_placement.identity != plan.release_identity
                     or os.fspath(current_placement.destination)
                     != plan.placement_destination
+                    or (
+                        plan.placement is not None
+                        and current_placement != plan.placement
+                    )
                 ):
                     raise AlbumPlacementAttention(
                         "release placement changed during durable preparation"
                     )
+                if isinstance(current_placement, AlbumPlacement):
+                    require_album_placement_current(current_placement)
                 return prepared
 
             outcome = execute_durable_new_album(
@@ -2825,6 +2855,18 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
                 identity_review_result = None
                 try:
                     placement = resolve_album_import_placement(album, token)
+                    if isinstance(placement, AlbumPlacement):
+                        require_album_placement_current(placement)
+                        if (
+                            isinstance(tracks, list)
+                            and bool(tracks)
+                            and album_placement_requires_publication(placement)
+                        ):
+                            raise AlbumPlacementAttention(
+                                "release identity finalization is unavailable "
+                                "for this non-durable queue import; the queue "
+                                "item was retained"
+                            )
                 except AlbumImportIdentityAmbiguous as exc:
                     identity_review_result = "identity_ambiguous"
                     placement = None

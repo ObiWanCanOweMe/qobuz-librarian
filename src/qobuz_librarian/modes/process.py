@@ -1,7 +1,6 @@
 """Core album processing — detect gaps, prompt, download, import, consolidate."""
 import math
 import os
-import stat
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,6 +34,10 @@ from qobuz_librarian.integrations.rip import (
     is_cancel_requested,
     snapshot_staging,
 )
+from qobuz_librarian.library.album_placement import (
+    AlbumPlacement,
+    require_album_placement_current,
+)
 from qobuz_librarian.library.backup import (
     backup_album_dir,
     capture_album_source_receipt,
@@ -65,6 +68,7 @@ from qobuz_librarian.library.catalog import (
 )
 from qobuz_librarian.library.release_identity import (
     ReleaseManifestError,
+    capture_directory_path_receipt,
     identity_from_album,
     publish_release_identity,
 )
@@ -140,10 +144,10 @@ def finalize_release_identity(
             "release finalization did not reach the planned destination"
         )
     try:
-        directory = os.lstat(final_path)
-    except OSError as exc:
+        path_receipt = capture_directory_path_receipt(Path(final_path))
+    except (ReleaseManifestError, OSError) as exc:
         raise ReleaseManifestError("release destination is unavailable") from exc
-    if not stat.S_ISDIR(directory.st_mode) or stat.S_ISLNK(directory.st_mode):
+    if not path_receipt.exists or path_receipt.directory_identity is None:
         raise ReleaseManifestError("release destination is not an exact directory")
     if type(authority) is not run_lock.RunLockLease or authority.intact() is not True:
         raise ReleaseManifestError("the shared run lock was lost before publication")
@@ -152,7 +156,8 @@ def finalize_release_identity(
     changed = publish_release_identity(
         Path(final_path),
         identity,
-        expected_directory=(directory.st_dev, directory.st_ino),
+        expected_directory=path_receipt.directory_identity,
+        expected_path_receipt=path_receipt,
     )
     if authority.intact() is not True:
         raise ReleaseManifestError("the shared run lock was lost during publication")
@@ -1360,6 +1365,8 @@ def process_album(album, args, *, allow_force=True, label=None,
             log.info("")
             try:
                 placement = resolve_album_import_placement(album, token)
+                if isinstance(placement, AlbumPlacement):
+                    require_album_placement_current(placement)
             except AlbumImportIdentityAmbiguous as exc:
                 log.info(fmt(C.RED, f"  ✗  identity-review: {exc}"))
                 return {

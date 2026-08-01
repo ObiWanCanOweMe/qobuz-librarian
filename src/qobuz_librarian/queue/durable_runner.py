@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 
@@ -39,6 +39,11 @@ from qobuz_librarian.integrations.staging import (
     inspect_staging_group_reference,
     inspect_staging_run_reference,
     isolated_staging_run_names,
+)
+from qobuz_librarian.library.album_placement import (
+    AlbumPlacementAttention,
+    require_album_placement_current,
+    resolve_album_placement,
 )
 from qobuz_librarian.library.backup import (
     backup_album_dir,
@@ -108,17 +113,66 @@ def _require_authority(authority: RunLockLease) -> None:
 
 
 def _require_current_plan(item, args, plan: DurableNewAlbumPlan) -> None:
+    if type(plan) is not DurableNewAlbumPlan:
+        raise DurableAlbumUnavailable(
+            "the album no longer matches the durable download plan"
+        )
+    if plan.placement is not None:
+        try:
+            require_album_placement_current(plan.placement)
+        except OSError as exc:
+            raise DurableAlbumUnavailable(
+                "the release placement path binding changed"
+            ) from exc
     if (
-        type(plan) is not DurableNewAlbumPlan
-        or plan_durable_new_album(
+        plan_durable_new_album(
             item,
             args,
             album_path_suffix=plan.album_path_suffix,
             release_identity=plan.release_identity,
             placement_destination=plan.placement_destination,
+            placement=plan.placement,
         ) != plan
     ):
         raise DurableAlbumUnavailable("the album no longer matches the durable download plan")
+
+
+def _refresh_plan_after_upgrade_backup(
+    item,
+    args,
+    plan: DurableNewAlbumPlan,
+) -> DurableNewAlbumPlan:
+    """Carry the placement across this runner's committed source retirement."""
+    if plan.placement is None:
+        return plan
+    try:
+        placement = resolve_album_placement(
+            plan.placement.friendly_path,
+            plan.placement.identity,
+        )
+    except (AlbumPlacementAttention, OSError, ValueError) as exc:
+        raise DurableAlbumUnavailable(
+            "the release placement could not be rebound after backup"
+        ) from exc
+    refreshed = replace(plan, placement=placement)
+    if (
+        placement.identity != plan.release_identity
+        or placement.suffix != plan.album_path_suffix
+        or str(placement.destination) != plan.placement_destination
+        or plan_durable_new_album(
+            item,
+            args,
+            album_path_suffix=refreshed.album_path_suffix,
+            release_identity=refreshed.release_identity,
+            placement_destination=refreshed.placement_destination,
+            placement=refreshed.placement,
+        )
+        != refreshed
+    ):
+        raise DurableAlbumUnavailable(
+            "the release placement changed during backup"
+        )
+    return refreshed
 
 
 def _owner_record(owner: RecoveryOwner) -> dict[str, str]:
@@ -741,6 +795,7 @@ def execute_durable_new_album(
                 operation_id=operation_id,
                 item_id=item_id,
             )
+        plan = _refresh_plan_after_upgrade_backup(item, args, plan)
 
     _require_authority(authority)
     item["snapshot_before"] = snapshot_staging()
@@ -1051,6 +1106,7 @@ def execute_durable_new_album(
 
     try:
         _require_authority(authority)
+        _require_current_plan(item, args, plan)
         import_kwargs = {
             "owner": _owner_record(owner),
             "on_reservation": checkpoint_reservation,

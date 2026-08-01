@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-from qobuz_librarian.library import album_placement
+from qobuz_librarian.library import album_placement, release_identity
 from qobuz_librarian.library.album_placement import (
     AlbumPlacementAttention,
     PlacementDisposition,
@@ -111,3 +111,28 @@ def test_explicit_adoption_proof_reuses_an_unmarked_friendly_path(tmp_path):
 
     assert placement.destination == friendly
     assert placement.disposition is PlacementDisposition.ADOPTED
+
+
+def test_same_release_refuses_a_path_replaced_after_manifest_read(
+        tmp_path, monkeypatch):
+    friendly = tmp_path / "Artist" / "Album (2020)"
+    displaced = tmp_path / "renamed-away"
+    identity = ReleaseIdentity("qobuz", "200")
+    friendly.mkdir(parents=True)
+    publish_release_identity(friendly, identity)
+    real_read = release_identity._read_release_identity_at
+
+    def read_then_replace(directory_descriptor):
+        value = real_read(directory_descriptor)
+        friendly.rename(displaced)
+        friendly.mkdir()
+        return value
+
+    monkeypatch.setattr(
+        release_identity, "_read_release_identity_at", read_then_replace)
+
+    with pytest.raises(AlbumPlacementAttention, match="valid release manifest"):
+        resolve_album_placement(friendly, identity)
+
+    assert not (friendly / release_identity.MANIFEST_NAME).exists()
+    assert (displaced / release_identity.MANIFEST_NAME).exists()

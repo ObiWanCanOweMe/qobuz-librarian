@@ -266,6 +266,8 @@ def test_executor_reunites_split_multi_artist_folders(monkeypatch, tmp_path):
 def test_executor_self_heal_retry_no_files_keeps_first_download_state(
         monkeypatch, tmp_path):
     from qobuz_librarian import config as cfg
+    from qobuz_librarian.library.album_placement import resolve_album_placement
+    from qobuz_librarian.library.release_identity import publish_release_identity
     from qobuz_librarian.queue import executor
 
     staging = tmp_path / "staging"
@@ -278,6 +280,11 @@ def test_executor_self_heal_retry_no_files_keeps_first_download_state(
     item = _qitem(title="Album", album=album, album_dir=None,
                   missing=album["tracks"]["items"], present=[])
     queue = [item]
+    friendly = tmp_path / "music" / "Artist" / "Album"
+    friendly.mkdir(parents=True)
+    identity = ReleaseIdentity("qobuz", "ALB")
+    publish_release_identity(friendly, identity)
+    placement = resolve_album_placement(friendly, identity)
 
     monkeypatch.setattr(executor, "staging_preflight", lambda _a: None)
     monkeypatch.setattr(executor, "snapshot_staging", lambda: set())
@@ -285,6 +292,8 @@ def test_executor_self_heal_retry_no_files_keeps_first_download_state(
     monkeypatch.setattr(executor, "_reimport_parked_albums", lambda: (False, []))
     monkeypatch.setattr(executor, "_run_pre_import_hooks_for_dirs",
                         lambda _d, _a: ([], 0))
+    monkeypatch.setattr(
+        executor, "resolve_album_import_placement", lambda *_args: placement)
     monkeypatch.setattr(executor, "track_signatures_for_album_dirs",
                         lambda _d: [])
     monkeypatch.setattr(
@@ -610,15 +619,16 @@ def test_collision_eligible_album_uses_durable_lane_with_frozen_suffix(
     )
     queue = [item]
     seen = []
+    placement = SimpleNamespace(
+        suffix=" [qobuz-200]",
+        identity=ReleaseIdentity("qobuz", "200"),
+        destination=post_dir,
+    )
 
     monkeypatch.setattr(
         executor,
         "resolve_album_import_placement",
-        lambda _album, _token: SimpleNamespace(
-            suffix=" [qobuz-200]",
-            identity=ReleaseIdentity("qobuz", "200"),
-            destination=post_dir,
-        ),
+        lambda _album, _token: placement,
     )
 
     def freeze_plan(
@@ -628,12 +638,14 @@ def test_collision_eligible_album_uses_durable_lane_with_frozen_suffix(
         album_path_suffix="",
         release_identity=None,
         placement_destination=None,
+        placement=None,
     ):
         seen.append((
             "plan",
             album_path_suffix,
             release_identity,
             placement_destination,
+            placement,
         ))
         return plan
 
@@ -667,12 +679,230 @@ def test_collision_eligible_album_uses_durable_lane_with_frozen_suffix(
             " [qobuz-200]",
             ReleaseIdentity("qobuz", "200"),
             post_dir,
+            placement,
         ),
         ("durable", " [qobuz-200]"),
     ]
     assert results[0]["imported"] is True
     assert queue == []
     assert drained is True
+
+
+@pytest.mark.parametrize("collision", [False, True], ids=["ordinary", "collision"])
+def test_downsampled_new_release_without_durable_proof_stops_before_beets(
+        monkeypatch, tmp_path, collision):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.library.album_placement import resolve_album_placement
+    from qobuz_librarian.library.release_identity import (
+        MANIFEST_NAME,
+        publish_release_identity,
+    )
+    from qobuz_librarian.queue import durable_album, executor
+
+    music = tmp_path / "music"
+    staging = tmp_path / "staging"
+    friendly = music / "Artist" / "Album (2020)"
+    friendly.parent.mkdir(parents=True)
+    wanted = ReleaseIdentity("qobuz", "200")
+    if collision:
+        friendly.mkdir()
+        publish_release_identity(friendly, ReleaseIdentity("qobuz", "100"))
+    placement = resolve_album_placement(friendly, wanted)
+    tracks = [
+        {"id": "t1", "media_number": 1, "track_number": 1},
+        {"id": "t2", "media_number": 1, "track_number": 2},
+    ]
+    album = {
+        "id": "200",
+        "title": "Album",
+        "artist": {"name": "Artist"},
+        "maximum_bit_depth": 24,
+        "maximum_sampling_rate": 96,
+        "tracks": {"items": tracks},
+    }
+    item = _qitem(
+        "Album",
+        album=album,
+        album_dir=None,
+        missing=tracks,
+        present=[],
+        quality=4,
+    )
+    queue = [item]
+    staged = staging / "Artist" / "Album"
+    staged.mkdir(parents=True)
+    (staged / "01.flac").write_bytes(b"audio")
+    started = []
+
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(cfg, "STAGING_DIR", staging)
+    monkeypatch.setattr(cfg, "DOWNSAMPLE_HIRES_ENABLED", True)
+    monkeypatch.setattr(
+        executor, "plan_durable_new_album", durable_album.plan_durable_new_album)
+    monkeypatch.setattr(
+        executor, "resolve_album_import_placement", lambda *_args: placement)
+    monkeypatch.setattr(executor, "staging_preflight", lambda _args: None)
+    monkeypatch.setattr(executor, "_reimport_parked_albums", lambda: (False, []))
+    monkeypatch.setattr(executor, "is_cancel_requested", lambda: False)
+
+    def download(current):
+        started.append("download")
+        current.update(n_ok=2, n_fail=0, n_lossy=0, elapsed=0.0)
+
+    monkeypatch.setattr(executor, "_download_for_queue_item", download)
+    monkeypatch.setattr(executor, "_staged_album_dirs", lambda _item: [staged])
+    monkeypatch.setattr(
+        executor,
+        "verify_and_recover",
+        lambda *_args, **_kwargs: {
+            "retried": False,
+            "recovered": False,
+            "under": False,
+        },
+    )
+    monkeypatch.setattr(
+        executor, "_run_pre_import_hooks_for_dirs", lambda *_args, **_kwargs: ([], 2))
+    monkeypatch.setattr(
+        executor,
+        "_import_album_with_retry",
+        lambda *_args, **_kwargs: started.append("beets") or True,
+    )
+    monkeypatch.setattr(
+        executor,
+        "_resolve_queue_item",
+        lambda current, _args, imported, *, authority=None: {
+            "result": current.get("result") or "downloaded",
+            "imported": imported,
+        },
+    )
+
+    args = Namespace(
+        dry_run=False,
+        no_import=False,
+        no_downsample=False,
+        consolidate=False,
+    )
+    results, drained = executor._execute_download_queue(
+        queue,
+        args,
+        token="tok",
+        consolidate_duplicates=False,
+    )
+
+    assert results == [{"result": "identity_attention", "imported": False}]
+    assert started == []
+    assert queue == [item]
+    assert drained is False
+    assert not (placement.destination / MANIFEST_NAME).exists()
+
+
+def test_downsampled_fallback_stops_if_final_placement_needs_first_manifest(
+        monkeypatch, tmp_path):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.library.album_placement import resolve_album_placement
+    from qobuz_librarian.library.release_identity import publish_release_identity
+    from qobuz_librarian.queue import durable_album, executor
+
+    music = tmp_path / "music"
+    staging = tmp_path / "staging"
+    friendly = music / "Artist" / "Album (2020)"
+    displaced = tmp_path / "renamed-away"
+    friendly.mkdir(parents=True)
+    wanted = ReleaseIdentity("qobuz", "200")
+    publish_release_identity(friendly, wanted)
+    tracks = [
+        {"id": "t1", "media_number": 1, "track_number": 1},
+        {"id": "t2", "media_number": 1, "track_number": 2},
+    ]
+    album = {
+        "id": "200",
+        "title": "Album",
+        "artist": {"name": "Artist"},
+        "maximum_bit_depth": 24,
+        "maximum_sampling_rate": 96,
+        "tracks": {"items": tracks},
+    }
+    item = _qitem(
+        "Album",
+        album=album,
+        album_dir=None,
+        missing=tracks,
+        present=[],
+        quality=4,
+    )
+    queue = [item]
+    staged = staging / "Artist" / "Album"
+    staged.mkdir(parents=True)
+    (staged / "01.flac").write_bytes(b"audio")
+    started = []
+
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(cfg, "STAGING_DIR", staging)
+    monkeypatch.setattr(cfg, "DOWNSAMPLE_HIRES_ENABLED", True)
+    monkeypatch.setattr(
+        executor, "plan_durable_new_album", durable_album.plan_durable_new_album)
+    monkeypatch.setattr(
+        executor,
+        "resolve_album_import_placement",
+        lambda *_args: resolve_album_placement(friendly, wanted),
+    )
+    monkeypatch.setattr(executor, "staging_preflight", lambda _args: None)
+    monkeypatch.setattr(executor, "_reimport_parked_albums", lambda: (False, []))
+    monkeypatch.setattr(executor, "is_cancel_requested", lambda: False)
+
+    def download(current):
+        started.append("download")
+        current.update(n_ok=2, n_fail=0, n_lossy=0, elapsed=0.0)
+
+    def hooks(*_args, **_kwargs):
+        started.append("hooks")
+        friendly.rename(displaced)
+        return [], 2
+
+    monkeypatch.setattr(executor, "_download_for_queue_item", download)
+    monkeypatch.setattr(executor, "_staged_album_dirs", lambda _item: [staged])
+    monkeypatch.setattr(
+        executor,
+        "verify_and_recover",
+        lambda *_args, **_kwargs: {
+            "retried": False,
+            "recovered": False,
+            "under": False,
+        },
+    )
+    monkeypatch.setattr(executor, "_run_pre_import_hooks_for_dirs", hooks)
+    monkeypatch.setattr(executor, "track_signatures_for_album_dirs", lambda _dirs: [])
+    monkeypatch.setattr(executor, "retain_download_staging", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        executor,
+        "_import_album_with_retry",
+        lambda *_args, **_kwargs: started.append("beets") or True,
+    )
+    monkeypatch.setattr(
+        executor,
+        "_resolve_queue_item",
+        lambda current, _args, imported, *, authority=None: {
+            "result": current.get("result") or "downloaded",
+            "imported": imported,
+        },
+    )
+
+    results, drained = executor._execute_download_queue(
+        queue,
+        Namespace(
+            dry_run=False,
+            no_import=False,
+            no_downsample=False,
+            consolidate=False,
+        ),
+        token="tok",
+        consolidate_duplicates=False,
+    )
+
+    assert results == [{"result": "identity_attention", "imported": False}]
+    assert started == ["download", "hooks"]
+    assert queue == [item]
+    assert drained is False
 
 
 def test_executor_keeps_only_failed_downloads_for_retry(monkeypatch, tmp_path):

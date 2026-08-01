@@ -49,6 +49,7 @@ from qobuz_librarian.library.release_identity import (
     MANIFEST_NAME,
     ReleaseIdentity,
     ReleaseManifestError,
+    capture_directory_path_receipt,
     normalise_release_id,
     publish_release_identity,
     read_release_identity,
@@ -529,7 +530,10 @@ def match_album_dir(album_dir, artist_name, token, *, catalog, prefer_hires):
     # every other viable release.  Hold a filesystem snapshot over the review
     # and validate it again before the one irreversible side effect.
     try:
-        expected_directory = _directory_identity(album_dir)
+        expected_path_receipt = capture_directory_path_receipt(album_dir)
+        expected_directory = expected_path_receipt.directory_identity
+        if expected_directory is None:
+            raise OSError("reviewed album directory is missing")
         initial_inventory = _reviewed_audio_inventory(album_dir)
         existing, _ = find_existing_tracks(candidates[0], album_dir=album_dir)
     except OSError:
@@ -576,6 +580,7 @@ def match_album_dir(album_dir, artist_name, token, *, catalog, prefer_hires):
             album_dir,
             ReleaseIdentity("qobuz", str(selected.album["id"])),
             expected_directory=expected_directory,
+            expected_path_receipt=expected_path_receipt,
         )
     except (ReleaseManifestError, OSError, KeyError):
         return _legacy_identity_invalid(album_dir, candidates, refreshed_existing)
