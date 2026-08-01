@@ -87,6 +87,46 @@ def test_artist_fingerprint_never_follows_a_manifest_symlink(
     assert len(value) == 64
 
 
+def test_artist_fingerprint_tracks_reserved_manifest_directory(tmp_path):
+    from qobuz_librarian.library.artist_fingerprint import artist_fingerprint
+    from qobuz_librarian.library.release_identity import MANIFEST_NAME
+
+    album_dir = tmp_path / "Artist" / "Album"
+    album_dir.mkdir(parents=True)
+    (album_dir / "01.flac").write_bytes(b"audio")
+    missing = artist_fingerprint(album_dir.parent)
+
+    reserved = album_dir / MANIFEST_NAME
+    reserved.mkdir()
+    invalid_directory = artist_fingerprint(album_dir.parent)
+    reserved.rmdir()
+    removed = artist_fingerprint(album_dir.parent)
+
+    assert invalid_directory != missing
+    assert removed == missing
+
+
+def test_artist_fingerprint_tracks_reserved_symlink_to_directory(tmp_path):
+    from qobuz_librarian.library.artist_fingerprint import artist_fingerprint
+    from qobuz_librarian.library.release_identity import MANIFEST_NAME
+
+    album_dir = tmp_path / "Artist" / "Album"
+    album_dir.mkdir(parents=True)
+    (album_dir / "01.flac").write_bytes(b"audio")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    missing = artist_fingerprint(album_dir.parent)
+
+    reserved = album_dir / MANIFEST_NAME
+    reserved.symlink_to(outside, target_is_directory=True)
+    invalid_symlink = artist_fingerprint(album_dir.parent)
+    reserved.unlink()
+    removed = artist_fingerprint(album_dir.parent)
+
+    assert invalid_symlink != missing
+    assert removed == missing
+
+
 def test_downsample_scan_uses_shared_refresh_state(tmp_path, monkeypatch):
     from qobuz_librarian.library import downsample_state
     from qobuz_librarian.web import flows

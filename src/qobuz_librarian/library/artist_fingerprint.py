@@ -25,9 +25,15 @@ def _manifest_rows(artist_dir: Path) -> list[tuple]:
     def _raise(error):
         raise error
 
-    for dirpath, _dirnames, filenames in os.walk(
+    for dirpath, dirnames, filenames in os.walk(
             artist_dir, followlinks=False, onerror=_raise):
-        if MANIFEST_NAME not in filenames:
+        reserved_is_directory = MANIFEST_NAME in dirnames
+        if reserved_is_directory:
+            # The reserved name is a manifest entry, never a subtree. Prune it
+            # before any lstat/read so even a racing directory replacement is
+            # not traversed on the next os.walk step.
+            dirnames[:] = [name for name in dirnames if name != MANIFEST_NAME]
+        if not reserved_is_directory and MANIFEST_NAME not in filenames:
             continue
         album_dir = Path(dirpath)
         manifest = album_dir / MANIFEST_NAME
