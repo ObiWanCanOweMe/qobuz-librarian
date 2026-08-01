@@ -271,6 +271,31 @@ def run_migrate_mode(args):
         log.info(fmt(C.RED,
             f"  ✗  {companion_failed} cover/sidecar file(s) could not be "
             "carried; see the results manifest."))
+    release_identity_outcomes = getattr(
+        result, "release_identity_outcomes", ())
+    identity_published = sum(
+        status == engine.COPIED
+        for _source, _destination, status, _reason
+        in release_identity_outcomes)
+    identity_reused = sum(
+        status == engine.SKIPPED
+        for _source, _destination, status, _reason
+        in release_identity_outcomes)
+    identity_failed = sum(
+        status == engine.FAILED
+        for _source, _destination, status, _reason
+        in release_identity_outcomes)
+    if identity_published:
+        log.info(fmt(C.GREEN,
+            f"  ✓  {identity_published} release identity manifest(s) published."))
+    if identity_reused:
+        log.info(fmt(C.YELLOW,
+            f"  ⚠  {identity_reused} existing release identity manifest(s) "
+            "verified."))
+    if identity_failed:
+        log.info(fmt(C.RED,
+            f"  ✗  {identity_failed} release identity manifest(s) could not "
+            "be published; see the results manifest."))
     if result.lingered:
         log.info(fmt(C.YELLOW,
             f"  ⚠  {result.lingered} moved but the original couldn't be removed "

@@ -8,6 +8,12 @@ from pathlib import Path
 import pytest
 
 from qobuz_librarian.library import migrate as m
+from qobuz_librarian.library.release_identity import (
+    MANIFEST_NAME,
+    ReleaseIdentity,
+    publish_release_identity,
+    read_release_identity,
+)
 
 
 def _meta(**kw):
@@ -306,6 +312,322 @@ def _placed_plan(tmp_path, n=1, *, existing_destination_root=False,
     return m.build_plan(items, destination)
 
 
+def _release_identity_plan(tmp_path, *, tracks=1):
+    album = tmp_path / "src" / "Legacy Album"
+    album.mkdir(parents=True)
+    items = []
+    for index in range(tracks):
+        track = album / f"track{index}.flac"
+        track.write_bytes(f"audio-{index}".encode())
+        items.append((
+            track,
+            _meta(title=f"Song {index}", track=index + 1),
+            "tags",
+        ))
+    (album / "cover.jpg").write_bytes(b"cover")
+    publish_release_identity(album, ReleaseIdentity("qobuz", "100"))
+    return m.build_plan(items, tmp_path / "dest"), album
+
+
+def test_release_identity_preview_is_sealed_outside_generic_companions(
+        tmp_path):
+    plan, _album = _release_identity_plan(tmp_path)
+
+    assert [
+        record["identity"]["release_id"]
+        for record in plan.release_identities
+    ] == ["100"]
+    assert all(
+        receipt["relative"][-1] != MANIFEST_NAME
+        for receipt in plan.companion_receipts
+    )
+    assert [receipt["relative"][-1]
+            for receipt in plan.companion_receipts] == ["cover.jpg"]
+
+
+def test_supplied_companion_channel_cannot_smuggle_release_manifest(tmp_path):
+    initial, _album = _release_identity_plan(tmp_path)
+    entry = initial.placed[0]
+    items = m.CollectedItems(initial.source_root, initial.source_root_receipt)
+    items.append((entry.source, entry.meta, "tags", entry.source_receipt))
+    items.companion_receipts = [
+        initial.release_identities[0]["source_receipt"],
+    ]
+
+    rebuilt = m.build_plan(items, tmp_path / "other-dest")
+
+    assert rebuilt.companion_receipts == []
+    assert len(rebuilt.release_identities) == 1
+
+
+def test_release_identity_publishes_only_after_all_album_audio_succeeds(
+        tmp_path, monkeypatch):
+    plan, album = _release_identity_plan(tmp_path, tracks=2)
+    second_destination = plan.dest_root / plan.placed[1].dest_rel
+    original_copy = m._stream_copy_noreplace
+
+    def fail_second(source, receipt, binding, destination, *args):
+        if Path(destination) == plan.placed[1].dest_rel:
+            raise OSError("second track failed")
+        return original_copy(source, receipt, binding, destination, *args)
+
+    monkeypatch.setattr(m, "_stream_copy_noreplace", fail_second)
+
+    result = m.execute_plan(plan)
+
+    destination_album = plan.dest_root / Path("Artist/Album (2017)")
+    assert result.copied == 0
+    assert result.failed == 2
+    assert not (plan.dest_root / plan.placed[0].dest_rel).exists()
+    assert not second_destination.exists()
+    assert not (destination_album / MANIFEST_NAME).exists()
+    assert result.release_identity_outcomes == [(
+        album / MANIFEST_NAME,
+        Path("Artist/Album (2017)"),
+        m.FAILED,
+        "not all mapped album audio completed or verified",
+    )]
+
+
+def test_unverified_album_collision_blocks_every_album_track(tmp_path):
+    destination_album = tmp_path / "dest" / "Artist" / "Album (2017)"
+    destination_album.mkdir(parents=True)
+    conflicting = destination_album / "02 - Song 1.flac"
+    conflicting.write_bytes(b"different audio")
+    plan, source_album = _release_identity_plan(tmp_path, tracks=2)
+
+    resumes = m.verified_resume_entries(plan)
+    result = m.execute_plan(plan, resume_entries=resumes)
+
+    assert resumes == []
+    assert result.copied == 0 and result.failed == 2
+    assert not (destination_album / "01 - Song 0.flac").exists()
+    assert conflicting.read_bytes() == b"different audio"
+    assert all(path.exists() for path in source_album.glob("*.flac"))
+    assert not (destination_album / MANIFEST_NAME).exists()
+
+
+def test_release_identity_executes_and_resume_is_idempotent(tmp_path):
+    plan, album = _release_identity_plan(tmp_path)
+
+    first = m.execute_plan(plan)
+    destination_album = plan.dest_root / Path("Artist/Album (2017)")
+
+    assert first.copied == 1 and first.failed == 0
+    assert first.companions == 1
+    assert read_release_identity(destination_album) == ReleaseIdentity(
+        "qobuz", "100")
+    assert first.release_identity_outcomes[-1][2] == m.COPIED
+    assert (album / MANIFEST_NAME).exists()
+
+    resumed_plan = m.build_plan([
+        (album / "track0.flac", _meta(title="Song 0", track=1), "tags"),
+    ], plan.dest_root)
+    resumes = m.verified_resume_entries(resumed_plan)
+    resumed = m.execute_plan(resumed_plan, resume_entries=resumes)
+
+    assert resumed.skipped == 1 and resumed.failed == 0
+    assert resumed.release_identity_outcomes[-1][2] == m.SKIPPED
+    assert read_release_identity(destination_album).release_id == "100"
+
+
+def test_release_identity_in_place_retires_audio_after_publication(tmp_path):
+    plan, source_album = _release_identity_plan(tmp_path)
+
+    result = m.execute_plan(plan, in_place=True)
+
+    destination_album = plan.dest_root / "Artist" / "Album (2017)"
+    assert result.copied == 1 and result.failed == 0
+    assert not (source_album / "track0.flac").exists()
+    assert read_release_identity(destination_album).release_id == "100"
+    assert (source_album / MANIFEST_NAME).exists()
+
+
+def test_multidisc_source_manifest_is_transferred_from_album_root(tmp_path):
+    album = tmp_path / "src" / "Album"
+    disc_one = album / "Disc 1"
+    disc_two = album / "Disc 2"
+    disc_one.mkdir(parents=True)
+    disc_two.mkdir()
+    first = disc_one / "one.flac"
+    second = disc_two / "two.flac"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+    publish_release_identity(album, ReleaseIdentity("qobuz", "100"))
+
+    plan = m.build_plan([
+        (first, _meta(title="One", track=1, disc=1, disctotal=2), "tags"),
+        (second, _meta(title="Two", track=1, disc=2, disctotal=2), "tags"),
+    ], tmp_path / "dest")
+    result = m.execute_plan(plan)
+
+    assert len(plan.release_identities) == 1
+    assert plan.release_identities[0]["source_folder"] == []
+    assert sorted(plan.release_identities[0]["mapped_source_folders"]) == [
+        ["Disc 1"], ["Disc 2"]]
+    assert result.copied == 2 and result.failed == 0
+    assert read_release_identity(
+        plan.dest_root / "Artist" / "Album (2017)").release_id == "100"
+
+
+def test_source_manifest_cannot_fan_out_to_distinct_destination_albums(
+        tmp_path):
+    album = tmp_path / "src" / "Album"
+    album.mkdir(parents=True)
+    first = album / "one.flac"
+    second = album / "two.flac"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+    publish_release_identity(album, ReleaseIdentity("qobuz", "100"))
+
+    with pytest.raises(OSError, match="multiple destination albums"):
+        m.build_plan([
+            (first, _meta(album="First", title="One", track=1), "tags"),
+            (second, _meta(album="Second", title="Two", track=1), "tags"),
+        ], tmp_path / "dest")
+
+    assert not (tmp_path / "dest").exists()
+
+
+def test_source_manifest_fan_out_includes_nonresumable_collisions(tmp_path):
+    album = tmp_path / "src" / "Album"
+    album.mkdir(parents=True)
+    first = album / "one.flac"
+    second = album / "two.flac"
+    duplicate = album / "duplicate.flac"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+    duplicate.write_bytes(b"duplicate")
+    publish_release_identity(album, ReleaseIdentity("qobuz", "100"))
+
+    with pytest.raises(OSError, match="multiple destination albums"):
+        m.build_plan([
+            (first, _meta(album="First", title="One", track=1), "tags"),
+            (second, _meta(album="Second", title="Same", track=1), "tags"),
+            (duplicate, _meta(
+                album="Second", title="Same", track=1), "tags"),
+        ], tmp_path / "dest")
+
+    assert not (tmp_path / "dest").exists()
+
+
+@pytest.mark.parametrize("destination_manifest", ["different", "malformed"])
+def test_release_identity_conflict_fails_album_before_audio_mutation(
+        tmp_path, destination_manifest):
+    destination_album = tmp_path / "dest" / "Artist" / "Album (2017)"
+    destination_album.mkdir(parents=True)
+    if destination_manifest == "different":
+        publish_release_identity(
+            destination_album, ReleaseIdentity("qobuz", "200"))
+    else:
+        (destination_album / MANIFEST_NAME).write_text("not json")
+    destination_before = (destination_album / MANIFEST_NAME).read_bytes()
+    plan, source_album = _release_identity_plan(tmp_path)
+    source_before = (
+        b'{"schema_version":1,"provider":"qobuz","release_id":"100"}\n'
+    )
+
+    result = m.execute_plan(plan)
+
+    assert result.copied == 0 and result.failed == 1
+    assert not (plan.dest_root / plan.placed[0].dest_rel).exists()
+    assert (source_album / MANIFEST_NAME).read_bytes() == source_before
+    assert (destination_album / MANIFEST_NAME).read_bytes() == destination_before
+    assert result.release_identity_outcomes[0][2] == m.FAILED
+    assert "destination release manifest" in result.release_identity_outcomes[0][3]
+    artifact = m.write_results_manifest(result, plan=plan)
+    with Path(artifact["path"]).open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    identity_row = next(
+        row for row in rows if row["record"] == "release_identity")
+    assert identity_row["status"] == m.FAILED
+    assert "destination release manifest" in identity_row["reason"]
+
+
+def test_changed_source_release_receipt_fails_album_before_audio_mutation(
+        tmp_path):
+    plan, source_album = _release_identity_plan(tmp_path)
+    manifest = source_album / MANIFEST_NAME
+    reviewed = manifest.read_bytes()
+    manifest.unlink()
+    manifest.write_bytes(reviewed)
+
+    result = m.execute_plan(plan)
+
+    assert result.copied == 0 and result.failed == 1
+    assert not (plan.dest_root / plan.placed[0].dest_rel).exists()
+    assert manifest.read_bytes() == reviewed
+    assert result.release_identity_outcomes[0][2] == m.FAILED
+    assert "source release manifest changed" in result.release_identity_outcomes[0][3]
+
+
+def test_release_identity_is_in_plan_and_result_audit_evidence(tmp_path):
+    plan, _album = _release_identity_plan(tmp_path)
+    preview = m.write_manifest(plan)
+    assert preview["context"]["release_identities"] == plan.release_identities
+
+    result = m.execute_plan(plan)
+    artifact = m.write_results_manifest(result, plan=plan)
+    with Path(artifact["path"]).open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    identity = next(row for row in rows if row["record"] == "release_identity")
+    assert identity["status"] == m.COPIED
+    summary = json.loads(next(
+        row["reason"] for row in rows if row["record"] == "summary"))
+    assert summary["release_identity_attempts"] == 1
+    assert summary["release_identity_failures"] == 0
+    assert summary["companion_attempts"] == 1
+    assert summary["companions_copied"] == 1
+
+
+def test_release_identity_change_invalidates_preview_artifact(tmp_path):
+    plan, _album = _release_identity_plan(tmp_path)
+    preview = m.write_manifest(plan)
+    plan.release_identities[0]["identity"]["release_id"] = "200"
+
+    assert m.verify_audit_artifact(plan, preview) is False
+    assert not (plan.dest_root / plan.placed[0].dest_rel).exists()
+
+
+def test_missing_release_identity_invalidates_preview_artifact(tmp_path):
+    plan, _album = _release_identity_plan(tmp_path)
+    preview = m.write_manifest(plan)
+    plan.release_identities = []
+
+    assert m.verify_audit_artifact(plan, preview) is False
+    assert not (plan.dest_root / plan.placed[0].dest_rel).exists()
+
+
+@pytest.mark.parametrize("in_place", [False, True])
+def test_late_destination_identity_conflict_rolls_back_album_audio(
+        tmp_path, monkeypatch, in_place):
+    plan, source_album = _release_identity_plan(tmp_path)
+    entry = plan.placed[0]
+    destination = plan.dest_root / entry.dest_rel
+    original_copy = m._stream_copy_noreplace
+    raced = False
+
+    def add_conflict_after_audio(source, receipt, binding, target, *args):
+        nonlocal raced
+        published = original_copy(source, receipt, binding, target, *args)
+        if not raced and Path(target) == entry.dest_rel:
+            raced = True
+            publish_release_identity(
+                destination.parent, ReleaseIdentity("qobuz", "200"))
+        return published
+
+    monkeypatch.setattr(m, "_stream_copy_noreplace", add_conflict_after_audio)
+
+    result = m.execute_plan(plan, in_place=in_place)
+
+    assert result.copied == 0 and result.failed == 1
+    assert not destination.exists()
+    assert (source_album / "track0.flac").exists()
+    assert read_release_identity(destination.parent).release_id == "200"
+    assert result.release_identity_outcomes[-1][2] == m.FAILED
+
+
 def test_copy_mode_leaves_originals_untouched(tmp_path):
     plan = _placed_plan(tmp_path)
     src = plan.placed[0].source
@@ -455,6 +777,7 @@ def _sealed_web_choice(files, dest):
         "destination_name_semantics": plan.destination_name_semantics,
         "manifest_artifact": manifest_artifact,
         "companion_receipts": plan.companion_receipts,
+        "release_identities": plan.release_identities,
     }}]
 
 
@@ -597,6 +920,77 @@ def test_referenced_migration_payload_executes_after_persistence_reload(
     assert [path.read_bytes() for path in copied] == [b"one"]
     assert source.exists()
     assert not job.error
+
+
+def test_referenced_migration_payload_preserves_release_identity(
+        tmp_path, monkeypatch):
+    from qobuz_librarian.web import flows, job_persistence
+    from qobuz_librarian.web import jobs as jm
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+    album = tmp_path / "src" / "Album"
+    album.mkdir(parents=True)
+    source = album / "x.flac"
+    source.write_bytes(b"one")
+    publish_release_identity(album, ReleaseIdentity("qobuz", "100"))
+    dest = tmp_path / "dest"
+    inline = _sealed_web_choice((source,), dest)[0]["payload"]
+    inline["resume_entries"] = []
+    job = jm.Job(title="Migration", kind="scan")
+    assert job_persistence.persist_migration_candidate_payload(
+        job.id, "c0", inline)
+    chosen = [{
+        "cid": "c0", "kind": "migrate", "title": "Album",
+        "artist": "Artist", "detail": "1 track", "selected": True,
+        "payload": job_persistence.migration_payload_reference(),
+    }]
+
+    flows.execute_migration(job, chosen, str(dest), in_place=False)
+
+    assert read_release_identity(
+        dest / "Artist" / "Album (2017)") == ReleaseIdentity("qobuz", "100")
+    assert not job.error
+
+
+def test_missing_persisted_release_identity_row_stops_before_audio(
+        tmp_path, monkeypatch):
+    from qobuz_librarian.web import flows, job_persistence
+    from qobuz_librarian.web import jobs as jm
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+    album = tmp_path / "src" / "Album"
+    album.mkdir(parents=True)
+    source = album / "x.flac"
+    source.write_bytes(b"one")
+    publish_release_identity(album, ReleaseIdentity("qobuz", "100"))
+    dest = tmp_path / "dest"
+    inline = _sealed_web_choice((source,), dest)[0]["payload"]
+    inline["resume_entries"] = []
+    job = jm.Job(title="Migration", kind="scan")
+    assert job_persistence.persist_migration_candidate_payload(
+        job.id, "c0", inline)
+    conn = job_persistence._get_conn()
+    conn.execute(
+        "DELETE FROM migration_candidate_entries "
+        "WHERE job_id=? AND candidate_id=? AND entry_kind='release_identity'",
+        (job.id, "c0"),
+    )
+    conn.commit()
+    chosen = [{
+        "cid": "c0", "kind": "migrate", "title": "Album",
+        "artist": "Artist", "detail": "1 track", "selected": True,
+        "payload": job_persistence.migration_payload_reference(),
+    }]
+
+    flows.execute_migration(job, chosen, str(dest), in_place=False)
+
+    assert job.error and "no longer matches" in job.error
+    assert not (dest / "Artist" / "Album (2017)" / "01 - x.flac").exists()
+    assert source.exists()
 
 
 @pytest.mark.parametrize("chosen", [

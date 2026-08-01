@@ -44,7 +44,16 @@ from pathlib import Path
 from typing import Callable, Mapping, Optional
 
 from qobuz_librarian import config
-from qobuz_librarian.library.release_identity import is_ignored_library_artifact
+from qobuz_librarian.library import release_identity as release_identity_codec
+from qobuz_librarian.library.release_identity import (
+    MANIFEST_NAME,
+    MAX_MANIFEST_BYTES,
+    ReleaseIdentity,
+    ReleaseManifestError,
+    is_ignored_library_artifact,
+    normalise_release_id,
+    publish_release_identity,
+)
 from qobuz_librarian.library.tags import (
     VA_NORMALIZED,
     beets_sanitize,
@@ -104,6 +113,9 @@ class MigrationPlan:
     source_root_receipt: Optional[dict] = None
     dest_root_receipt: Optional[dict] = None
     companion_receipts: list = field(default_factory=list)
+    # Validated reserved metadata, deliberately separate from generic sidecars.
+    # Each record binds one sealed source manifest to one destination album.
+    release_identities: list = field(default_factory=list)
     destination_name_semantics: Optional[dict] = None
 
     @property
@@ -150,6 +162,9 @@ class ExecResult:
     # Companion work has its own count and must not distort the track summary,
     # but every attempt still belongs in the durable results evidence.
     companion_outcomes: list = field(default_factory=list)
+    # Reserved identity publication has its own evidence channel and never
+    # contributes to generic companion counts.
+    release_identity_outcomes: list = field(default_factory=list)
     # Exact private locations retained after an uncertain namespace outcome.
     # Each record is deliberately serializable for CLI/Web persistence.
     recoveries: list = field(default_factory=list)
@@ -1755,7 +1770,7 @@ def _capture_companion_receipts(binding, entries) -> list:
             ]
             for encoded_name in before_names:
                 name = os.fsdecode(encoded_name)
-                if name.startswith("._"):
+                if is_ignored_library_artifact(name):
                     continue
                 if Path(name).suffix.lower() not in _COMPANION_EXTS:
                     continue
@@ -1786,6 +1801,130 @@ def _capture_companion_receipts(binding, entries) -> list:
             for descriptor in reversed(descriptors):
                 os.close(descriptor)
     return receipts
+
+
+def _release_identity_dict(identity: ReleaseIdentity) -> dict:
+    return {
+        "provider": identity.provider,
+        "release_id": identity.release_id,
+    }
+
+
+def _identity_from_opened_manifest(opened, receipt) -> ReleaseIdentity:
+    try:
+        size = int(receipt["file"]["size"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ReleaseManifestError(
+            "release manifest receipt is malformed") from exc
+    if size > MAX_MANIFEST_BYTES:
+        raise ReleaseManifestError("release manifest is too large")
+    contents = os.pread(opened.descriptor, MAX_MANIFEST_BYTES + 1, 0)
+    if len(contents) != size or not opened.still_exact(receipt):
+        raise ReleaseManifestError("release manifest changed while it was read")
+    return release_identity_codec._manifest_identity_from_bytes(contents)
+
+
+def _capture_release_manifest_in_folder(binding, folder):
+    descriptors = []
+    parent_fd = binding.root_fd
+    opened = None
+    try:
+        for part in folder:
+            child_fd = _open_directory(part, dir_fd=parent_fd)
+            if (
+                not _named_entry_matches(parent_fd, part, child_fd)
+                or not binding.directory_is_on_root_mount(child_fd)
+            ):
+                os.close(child_fd)
+                raise OSError(
+                    "migration source crosses a nested filesystem mount")
+            descriptors.append(child_fd)
+            parent_fd = child_fd
+        try:
+            value = os.stat(
+                MANIFEST_NAME, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(value.st_mode):
+            raise ReleaseManifestError(
+                "release manifest is not a regular file")
+        parent_receipts = [
+            {"name": part, "identity": _directory_identity(descriptor)}
+            for part, descriptor in zip(folder, descriptors)
+        ]
+        _path, _metadata, receipt = _scan_file_from_descriptor(
+            binding,
+            parent_fd,
+            parent_receipts,
+            folder + (MANIFEST_NAME,),
+        )
+        opened = _open_file_receipt(binding, receipt)
+        identity = _identity_from_opened_manifest(opened, receipt)
+        return receipt, identity
+    finally:
+        if opened is not None:
+            opened.close()
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _capture_release_identity_receipts(binding, entries) -> list:
+    destinations_by_source = {}
+    for entry in entries:
+        if (
+            entry.dest_rel is None
+            or not isinstance(entry.source_receipt, dict)
+        ):
+            continue
+        source_folder = tuple(entry.source_receipt.get("relative", ())[:-1])
+        destination_parts = tuple(Path(entry.dest_rel).parts)
+        if len(destination_parts) >= 2:
+            destinations_by_source.setdefault(source_folder, set()).add(
+                destination_parts[:2])
+
+    manifest_cache = {}
+    grouped = {}
+    for mapped_source, destinations in sorted(destinations_by_source.items()):
+        found = None
+        for length in range(len(mapped_source), -1, -1):
+            candidate = mapped_source[:length]
+            if candidate not in manifest_cache:
+                manifest_cache[candidate] = _capture_release_manifest_in_folder(
+                    binding, candidate)
+            if manifest_cache[candidate] is not None:
+                found = candidate
+                break
+        if found is None:
+            continue
+        if len(destinations) != 1:
+            raise OSError(
+                "one release manifest maps to multiple destination albums")
+        destination = next(iter(destinations))
+        grouped.setdefault((found, destination), set()).add(mapped_source)
+
+    destinations_by_manifest = {}
+    for manifest_folder, destination in grouped:
+        destinations_by_manifest.setdefault(manifest_folder, set()).add(
+            destination)
+    if any(len(destinations) != 1
+           for destinations in destinations_by_manifest.values()):
+        raise OSError(
+            "one release manifest maps to multiple destination albums")
+
+    records = []
+    for (manifest_folder, destination), mapped_sources in sorted(
+            grouped.items()):
+        receipt, identity = manifest_cache[manifest_folder]
+        records.append({
+            "source_folder": list(manifest_folder),
+            "mapped_source_folders": [
+                list(folder) for folder in sorted(mapped_sources)
+            ],
+            "destination_folder": list(destination),
+            "source_receipt": receipt,
+            "identity": _release_identity_dict(identity),
+        })
+    return records
 
 
 def build_plan(items, dest_root: Path) -> MigrationPlan:
@@ -1933,8 +2072,20 @@ def build_plan(items, dest_root: Path) -> MigrationPlan:
     companion_receipts = [
         receipt for receipt in companion_receipts
         if isinstance(receipt, dict)
+        and isinstance(receipt.get("relative"), (list, tuple))
+        and bool(receipt["relative"])
+        and not is_ignored_library_artifact(receipt["relative"][-1])
         and tuple(receipt.get("relative", ())[:-1]) in mapped_source_folders
     ]
+
+    release_identities = []
+    if source_root_receipt is not None:
+        source_binding = _open_root_receipt(source_root_receipt)
+        try:
+            release_identities = _capture_release_identity_receipts(
+                source_binding, entries)
+        finally:
+            source_binding.close()
 
     return MigrationPlan(
         dest_root=dest_root,
@@ -1943,6 +2094,7 @@ def build_plan(items, dest_root: Path) -> MigrationPlan:
         source_root_receipt=source_root_receipt,
         dest_root_receipt=dest_root_receipt,
         companion_receipts=companion_receipts,
+        release_identities=release_identities,
         destination_name_semantics=destination_name_semantics,
     )
 
@@ -2340,6 +2492,8 @@ def _enumerate_source_descriptors(binding, *, cancel_check=None,
 def _carry_companion_files(plan: "MigrationPlan", result: "ExecResult", *,
                            entry_map,
                            resume_entries=None,
+                           verify_resumes=True,
+                           carry_companions=True,
                            progress: Optional[Callable] = None,
                            cancel_check: Optional[Callable[[], bool]] = None,
                            source_root_binding=None,
@@ -2375,14 +2529,19 @@ def _carry_companion_files(plan: "MigrationPlan", result: "ExecResult", *,
     for source, dest_rel, status, _reason in result.outcomes:
         if _cancelled():
             return
-        if status == COPIED:
+        if (
+            status == COPIED
+            or (status == SKIPPED and _reason == "verified existing copy")
+        ):
             _remember(entry_map.get(_plan_entry_key(source, dest_rel)))
 
     # Planning keeps a destination mapping only for the unambiguous
     # "already exists" collision. Re-check it here rather than trusting the
     # preview-time result; the file may have changed while the user reviewed
     # the plan. Other collision classes never become companion targets.
-    if resume_entries is None:
+    if not verify_resumes:
+        resume_entries = []
+    elif resume_entries is None:
         resume_entries = [
             entry for entry in plan.collisions if _is_resume_collision(entry)
         ]
@@ -2494,6 +2653,9 @@ def _carry_companion_files(plan: "MigrationPlan", result: "ExecResult", *,
                 result, fatal_exception) from fatal_exception
         if _cancelled():
             return
+
+    if not carry_companions:
+        return
 
     receipts_by_folder: dict = {}
     for receipt in plan.companion_receipts:
@@ -4561,6 +4723,15 @@ def _plan_context(plan: MigrationPlan) -> dict:
         "destination_root_receipt": plan.dest_root_receipt,
         "destination_name_semantics": plan.destination_name_semantics,
         "companion_receipts": plan.companion_receipts,
+        "release_identities": plan.release_identities,
+        "album_entries": [
+            {
+                "destination_folder": list(Path(entry.dest_rel).parts[:2]),
+                "entry_seal": _entry_seal(entry),
+            }
+            for entry in plan.entries
+            if entry.dest_rel is not None and len(Path(entry.dest_rel).parts) >= 2
+        ],
     }
 
 
@@ -4705,6 +4876,7 @@ def _validate_plan(plan, resume_entries) -> tuple:
     if (
         not isinstance(plan.entries, list)
         or not isinstance(plan.companion_receipts, list)
+        or not isinstance(plan.release_identities, list)
         or not isinstance(plan.source_root, Path)
         or not isinstance(plan.dest_root, Path)
     ):
@@ -4731,6 +4903,7 @@ def _validate_plan(plan, resume_entries) -> tuple:
 
     placed_keys = set()
     mapped_folders = set()
+    mapped_albums = set()
     audio_relatives = set()
     source_paths = set()
     entry_map = {}
@@ -4774,7 +4947,10 @@ def _validate_plan(plan, resume_entries) -> tuple:
             ):
                 raise OSError("migration destination path is malformed")
             if entry.source_receipt is not None:
-                mapped_folders.add(tuple(entry.source_receipt["relative"][:-1]))
+                source_folder = tuple(entry.source_receipt["relative"][:-1])
+                mapped_folders.add(source_folder)
+                if len(parts) >= 2:
+                    mapped_albums.add((source_folder, parts[:2]))
         entry_key = _plan_entry_key(entry.source, entry.dest_rel)
         if entry_key in entry_map:
             raise OSError("migration plan contains a duplicate mapping")
@@ -4827,11 +5003,81 @@ def _validate_plan(plan, resume_entries) -> tuple:
             relative in companion_relatives
             or relative in audio_relatives
             or relative[:-1] not in mapped_folders
+            or relative[-1] == MANIFEST_NAME
             or Path(relative[-1]).suffix.lower() not in _COMPANION_EXTS
         ):
             raise OSError("migration companion receipt is not in the plan")
         companion_relatives.add(relative)
-    return resume_entries, entry_map
+
+    release_identity_map = {}
+    destination_identities = {}
+    for record in plan.release_identities:
+        if not isinstance(record, dict) or set(record) != {
+            "source_folder",
+            "mapped_source_folders",
+            "destination_folder",
+            "source_receipt",
+            "identity",
+        }:
+            raise OSError("migration release identity is malformed")
+        source_folder = record["source_folder"]
+        mapped_source_folders = record["mapped_source_folders"]
+        destination_folder = record["destination_folder"]
+        identity = record["identity"]
+        if (
+            not isinstance(source_folder, list)
+            or any(not _safe_component(part) for part in source_folder)
+            or not isinstance(mapped_source_folders, list)
+            or not mapped_source_folders
+            or any(
+                not isinstance(folder, list)
+                or any(not _safe_component(part) for part in folder)
+                for folder in mapped_source_folders
+            )
+            or len({tuple(folder) for folder in mapped_source_folders})
+            != len(mapped_source_folders)
+            or not isinstance(destination_folder, list)
+            or len(destination_folder) != 2
+            or any(not _safe_component(part) for part in destination_folder)
+            or not isinstance(identity, dict)
+            or set(identity) != {"provider", "release_id"}
+            or identity.get("provider") != "qobuz"
+            or type(identity.get("provider")) is not str
+            or type(identity.get("release_id")) is not str
+            or normalise_release_id(identity.get("release_id"))
+            != identity.get("release_id")
+        ):
+            raise OSError("migration release identity is malformed")
+        _validate_file_receipt(
+            record["source_receipt"],
+            expected_relative=source_folder + [MANIFEST_NAME],
+        )
+        relative = tuple(record["source_receipt"]["relative"])
+        key = (tuple(source_folder), tuple(destination_folder))
+        destination = tuple(destination_folder)
+        canonical = (identity["provider"], identity["release_id"])
+        mapped_keys = {
+            (tuple(folder), tuple(destination_folder))
+            for folder in mapped_source_folders
+        }
+        if (
+            any(mapped_key not in mapped_albums for mapped_key in mapped_keys)
+            or any(
+                tuple(folder[:len(source_folder)]) != tuple(source_folder)
+                for folder in mapped_source_folders
+            )
+            or key in release_identity_map
+            or relative in audio_relatives
+            or relative in companion_relatives
+            or (
+                destination in destination_identities
+                and destination_identities[destination] != canonical
+            )
+        ):
+            raise OSError("migration release identity is not in the plan")
+        release_identity_map[key] = record
+        destination_identities[destination] = canonical
+    return resume_entries, entry_map, release_identity_map
 
 
 def _record_plan_refusal(result, plan, resume_entries, reason) -> ExecResult:
@@ -4862,6 +5108,285 @@ def _record_plan_refusal(result, plan, resume_entries, reason) -> ExecResult:
         result.outcomes.append(
             (entry.source, entry.dest_rel, FAILED, reason))
     return result
+
+
+def _entry_album_mapping(entry) -> tuple | None:
+    if entry.dest_rel is None or not isinstance(entry.source_receipt, dict):
+        return None
+    destination = tuple(Path(entry.dest_rel).parts)
+    if len(destination) < 2:
+        return None
+    return (
+        tuple(entry.source_receipt.get("relative", ())[:-1]),
+        destination[:2],
+    )
+
+
+def _open_relative_directory(binding, parts):
+    descriptors = []
+    parent_fd = binding.root_fd
+    prefix = []
+    try:
+        for part in parts:
+            try:
+                child_fd = _open_directory(part, dir_fd=parent_fd)
+            except FileNotFoundError:
+                for descriptor in reversed(descriptors):
+                    os.close(descriptor)
+                return None, []
+            if (
+                not _named_entry_matches(parent_fd, part, child_fd)
+                or not binding.directory_is_on_root_mount(child_fd)
+            ):
+                os.close(child_fd)
+                raise OSError("migration album directory changed")
+            descriptors.append(child_fd)
+            prefix.append(part)
+            if not binding.trust_directory(prefix, child_fd):
+                raise OSError("migration album directory conflicts with its proof")
+            parent_fd = child_fd
+        return parent_fd, descriptors
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+
+
+def _destination_release_identity(binding, destination_folder):
+    album_fd, descriptors = _open_relative_directory(
+        binding, destination_folder)
+    if album_fd is None:
+        return None
+    try:
+        identity = release_identity_codec._read_release_identity_at(album_fd)
+        value = os.fstat(album_fd)
+        return identity, (int(value.st_dev), int(value.st_ino))
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _release_identity_source_path(plan, record) -> Path:
+    return Path(plan.source_root).joinpath(*record["source_receipt"]["relative"])
+
+
+def _release_identity_value(record) -> ReleaseIdentity:
+    identity = record["identity"]
+    return ReleaseIdentity(identity["provider"], identity["release_id"])
+
+
+def _release_identity_entries(plan, mapping):
+    destination_folder = mapping[1]
+    return [
+        entry for entry in plan.entries
+        if (
+            _entry_album_mapping(entry) is not None
+            and _entry_album_mapping(entry)[1] == destination_folder
+        )
+    ]
+
+
+def _preflight_release_identities(
+        plan, result, source_root, destination_root, resume_entries,
+        release_identity_map):
+    states = []
+    blocked = set()
+    selected_resumes = {id(entry) for entry in resume_entries}
+    for mapping, record in release_identity_map.items():
+        source_path = _release_identity_source_path(plan, record)
+        destination_folder = Path(*record["destination_folder"])
+        entries = _release_identity_entries(plan, mapping)
+        opened = None
+        try:
+            try:
+                opened = _open_file_receipt(
+                    source_root, record["source_receipt"])
+                current = _identity_from_opened_manifest(
+                    opened, record["source_receipt"])
+            except (OSError, ValueError) as exc:
+                raise OSError(
+                    f"source release manifest changed after preview: {exc}") from exc
+            expected = _release_identity_value(record)
+            if current != expected:
+                raise OSError(
+                    "source release manifest identity differs from the plan")
+            if any(
+                entry.status == COLLISION and id(entry) not in selected_resumes
+                for entry in entries
+            ):
+                raise OSError(
+                    "not every mapped destination collision was verified")
+            try:
+                destination_state = _destination_release_identity(
+                    destination_root, tuple(record["destination_folder"]))
+            except (OSError, ValueError) as exc:
+                raise OSError(
+                    f"destination release manifest is malformed or unsafe: {exc}"
+                ) from exc
+            if destination_state is not None:
+                destination_identity, _expected_directory = destination_state
+                if (
+                    destination_identity is not None
+                    and destination_identity != expected
+                ):
+                    raise OSError(
+                        "destination release manifest identifies a different release")
+            states.append({
+                "mapping": mapping,
+                "record": record,
+                "entries": entries,
+                "opened_source": opened,
+            })
+            opened = None
+        except OSError as exc:
+            reason = str(exc)
+            result.release_identity_outcomes.append((
+                source_path, destination_folder, FAILED, reason))
+            for entry in entries:
+                blocked.add(id(entry))
+                result.failed += 1
+                result.outcomes.append((
+                    entry.source, entry.dest_rel, FAILED, reason))
+        finally:
+            if opened is not None:
+                opened.close()
+    return states, blocked
+
+
+def _publish_release_identities(plan, result, destination_root, states):
+    successful_destinations = set()
+    outcomes = {
+        _plan_entry_key(source, destination): (status, reason)
+        for source, destination, status, reason in result.outcomes
+    }
+    for state in states:
+        record = state["record"]
+        opened = state["opened_source"]
+        source_path = _release_identity_source_path(plan, record)
+        destination_folder = Path(*record["destination_folder"])
+        successful = True
+        for entry in state["entries"]:
+            status_reason = outcomes.get(
+                _plan_entry_key(entry.source, entry.dest_rel))
+            if status_reason is None or not (
+                status_reason[0] == COPIED
+                or status_reason == (SKIPPED, "verified existing copy")
+            ):
+                successful = False
+                break
+        if not successful:
+            result.release_identity_outcomes.append((
+                source_path,
+                destination_folder,
+                FAILED,
+                "not all mapped album audio completed or verified",
+            ))
+            continue
+        try:
+            expected = _release_identity_value(record)
+            if (
+                _identity_from_opened_manifest(
+                    opened, record["source_receipt"])
+                != expected
+            ):
+                raise OSError("source release manifest identity changed")
+            destination_state = _destination_release_identity(
+                destination_root, tuple(record["destination_folder"]))
+            if destination_state is None:
+                raise OSError("destination album was not created")
+            current, expected_directory = destination_state
+            if current is not None and current != expected:
+                raise OSError(
+                    "destination release manifest identifies a different release")
+            created = publish_release_identity(
+                plan.dest_root / destination_folder,
+                expected,
+                expected_directory=expected_directory,
+            )
+            verified = _destination_release_identity(
+                destination_root, tuple(record["destination_folder"]))
+            if verified is None or verified[0] != expected:
+                raise OSError("destination release manifest could not be verified")
+            result.release_identity_outcomes.append((
+                source_path,
+                destination_folder,
+                COPIED if created else SKIPPED,
+                "" if created else "verified existing release identity",
+            ))
+            successful_destinations.add(tuple(record["destination_folder"]))
+        except (OSError, ValueError) as exc:
+            result.release_identity_outcomes.append((
+                source_path, destination_folder, FAILED, str(exc)))
+    return successful_destinations
+
+
+def _replace_track_outcome(result, entry, status, reason) -> None:
+    key = _plan_entry_key(entry.source, entry.dest_rel)
+    for index, outcome in enumerate(result.outcomes):
+        if _plan_entry_key(outcome[0], outcome[1]) == key:
+            result.outcomes[index] = (
+                entry.source, entry.dest_rel, status, reason)
+            return
+
+
+def _settle_identity_audio(
+        pending, successful_destinations, result, *, in_place,
+        retired_receipts):
+    for item in pending:
+        entry = item["entry"]
+        opened = item["opened_source"]
+        published = item["published"]
+        destination = tuple(Path(entry.dest_rel).parts[:2])
+        try:
+            if destination not in successful_destinations:
+                discarded = _discard_owned_publication(
+                    published,
+                    entry.source_receipt["file"],
+                    recoveries=result.recoveries,
+                )
+                if not discarded:
+                    recovery = _owned_publication_recovery(
+                        published,
+                        entry.source,
+                        entry.source_receipt,
+                        "release identity publication failed and the exact "
+                        "same-run audio could not be removed safely",
+                    )
+                    if recovery not in result.recoveries:
+                        result.recoveries.append(recovery)
+                else:
+                    result.copied -= 1
+                    result.failed += 1
+                    _replace_track_outcome(
+                        result,
+                        entry,
+                        FAILED,
+                        "release identity publication failed; copied audio "
+                        "was rolled back",
+                    )
+                continue
+            if in_place:
+                safety = _hold_published_destination(
+                    published, entry.source_receipt["file"])
+                try:
+                    if _remove_sealed_source(
+                        opened,
+                        entry.source_receipt,
+                        safety.intact,
+                        result.recoveries,
+                    ):
+                        retired_receipts.append(entry.source_receipt)
+                        safety.release()
+                    else:
+                        result.lingered += 1
+                finally:
+                    safety.close()
+        finally:
+            _close_published_file(published)
+            opened.close()
 
 
 def execute_plan(plan: MigrationPlan, *, in_place: bool = False,
@@ -4933,7 +5458,7 @@ def _execute_plan(plan: MigrationPlan, *, in_place: bool = False,
             f"selected migration resume entries are malformed: {exc}",
         )
     try:
-        resume_entries, entry_map = _validate_plan(
+        resume_entries, entry_map, release_identity_map = _validate_plan(
             plan, supplied_resume_entries)
     except OSError as exc:
         reason = str(exc)
@@ -4945,6 +5470,8 @@ def _execute_plan(plan: MigrationPlan, *, in_place: bool = False,
     placed = plan.placed
     retired_receipts = []
     source_root = destination_root = None
+    release_identity_states = []
+    pending_identity_audio = []
     try:
         try:
             if (
@@ -4968,6 +5495,26 @@ def _execute_plan(plan: MigrationPlan, *, in_place: bool = False,
             reason = str(exc)
             return _record_plan_refusal(
                 result, plan, resume_entries, reason)
+
+        release_identity_states, blocked_entries = (
+            _preflight_release_identities(
+                plan,
+                result,
+                source_root,
+                destination_root,
+                resume_entries,
+                release_identity_map,
+            )
+        )
+        placed = [entry for entry in placed if id(entry) not in blocked_entries]
+        resume_entries = [
+            entry for entry in resume_entries
+            if id(entry) not in blocked_entries
+        ]
+        identity_destinations = {
+            tuple(record["destination_folder"])
+            for record in plan.release_identities
+        }
 
         total = len(placed)
         for i, entry in enumerate(placed, 1):
@@ -5006,7 +5553,22 @@ def _execute_plan(plan: MigrationPlan, *, in_place: bool = False,
                     entry.dest_rel,
                     entry.destination_path_receipt,
                 )
-                if in_place:
+                identity_bound = (
+                    tuple(Path(entry.dest_rel).parts[:2])
+                    in identity_destinations
+                )
+                if identity_bound:
+                    pending_identity_audio.append({
+                        "entry": entry,
+                        "opened_source": opened_source,
+                        "published": published,
+                    })
+                    opened_source = None
+                    published = None
+                    result.copied += 1
+                    result.outcomes.append(
+                        (src, entry.dest_rel, COPIED, ""))
+                elif in_place:
                     destination_safety = _hold_published_destination(
                         published,
                         entry.source_receipt["file"],
@@ -5192,6 +5754,25 @@ def _execute_plan(plan: MigrationPlan, *, in_place: bool = False,
             _carry_companion_files(
                 plan, result, entry_map=entry_map,
                 resume_entries=resume_entries,
+                carry_companions=False,
+                progress=progress, cancel_check=cancel_check,
+                source_root_binding=source_root,
+                destination_root_binding=destination_root)
+        successful_identities = _publish_release_identities(
+            plan, result, destination_root, release_identity_states)
+        _settle_identity_audio(
+            pending_identity_audio,
+            successful_identities,
+            result,
+            in_place=in_place,
+            retired_receipts=retired_receipts,
+        )
+        pending_identity_audio = []
+        if not result.cancelled:
+            _carry_companion_files(
+                plan, result, entry_map=entry_map,
+                resume_entries=[],
+                verify_resumes=False,
                 progress=progress, cancel_check=cancel_check,
                 source_root_binding=source_root,
                 destination_root_binding=destination_root)
@@ -5215,6 +5796,25 @@ def _execute_plan(plan: MigrationPlan, *, in_place: bool = False,
     finally:
         active_abort = _migration_abort_in_chain(sys.exception())
         cleanup_failures = []
+        for item in pending_identity_audio:
+            _capture_cleanup(
+                cleanup_failures,
+                "pending identity audio destination teardown",
+                lambda item=item: _close_published_file(item["published"]),
+            )
+            _capture_cleanup(
+                cleanup_failures,
+                "pending identity audio source teardown",
+                item["opened_source"].close,
+            )
+        for state in release_identity_states:
+            opened = state.get("opened_source")
+            if opened is not None:
+                _capture_cleanup(
+                    cleanup_failures,
+                    "release identity source teardown",
+                    opened.close,
+                )
         for boundary, binding in (
             ("destination root teardown", destination_root),
             ("source root teardown", source_root),
@@ -5298,7 +5898,8 @@ def _write_csv_for_plan(plan, path, prefix, header, row_builder) -> dict:
         # If the preview safely created a missing destination root, everything
         # after this point binds the exact directory that now exists.
         plan.dest_root_receipt = _refresh_root_receipt(binding)
-        _resume_entries, entry_map = _validate_plan(plan, [])
+        _resume_entries, entry_map, _release_identity_map = _validate_plan(
+            plan, [])
         context = _plan_context(plan)
         context_seal = _canonical_digest(context)
         rows = row_builder(context_seal, entry_map)
@@ -5452,10 +6053,16 @@ def _results_rows(result, plan, context_seal, entry_map) -> list:
         for _source, _destination, status, _reason
         in result.companion_outcomes
     )
+    release_identity_failures = sum(
+        status == FAILED
+        for _source, _destination, status, _reason
+        in result.release_identity_outcomes
+    )
     state = (
         "cancelled" if result.cancelled
         else "failed" if (
-            result.failed or companion_failures or result.recoveries
+            result.failed or companion_failures or release_identity_failures
+            or result.recoveries
             or result.cleanup_failures)
         else "completed"
     )
@@ -5469,6 +6076,8 @@ def _results_rows(result, plan, context_seal, entry_map) -> list:
         "companions_copied": int(result.companions),
         "companion_attempts": len(result.companion_outcomes),
         "companion_failures": int(companion_failures),
+        "release_identity_attempts": len(result.release_identity_outcomes),
+        "release_identity_failures": int(release_identity_failures),
         "pruned": int(result.pruned),
         "track_attempts": len(result.outcomes),
         "recoveries": len(result.recoveries),
@@ -5493,6 +6102,7 @@ def _results_rows(result, plan, context_seal, entry_map) -> list:
     for record, outcomes in (
         ("track", result.outcomes),
         ("companion", result.companion_outcomes),
+        ("release_identity", result.release_identity_outcomes),
     ):
         for source, destination, status, reason in outcomes:
             rows.append([
@@ -5573,7 +6183,7 @@ def verify_audit_artifact(plan: MigrationPlan, artifact) -> bool:
             or not _safe_component(path.name)
         ):
             return False
-        _resume_entries, _entry_map = _validate_plan(
+        _resume_entries, _entry_map, _release_identity_map = _validate_plan(
             plan,
             [entry for entry in plan.entries if _is_resume_collision(entry)],
         )
@@ -5605,6 +6215,64 @@ def verify_audit_artifact(plan: MigrationPlan, artifact) -> bool:
         if any(
             _canonical_digest(companion) not in full_companion_seals
             for companion in plan.companion_receipts
+        ):
+            return False
+        full_release_identities = context.get("release_identities")
+        if not isinstance(full_release_identities, list):
+            return False
+        full_release_identity_seals = set()
+        for record in full_release_identities:
+            seal = _canonical_digest(record)
+            if seal in full_release_identity_seals:
+                return False
+            full_release_identity_seals.add(seal)
+        if any(
+            _canonical_digest(record) not in full_release_identity_seals
+            for record in plan.release_identities
+        ):
+            return False
+        selected_albums = {
+            tuple(Path(entry.dest_rel).parts[:2])
+            for entry in plan.entries
+            if entry.dest_rel is not None and len(Path(entry.dest_rel).parts) >= 2
+        }
+        relevant_full_identity_seals = {
+            _canonical_digest(record)
+            for record in full_release_identities
+            if (
+                isinstance(record, dict)
+                and isinstance(record.get("destination_folder"), list)
+                and tuple(record["destination_folder"]) in selected_albums
+            )
+        }
+        if relevant_full_identity_seals != {
+            _canonical_digest(record) for record in plan.release_identities
+        }:
+            return False
+        full_album_entries = context.get("album_entries")
+        if not isinstance(full_album_entries, list):
+            return False
+        relevant_full_entry_seals = []
+        for item in full_album_entries:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"destination_folder", "entry_seal"}
+                or not isinstance(item["destination_folder"], list)
+                or len(item["destination_folder"]) != 2
+                or not isinstance(item["entry_seal"], str)
+                or len(item["entry_seal"]) != 64
+            ):
+                return False
+            if tuple(item["destination_folder"]) in selected_albums:
+                relevant_full_entry_seals.append(item["entry_seal"])
+        selected_entry_seals = [
+            _entry_seal(entry) for entry in plan.entries
+            if entry.dest_rel is not None
+        ]
+        if (
+            len(set(relevant_full_entry_seals))
+            != len(relevant_full_entry_seals)
+            or sorted(relevant_full_entry_seals) != sorted(selected_entry_seals)
         ):
             return False
 

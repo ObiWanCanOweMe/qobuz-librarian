@@ -2636,8 +2636,20 @@ def scan_migration(job, src, dest, *, use_acoustid, in_place=False):
             group = groups.setdefault(
                 key, {"entries": [], "resume_entries": []})
             group[kind].append(entry)
+    resume_ids = {id(entry) for entry in resume_entries}
+    unsafe_albums = {
+        tuple(entry.dest_rel.parts[:2])
+        for entry in plan.collisions
+        if (
+            entry.dest_rel is not None
+            and len(entry.dest_rel.parts) >= 2
+            and id(entry) not in resume_ids
+        )
+    }
     migration_candidate_ids = []
     for (artist, album), group in sorted(groups.items()):
+        if (artist, album) in unsafe_albums:
+            continue
         entries = group["entries"]
         resumes = group["resume_entries"]
         source_folders = {
@@ -2673,6 +2685,15 @@ def scan_migration(job, src, dest, *, use_acoustid, in_place=False):
             "companion_receipts": [
                 receipt for receipt in plan.companion_receipts
                 if tuple(receipt.get("relative", ())[:-1]) in source_folders
+            ],
+            "release_identities": [
+                record for record in plan.release_identities
+                if any(
+                    tuple(folder) in source_folders
+                    for folder in record.get("mapped_source_folders", ())
+                )
+                and tuple(record.get("destination_folder", ()))
+                == (artist, album)
             ],
         }
         cid = job.add_candidate(
@@ -2761,6 +2782,8 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
     destination_name_semantics = None
     companion_receipts = []
     companion_seen = set()
+    release_identities = []
+    release_identity_seen = set()
     manifest_artifact = None
     for c in chosen:
         payload = c.get("payload", {})
@@ -2821,6 +2844,29 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
             if key not in companion_seen:
                 companion_seen.add(key)
                 companion_receipts.append(receipt)
+        for record in payload.get("release_identities", []):
+            if not isinstance(record, dict):
+                job.error = (
+                    "The saved migration preview is malformed. Nothing was "
+                    "changed; scan again.")
+                job.summary = job.error
+                return
+            try:
+                key = json.dumps(
+                    record,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                )
+            except (TypeError, ValueError):
+                job.error = (
+                    "The saved migration preview is malformed. Nothing was "
+                    "changed; scan again.")
+                job.summary = job.error
+                return
+            if key not in release_identity_seen:
+                release_identity_seen.add(key)
+                release_identities.append(record)
         for raw in payload.get("entries", []):
             if not isinstance(raw, (list, tuple)) or len(raw) != 4:
                 job.error = (
@@ -2857,6 +2903,7 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
         source_root_receipt=source_root_receipt,
         dest_root_receipt=dest_root_receipt,
         companion_receipts=companion_receipts,
+        release_identities=release_identities,
         destination_name_semantics=destination_name_semantics,
     )
     resume_entries = plan.collisions
@@ -2956,6 +3003,26 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
     for source, _destination, status, reason in companion_outcomes:
         if status == engine.FAILED:
             job.push_line(f"sidecar failed: {source} — {reason}")
+    release_identity_outcomes = getattr(
+        result, "release_identity_outcomes", ())
+    release_identity_published = sum(
+        status == engine.COPIED
+        for _source, _destination, status, _reason
+        in release_identity_outcomes
+    )
+    release_identity_reused = sum(
+        status == engine.SKIPPED
+        for _source, _destination, status, _reason
+        in release_identity_outcomes
+    )
+    release_identity_failed = sum(
+        status == engine.FAILED
+        for _source, _destination, status, _reason
+        in release_identity_outcomes
+    )
+    for source, _destination, status, reason in release_identity_outcomes:
+        if status == engine.FAILED:
+            job.push_line(f"release identity failed: {source} — {reason}")
     recoveries = tuple(getattr(result, "recoveries", ()))
     for recovery in recoveries:
         location = recovery.get("location", "unknown location")
@@ -2974,6 +3041,15 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
         )
     if companion_failed:
         parts.append(f"{plural(companion_failed, 'cover/sidecar file')} failed")
+    if release_identity_published:
+        parts.append(
+            f"published {plural(release_identity_published, 'release identity')}")
+    if release_identity_reused:
+        parts.append(
+            f"verified {plural(release_identity_reused, 'release identity')}")
+    if release_identity_failed:
+        parts.append(
+            f"{plural(release_identity_failed, 'release identity')} failed")
     if result.lingered:
         parts.append(f"{result.lingered} moved but the original couldn't be removed")
     if result.failed:
@@ -2982,6 +3058,11 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
         # failed copies ends red, like every other execute path, instead of a
         # green DONE that buries "N failed" mid-sentence.
         job.error = f"{plural(result.failed, 'file')} couldn't be migrated; see the log."
+    elif release_identity_failed:
+        job.error = (
+            f"{plural(release_identity_failed, 'release identity')} couldn't "
+            "be migrated; see the log."
+        )
     if pruned:
         parts.append(f"cleared {plural(pruned, 'empty source folder')}")
     if result.cancelled:

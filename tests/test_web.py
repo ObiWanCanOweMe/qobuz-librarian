@@ -1819,6 +1819,15 @@ def test_migration_payload_schema_round_trips_normalized_rows(monkeypatch):
         "companion_receipts": [
             {"relative": ["Artist", "cover.jpg"], "file": {"size": 9}},
         ],
+        "release_identities": [{
+            "source_folder": ["Artist"],
+            "mapped_source_folders": [["Artist"]],
+            "destination_folder": ["Artist", "Album"],
+            "source_receipt": {
+                "relative": ["Artist", ".qobuz-librarian-release.json"],
+            },
+            "identity": {"provider": "qobuz", "release_id": "100"},
+        }],
     }
 
     assert job_persistence.migration_payload_reference() == {
@@ -1838,7 +1847,55 @@ def test_migration_payload_schema_round_trips_normalized_rows(monkeypatch):
     assert conn.execute(
         "SELECT entry_kind, ordinal FROM migration_candidate_entries "
         "ORDER BY entry_kind, ordinal"
-    ).fetchall() == [("companion", 0), ("entry", 0), ("resume", 0)]
+    ).fetchall() == [
+        ("companion", 0),
+        ("entry", 0),
+        ("release_identity", 0),
+        ("resume", 0),
+    ]
+
+
+def test_migration_payload_schema_upgrade_preserves_existing_rows(monkeypatch):
+    from qobuz_librarian.web import job_persistence
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+    conn = job_persistence._get_conn()
+    conn.execute("DROP INDEX IF EXISTS idx_migration_candidate_entries")
+    conn.execute("ALTER TABLE migration_candidate_entries RENAME TO entries_v7")
+    conn.execute(
+        "CREATE TABLE migration_candidate_entries ("
+        "job_id TEXT NOT NULL, candidate_id TEXT NOT NULL, "
+        "entry_kind TEXT NOT NULL CHECK (entry_kind IN "
+        "('entry', 'resume', 'companion')), "
+        "ordinal INTEGER NOT NULL CHECK (ordinal >= 0), "
+        "source TEXT, destination TEXT, source_receipt TEXT NOT NULL, "
+        "destination_receipt TEXT, "
+        "PRIMARY KEY (job_id, candidate_id, entry_kind, ordinal))"
+    )
+    conn.execute("DROP TABLE entries_v7")
+    conn.execute(
+        "INSERT INTO migration_candidate_entries VALUES "
+        "('job', 'candidate', 'companion', 0, NULL, NULL, '{}', NULL)"
+    )
+    conn.execute("PRAGMA user_version = 6")
+    conn.commit()
+    conn.close()
+    job_persistence._conn = None
+
+    job_persistence.init()
+
+    conn = job_persistence._get_conn()
+    assert conn.execute(
+        "SELECT entry_kind, source_receipt "
+        "FROM migration_candidate_entries"
+    ).fetchall() == [("companion", "{}")]
+    conn.execute(
+        "INSERT INTO migration_candidate_entries VALUES "
+        "('job', 'candidate', 'release_identity', 0, NULL, NULL, '{}', NULL)"
+    )
+    conn.commit()
 
 
 def test_migration_payload_stores_and_hydrates_one_shared_artifact(monkeypatch):
@@ -1857,6 +1914,7 @@ def test_migration_payload_stores_and_hydrates_one_shared_artifact(monkeypatch):
         "destination_name_semantics": {},
         "manifest_artifact": shared_artifact,
         "companion_receipts": [],
+        "release_identities": [],
     }
     for candidate_id in ("c0", "c1"):
         assert job_persistence.persist_migration_candidate_payload(
@@ -1910,6 +1968,7 @@ def test_delete_job_removes_migration_payload_rows(monkeypatch):
         "source_root_receipt": {}, "dest_root_receipt": {},
         "destination_name_semantics": {}, "manifest_artifact": {},
         "companion_receipts": [],
+        "release_identities": [],
     }
     assert job_persistence.persist_migration_candidate_payload(
         job.id, "c0", payload
@@ -1945,6 +2004,7 @@ def test_resolve_migration_candidates_rejects_wrong_owner_and_corruption(
         "source_root_receipt": {}, "dest_root_receipt": {},
         "destination_name_semantics": {}, "manifest_artifact": {},
         "companion_receipts": [],
+        "release_identities": [],
     }
     assert job_persistence.persist_migration_candidate_payload(
         "owner", "c0", payload
@@ -1994,6 +2054,7 @@ def test_resolve_migration_candidates_preserves_display_and_legacy(
         "source_root_receipt": {}, "dest_root_receipt": {},
         "destination_name_semantics": {}, "manifest_artifact": {},
         "companion_receipts": [],
+        "release_identities": [],
     }
     assert job_persistence.persist_migration_candidate_payload(
         "owner", "c0", payload
@@ -2047,6 +2108,7 @@ def test_migration_payload_scale_keeps_job_snapshot_bounded(monkeypatch):
             "destination_name_semantics": {"case_sensitive": True},
             "manifest_artifact": {"path": "/dest/manifest.csv"},
             "companion_receipts": [],
+            "release_identities": [],
         }
         assert job_persistence.persist_migration_candidate_payload(
             job.id, cid, payload
