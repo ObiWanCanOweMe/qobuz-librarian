@@ -65,6 +65,21 @@ def test_durable_new_album_plan_refuses_existing_or_partial_work():
     assert plan_durable_new_album(
         _item(album), Namespace(no_import=False, consolidate=True)
     ) is None
+
+
+def test_durable_new_album_plan_freezes_collision_suffix():
+    album = _album()
+
+    plan = plan_durable_new_album(
+        _item(album),
+        Namespace(no_import=False),
+        album_path_suffix=" [qobuz-200]",
+    )
+
+    assert plan is not None
+    assert plan.album_path_suffix == " [qobuz-200]"
+
+
 def test_durable_input_becomes_ready_only_for_exact_zero_remainder_download():
     album = _album()
     plan = plan_durable_new_album(_item(album), Namespace(no_import=False))
@@ -100,5 +115,4 @@ def test_durable_input_becomes_ready_only_for_exact_zero_remainder_download():
         counts=DownloadCounts(failed=1),
     )
     assert completion_input_from_download(initial, incomplete) is None
-
 

@@ -2391,15 +2391,16 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
                 initial_identity_review = ("identity_ambiguous", exc)
             except AlbumPlacementAttention as exc:
                 initial_identity_review = ("identity_attention", exc)
-        plan = plan_durable_new_album(item, args)
-        if (
-            initial_identity_review is not None
-            or (initial_placement is not None and initial_placement.suffix)
-        ):
-            # Managed durable imports intentionally keep their stable ordinary
-            # override. Collision editions use the per-album legacy lane whose
-            # one-shot YAML carries this album's suffix.
+        if initial_identity_review is not None:
             plan = None
+        elif initial_placement is not None and initial_placement.suffix:
+            plan = plan_durable_new_album(
+                item,
+                args,
+                album_path_suffix=initial_placement.suffix,
+            )
+        else:
+            plan = plan_durable_new_album(item, args)
         if plan is not None and not _durable_plan_allowed(
             items,
             item,
@@ -2588,7 +2589,7 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
                     on_sources_changed=checkpoint_sources,
                 )
                 current_placement = resolve_album_import_placement(album, token)
-                if current_placement.suffix:
+                if current_placement.suffix != plan.album_path_suffix:
                     raise AlbumPlacementAttention(
                         "collision routing changed during durable preparation"
                     )

@@ -288,7 +288,7 @@ def test_failed_download_leaving_only_art_stays_retryable(
     assert saved.recovery_references == ()
 
 
-def test_durable_album_removes_queue_only_under_live_completion_proof(
+def test_durable_collision_suffix_reaches_managed_import_with_completion_proof(
     tmp_path, monkeypatch, authority
 ):
     staging = tmp_path / "staging"
@@ -301,7 +301,11 @@ def test_durable_album_removes_queue_only_under_live_completion_proof(
     item = _single_track_item("Safe Album")
     queue = [item]
     args = Namespace(no_import=False)
-    plan = plan_durable_new_album(item, args)
+    plan = plan_durable_new_album(
+        item,
+        args,
+        album_path_suffix=" [qobuz-42]",
+    )
     assert plan is not None
 
     slot = plan.expectation.catalogue_slots[0]
@@ -375,7 +379,9 @@ def test_durable_album_removes_queue_only_under_live_completion_proof(
         on_reservation,
         on_intent,
         authority_check,
+        album_path_suffix,
     ):
+        observed["album_path_suffix"] = album_path_suffix
         authority_check()
         reservation = {
             "version": 1,
@@ -537,6 +543,7 @@ def test_durable_album_removes_queue_only_under_live_completion_proof(
 
     assert result.status is durable_runner.DurableAlbumStatus.COMPLETE
     assert observed["active_before_download"] is True
+    assert observed["album_path_suffix"] == " [qobuz-42]"
     assert observed["live_queue"] and observed["live_queue"][0] is True
     assert queue == []
     assert queue_state.list_queue_journals() == ()

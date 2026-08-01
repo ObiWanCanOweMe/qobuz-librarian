@@ -108,7 +108,14 @@ def _require_authority(authority: RunLockLease) -> None:
 
 
 def _require_current_plan(item, args, plan: DurableNewAlbumPlan) -> None:
-    if type(plan) is not DurableNewAlbumPlan or plan_durable_new_album(item, args) != plan:
+    if (
+        type(plan) is not DurableNewAlbumPlan
+        or plan_durable_new_album(
+            item,
+            args,
+            album_path_suffix=plan.album_path_suffix,
+        ) != plan
+    ):
         raise DurableAlbumUnavailable("the album no longer matches the durable download plan")
 
 
@@ -1042,13 +1049,18 @@ def execute_durable_new_album(
 
     try:
         _require_authority(authority)
+        import_kwargs = {
+            "owner": _owner_record(owner),
+            "on_reservation": checkpoint_reservation,
+            "on_intent": checkpoint_carrier,
+            "authority_check": lambda: _require_authority(authority),
+        }
+        if plan.album_path_suffix:
+            import_kwargs["album_path_suffix"] = plan.album_path_suffix
         imported = beets_import_managed(
             album_dirs,
             binding_records,
-            owner=_owner_record(owner),
-            on_reservation=checkpoint_reservation,
-            on_intent=checkpoint_carrier,
-            authority_check=lambda: _require_authority(authority),
+            **import_kwargs,
         )
         _require_authority(authority)
     except BaseException:

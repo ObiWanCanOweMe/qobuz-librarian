@@ -1426,7 +1426,8 @@ def _managed_carrier_reservation(capture):
     }
 
 
-def _prepare_managed_override(capture, plugin_config):
+def _prepare_managed_override(
+        capture, plugin_config, *, album_path_suffix: str = ""):
     """Create a sealed anonymous config that cannot survive this process."""
     required = (
         "memfd_create",
@@ -1468,6 +1469,7 @@ def _prepare_managed_override(capture, plugin_config):
         payload = _build_import_override_yaml(
             plugin_config,
             ownership_enabled=True,
+            album_path_suffix=album_path_suffix,
         ).encode("utf-8")
         offset = 0
         while offset < len(payload):
@@ -4499,9 +4501,16 @@ def _configured_beets_plugins(runtime=None):
     paths = payload["paths"]
     if (
         not isinstance(paths, dict)
-        or set(paths) != {"default", "comp", "singleton"}
-        or any(not isinstance(value, str) or len(value) > 4096
-               for value in paths.values())
+        or len(paths) > 256
+        or not {"default", "comp", "singleton"}.issubset(paths)
+        or any(
+            not isinstance(key, str)
+            or not key
+            or len(key) > 4096
+            or not isinstance(value, str)
+            or len(value) > 4096
+            for key, value in paths.items()
+        )
     ):
         return None
     return {
@@ -4618,21 +4627,27 @@ def _build_import_override_yaml(
         "comp": cfg.BEETS_PATH_COMP,
     }
     if album_path_suffix and plugin_config is not None:
-        effective_paths = plugin_config["paths"]
-        configured_paths = {
-            key: configured_paths[key] or effective_paths[key]
-            for key in configured_paths
-        }
-        for key in ("default", "comp"):
+        effective_paths = dict(plugin_config["paths"])
+        for key, configured in configured_paths.items():
+            if configured:
+                effective_paths[key] = configured
+        configured_paths = {}
+        album_token = re.compile(r"\$album(?![A-Za-z0-9_])")
+        for key, template in effective_paths.items():
+            if key == "singleton" and not album_token.search(template):
+                configured_paths[key] = template
+                continue
             configured_paths[key] = append_album_path_suffix(
-                configured_paths[key], album_path_suffix)
-        if re.search(r"\$album(?![A-Za-z0-9_])", configured_paths["singleton"]):
-            configured_paths["singleton"] = append_album_path_suffix(
-                configured_paths["singleton"], album_path_suffix)
+                template,
+                album_path_suffix,
+            )
     _paths = []
-    for key in ("default", "singleton", "comp"):
-        if configured_paths[key]:
-            _paths.append(f"  {key}: {_yaml_sq(configured_paths[key])}\n")
+    for key, template in configured_paths.items():
+        if template:
+            rendered_key = (
+                key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else _yaml_sq(key)
+            )
+            _paths.append(f"  {rendered_key}: {_yaml_sq(template)}\n")
     if _paths:
         override_yaml += "paths:\n" + "".join(_paths)
 
@@ -4940,7 +4955,8 @@ class _ManagedBeetsRunCleanup:
                 self._finalizer.detach()
 
 
-def _prepare_managed_beets_run(roots, bindings, owner, *, on_reservation):
+def _prepare_managed_beets_run(
+        roots, bindings, owner, *, on_reservation, album_path_suffix: str = ""):
     runtime = _resolve_beets_runtime()
     if runtime is None:
         return None
@@ -4950,6 +4966,14 @@ def _prepare_managed_beets_run(roots, bindings, owner, *, on_reservation):
         return None
     plugin_config = _configured_beets_plugins(runtime)
     if plugin_config is None:
+        return None
+    try:
+        _build_import_override_yaml(
+            plugin_config,
+            ownership_enabled=True,
+            album_path_suffix=album_path_suffix,
+        )
+    except ValueError:
         return None
 
     before = _normalise_managed_bindings(bindings, roots)
@@ -5354,7 +5378,14 @@ def beets_import_albums(
 
 
 def beets_import_managed(
-    album_dirs, bindings, *, owner, on_reservation, on_intent, authority_check=None
+    album_dirs,
+    bindings,
+    *,
+    owner,
+    on_reservation,
+    on_intent,
+    authority_check=None,
+    album_path_suffix: str = "",
 ):
     """Run one non-retrying import with durable slot-to-file evidence."""
     owner = normalise_recovery_owner(owner)
@@ -5376,6 +5407,7 @@ def beets_import_managed(
                 bindings,
                 owner,
                 on_reservation=on_reservation,
+                album_path_suffix=album_path_suffix,
             )
         )
     except Exception:
@@ -5415,7 +5447,11 @@ def beets_import_managed(
     try:
         current_intent = _normalise_managed_bindings(intent, roots)
         if current_intent == intent:
-            override_path = _prepare_managed_override(capture, plugin_config)
+            override_path = _prepare_managed_override(
+                capture,
+                plugin_config,
+                album_path_suffix=album_path_suffix,
+            )
     except Exception:
         current_intent = None
     except BaseException as exc:

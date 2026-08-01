@@ -488,7 +488,7 @@ def test_executor_per_album_isolation_one_album_failure_keeps_others(monkeypatch
     monkeypatch.setattr(
         executor,
         "plan_durable_new_album",
-        lambda item, _args: object() if item["album"]["id"] == "B" else None,
+        lambda _item, _args, **_kwargs: None,
     )
     monkeypatch.setattr(
         executor, "retire_empty_download_staging", lambda _item: True)
@@ -522,6 +522,68 @@ def test_executor_per_album_isolation_one_album_failure_keeps_others(monkeypatch
     assert parked == []
     assert [item["label"] for item in items] == ["B"]
     assert drained is False
+
+
+def test_collision_eligible_album_uses_durable_lane_with_frozen_suffix(
+        monkeypatch, tmp_path):
+    from qobuz_librarian.queue import executor
+
+    post_dir = tmp_path / "music" / "Artist" / "Album [qobuz-200]"
+    plan = SimpleNamespace(album_path_suffix=" [qobuz-200]")
+    item = _qitem(
+        "Collision",
+        album_dir=None,
+        album={
+            "id": "200",
+            "title": "Album",
+            "artist": {"name": "Artist"},
+            "tracks": {"items": []},
+        },
+    )
+    queue = [item]
+    seen = []
+
+    monkeypatch.setattr(
+        executor,
+        "resolve_album_import_placement",
+        lambda _album, _token: SimpleNamespace(suffix=" [qobuz-200]"),
+    )
+
+    def freeze_plan(_item, _args, *, album_path_suffix=""):
+        seen.append(("plan", album_path_suffix))
+        return plan
+
+    def durable(current_queue, current_item, _args, **kwargs):
+        seen.append(("durable", kwargs["plan"].album_path_suffix))
+        current_queue.remove(current_item)
+        return SimpleNamespace(
+            status=executor.DurableAlbumStatus.COMPLETE,
+            post_dir=post_dir,
+        )
+
+    monkeypatch.setattr(executor, "plan_durable_new_album", freeze_plan)
+    monkeypatch.setattr(executor, "_durable_plan_allowed", lambda *_a, **_k: True)
+    monkeypatch.setattr(executor, "staging_preflight", lambda _args: None)
+    monkeypatch.setattr(executor, "_reimport_parked_albums", lambda: (False, []))
+    monkeypatch.setattr(executor, "execute_durable_new_album", durable)
+    monkeypatch.setattr(executor, "is_cancel_requested", lambda: False)
+    monkeypatch.setattr(executor, "warn_if_download_truncated", lambda *_a: [])
+
+    args = Namespace(
+        dry_run=False,
+        no_import=False,
+        no_downsample=True,
+        consolidate=False,
+    )
+    results, drained = executor._execute_download_queue(queue, args, token="tok")
+
+    assert seen == [
+        ("plan", " [qobuz-200]"),
+        ("durable", " [qobuz-200]"),
+    ]
+    assert results[0]["imported"] is True
+    assert queue == []
+    assert drained is True
 
 
 def test_executor_keeps_only_failed_downloads_for_retry(monkeypatch, tmp_path):

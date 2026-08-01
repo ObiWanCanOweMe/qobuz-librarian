@@ -33,6 +33,7 @@ class DurableNewAlbumPlan:
     expectation: CompletionExpectation
     effective_tier: int
     library_backup_kind: str | None = None
+    album_path_suffix: str = ""
 
 
 def _full_album_gap_fill(item, tracks) -> bool:
@@ -89,10 +90,12 @@ def queue_item_may_create_library_backup(item) -> bool:
     )
 
 
-def plan_durable_new_album(item, args) -> DurableNewAlbumPlan | None:
+def plan_durable_new_album(
+        item, args, *, album_path_suffix: str = "") -> DurableNewAlbumPlan | None:
     """Freeze one full-album lane the live completion proof can authorise."""
     if (
         type(item) is not dict
+        or type(album_path_suffix) is not str
         or getattr(args, "no_import", False)
         or getattr(args, "consolidate", False)
         or (
@@ -154,7 +157,12 @@ def plan_durable_new_album(item, args) -> DurableNewAlbumPlan | None:
         else "gap-fill" if full_gap_fill
         else None
     )
-    return DurableNewAlbumPlan(expectation, effective_tier, backup_kind)
+    return DurableNewAlbumPlan(
+        expectation,
+        effective_tier,
+        backup_kind,
+        album_path_suffix,
+    )
 
 
 def initial_completion_input(

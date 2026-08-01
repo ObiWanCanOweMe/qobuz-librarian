@@ -627,6 +627,9 @@ def test_collision_suffix_is_written_to_each_effective_album_path(monkeypatch):
             "default": "$albumartist/$album ($year)/$track - $title",
             "comp": "Compilations/$album ($year)/$track - $title",
             "singleton": "Singletons/$artist - $title",
+            "albumtype:soundtrack": (
+                "Soundtracks/$albumartist/$album ($year)/$track - $title"
+            ),
         },
     }
 
@@ -637,6 +640,11 @@ def test_collision_suffix_is_written_to_each_effective_album_path(monkeypatch):
     assert "$album ($year) [qobuz-200]/$track" in collision
     assert "Compilations/$album ($year) [qobuz-200]/$track" in collision
     assert "Singletons/$artist - $title" in collision
+    assert (
+        "  'albumtype:soundtrack': "
+        "'Soundtracks/$albumartist/$album ($year) [qobuz-200]/$track - $title'"
+        in collision
+    )
     assert "[qobuz-200]" not in plain
     assert plain == _build_import_override_yaml(configured)
 
@@ -644,6 +652,51 @@ def test_collision_suffix_is_written_to_each_effective_album_path(monkeypatch):
     singleton_album = _render_beets_override(
         configured, album_path_suffix=" [qobuz-200]")
     assert "Singletons/$album [qobuz-200]/$track" in singleton_album
+
+
+def test_empty_collision_suffix_preserves_frozen_override_yaml(monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.integrations import beets
+
+    monkeypatch.setattr(cfg, "BEETS_DB_PATH", Path("/config/beets/musiclibrary.db"))
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", Path("/music"))
+    monkeypatch.setattr(cfg, "BEETS_PATH_DEFAULT", "")
+    monkeypatch.setattr(cfg, "BEETS_PATH_SINGLETON", "")
+    monkeypatch.setattr(cfg, "BEETS_PATH_COMP", "")
+    monkeypatch.setattr(cfg, "BEETS_PLUGINS", [])
+    monkeypatch.setattr(cfg, "ARTWORK", "sidecar")
+    monkeypatch.setattr(
+        beets,
+        "__file__",
+        "/app/qobuz_librarian/integrations/beets.py",
+    )
+    configured = {
+        "plugins": [],
+        "disabled": [],
+        "musicbrainz_enabled": False,
+        "plugin_paths": [],
+        "paths": {
+            "default": "$albumartist/$album/$track - $title",
+            "comp": "Compilations/$album/$track - $title",
+            "singleton": "Singletons/$artist - $title",
+            "albumtype:soundtrack": "Soundtracks/$album/$track - $title",
+        },
+    }
+
+    assert beets._render_beets_override(configured, album_path_suffix="") == (
+        "library: '/config/beets/musiclibrary.db'\n"
+        "directory: '/music'\n"
+        "import:\n"
+        "  quiet: yes\n"
+        "  incremental: no\n"
+        "  autotag: no\n"
+        "  move: yes\n"
+        "  duplicate_action: merge\n"
+        "pluginpath:\n"
+        "  - '/app/qobuz_librarian/integrations/beets_plugins'\n"
+        "disabled_plugins: []\n"
+        "plugins: [qobuz_art_guard]\n"
+    )
 
 
 def test_config_probe_returns_effective_album_paths(monkeypatch):
@@ -666,6 +719,7 @@ def test_config_probe_returns_effective_album_paths(monkeypatch):
             "default": "$albumartist/$album/$track - $title",
             "comp": "Compilations/$album/$track - $title",
             "singleton": "Singletons/$artist - $title",
+            "albumtype:soundtrack": "Soundtracks/$album/$track - $title",
         },
     }
     monkeypatch.setattr(
@@ -678,7 +732,14 @@ def test_config_probe_returns_effective_album_paths(monkeypatch):
         ),
     )
 
-    assert beets._configured_beets_plugins(runtime)["paths"] == payload["paths"]
+    paths = beets._configured_beets_plugins(runtime)["paths"]
+    assert paths == payload["paths"]
+    assert list(paths) == [
+        "default",
+        "comp",
+        "singleton",
+        "albumtype:soundtrack",
+    ]
 
 
 def test_unsupported_collision_template_stops_before_staging_or_beets(
@@ -701,9 +762,10 @@ def test_unsupported_collision_template_stops_before_staging_or_beets(
             "musicbrainz_enabled": False,
             "disabled": [],
             "paths": {
-                "default": "$artist/$track - $title",
+                "default": "$albumartist/$album/$track - $title",
                 "comp": "Compilations/$album/$track - $title",
                 "singleton": "Singletons/$artist - $title",
+                "genre:Classical": "Classical/$album/$album/$track - $title",
             },
         },
     )
@@ -717,6 +779,51 @@ def test_unsupported_collision_template_stops_before_staging_or_beets(
         album_path_suffix=" [qobuz-200]") == (None, None, None)
     assert prepared == []
     assert any("identity-review" in line for line in lines)
+
+
+def test_unsupported_managed_collision_template_stops_before_staging(
+        monkeypatch, tmp_path):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.integrations import beets
+
+    config_dir = tmp_path / "beets-config"
+    config_dir.mkdir()
+    (config_dir / "config.yaml").write_text("{}")
+    monkeypatch.setattr(cfg, "BEETS_CONFIG_DIR", config_dir)
+    monkeypatch.setattr(beets, "_resolve_beets_runtime", lambda: object())
+    monkeypatch.setattr(
+        beets,
+        "_configured_beets_plugins",
+        lambda _runtime: {
+            "plugins": [],
+            "plugin_paths": [],
+            "musicbrainz_enabled": False,
+            "disabled": [],
+            "paths": {
+                "default": "$albumartist/$album/$track - $title",
+                "comp": "Compilations/$album/$track - $title",
+                "singleton": "Singletons/$artist - $title",
+                "genre:Classical": "Classical/$album/$album/$track - $title",
+            },
+        },
+    )
+    prepared = []
+    reservations = []
+    monkeypatch.setattr(
+        beets,
+        "_prepare_staging_tags",
+        lambda **kwargs: prepared.append(kwargs),
+    )
+
+    assert beets._prepare_managed_beets_run(
+        [],
+        [],
+        {"operation_id": "a" * 64, "item_id": "b" * 64},
+        on_reservation=reservations.append,
+        album_path_suffix=" [qobuz-200]",
+    ) is None
+    assert prepared == []
+    assert reservations == []
 
 
 def test_collision_suffix_reaches_both_beets_import_entry_points(
