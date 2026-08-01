@@ -55,13 +55,14 @@ def collision_album_path(friendly_path: Path, identity: ReleaseIdentity) -> Path
     suffix = qobuz_collision_suffix(identity)
     suffix_bytes = os.fsencode(suffix)
     limit = _component_name_max(friendly_path)
-    if len(suffix_bytes) >= limit:
+    if len(suffix_bytes) > limit:
         raise AlbumPlacementAttention(
             "collision suffix exceeds the filesystem component length limit"
         )
-    stem = _truncate_component(
+    stem_limit = limit - len(suffix_bytes)
+    stem = "" if stem_limit == 0 else _truncate_component(
         friendly_path.name,
-        limit=limit - len(suffix_bytes),
+        limit=stem_limit,
     )
     return friendly_path.with_name(stem + suffix)
 

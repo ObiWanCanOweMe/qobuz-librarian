@@ -73,6 +73,20 @@ def test_collision_truncates_stem_but_preserves_complete_suffix(
     assert result.destination.name.startswith("A")
 
 
+def test_collision_allows_a_suffix_that_exactly_fills_the_component_limit(
+        tmp_path, monkeypatch):
+    friendly = tmp_path / "Artist" / "A"
+    friendly.mkdir(parents=True)
+    publish_release_identity(friendly, ReleaseIdentity("qobuz", "100"))
+    identity = ReleaseIdentity("qobuz", "9" * 39)
+    monkeypatch.setattr(album_placement, "_component_name_max", lambda _path: 48)
+
+    result = resolve_album_placement(friendly, identity)
+
+    assert result.destination.name == f" [qobuz-{'9' * 39}]"
+    assert len(os.fsencode(result.destination.name)) == 48
+
+
 def test_matching_suffixed_path_is_reused_only_with_its_manifest(tmp_path):
     friendly = tmp_path / "Artist" / "Album (2020)"
     friendly.mkdir(parents=True)
