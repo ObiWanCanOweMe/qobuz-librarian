@@ -10,7 +10,7 @@ from typing import Callable
 
 from qobuz_librarian import config as cfg
 from qobuz_librarian.library import flac_cache, scanner
-from qobuz_librarian.library.release_identity import is_release_manifest_name
+from qobuz_librarian.library.release_identity import is_ignored_library_artifact
 
 STATE_VERSION = 1
 
@@ -74,8 +74,7 @@ def build(
                 return InventoryResult(
                     None, False, processed, [str(error) for error in errors], True)
             if (
-                is_release_manifest_name(path.name)
-                or path.name.startswith("._")
+                is_ignored_library_artifact(path.name)
                 or path.suffix.lower() not in exts
             ):
                 continue
