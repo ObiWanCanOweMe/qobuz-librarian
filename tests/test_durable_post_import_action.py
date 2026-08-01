@@ -453,7 +453,8 @@ def test_committed_whole_album_relocation_publishes_at_new_directory_identity(
     assert authority_checks == ["check"] * 5
 
 
-def test_current_identity_inventory_rejects_extra_and_replaced_audio(tmp_path):
+def test_current_identity_inventory_rejects_extra_and_replaced_audio(
+        tmp_path, monkeypatch):
     final_dir = tmp_path / "music" / "Artist" / "Album"
     final_dir.mkdir(parents=True)
     audio = final_dir / "01.flac"
@@ -485,6 +486,54 @@ def test_current_identity_inventory_rejects_extra_and_replaced_audio(tmp_path):
     assert not post_import_finalizer._current_inventory_matches(
         evidence, str(final_dir), relocated=False
     )
+
+    audio.write_bytes(b"completed audio")
+    value = audio.stat()
+    receipt.identity = (
+        value.st_dev, value.st_ino, value.st_size,
+        value.st_mtime_ns, value.st_ctime_ns,
+    )
+    receipt.sha256 = hashlib.sha256(audio.read_bytes()).hexdigest()
+    real_lstat = post_import_finalizer.os.lstat
+    real_stat = post_import_finalizer.os.stat
+    overwritten = False
+
+    def lstat_then_overwrite(path, *args, **kwargs):
+        nonlocal overwritten
+        named = real_lstat(path, *args, **kwargs)
+        if Path(path) == audio:
+            audio.write_bytes(b"corrupted audio")
+            overwritten = True
+        return named
+
+    def stat_then_overwrite(path, *args, **kwargs):
+        nonlocal overwritten
+        named = real_stat(path, *args, **kwargs)
+        if (
+            not overwritten
+            and path == audio.name
+            and kwargs.get("dir_fd") is not None
+        ):
+            audio.write_bytes(b"corrupted audio")
+            overwritten = True
+        return named
+
+    monkeypatch.setattr(
+        post_import_finalizer.os,
+        "lstat",
+        lstat_then_overwrite,
+    )
+    monkeypatch.setattr(
+        post_import_finalizer.os,
+        "stat",
+        stat_then_overwrite,
+    )
+
+    assert not post_import_finalizer._current_inventory_matches(
+        evidence, str(final_dir), relocated=False
+    )
+    assert overwritten is True
+    assert audio.read_bytes() == b"corrupted audio"
 
 
 def test_split_relocation_noop_keeps_action_and_refuses_publication(

@@ -6,6 +6,7 @@ from qobuz_librarian.library import album_placement, release_identity
 from qobuz_librarian.library.album_placement import (
     AlbumPlacementAttention,
     PlacementDisposition,
+    capture_legacy_adoption_receipt,
     resolve_album_placement,
 )
 from qobuz_librarian.library.release_identity import (
@@ -105,9 +106,14 @@ def test_explicit_adoption_proof_reuses_an_unmarked_friendly_path(tmp_path):
     friendly = tmp_path / "Artist" / "Album (2020)"
     identity = ReleaseIdentity("qobuz", "200")
     friendly.mkdir(parents=True)
+    receipt = capture_legacy_adoption_receipt(friendly, identity)
 
     placement = resolve_album_placement(
-        friendly, identity, adopted_identity=identity)
+        friendly,
+        identity,
+        adopted_identity=identity,
+        adoption_receipt=receipt,
+    )
 
     assert placement.destination == friendly
     assert placement.disposition is PlacementDisposition.ADOPTED

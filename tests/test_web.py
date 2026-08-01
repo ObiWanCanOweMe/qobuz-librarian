@@ -303,6 +303,57 @@ def test_direct_album_download_refreshes_saved_quality_state(
     }
 
 
+def test_direct_album_identity_attention_is_not_published_as_success(
+        monkeypatch, tmp_path):
+    from qobuz_librarian.library import hidden as hidden_mod
+    from qobuz_librarian.modes import process as process_mod
+    from qobuz_librarian.web import app as app_mod
+    from qobuz_librarian.web import flows
+
+    album = {
+        "id": "alb1",
+        "title": "Album",
+        "artist": {"name": "Artist"},
+    }
+    calls = []
+    monkeypatch.setattr(
+        process_mod,
+        "process_album",
+        lambda *_a, **_k: {
+            "imported": True,
+            "n_ok": 1,
+            "n_fail": 0,
+            "result": "identity_attention",
+            "dir": tmp_path / "Artist" / "Album",
+        },
+    )
+    monkeypatch.setattr(
+        flows,
+        "_refresh_after_local_album_change",
+        lambda *a, **kw: calls.append(("refresh", a, kw)),
+    )
+    monkeypatch.setattr(
+        flows,
+        "prune_library_review_candidates",
+        lambda *a, **kw: calls.append(("prune", a, kw)),
+    )
+    monkeypatch.setattr(
+        hidden_mod,
+        "unmark_single",
+        lambda *a, **kw: calls.append(("unmark", a, kw)),
+    )
+
+    job = jm.Job(title="Album", artist="Artist", album_id="alb1")
+    app_mod._make_download_run(album, "tok")(job)
+
+    assert job.status == jm.JobStatus.FAILED
+    assert job.attention == "identity"
+    assert "identity" in job.error.lower()
+    assert "identity" in job.summary.lower()
+    assert "downloaded" not in job.summary.lower()
+    assert calls == []
+
+
 def test_direct_single_track_download_refreshes_saved_quality_state(
         monkeypatch, tmp_path):
     import qobuz_librarian.library.catalog as cat_mod
@@ -3812,6 +3863,85 @@ def test_whole_review_download_retires_and_reparks_failures(monkeypatch, tmp_pat
             "Failed One": True}
     finally:
         lss._write_state(original)
+        _remove_job(running)
+        if parked is not None:
+            _remove_job(parked)
+
+
+def test_whole_review_identity_attention_is_reparked_without_retirement(
+        monkeypatch, tmp_path):
+    """An imported-but-unverified album is neither success nor disposable."""
+    from qobuz_librarian.library import library_scan_state as lss
+    from qobuz_librarian.modes import process as process_mod
+    from qobuz_librarian.web import flows
+
+    running = _inject_job(jm.JobStatus.RUNNING, "Library scan")
+    running.execute_kind = "library"
+    running._consumed_whole_review = True
+    running.add_candidate(
+        kind="album",
+        title="Unverified",
+        artist="Agalloch",
+        payload={"album_id": "attention1"},
+        selected=True,
+    )
+    chosen = list(running.candidates)
+    side_effects = []
+    monkeypatch.setattr(flows.cfg, "ARTIST_API_DELAY", 0)
+    monkeypatch.setattr(
+        flows,
+        "get_album",
+        lambda aid, _t: {"id": aid, "artist": {"name": "Agalloch"}},
+    )
+    monkeypatch.setattr(flows, "clear_scan_caches", lambda: None)
+    monkeypatch.setattr(
+        flows,
+        "_refresh_after_local_album_change",
+        lambda *a, **k: side_effects.append("refresh"),
+    )
+    monkeypatch.setattr(
+        flows,
+        "prune_library_review_candidates",
+        lambda *a, **k: side_effects.append("prune"),
+    )
+    monkeypatch.setattr(
+        lss,
+        "mark_review_retired",
+        lambda **_kwargs: side_effects.append("retire"),
+    )
+    monkeypatch.setattr(
+        process_mod,
+        "process_album",
+        lambda *_a, **_k: {
+            "result": "identity_attention",
+            "imported": True,
+            "n_ok": 1,
+            "n_fail": 0,
+            "dir": str(tmp_path),
+        },
+    )
+    parked = None
+    try:
+        flows.execute_albums(running, chosen, "tok")
+
+        assert running.status == jm.JobStatus.FAILED
+        assert running.attention == "identity"
+        assert "identity" in running.error.lower()
+        assert "identity" in running.summary.lower()
+        assert "downloaded and imported" not in running.summary.lower()
+        assert side_effects == []
+        parked = next(
+            j for j in jm.registry.awaiting_review()
+            if getattr(j, "execute_kind", "") == "library"
+            and any(
+                (c.get("payload") or {}).get("album_id") == "attention1"
+                for c in j.candidates
+            )
+        )
+        assert [(c["title"], c["selected"]) for c in parked.candidates] == [
+            ("Unverified", True)
+        ]
+    finally:
         _remove_job(running)
         if parked is not None:
             _remove_job(parked)

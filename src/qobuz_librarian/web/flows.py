@@ -1479,6 +1479,7 @@ def _note_staging_wait(job, phase, current, total):
 def execute_albums(job, chosen, token):
     """Download each selected album via the normal process_album path."""
     from qobuz_librarian.modes.process import process_album
+    from qobuz_librarian.web import jobs as job_mgr
     from qobuz_librarian.web.jobs import staging_lock
 
     chosen = [c for c in chosen if not is_non_actionable(c)]
@@ -1494,6 +1495,7 @@ def execute_albums(job, chosen, token):
     ok = 0
     partial = 0
     failed = 0
+    identity_attention = 0
     processed = 0
     # Picks that didn't land (never fetched, errored, or came back empty).
     failed_cands = []
@@ -1556,7 +1558,16 @@ def execute_albums(job, chosen, token):
             # Cancelled mid-download: processed already points past this album,
             # so the cancel fold-back below would drop its pick — remember it.
             cancelled_cand = cand
-        if result and result.get("imported") and result.get("n_ok", 0) > 0:
+        if result and result.get("result") == "identity_attention":
+            # Audio may have landed, but release ownership was not proven.
+            # Keep the pick live and do not publish any derived library state
+            # from an unverified destination.
+            job._imported_any = (
+                job._imported_any or bool(result.get("imported"))
+            )
+            identity_attention += 1
+            failed_cands.append(cand)
+        elif result and result.get("imported") and result.get("n_ok", 0) > 0:
             job._imported_any = True
             _refresh_after_local_album_change(
                 full,
@@ -1606,23 +1617,45 @@ def execute_albums(job, chosen, token):
                        f"{len(chosen) - processed} not started.")
         log.info(job.summary)
         return
-    parts = [f"{ok}/{plural(len(chosen), 'album')} downloaded and imported"]
+    if identity_attention:
+        parts = []
+        if ok:
+            parts.append(f"{plural(ok, 'album')} completed")
+    else:
+        parts = [f"{ok}/{plural(len(chosen), 'album')} downloaded and imported"]
     if partial:
         parts.append(f"{plural(partial, 'album')} only partly (some tracks failed)")
+    if identity_attention:
+        parts.append(
+            f"{plural(identity_attention, 'album')} needs release-identity "
+            "attention and was not counted complete"
+        )
     job.summary = "Finished. " + ", ".join(parts) + "."
-    log.info(f"Finished. {ok}/{plural(len(chosen), 'album')} downloaded and imported.")
+    log.info(job.summary)
     if partial:
         log.info(f"  {plural(partial, 'album')} downloaded only partly "
                  f"(some tracks failed); see the log.")
-    if failed:
+    if identity_attention:
+        job.status = job_mgr.JobStatus.FAILED
+        job.attention = "identity"
+        extra = f"; {failed} other failed" if failed else ""
+        job.error = (
+            f"{plural(identity_attention, 'album')} needs release-identity "
+            f"attention{extra}. Its review entry was retained for retry."
+        )
+    elif failed:
         job.error = f"{failed} of {plural(len(chosen), 'album')} didn't finish; see the log."
     # A whole-review download (every candidate ticked, nothing re-parked at
     # approval) consumed the entire living review.
     if getattr(job, "_consumed_whole_review", False):
         if failed_cands:
-            _park_library_failures(failed_cands)
-        from qobuz_librarian.library import library_scan_state
-        library_scan_state.mark_review_retired(reason="worked_through")
+            _park_library_failures(
+                failed_cands,
+                execute_kind=("new_releases" if is_nr_run else "library"),
+            )
+        if is_library_run and not identity_attention:
+            from qobuz_librarian.library import library_scan_state
+            library_scan_state.mark_review_retired(reason="worked_through")
     elif failed_cands and is_library_run:
         # Partial approve: the unticked picks stayed behind as a living split-
         # off review.

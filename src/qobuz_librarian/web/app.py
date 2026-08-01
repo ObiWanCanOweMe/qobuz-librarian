@@ -3063,6 +3063,9 @@ _DOWNLOAD_SUMMARY_LABELS = {
     "upgrade_aborted_backup_failed": "Upgrade aborted: couldn't back up the original.",
     "partial": "Re-download came back incomplete; kept your original.",
     "not_imported": "Downloaded, but the import didn't land. Library unchanged.",
+    "identity_attention": (
+        "Import needs release-identity attention and was not counted complete."
+    ),
 }
 
 
@@ -3215,6 +3218,7 @@ def _make_download_run(
                     drained is True
                     and result is not None
                     and result.get("imported") is True
+                    and result.get("result") != "identity_attention"
                     and recovery_status == "clear"
                     and not refresh_failed
                 )
@@ -3232,6 +3236,8 @@ def _make_download_run(
                     completion_acknowledged = _durable_completion_status(j)
                     if (
                         completion_acknowledged is True
+                        and result is not None
+                        and result.get("result") != "identity_attention"
                         and recovery_status == "clear"
                         and _run_lock_intact()
                         and _reconcile_acknowledged_job(j)
@@ -3265,7 +3271,15 @@ def _make_download_run(
         benign = {"already_complete", "skipped_already_higher_quality",
                   "skipped_has_extras", "dry_run", "user_skipped",
                   "lossy_only", "no_tracks", "cancelled"}
-        if durable_failure:
+        identity_attention = r.get("result") == "identity_attention"
+        if identity_attention:
+            j.status = job_mgr.JobStatus.FAILED
+            j.attention = "identity"
+            j.error = (
+                "The import needs release-identity attention and was not "
+                "counted complete. See the job log before retrying."
+            )
+        elif durable_failure:
             pass
         elif r.get("result") not in benign and not r.get("imported"):
             j.status = job_mgr.JobStatus.FAILED
@@ -3285,7 +3299,7 @@ def _make_download_run(
             j.summary = summary
         # Claiming/completing the album the normal way graduates it out of the
         # "downloaded single" state, so the rest stops being suppressed in scans.
-        if r.get("imported"):
+        if r.get("imported") and not identity_attention:
             _refresh_after_local_album_change(
                 album,
                 r,

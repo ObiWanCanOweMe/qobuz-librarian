@@ -31,6 +31,7 @@ from qobuz_librarian.integrations.staging import (
     StagingReferenceStatus,
 )
 from qobuz_librarian.library.album_placement import resolve_album_placement
+from qobuz_librarian.library.backup import backup_album_dir
 from qobuz_librarian.library.release_identity import (
     ReleaseIdentity,
     publish_release_identity,
@@ -117,11 +118,16 @@ def test_durable_import_refuses_a_changed_planned_path_before_mutation(
 
 
 def test_durable_upgrade_rebinds_placement_after_owned_source_retirement(
-        tmp_path):
+        tmp_path, monkeypatch):
     item = _single_track_item("Upgrade Album")
-    args = Namespace(no_import=False)
-    friendly = tmp_path / "music" / "Artist" / "Upgrade Album"
+    music = tmp_path / "music"
+    friendly = music / "Artist" / "Upgrade Album"
     friendly.mkdir(parents=True)
+    (friendly / "01.flac").write_bytes(b"reviewed release audio")
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    monkeypatch.setattr(cfg, "DOWNSAMPLE_HIRES_ENABLED", False)
+    args = Namespace(no_import=False, no_downsample=True)
     identity = ReleaseIdentity("qobuz", "42")
     publish_release_identity(friendly, identity)
     placement = resolve_album_placement(friendly, identity)
@@ -138,7 +144,9 @@ def test_durable_upgrade_rebinds_placement_after_owned_source_retirement(
     assert plan is not None
     assert plan.library_backup_kind == "upgrade"
 
-    friendly.rename(tmp_path / "owned-upgrade-backup")
+    backup = backup_album_dir(friendly)
+    assert backup is not None and backup.complete is True
+    item["backup_path"] = backup
     refreshed = durable_runner._refresh_plan_after_upgrade_backup(
         item,
         args,

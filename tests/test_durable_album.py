@@ -1,5 +1,8 @@
 from argparse import Namespace
 
+import pytest
+
+from qobuz_librarian import config as cfg
 from qobuz_librarian.completion import (
     CompletionOrigin,
     CompletionOriginKind,
@@ -9,6 +12,7 @@ from qobuz_librarian.completion import (
     StagedBinding,
 )
 from qobuz_librarian.library.album_placement import resolve_album_placement
+from qobuz_librarian.library.backup import backup_album_dir
 from qobuz_librarian.library.release_identity import ReleaseIdentity, publish_release_identity
 from qobuz_librarian.queue.durable_album import (
     completion_input_from_download,
@@ -136,3 +140,96 @@ def test_durable_input_becomes_ready_only_for_exact_zero_remainder_download():
         counts=DownloadCounts(failed=1),
     )
     assert completion_input_from_download(initial, incomplete) is None
+
+
+def test_upgrade_rebind_rejects_same_release_directory_injected_after_backup(
+        tmp_path, monkeypatch):
+    from qobuz_librarian.queue import durable_runner
+
+    music = tmp_path / "music"
+    friendly = music / "Artist" / "Album"
+    friendly.mkdir(parents=True)
+    (friendly / "01.flac").write_bytes(b"reviewed release audio")
+    identity = ReleaseIdentity("qobuz", "42")
+    publish_release_identity(friendly, identity)
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    monkeypatch.setattr(cfg, "DOWNSAMPLE_HIRES_ENABLED", False)
+
+    album = _album()
+    item = _item(album)
+    item.update(
+        album_dir=str(friendly),
+        missing=album["tracks"]["items"],
+        present=[],
+        auto_upgrade=True,
+    )
+    args = Namespace(no_import=False, no_downsample=True)
+    placement = resolve_album_placement(friendly, identity)
+    plan = plan_durable_new_album(
+        item,
+        args,
+        album_path_suffix=placement.suffix,
+        release_identity=identity,
+        placement_destination=placement.destination,
+        placement=placement,
+    )
+    assert plan is not None and plan.library_backup_kind == "upgrade"
+
+    backup = backup_album_dir(friendly)
+    assert backup is not None and backup.complete is True
+    item["backup_path"] = backup
+    friendly.mkdir()
+    (friendly / "01.flac").write_bytes(b"injected release audio")
+    publish_release_identity(friendly, identity)
+
+    with pytest.raises(durable_runner.DurableAlbumUnavailable, match="backup"):
+        durable_runner._refresh_plan_after_upgrade_backup(item, args, plan)
+
+    assert backup.path.exists()
+    assert (friendly / "01.flac").read_bytes() == b"injected release audio"
+
+
+def test_upgrade_rebind_accepts_its_exact_missing_destination_transition(
+        tmp_path, monkeypatch):
+    from qobuz_librarian.queue import durable_runner
+
+    music = tmp_path / "music"
+    friendly = music / "Artist" / "Album"
+    friendly.mkdir(parents=True)
+    (friendly / "01.flac").write_bytes(b"reviewed release audio")
+    identity = ReleaseIdentity("qobuz", "42")
+    publish_release_identity(friendly, identity)
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    monkeypatch.setattr(cfg, "DOWNSAMPLE_HIRES_ENABLED", False)
+
+    album = _album()
+    item = _item(album)
+    item.update(
+        album_dir=str(friendly),
+        missing=album["tracks"]["items"],
+        present=[],
+        auto_upgrade=True,
+    )
+    args = Namespace(no_import=False, no_downsample=True)
+    placement = resolve_album_placement(friendly, identity)
+    plan = plan_durable_new_album(
+        item,
+        args,
+        album_path_suffix=placement.suffix,
+        release_identity=identity,
+        placement_destination=placement.destination,
+        placement=placement,
+    )
+    backup = backup_album_dir(friendly)
+    assert plan is not None and backup is not None and backup.complete is True
+    item["backup_path"] = backup
+
+    refreshed = durable_runner._refresh_plan_after_upgrade_backup(
+        item, args, plan
+    )
+
+    assert refreshed.placement.destination == friendly
+    assert refreshed.placement.destination_receipt.exists is False
+    assert backup.path.exists()

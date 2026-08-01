@@ -206,6 +206,136 @@ def test_read_revalidates_same_inode_manifest_contents_after_parsing(
         read_release_identity(album)
 
 
+def test_read_rejects_same_inode_overwrite_during_final_named_check(
+        tmp_path, monkeypatch):
+    album = tmp_path / "Album"
+    album.mkdir()
+    publish_release_identity(album, ReleaseIdentity("qobuz", "123"))
+    manifest = album / MANIFEST_NAME
+    real_stat = os.stat
+    replaced = False
+
+    def stat_then_overwrite(path, *args, **kwargs):
+        nonlocal replaced
+        value = real_stat(path, *args, **kwargs)
+        if path == MANIFEST_NAME and kwargs.get("dir_fd") is not None:
+            manifest.write_text(
+                '{"schema_version":1,"provider":"qobuz","release_id":"456"}\n'
+            )
+            replaced = True
+        return value
+
+    monkeypatch.setattr(release_identity.os, "stat", stat_then_overwrite)
+
+    with pytest.raises(ReleaseManifestError, match="changed while it was read"):
+        read_release_identity(album)
+
+    assert replaced is True
+    assert json.loads(manifest.read_text())["release_id"] == "456"
+
+
+def test_publish_rejects_same_inode_temp_overwrite_before_link(
+        tmp_path, monkeypatch):
+    album = tmp_path / "Album"
+    album.mkdir()
+    real_link = os.link
+
+    def overwrite_then_link(source, destination, *args, **kwargs):
+        (album / source).write_text(
+            '{"schema_version":1,"provider":"qobuz","release_id":"456"}\n'
+        )
+        return real_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(release_identity.os, "link", overwrite_then_link)
+
+    with pytest.raises(ReleaseManifestError, match="temporary release manifest changed"):
+        publish_release_identity(album, ReleaseIdentity("qobuz", "123"))
+
+    assert read_release_identity(album) == ReleaseIdentity("qobuz", "456")
+    assert any(
+        path.name.startswith(release_identity._TEMP_PREFIX)
+        for path in album.iterdir()
+    )
+
+
+def test_publish_retains_temp_if_final_link_disappears_before_cleanup(
+        tmp_path, monkeypatch):
+    album = tmp_path / "Album"
+    album.mkdir()
+    real_remove = release_identity._remove_temporary_manifest
+    removed_final = False
+
+    def remove_final_then_temp(*args, **kwargs):
+        nonlocal removed_final
+        directory_descriptor = args[0]
+        if not removed_final:
+            os.unlink(MANIFEST_NAME, dir_fd=directory_descriptor)
+            removed_final = True
+        return real_remove(*args, **kwargs)
+
+    monkeypatch.setattr(
+        release_identity,
+        "_remove_temporary_manifest",
+        remove_final_then_temp,
+    )
+
+    with pytest.raises(ReleaseManifestError, match="release manifest changed"):
+        publish_release_identity(album, ReleaseIdentity("qobuz", "123"))
+
+    evidence = [
+        path for path in album.iterdir()
+        if path.name.startswith(release_identity._TEMP_PREFIX)
+    ]
+    assert len(evidence) == 1
+    assert json.loads(evidence[0].read_text())["release_id"] == "123"
+
+
+def test_publish_cleanup_failure_closes_every_held_descriptor(
+        tmp_path, monkeypatch):
+    album = tmp_path / "Album"
+    album.mkdir()
+    real_open_album = release_identity._open_album_directory
+    real_temporary = release_identity._temporary_manifest
+    held = []
+
+    def capture_album_descriptors(*args, **kwargs):
+        receipt, descriptors = real_open_album(*args, **kwargs)
+        held.extend(descriptors)
+        return receipt, descriptors
+
+    def capture_temporary(*args, **kwargs):
+        name, descriptor = real_temporary(*args, **kwargs)
+        held.append(descriptor)
+        return name, descriptor
+
+    def refuse_cleanup(*_args, **_kwargs):
+        raise ReleaseManifestError("cannot remove temporary release manifest")
+
+    monkeypatch.setattr(
+        release_identity,
+        "_open_album_directory",
+        capture_album_descriptors,
+    )
+    monkeypatch.setattr(
+        release_identity,
+        "_temporary_manifest",
+        capture_temporary,
+    )
+    monkeypatch.setattr(
+        release_identity,
+        "_remove_temporary_manifest",
+        refuse_cleanup,
+    )
+
+    with pytest.raises(ReleaseManifestError, match="cannot remove temporary"):
+        publish_release_identity(album, ReleaseIdentity("qobuz", "123"))
+
+    assert held
+    for descriptor in held:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
 def test_release_id_and_reserved_artifact_rules():
     assert identity_from_album({"id": 123}) == ReleaseIdentity("qobuz", "123")
     assert identity_from_album({"id": " 123 "}) == ReleaseIdentity("qobuz", "123")

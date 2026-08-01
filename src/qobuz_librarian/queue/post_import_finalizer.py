@@ -33,6 +33,9 @@ from qobuz_librarian.library.post_import_relocation import (
 )
 from qobuz_librarian.library.release_identity import (
     ReleaseManifestError,
+    _close_descriptors,
+    _directory_chain_matches,
+    _open_album_directory,
     capture_directory_path_receipt,
     directory_path_receipt_matches,
     publish_release_identity,
@@ -314,8 +317,6 @@ def _current_inventory_matches(
 ) -> bool:
     """Recheck exact audio bytes at the settled path immediately before publish."""
     inventory = evidence.inventory
-    if path_receipt is not None and not directory_path_receipt_matches(path_receipt):
-        return False
     if inventory is None or inventory.path != evidence.album_path:
         return False
     album_parts = PurePosixPath(evidence.album_path).parts
@@ -328,50 +329,193 @@ def _current_inventory_matches(
         if relative in expected:
             return False
         expected[relative] = receipt
-    try:
-        actual = {
-            path.relative_to(final_path).as_posix(): path
-            for path in Path(final_path).rglob("*")
-            if path.suffix.lower() in cfg.AUDIO_EXTS and path.is_file()
-        }
-    except OSError:
-        return False
-    if set(actual) != set(expected):
-        return False
-    for relative, path in actual.items():
-        receipt = expected[relative]
-        descriptor = None
+    if path_receipt is None:
         try:
-            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-            before = os.fstat(descriptor)
-            if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
-                return False
-            digest_value = hashlib.sha256()
-            while chunk := os.read(descriptor, 1024 * 1024):
-                digest_value.update(chunk)
-            digest = digest_value.hexdigest()
-            after = os.fstat(descriptor)
-            named = os.lstat(path)
-        except OSError:
+            path_receipt = capture_directory_path_receipt(Path(final_path))
+        except (ReleaseManifestError, OSError):
             return False
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
-        identity = (
-            after.st_dev, after.st_ino, after.st_size,
-            after.st_mtime_ns, after.st_ctime_ns,
+    descriptors = ()
+    try:
+        opened_receipt, descriptors = _open_album_directory(
+            Path(final_path),
+            expected_path_receipt=path_receipt,
         )
         if (
-            (before.st_dev, before.st_ino, before.st_size,
-             before.st_mtime_ns, before.st_ctime_ns) != identity
-            or (named.st_dev, named.st_ino) != identity[:2]
-            or digest != receipt.sha256
-            or (not relocated and identity != receipt.identity)
+            opened_receipt != path_receipt
+            or not _directory_chain_matches(opened_receipt, descriptors)
         ):
             return False
+        seen = set()
+        if not _audit_audio_tree_at(
+            descriptors[-1],
+            (),
+            expected,
+            seen,
+            relocated=relocated,
+        ):
+            return False
+        return bool(
+            seen == set(expected)
+            and _directory_chain_matches(opened_receipt, descriptors)
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+    finally:
+        _close_descriptors(descriptors)
+
+
+def _audit_file_version(value):
     return (
-        path_receipt is None
-        or directory_path_receipt_matches(path_receipt)
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
+
+
+def _audit_directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | os.O_DIRECTORY
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _audit_regular_flags() -> int:
+    return (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _audit_audio_file_at(
+    parent_descriptor,
+    name,
+    receipt,
+    *,
+    relocated,
+) -> bool:
+    descriptor = None
+    try:
+        descriptor = os.open(
+            name,
+            _audit_regular_flags(),
+            dir_fd=parent_descriptor,
+        )
+        before = os.fstat(descriptor)
+        named = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        digest_value = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest_value.update(chunk)
+        after = os.fstat(descriptor)
+        final_named = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        final = os.fstat(descriptor)
+        versions = tuple(
+            _audit_file_version(value)
+            for value in (before, named, after, final_named, final)
+        )
+        return bool(
+            all(stat.S_ISREG(value.st_mode) for value in (
+                before, named, after, final_named, final
+            ))
+            and len(set(versions)) == 1
+            and digest_value.hexdigest() == receipt.sha256
+            and (relocated or versions[-1] == receipt.identity)
+        )
+    except OSError:
+        return False
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _audit_audio_tree_at(
+    directory_descriptor,
+    prefix,
+    expected,
+    seen,
+    *,
+    relocated,
+) -> bool:
+    before = os.fstat(directory_descriptor)
+    if not stat.S_ISDIR(before.st_mode):
+        return False
+    for name in sorted(os.listdir(directory_descriptor)):
+        if name in {"", ".", ".."}:
+            return False
+        named = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        relative_parts = (*prefix, name)
+        relative = PurePosixPath(*relative_parts).as_posix()
+        if stat.S_ISDIR(named.st_mode):
+            child = None
+            try:
+                child = os.open(
+                    name,
+                    _audit_directory_flags(),
+                    dir_fd=directory_descriptor,
+                )
+                held_before = os.fstat(child)
+                if (
+                    _audit_file_version(named)
+                    != _audit_file_version(held_before)
+                    or not _audit_audio_tree_at(
+                        child,
+                        relative_parts,
+                        expected,
+                        seen,
+                        relocated=relocated,
+                    )
+                ):
+                    return False
+                named_after = os.stat(
+                    name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                held_final = os.fstat(child)
+                if len({
+                    _audit_file_version(named),
+                    _audit_file_version(held_before),
+                    _audit_file_version(named_after),
+                    _audit_file_version(held_final),
+                }) != 1:
+                    return False
+            finally:
+                if child is not None:
+                    os.close(child)
+            continue
+        if Path(name).suffix.lower() not in cfg.AUDIO_EXTS:
+            continue
+        if not stat.S_ISREG(named.st_mode) or relative not in expected:
+            return False
+        if relative in seen or not _audit_audio_file_at(
+            directory_descriptor,
+            name,
+            expected[relative],
+            relocated=relocated,
+        ):
+            return False
+        seen.add(relative)
+    final = os.fstat(directory_descriptor)
+    return (
+        stat.S_ISDIR(final.st_mode)
+        and _audit_file_version(before) == _audit_file_version(final)
     )
 
 
@@ -481,6 +625,15 @@ def _publish_retirement_identity(
                 "relocated release identity is unavailable after publication"
             )
         _require_authority(authority)
+        if not _current_inventory_matches(
+            evidence,
+            final_path,
+            relocated=True,
+            path_receipt=path_receipt,
+        ):
+            raise ReleaseManifestError(
+                "release destination audio inventory changed"
+            )
         return False
     node_matches_completion = (
         directory_identity == evidence.album_identity[:2]

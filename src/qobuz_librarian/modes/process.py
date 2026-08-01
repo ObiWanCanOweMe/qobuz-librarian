@@ -67,7 +67,11 @@ from qobuz_librarian.library.catalog import (
     track_signatures_for_album_dirs,
 )
 from qobuz_librarian.library.release_identity import (
+    DirectoryPathReceipt,
     ReleaseManifestError,
+    _close_descriptors,
+    _directory_chain_matches,
+    _open_album_directory,
     capture_directory_path_receipt,
     identity_from_album,
     publish_release_identity,
@@ -116,6 +120,8 @@ def finalize_release_identity(
     final_dir: Path,
     *,
     expected_destination: Path,
+    expected_path_receipt: DirectoryPathReceipt,
+    frozen_slots,
     authority: run_lock.RunLockLease,
     cancel_check=None,
 ) -> bool:
@@ -143,16 +149,25 @@ def finalize_release_identity(
         raise ReleaseManifestError(
             "release finalization did not reach the planned destination"
         )
-    try:
-        path_receipt = capture_directory_path_receipt(Path(final_path))
-    except (ReleaseManifestError, OSError) as exc:
-        raise ReleaseManifestError("release destination is unavailable") from exc
-    if not path_receipt.exists or path_receipt.directory_identity is None:
+    path_receipt = expected_path_receipt
+    if (
+        not isinstance(path_receipt, DirectoryPathReceipt)
+        or path_receipt.path != final_path
+        or not path_receipt.exists
+        or path_receipt.directory_identity is None
+    ):
         raise ReleaseManifestError("release destination is not an exact directory")
     if type(authority) is not run_lock.RunLockLease or authority.intact() is not True:
         raise ReleaseManifestError("the shared run lock was lost before publication")
     if cancel_check is not None and cancel_check():
         raise ReleaseManifestError("release identity publication was cancelled")
+    if not _final_release_inventory_matches(
+        Path(final_path),
+        tracks,
+        frozen_slots,
+        path_receipt,
+    ):
+        raise ReleaseManifestError("release destination audio inventory changed")
     changed = publish_release_identity(
         Path(final_path),
         identity,
@@ -161,6 +176,13 @@ def finalize_release_identity(
     )
     if authority.intact() is not True:
         raise ReleaseManifestError("the shared run lock was lost during publication")
+    if not _final_release_inventory_matches(
+        Path(final_path),
+        tracks,
+        frozen_slots,
+        path_receipt,
+    ):
+        raise ReleaseManifestError("release destination audio inventory changed")
     return changed
 
 
@@ -231,6 +253,42 @@ def _final_album_matches_frozen_slots(folder: Path, frozen) -> bool:
         and len(set(signatures)) == len(signatures)
         and set(signatures) == set(frozen.values())
     )
+
+
+def _final_release_inventory_matches(
+    folder: Path,
+    qobuz_tracks,
+    frozen_slots,
+    path_receipt: DirectoryPathReceipt,
+) -> bool:
+    """Audit the exact held destination named by *path_receipt*.
+
+    The descriptor-root alias keeps both existing scanners on the opened
+    directory inode.  A public-path swap cannot redirect either inventory
+    proof, and the complete directory chain is checked again afterwards.
+    """
+    descriptors = ()
+    try:
+        receipt, descriptors = _open_album_directory(
+            folder,
+            expected_path_receipt=path_receipt,
+        )
+        if receipt != path_receipt or not _directory_chain_matches(
+            receipt, descriptors
+        ):
+            return False
+        held_root = Path(f"/proc/self/fd/{descriptors[-1]}")
+        matches = (
+            _folder_holds_exact_tracks(held_root, qobuz_tracks)
+            and _final_album_matches_frozen_slots(held_root, frozen_slots)
+        )
+        return bool(
+            matches and _directory_chain_matches(receipt, descriptors)
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+    finally:
+        _close_descriptors(descriptors)
 
 
 def _split_relocation_allows_identity(result) -> bool:
@@ -1757,21 +1815,22 @@ def process_album(album, args, *, allow_force=True, label=None,
                 and release_slot_signatures is not None
                 and len(post_import_signatures) == n_ok
                 and n_ok == len(missing)
-                and _folder_holds_exact_tracks(post_dir, qobuz_tracks)
-                and _final_album_matches_frozen_slots(
-                    post_dir, release_slot_signatures
-                )
                 and not is_cancel_requested()
             ):
                 try:
+                    final_path_receipt = capture_directory_path_receipt(
+                        post_dir
+                    )
                     finalize_release_identity(
                         album,
                         post_dir,
                         expected_destination=placement.destination,
+                        expected_path_receipt=final_path_receipt,
+                        frozen_slots=release_slot_signatures,
                         authority=run_lock.current_lease(),
                         cancel_check=is_cancel_requested,
                     )
-                except ReleaseManifestError as exc:
+                except (ReleaseManifestError, OSError) as exc:
                     release_identity_attention = True
                     log.info(fmt(
                         C.RED,

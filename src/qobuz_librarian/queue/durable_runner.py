@@ -46,7 +46,9 @@ from qobuz_librarian.library.album_placement import (
     resolve_album_placement,
 )
 from qobuz_librarian.library.backup import (
+    BackupResult,
     backup_album_dir,
+    canonical_album_source_receipt,
     library_backup_record,
     load_backup_result,
     load_library_backup_record,
@@ -145,6 +147,39 @@ def _refresh_plan_after_upgrade_backup(
     """Carry the placement across this runner's committed source retirement."""
     if plan.placement is None:
         return plan
+    backup = item.get("backup_path") if type(item) is dict else None
+    previous_receipt = plan.placement.destination_receipt
+    receipt = backup.receipt if isinstance(backup, BackupResult) else None
+    source_receipt = (
+        canonical_album_source_receipt(
+            receipt.get("source_receipt"),
+            expected_origin=plan.placement_destination,
+        )
+        if type(receipt) is dict
+        else None
+    )
+    try:
+        source_generation = source_receipt["path_generations"][-1]
+        source_directory = (
+            int(source_generation[1]),
+            int(source_generation[2]),
+        )
+    except (IndexError, KeyError, TypeError, ValueError):
+        source_directory = None
+    if (
+        not isinstance(backup, BackupResult)
+        or backup.complete is not True
+        or type(receipt) is not dict
+        or receipt.get("kind") != "upgrade"
+        or source_receipt is None
+        or previous_receipt is None
+        or previous_receipt.exists is not True
+        or previous_receipt.directory_identity != source_directory
+        or previous_receipt.path != plan.placement_destination
+    ):
+        raise DurableAlbumUnavailable(
+            "the release placement is not bound to the committed backup"
+        )
     try:
         placement = resolve_album_placement(
             plan.placement.friendly_path,
@@ -154,6 +189,18 @@ def _refresh_plan_after_upgrade_backup(
         raise DurableAlbumUnavailable(
             "the release placement could not be rebound after backup"
         ) from exc
+    current_receipt = placement.destination_receipt
+    expected_missing = (Path(plan.placement_destination).name,)
+    if (
+        current_receipt is None
+        or current_receipt.exists is not False
+        or current_receipt.path != previous_receipt.path
+        or current_receipt.missing != expected_missing
+        or current_receipt.identities != previous_receipt.identities[:-1]
+    ):
+        raise DurableAlbumUnavailable(
+            "the release placement did not make the committed backup transition"
+        )
     refreshed = replace(plan, placement=placement)
     if (
         placement.identity != plan.release_identity

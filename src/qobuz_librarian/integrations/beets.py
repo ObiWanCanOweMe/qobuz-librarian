@@ -48,6 +48,7 @@ from qobuz_librarian.completion import (
 from qobuz_librarian.file_exclusion import acquire_inode_write_exclusion
 from qobuz_librarian.library.album_placement import (
     AlbumPlacementAttention,
+    capture_legacy_adoption_receipt,
     resolve_album_placement,
 )
 from qobuz_librarian.library.catalog import (
@@ -4571,6 +4572,7 @@ def resolve_album_import_placement(album, token):
         return resolve_album_placement(friendly, identity)
 
     artist_name = (album.get("artist") or {}).get("name") or ""
+    adoption_receipt = capture_legacy_adoption_receipt(friendly, identity)
     existing = read_album_dir(friendly)
     candidates = find_qobuz_album_candidates_for_dir(
         friendly,
@@ -4578,7 +4580,11 @@ def resolve_album_import_placement(album, token):
         token,
         target_dir=friendly,
     )
-    selected, compatible = select_legacy_release(existing, candidates)
+    selected, compatible = select_legacy_release(
+        existing,
+        candidates,
+        adoption_receipt=adoption_receipt,
+    )
     if len(compatible) > 1:
         raise AlbumImportIdentityAmbiguous(
             "identity_ambiguous: friendly path matches multiple Qobuz releases"
@@ -4586,10 +4592,14 @@ def resolve_album_import_placement(album, token):
     adopted_identity = (
         identity_from_album(selected.album) if selected is not None else None
     )
+    selected_receipt = (
+        selected.adoption_receipt if selected is not None else None
+    )
     return resolve_album_placement(
         friendly,
         identity,
         adopted_identity=adopted_identity,
+        adoption_receipt=selected_receipt,
     )
 
 

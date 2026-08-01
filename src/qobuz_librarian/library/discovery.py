@@ -24,13 +24,18 @@ import re
 import stat
 import tempfile
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from qobuz_librarian import config as cfg
 from qobuz_librarian.api.auth import AuthLost, QobuzError, QobuzUnavailable
 from qobuz_librarian.api.search import get_album, get_artist_albums, search_artists
 from qobuz_librarian.library import hidden as hidden_mod
+from qobuz_librarian.library.album_placement import (
+    LegacyAdoptionReceipt,
+    capture_legacy_adoption_receipt,
+    legacy_adoption_receipt_matches,
+)
 from qobuz_librarian.library.catalog import (
     _dir_year,
     album_released_within,
@@ -50,6 +55,7 @@ from qobuz_librarian.library.release_identity import (
     ReleaseIdentity,
     ReleaseManifestError,
     capture_directory_path_receipt,
+    identity_from_album,
     normalise_release_id,
     publish_release_identity,
     read_release_identity,
@@ -320,6 +326,7 @@ class LegacyReleaseEvidence:
     present: list
     missing: list
     extras: list
+    adoption_receipt: LegacyAdoptionReceipt | None = None
 
 
 def _record_owned_title(owned_titles, album_dir):
@@ -400,7 +407,12 @@ class DirMatch:
     candidate_releases: list[dict] = field(default_factory=list)
 
 
-def select_legacy_release(existing: list[dict], candidates: list[dict]):
+def select_legacy_release(
+    existing: list[dict],
+    candidates: list[dict],
+    *,
+    adoption_receipt: LegacyAdoptionReceipt | None = None,
+):
     """Select a legacy folder's sole compatible release, if it has one.
 
     A partial folder proves an edition only if it has at least one matching
@@ -416,8 +428,20 @@ def select_legacy_release(existing: list[dict], candidates: list[dict]):
         missing, present = compute_missing(tracks, existing)
         extras = find_extras_in_existing(tracks, existing)
         if present and not extras:
+            selected_identity = identity_from_album(album)
+            selected_receipt = (
+                replace(adoption_receipt, identity=selected_identity)
+                if adoption_receipt is not None
+                and selected_identity is not None
+                else None
+            )
             compatible.append(LegacyReleaseEvidence(
-                album, list(present), list(missing), list(extras)))
+                album,
+                list(present),
+                list(missing),
+                list(extras),
+                selected_receipt,
+            ))
     return (compatible[0] if len(compatible) == 1 else None, compatible)
 
 
@@ -534,12 +558,22 @@ def match_album_dir(album_dir, artist_name, token, *, catalog, prefer_hires):
         expected_directory = expected_path_receipt.directory_identity
         if expected_directory is None:
             raise OSError("reviewed album directory is missing")
+        first_identity = identity_from_album(candidates[0])
+        if first_identity is None:
+            raise OSError("reviewed album candidate has no identity")
+        adoption_receipt = capture_legacy_adoption_receipt(
+            album_dir, first_identity
+        )
         initial_inventory = _reviewed_audio_inventory(album_dir)
         existing, _ = find_existing_tracks(candidates[0], album_dir=album_dir)
     except OSError:
         return _legacy_identity_invalid(album_dir, candidates, [])
 
-    selected, compatible = select_legacy_release(existing, candidates)
+    selected, compatible = select_legacy_release(
+        existing,
+        candidates,
+        adoption_receipt=adoption_receipt,
+    )
     compatible_albums = [evidence.album for evidence in compatible]
     if selected is None:
         if compatible:
@@ -565,7 +599,10 @@ def match_album_dir(album_dir, artist_name, token, *, catalog, prefer_hires):
         return _legacy_identity_invalid(album_dir, candidates, existing)
 
     refreshed, refreshed_compatible = select_legacy_release(
-        refreshed_existing, candidates)
+        refreshed_existing,
+        candidates,
+        adoption_receipt=adoption_receipt,
+    )
     if refreshed is None:
         if refreshed_compatible:
             return DirMatch(
@@ -573,6 +610,17 @@ def match_album_dir(album_dir, artist_name, token, *, catalog, prefer_hires):
                 candidate_releases=[evidence.album for evidence in refreshed_compatible])
         return _legacy_identity_invalid(album_dir, candidates, refreshed_existing)
     if refreshed.album.get("id") != selected.album.get("id"):
+        return _legacy_identity_invalid(album_dir, candidates, refreshed_existing)
+    selected_identity = identity_from_album(selected.album)
+    if (
+        selected_identity is None
+        or selected.adoption_receipt is None
+        or not legacy_adoption_receipt_matches(
+            selected.adoption_receipt,
+            album_dir,
+            selected_identity,
+        )
+    ):
         return _legacy_identity_invalid(album_dir, candidates, refreshed_existing)
 
     try:

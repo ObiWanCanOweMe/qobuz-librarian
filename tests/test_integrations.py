@@ -890,7 +890,9 @@ def test_import_placement_reports_ambiguous_unmarked_friendly_path(
     monkeypatch.setattr(
         beets,
         "select_legacy_release",
-        lambda _existing, _candidates: (None, [object(), object()]),
+        lambda _existing, _candidates, **_kwargs: (
+            None, [object(), object()]
+        ),
     )
 
     with pytest.raises(beets.AlbumImportIdentityAmbiguous):
@@ -916,7 +918,7 @@ def test_import_placement_refuses_unmarked_path_without_compatible_release(
     monkeypatch.setattr(
         beets,
         "select_legacy_release",
-        lambda _existing, _candidates: (None, []),
+        lambda _existing, _candidates, **_kwargs: (None, []),
     )
 
     with pytest.raises(beets.AlbumPlacementAttention, match="unmarked"):
@@ -924,6 +926,53 @@ def test_import_placement_refuses_unmarked_path_without_compatible_release(
             {"id": "200", "title": "Album", "artist": {"name": "Artist"}},
             "token",
         )
+
+
+def test_import_placement_rejects_directory_swapped_after_legacy_selection(
+        monkeypatch, tmp_path):
+    from qobuz_librarian.integrations import beets
+
+    friendly = tmp_path / "music" / "Artist" / "Album (2020)"
+    reviewed = tmp_path / "reviewed-album"
+    replacement = tmp_path / "empty-replacement"
+    friendly.mkdir(parents=True)
+    replacement.mkdir()
+    (friendly / "01.flac").write_bytes(b"reviewed audio")
+    existing = [{"title": "One", "isrc": "A", "discnumber": 1}]
+    candidates = [{
+        "id": "200",
+        "tracks": {"items": [{
+            "title": "One",
+            "isrc": "A",
+            "media_number": 1,
+            "track_number": 0,
+        }]},
+    }]
+    monkeypatch.setattr(beets, "find_album_dir_filesystem", lambda _album: friendly)
+    monkeypatch.setattr(beets, "read_album_dir", lambda _path: existing)
+    monkeypatch.setattr(
+        beets,
+        "find_qobuz_album_candidates_for_dir",
+        lambda *_args, **_kwargs: candidates,
+    )
+    real_select = beets.select_legacy_release
+
+    def select_then_swap(*args, **kwargs):
+        result = real_select(*args, **kwargs)
+        friendly.rename(reviewed)
+        replacement.rename(friendly)
+        return result
+
+    monkeypatch.setattr(beets, "select_legacy_release", select_then_swap)
+
+    with pytest.raises(beets.AlbumPlacementAttention, match="changed|proof"):
+        beets.resolve_album_import_placement(
+            {"id": "200", "title": "Album", "artist": {"name": "Artist"}},
+            "token",
+        )
+
+    assert not (friendly / ".qobuz-librarian-release.json").exists()
+    assert (reviewed / "01.flac").read_bytes() == b"reviewed audio"
 
 
 def test_import_override_pins_duplicate_action_merge(monkeypatch):

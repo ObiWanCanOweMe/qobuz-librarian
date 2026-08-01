@@ -7,6 +7,7 @@ import json
 import os
 import secrets
 import stat
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -326,15 +327,17 @@ def _read_release_identity_at(directory_descriptor: int) -> ReleaseIdentity | No
         if len(contents) > MAX_MANIFEST_BYTES:
             _manifest_error("release manifest is too large")
         identity = _manifest_identity_from_bytes(contents)
+        named_version = _stable_named_regular_file_version(
+            directory_descriptor,
+            MANIFEST_NAME,
+            descriptor,
+            expected_version=_file_version(after),
+        )
         final = os.fstat(descriptor)
         if (
-            not stat.S_ISREG(final.st_mode)
+            named_version is None
+            or not stat.S_ISREG(final.st_mode)
             or _file_version(after) != _file_version(final)
-            or not _named_entry_matches(
-                directory_descriptor,
-                MANIFEST_NAME,
-                descriptor,
-            )
         ):
             _manifest_error("release manifest changed while it was read")
         return identity
@@ -407,7 +410,7 @@ def _temporary_manifest(directory_descriptor: int, contents: bytes) -> tuple[str
         try:
             descriptor = os.open(
                 name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                 0o600,
                 dir_fd=directory_descriptor,
             )
@@ -430,25 +433,145 @@ def _temporary_manifest(directory_descriptor: int, contents: bytes) -> tuple[str
 
 
 def _named_entry_matches(directory_descriptor: int, name: str, descriptor: int) -> bool:
+    return _stable_named_regular_file_version(
+        directory_descriptor, name, descriptor
+    ) is not None
+
+
+def _stable_named_regular_file_version(
+    directory_descriptor: int,
+    name: str,
+    descriptor: int,
+    *,
+    expected_version=None,
+):
+    """Return one full version only while the name and held fd stay identical."""
     try:
-        held = os.fstat(descriptor)
+        before = os.fstat(descriptor)
         named = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+        after = os.fstat(descriptor)
+    except OSError:
+        return None
+    versions = (_file_version(before), _file_version(named), _file_version(after))
+    if (
+        stat.S_ISREG(before.st_mode)
+        and stat.S_ISREG(named.st_mode)
+        and stat.S_ISREG(after.st_mode)
+        and versions[0] == versions[1] == versions[2]
+        and (expected_version is None or versions[0] == expected_version)
+    ):
+        return versions[0]
+    return None
+
+
+def _descriptor_has_exact_contents(
+    descriptor: int,
+    contents: bytes,
+    *,
+    expected_version=None,
+) -> bool:
+    try:
+        before = os.fstat(descriptor)
+        raw = os.pread(descriptor, len(contents) + 1, 0)
+        after = os.fstat(descriptor)
     except OSError:
         return False
-    return (
-        stat.S_ISREG(held.st_mode)
-        and stat.S_ISREG(named.st_mode)
-        and _identity(held) == _identity(named)
+    version = _file_version(before)
+    return bool(
+        stat.S_ISREG(before.st_mode)
+        and stat.S_ISREG(after.st_mode)
+        and version == _file_version(after)
+        and (expected_version is None or version == expected_version)
+        and raw == contents
     )
 
 
-def _remove_temporary_manifest(directory_descriptor: int, name: str):
+def _publication_entry_matches(
+    directory_descriptor: int,
+    name: str,
+    descriptor: int,
+    expected_version,
+    contents: bytes,
+) -> bool:
+    if not _descriptor_has_exact_contents(
+        descriptor,
+        contents,
+        expected_version=expected_version,
+    ):
+        return False
+    if _stable_named_regular_file_version(
+        directory_descriptor,
+        name,
+        descriptor,
+        expected_version=expected_version,
+    ) is None:
+        return False
+    final = os.fstat(descriptor)
+    return (
+        stat.S_ISREG(final.st_mode)
+        and _file_version(final) == expected_version
+    )
+
+
+def _remove_temporary_manifest(
+    directory_descriptor: int,
+    name: str,
+    descriptor: int,
+    expected_version,
+    contents: bytes,
+    *,
+    require_final: bool,
+):
+    if not _publication_entry_matches(
+        directory_descriptor,
+        name,
+        descriptor,
+        expected_version,
+        contents,
+    ):
+        _manifest_error("temporary release manifest changed during cleanup")
+    if require_final and not _publication_entry_matches(
+        directory_descriptor,
+        MANIFEST_NAME,
+        descriptor,
+        expected_version,
+        contents,
+    ):
+        _manifest_error("release manifest changed during publication")
     try:
         os.unlink(name, dir_fd=directory_descriptor)
-    except FileNotFoundError:
-        return
     except OSError as exc:
         _manifest_error("cannot remove temporary release manifest", exc)
+    try:
+        os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        _manifest_error("cannot verify temporary release manifest cleanup", exc)
+    else:
+        _manifest_error("temporary release manifest changed during cleanup")
+    try:
+        os.fsync(directory_descriptor)
+    except OSError as exc:
+        _manifest_error("cannot commit temporary release manifest cleanup", exc)
+    if require_final:
+        final_value = os.fstat(descriptor)
+        final_version = _file_version(final_value)
+        if (
+            not stat.S_ISREG(final_value.st_mode)
+            or final_value.st_nlink < 1
+            or final_version[:4] != expected_version[:4]
+            or not _publication_entry_matches(
+                directory_descriptor,
+                MANIFEST_NAME,
+                descriptor,
+                final_version,
+                contents,
+            )
+        ):
+            _manifest_error("release manifest changed during publication")
+        return final_version
+    return expected_version
 
 
 def publish_release_identity(
@@ -468,6 +591,8 @@ def publish_release_identity(
     directory_descriptor = descriptors[-1]
     temporary_name = None
     temporary_descriptor = None
+    temporary_version = None
+    linked = False
     try:
         _validate_expected_directory(directory_descriptor, expected_directory)
         existing = _read_release_identity_at(directory_descriptor)
@@ -479,8 +604,18 @@ def publish_release_identity(
             _manifest_error("release manifest identifies a different release")
 
         temporary_name, temporary_descriptor = _temporary_manifest(directory_descriptor, contents)
-        if not _named_entry_matches(
-            directory_descriptor, temporary_name, temporary_descriptor
+        temporary_version = _stable_named_regular_file_version(
+            directory_descriptor,
+            temporary_name,
+            temporary_descriptor,
+        )
+        if (
+            temporary_version is None
+            or not _descriptor_has_exact_contents(
+                temporary_descriptor,
+                contents,
+                expected_version=temporary_version,
+            )
         ):
             _manifest_error("temporary release manifest changed before publication")
         if not _directory_chain_matches(path_receipt, descriptors):
@@ -493,6 +628,7 @@ def publish_release_identity(
                 dst_dir_fd=directory_descriptor,
                 follow_symlinks=False,
             )
+            linked = True
         except FileExistsError:
             existing = _read_release_identity_at(directory_descriptor)
             if not _directory_chain_matches(path_receipt, descriptors):
@@ -507,40 +643,99 @@ def publish_release_identity(
         except OSError as exc:
             _manifest_error("cannot publish release manifest", exc)
 
-        if not _named_entry_matches(
-            directory_descriptor, MANIFEST_NAME, temporary_descriptor
+        linked_value = os.fstat(temporary_descriptor)
+        linked_version = _file_version(linked_value)
+        if (
+            not stat.S_ISREG(linked_value.st_mode)
+            or linked_value.st_nlink < 2
+            or linked_version[:4] != temporary_version[:4]
+            or not _descriptor_has_exact_contents(
+                temporary_descriptor,
+                contents,
+                expected_version=linked_version,
+            )
+        ):
+            _manifest_error("temporary release manifest changed during publication")
+        # Creating the owned hard link legitimately advances ctime.  From this
+        # point onward every name and content check uses that complete version.
+        temporary_version = linked_version
+        if not _publication_entry_matches(
+            directory_descriptor,
+            temporary_name,
+            temporary_descriptor,
+            temporary_version,
+            contents,
+        ):
+            _manifest_error("temporary release manifest changed during publication")
+        if not _publication_entry_matches(
+            directory_descriptor,
+            MANIFEST_NAME,
+            temporary_descriptor,
+            temporary_version,
+            contents,
         ):
             _manifest_error("release manifest changed during publication")
+        try:
+            os.fsync(directory_descriptor)
+        except OSError as exc:
+            _manifest_error("cannot preserve release manifest recovery evidence", exc)
         if not _directory_chain_matches(path_receipt, descriptors):
             # The newly linked manifest is retained on the opened inode as
             # durable recovery evidence.  Commit that link before reporting
             # the public-path failure, then durably remove only our held temp.
-            try:
-                os.fsync(directory_descriptor)
-            except OSError as exc:
-                _manifest_error(
-                    "cannot preserve release manifest recovery evidence",
-                    exc,
-                )
-            _remove_temporary_manifest(directory_descriptor, temporary_name)
+            temporary_version = _remove_temporary_manifest(
+                directory_descriptor,
+                temporary_name,
+                temporary_descriptor,
+                temporary_version,
+                contents,
+                require_final=True,
+            )
             temporary_name = None
-            try:
-                os.fsync(directory_descriptor)
-            except OSError as exc:
-                _manifest_error(
-                    "cannot finish release manifest recovery evidence",
-                    exc,
-                )
             _manifest_error("album directory changed during manifest publication")
-        _remove_temporary_manifest(directory_descriptor, temporary_name)
+        temporary_version = _remove_temporary_manifest(
+            directory_descriptor,
+            temporary_name,
+            temporary_descriptor,
+            temporary_version,
+            contents,
+            require_final=True,
+        )
         temporary_name = None
-        os.fsync(directory_descriptor)
+        if not _publication_entry_matches(
+            directory_descriptor,
+            MANIFEST_NAME,
+            temporary_descriptor,
+            temporary_version,
+            contents,
+        ):
+            _manifest_error("release manifest changed during publication")
         if not _directory_chain_matches(path_receipt, descriptors):
             _manifest_error("album directory changed during manifest publication")
         return True
     finally:
-        if temporary_descriptor is not None:
-            os.close(temporary_descriptor)
+        cleanup_error = None
         if temporary_name is not None:
-            _remove_temporary_manifest(directory_descriptor, temporary_name)
-        _close_descriptors(descriptors)
+            try:
+                if temporary_descriptor is None or temporary_version is None:
+                    _manifest_error("temporary release manifest cleanup lost its binding")
+                _remove_temporary_manifest(
+                    directory_descriptor,
+                    temporary_name,
+                    temporary_descriptor,
+                    temporary_version,
+                    contents,
+                    require_final=linked,
+                )
+            except BaseException as exc:
+                cleanup_error = exc
+        try:
+            if temporary_descriptor is not None:
+                try:
+                    os.close(temporary_descriptor)
+                except OSError:
+                    pass
+        finally:
+            _close_descriptors(descriptors)
+        if cleanup_error is not None and sys.exc_info()[0] is None:
+            raise cleanup_error
