@@ -212,6 +212,53 @@ def test_whole_album_relocation_carries_exact_release_manifest(
 
 
 @pytest.mark.parametrize(
+    ("kind", "require_no_conflicts"),
+    (
+        (relocation.RelocationKind.WHOLE_ALBUM, False),
+        (relocation.RelocationKind.SPLIT_GAP_FILL, True),
+    ),
+)
+def test_same_release_manifest_serializations_are_semantic_duplicates(
+    tmp_path, monkeypatch, kind, require_no_conflicts
+):
+    music, _data, database = _configure(tmp_path, monkeypatch)
+    source = music / "Artist, Other" / "Album"
+    destination = music / "Artist" / "Album"
+    source.mkdir(parents=True)
+    destination.mkdir(parents=True)
+    track = source / "01.flac"
+    track.write_bytes(b"audio")
+    _database(database, tracks=(track,))
+    publish_release_identity(source, ReleaseIdentity("qobuz", "100"))
+    destination_manifest = (
+        b'{\n  "release_id": "100",\n  "provider": "qobuz",\n'
+        b'  "schema_version": 1\n}\n'
+    )
+    (destination / MANIFEST_NAME).write_bytes(destination_manifest)
+    assert (source / MANIFEST_NAME).read_bytes() != destination_manifest
+    assert read_release_identity(source) == read_release_identity(destination)
+
+    authority = run_lock.acquire()
+    try:
+        result = relocation.relocate_post_import_album(
+            source,
+            destination,
+            kind=kind,
+            authority=authority,
+            require_no_conflicts=require_no_conflicts,
+        )
+    finally:
+        authority.close()
+
+    assert result.changed is True
+    assert (destination / track.name).read_bytes() == b"audio"
+    assert (destination / MANIFEST_NAME).read_bytes() == destination_manifest
+    assert read_release_identity(destination) == ReleaseIdentity("qobuz", "100")
+    assert not source.exists()
+    assert _paths(database)[0] == [str(destination / track.name)]
+
+
+@pytest.mark.parametrize(
     ("source_release", "destination_release"),
     (("100", "200"), ("malformed", None), (None, "200")),
 )

@@ -1122,6 +1122,27 @@ def _build_plan(source, destination) -> dict:
     }
 
 
+def _prefer_destination_release_manifest(plan, source, destination) -> None:
+    """Keep an equal validated destination manifest without a byte comparison."""
+    if (
+        destination is None
+        or MANIFEST_NAME not in source["files"]
+        or MANIFEST_NAME not in destination["files"]
+    ):
+        return
+    plan["conflicts"] = [
+        relative
+        for relative in plan["conflicts"]
+        if relative != MANIFEST_NAME
+    ]
+    plan["duplicates"] = sorted(
+        {*plan["duplicates"], MANIFEST_NAME}
+    )
+    plan["selected_files"] = sorted(
+        {*plan["selected_files"], MANIFEST_NAME}
+    )
+
+
 def _whole_album_release_allowed(
     source_path, destination_path, source_snapshot, destination_snapshot
 ) -> bool:
@@ -3690,6 +3711,9 @@ def relocate_post_import_album(
                     "release identities do not permit this album relocation",
                 )
             plan = _build_plan(source_snapshot, destination_snapshot)
+            _prefer_destination_release_manifest(
+                plan, source_snapshot, destination_snapshot
+            )
             if (
                 kind is RelocationKind.WHOLE_ALBUM
                 or require_no_conflicts
