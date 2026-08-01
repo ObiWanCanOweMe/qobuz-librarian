@@ -5,6 +5,10 @@ import pytest
 
 from qobuz_librarian import config as cfg
 from qobuz_librarian import run_lock
+from qobuz_librarian.library.album_placement import (
+    AlbumPlacement,
+    PlacementDisposition,
+)
 from qobuz_librarian.library.release_identity import (
     MANIFEST_NAME,
     ReleaseIdentity,
@@ -14,15 +18,14 @@ from qobuz_librarian.library.release_identity import (
 )
 
 
-def _patch_download_receipts(monkeypatch, download, added):
-    from qobuz_librarian.integrations.staging import StagedFile
+def _patch_download_receipts(monkeypatch, download, added, run_root):
+    from qobuz_librarian.integrations.staging import StagedFile, StagingRun
 
-    class _Run:
-        path = Path("/")
-
-        @staticmethod
-        def to_record():
-            return {"path": "/", "root_identity": [0, 0, 0, 0, 0, 0]}
+    value = run_root.stat()
+    run = StagingRun(run_root, (
+        value.st_dev, value.st_ino, value.st_mode, value.st_size,
+        value.st_mtime_ns, value.st_ctime_ns,
+    ))
 
     def sealed_added(_snapshot):
         receipts = []
@@ -35,11 +38,16 @@ def _patch_download_receipts(monkeypatch, download, added):
         return receipts
 
     monkeypatch.setattr(download, "files_added_since", sealed_added)
-    monkeypatch.setattr(download, "create_staging_run", lambda: _Run())
-    monkeypatch.setattr(
-        download,
-        "capture_staging_run",
-        lambda _run: SimpleNamespace(files=(object(),)),
+    monkeypatch.setattr(download, "create_staging_run", lambda: run)
+
+
+def _adopted_placement(album_dir):
+    return AlbumPlacement(
+        identity=ReleaseIdentity("qobuz", "ALB"),
+        friendly_path=album_dir,
+        destination=album_dir,
+        disposition=PlacementDisposition.ADOPTED,
+        suffix="",
     )
 
 
@@ -802,10 +810,11 @@ def test_gap_fill_backup_restored_when_track_returns_lossy(monkeypatch, tmp_path
     owned.write_bytes(b"the-owned-original")
     existing = [{"path": str(owned), "title": "T1", "tracknumber": 1, "discnumber": 1}]
 
-    staging = tmp_path / "staging"
-    staging.mkdir()
+    staging_root = tmp_path / "staging"
+    staging = staging_root / ".qobuz-run-000000000000000000000000"
+    staging.mkdir(parents=True)
     monkeypatch.setattr(cfg, "MUSIC_ROOT", tmp_path / "music")
-    monkeypatch.setattr(cfg, "STAGING_DIR", staging)
+    monkeypatch.setattr(cfg, "STAGING_DIR", staging_root)
     monkeypatch.setattr(cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
     monkeypatch.setattr(cfg, "AUTO_UPGRADE_ENABLED", False)
 
@@ -829,7 +838,19 @@ def test_gap_fill_backup_restored_when_track_returns_lossy(monkeypatch, tmp_path
     monkeypatch.setattr(proc, "is_cancel_requested", lambda: False)
     monkeypatch.setattr(
         proc, "_pre_import_staging_hooks", lambda _a, _dirs=None: ([], 0))
-    monkeypatch.setattr(proc, "beets_import_paths", lambda *a, **k: True)
+    def fake_import(*_a, **_k):
+        assert not owned.exists()
+        for file in new_flacs:
+            (album_dir / file.name).write_bytes(file.read_bytes())
+            file.unlink()
+        return True
+
+    monkeypatch.setattr(proc, "beets_import_paths", fake_import)
+    monkeypatch.setattr(
+        proc,
+        "resolve_album_import_placement",
+        lambda _album, _token: _adopted_placement(album_dir),
+    )
     monkeypatch.setattr(proc, "write_post_import_sidecars", lambda _ds: None)
     monkeypatch.setattr(proc, "sweep_staging_artwork", lambda: None)
     monkeypatch.setattr(proc, "log_fetch", lambda _e: None)
@@ -838,7 +859,8 @@ def test_gap_fill_backup_restored_when_track_returns_lossy(monkeypatch, tmp_path
                         lambda _result: [staging])
 
     monkeypatch.setattr(dl, "rip_url", lambda *a, **k: (0, ""))
-    _patch_download_receipts(monkeypatch, dl, [*new_flacs, lossy_rip])
+    _patch_download_receipts(
+        monkeypatch, dl, [*new_flacs, lossy_rip], staging)
     monkeypatch.setattr(
         dl, "cleanup_lossy",
         lambda files: (
@@ -1123,10 +1145,11 @@ def test_gap_fill_partial_import_restores_backup_despite_extra_track(
     (album_dir / "09 - Bonus.flac").write_bytes(b"\x00" * 500)
     existing = [{"path": str(owned), "title": "T1", "tracknumber": 1, "discnumber": 1}]
 
-    staging = tmp_path / "staging"
-    staging.mkdir()
+    staging_root = tmp_path / "staging"
+    staging = staging_root / ".qobuz-run-000000000000000000000000"
+    staging.mkdir(parents=True)
     monkeypatch.setattr(cfg, "MUSIC_ROOT", tmp_path / "music")
-    monkeypatch.setattr(cfg, "STAGING_DIR", staging)
+    monkeypatch.setattr(cfg, "STAGING_DIR", staging_root)
     monkeypatch.setattr(cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
     monkeypatch.setattr(cfg, "AUTO_UPGRADE_ENABLED", False)
 
@@ -1158,16 +1181,22 @@ def test_gap_fill_partial_import_restores_backup_despite_extra_track(
     t1_rip.write_bytes(b"\x00" * 1000)
 
     def fake_import(*_a, **_k):
+        assert not owned.exists()
         for f in new_flacs:
             (album_dir / f.name).write_bytes(f.read_bytes())
             f.unlink()
         return True
     monkeypatch.setattr(proc, "beets_import_paths", fake_import)
+    monkeypatch.setattr(
+        proc,
+        "resolve_album_import_placement",
+        lambda _album, _token: _adopted_placement(album_dir),
+    )
     monkeypatch.setattr(proc, "validated_staged_album_dirs",
                         lambda _result: [staging])
 
     monkeypatch.setattr(dl, "rip_url", lambda *a, **k: (0, ""))
-    _patch_download_receipts(monkeypatch, dl, [*new_flacs, t1_rip])
+    _patch_download_receipts(monkeypatch, dl, [*new_flacs, t1_rip], staging)
     monkeypatch.setattr(dl, "cleanup_lossy", lambda f: (list(f), [], []))
     monkeypatch.setattr(dl, "snapshot_staging", lambda: set())
     monkeypatch.setattr(dl, "detect_auth_lost", lambda _o: False)
