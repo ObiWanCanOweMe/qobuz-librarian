@@ -388,6 +388,11 @@ def test_executor_upgrade_carries_non_audio_companions_from_backup(monkeypatch, 
     # the backup into the rebuilt album before reaping it, exactly as the
     # single-album process.py path does.
     from qobuz_librarian.library.backup import backup_album_dir
+    from qobuz_librarian.library.release_identity import (
+        ReleaseIdentity,
+        publish_release_identity,
+        read_release_identity,
+    )
     from qobuz_librarian.modes import process as proc
     from qobuz_librarian.queue import executor
 
@@ -398,6 +403,7 @@ def test_executor_upgrade_carries_non_audio_companions_from_backup(monkeypatch, 
     (album_dir / "booklet.pdf").write_bytes(b"the-booklet")
     (album_dir / "scans").mkdir()
     (album_dir / "scans" / "front.jpg").write_bytes(b"art")
+    publish_release_identity(album_dir, ReleaseIdentity("qobuz", "A"))
     monkeypatch.setattr(executor.cfg, "MUSIC_ROOT", music)
     monkeypatch.setattr(executor.cfg, "UPGRADE_BACKUP_DIR",
                         tmp_path / "backups")
@@ -425,6 +431,60 @@ def test_executor_upgrade_carries_non_audio_companions_from_backup(monkeypatch, 
     assert not backup.path.exists()
     assert (album_dir / "booklet.pdf").read_bytes() == b"the-booklet"
     assert (album_dir / "scans" / "front.jpg").read_bytes() == b"art"
+    assert (album_dir / "01.flac").read_bytes() == b"new"
+    assert read_release_identity(album_dir) == ReleaseIdentity("qobuz", "A")
+
+
+def test_executor_upgrade_retains_legacy_unbound_backup(monkeypatch, tmp_path):
+    """Legacy whole-album receipts stay restore-only, never carry/delete authority."""
+    from qobuz_librarian.library.backup import backup_album_dir
+    from qobuz_librarian.modes import process as proc
+    from qobuz_librarian.queue import executor
+
+    music = tmp_path / "music"
+    album_dir = music / "Artist" / "Legacy Album"
+    album_dir.mkdir(parents=True)
+    (album_dir / "01.flac").write_bytes(b"old")
+    (album_dir / "booklet.pdf").write_bytes(b"legacy-booklet")
+    monkeypatch.setattr(executor.cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(
+        executor.cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    backup = backup_album_dir(album_dir)
+    assert backup is not None and backup.complete is True
+    assert "release_identity" not in backup.receipt
+    album_dir.mkdir(parents=True)
+    (album_dir / "01.flac").write_bytes(b"new")
+
+    monkeypatch.setattr(
+        executor, "find_album_dir_filesystem", lambda _a: album_dir)
+    monkeypatch.setattr(
+        proc, "find_album_dir_filesystem", lambda _a: album_dir)
+    monkeypatch.setattr(proc, "_upgrade_replacement_verified", lambda *a: True)
+    monkeypatch.setattr(proc, "_upgrade_trees_verified", lambda *_a: True)
+
+    item = {
+        "album": {
+            "id": "A",
+            "artist": {"name": "Artist"},
+            "tracks": {"items": []},
+        },
+        "album_dir": album_dir,
+        "backup_path": backup,
+        "gap_fill_backup_path": None,
+        "siblings_to_delete": [],
+        "n_ok": 1,
+        "n_fail": 0,
+        "n_lossy": 0,
+        "auto_upgrade": True,
+    }
+    executor._resolve_queue_item(
+        item,
+        Namespace(no_import=False, consolidate=False),
+        imported_globally=True,
+    )
+
+    assert backup.path.is_dir()
+    assert not (album_dir / "booklet.pdf").exists()
     assert (album_dir / "01.flac").read_bytes() == b"new"
 
 

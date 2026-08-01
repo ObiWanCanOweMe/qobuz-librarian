@@ -2964,6 +2964,17 @@ def _release_identity_binding_schema_valid(receipt) -> bool:
     )
 
 
+def _upgrade_release_identity_binding_present(receipt) -> bool:
+    """Require the explicit receipt pair before granting upgrade authority."""
+    return (
+        type(receipt) is dict
+        and receipt.get("kind") == "upgrade"
+        and "release_identity" in receipt
+        and "release_identity_receipt" in receipt
+        and _release_identity_binding_schema_valid(receipt)
+    )
+
+
 def _tree_snapshot_schema_valid(value) -> bool:
     if (
         type(value) is not dict
@@ -3724,6 +3735,11 @@ def canonical_library_backup_disposal_record(
     if carrier is None or type(value) is not dict:
         return None
     receipt = carrier["receipt"]
+    if (
+        carrier["kind"] == "upgrade"
+        and not _upgrade_release_identity_binding_present(receipt)
+    ):
+        return None
     snapshot = value.get("snapshot")
     expected_name = _library_backup_disposal_quarantine_name(
         receipt, expected_owner)
@@ -4083,6 +4099,12 @@ def library_backup_disposal_record(backup, *, expected_owner=None):
         return None
     _public, _root, _parts, descriptors = opened
     try:
+        if (
+            backup.receipt.get("kind") == "upgrade"
+            and _validated_upgrade_release_identity(
+                descriptors[-1], backup.receipt) is None
+        ):
+            return None
         snapshot = _receipt_disposal_snapshot(
             descriptors[-1], backup.receipt)
         if snapshot is None or _exact_tree_snapshot(descriptors[-1]) != snapshot:
@@ -4164,6 +4186,21 @@ def _release_identity_from_exact_tree(
         raise ReleaseManifestError(
             "release manifest identity differs from its backup receipt")
     return identity
+
+
+def _validated_upgrade_release_identity(directory_fd, receipt):
+    """Return a bound upgrade identity, never one derived by legacy fallback."""
+    if not _upgrade_release_identity_binding_present(receipt):
+        return None
+    try:
+        return _release_identity_from_exact_tree(
+            directory_fd,
+            receipt["tree"],
+            declared_identity=receipt["release_identity"],
+            declared_receipt=receipt["release_identity_receipt"],
+        )
+    except (OSError, TypeError, ValueError):
+        return None
 
 
 def _album_proof_is_intact(proof) -> bool:
@@ -4807,6 +4844,12 @@ def dispose_backup(
     replacement_alias = None
     backup_alias = None
     try:
+        if (
+            backup.receipt.get("kind") == "upgrade"
+            and _validated_upgrade_release_identity(
+                directory_fd, backup.receipt) is None
+        ):
+            return False
         replacement_proof = _hold_album_proof(
             replacement_path, expected_replacement_receipt)
         if replacement_proof is None:
@@ -5976,6 +6019,12 @@ def carry_backup_companions(
     held_backup = None
     intent = None
     try:
+        if (
+            backup.receipt.get("kind") == "upgrade"
+            and _validated_upgrade_release_identity(
+                backup_fd, backup.receipt) is None
+        ):
+            return None
         identity_proof = _hold_album_proof(
             replacement_path, expected_replacement_receipt)
         if identity_proof is None:
@@ -6175,13 +6224,8 @@ def carry_backup_release_identity(
     replacement_proof = None
     refreshed_proof = None
     try:
-        backup_identity = _release_identity_from_exact_tree(
-            backup_fd,
-            backup.receipt["tree"],
-            declared_identity=backup.receipt.get("release_identity"),
-            declared_receipt=backup.receipt.get(
-                "release_identity_receipt"),
-        )
+        backup_identity = _validated_upgrade_release_identity(
+            backup_fd, backup.receipt)
         if backup_identity != expected_identity:
             return None
 

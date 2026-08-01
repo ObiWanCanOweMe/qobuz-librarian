@@ -4138,6 +4138,10 @@ def test_restore_backup_moves_the_files_home(client, tmp_path, monkeypatch):
 def test_discard_backup_removes_a_redundant_backup(client, tmp_path, monkeypatch):
     from qobuz_librarian import config as cfg
     from qobuz_librarian.library import backup as backup_mod
+    from qobuz_librarian.library.release_identity import (
+        ReleaseIdentity,
+        publish_release_identity,
+    )
     from qobuz_librarian.web import job_persistence
 
     job_persistence._reset_for_tests()
@@ -4148,10 +4152,13 @@ def test_discard_backup_removes_a_redundant_backup(client, tmp_path, monkeypatch
     origin = tmp_path / "music" / "Artist" / "Album (2020)"
     origin.mkdir(parents=True)
     (origin / "01 - Song.flac").write_bytes(b"data")
+    identity = ReleaseIdentity("qobuz", "100")
+    publish_release_identity(origin, identity)
     carried = backup_mod.backup_album_dir(origin)
     assert carried is not None and carried.complete is True
     origin.mkdir(parents=True)
     (origin / "01 - Song.flac").write_bytes(b"data")
+    publish_release_identity(origin, identity)
     job = jm.Job(title="Repair needing recovery")
     job.execute_kind = "repair"
     job.status = jm.JobStatus.FAILED
@@ -4175,6 +4182,7 @@ def test_discard_backup_removes_a_redundant_backup(client, tmp_path, monkeypatch
         origin.mkdir(parents=True)
         (origin / "01 - Song.flac").write_bytes(b"data")
         (origin / "02 - Other.flac").write_bytes(b"MORE")
+        publish_release_identity(origin, identity)
         r = client.post("/backups/discard", data={"backup": kept.name})
         assert r.status_code == 200
         assert "byte-for-byte" in r.text

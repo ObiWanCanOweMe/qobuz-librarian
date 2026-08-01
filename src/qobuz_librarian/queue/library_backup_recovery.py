@@ -11,6 +11,7 @@ from qobuz_librarian.completion import RecoveryOwner
 from qobuz_librarian.library.backup import (
     capture_album_source_receipt,
     carry_backup_companions,
+    carry_backup_release_identity,
     dispose_backup,
     library_backup_disposal_record,
     library_backup_record_absent,
@@ -20,6 +21,7 @@ from qobuz_librarian.library.backup import (
     warn_pin_failed,
 )
 from qobuz_librarian.library.catalog import folder_holds_all_tracks
+from qobuz_librarian.library.release_identity import identity_from_album
 from qobuz_librarian.queue import journal as queue_state
 
 _BACKUP_INTENT = "library-backup-intent"
@@ -257,6 +259,32 @@ def prepare_library_backup_settlement(
         return _attention(journal, "library-backup-replacement-unavailable")
 
     if reference.data["kind"] == "upgrade":
+        authority_check()
+        expected_identity = identity_from_album(album)
+        if expected_identity is None:
+            _pin(
+                backup,
+                owner_data,
+                "queue backup kept — release identity could not be derived",
+                authority_check,
+            )
+            return _attention(
+                journal, "library-backup-release-identity-unsettled")
+        replacement_receipt = carry_backup_release_identity(
+            backup,
+            replacement,
+            expected_identity,
+        )
+        authority_check()
+        if replacement_receipt is None:
+            _pin(
+                backup,
+                owner_data,
+                "queue backup kept — release identity could not be carried exactly",
+                authority_check,
+            )
+            return _attention(
+                journal, "library-backup-release-identity-unsettled")
         authority_check()
         replacement_receipt = carry_backup_companions(
             backup,
