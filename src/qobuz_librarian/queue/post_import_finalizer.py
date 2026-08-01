@@ -147,6 +147,9 @@ def _settle_action(journal, retirement, authority):
             await_handoff=True,
             retain_completion=True,
             expected=action.expectation,
+            require_no_conflicts=(
+                action.kind == RelocationKind.SPLIT_GAP_FILL.value
+            ),
         )
         if (
             result.changed is False
@@ -155,7 +158,6 @@ def _settle_action(journal, retirement, authority):
             and result.published_files == 0
             and str(result.destination) == retirement.final_path
             and action.kind == RelocationKind.WHOLE_ALBUM.value
-            and result.reason == "there is nothing to relocate"
         ):
             return queue_state.clear_planned_noop_post_import_action(
                 journal,
@@ -166,6 +168,10 @@ def _settle_action(journal, retirement, authority):
             result.changed is not True
             or result.operation_id is None
             or result.ownership_receipt is None
+            or (
+                action.kind == RelocationKind.SPLIT_GAP_FILL.value
+                and result.reason is not None
+            )
         ):
             raise PostImportRelocationUnavailable(
                 errno.EBUSY, "the recorded post-import action made no exact move"

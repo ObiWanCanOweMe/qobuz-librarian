@@ -3527,6 +3527,7 @@ def relocate_post_import_album(
     authority: RunLockLease,
     await_handoff: bool = False,
     retain_completion: bool = False,
+    require_no_conflicts: bool = False,
     expected=None,
 ) -> RelocationResult:
     """Copy, publish, and commit one additive post-import relocation."""
@@ -3537,6 +3538,8 @@ def relocate_post_import_album(
         raise ValueError("relocation handoff mode is invalid")
     if type(retain_completion) is not bool:
         raise ValueError("relocation retained completion mode is invalid")
+    if type(require_no_conflicts) is not bool:
+        raise ValueError("relocation conflict policy is invalid")
     if retain_completion and not await_handoff:
         raise ValueError("retained completion requires a deferred handoff")
     root, source_path, source_parts = _absolute_album_path(source)
@@ -3641,7 +3644,10 @@ def relocate_post_import_album(
                         "was recorded",
                     )
             plan = _build_plan(source_snapshot, destination_snapshot)
-            if kind is RelocationKind.WHOLE_ALBUM and plan["conflicts"]:
+            if (
+                kind is RelocationKind.WHOLE_ALBUM
+                or require_no_conflicts
+            ) and plan["conflicts"]:
                 return RelocationResult(
                     source_path,
                     0,

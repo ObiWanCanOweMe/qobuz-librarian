@@ -184,7 +184,7 @@ def test_slot_proof_freezes_requested_and_reviewed_baseline(monkeypatch, tmp_pat
     }
 
 
-def test_synchronous_split_noop_is_not_identity_authority(tmp_path):
+def test_synchronous_partial_split_is_not_identity_authority(tmp_path):
     from qobuz_librarian.modes import process as proc
 
     source = tmp_path / "Other" / "Album"
@@ -193,11 +193,12 @@ def test_synchronous_split_noop_is_not_identity_authority(tmp_path):
     destination.mkdir(parents=True)
     (source / "01.flac").write_bytes(b"source recording")
     (destination / "01.flac").write_bytes(b"contradictory recording")
+    (destination / "02.flac").write_bytes(b"moved recording")
     result = SimpleNamespace(
-        changed=False,
-        published_files=0,
+        changed=True,
+        published_files=1,
         destination=destination,
-        reason="all destination names already exist",
+        reason="kept 1 existing destination name(s)",
     )
 
     assert not proc._split_relocation_allows_identity(result)

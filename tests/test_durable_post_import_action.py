@@ -489,6 +489,50 @@ def test_split_relocation_noop_keeps_action_and_refuses_publication(
     assert not (destination / MANIFEST_NAME).exists()
 
 
+def test_split_partial_conflict_keeps_action_and_refuses_publication(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "music" / "Other" / "Album"
+    destination = tmp_path / "music" / "Artist" / "Album"
+    source.mkdir(parents=True)
+    destination.mkdir(parents=True)
+    conflict = source / "01.flac"
+    conflict.write_bytes(b"source conflict")
+    (destination / "01.flac").write_bytes(b"destination conflict")
+    (destination / "02.flac").write_bytes(b"already moved")
+    action = SimpleNamespace(
+        action_id="c" * 64,
+        kind=post_import_finalizer.RelocationKind.SPLIT_GAP_FILL.value,
+        source=str(source),
+        destination=str(destination),
+        expectation={"exact": True},
+        phase=journal.PostImportActionPhase.PLANNED,
+    )
+    retirement = SimpleNamespace(
+        item_id="b" * 64, action=action, final_path=str(destination),
+    )
+    saved = SimpleNamespace(retirements=(retirement,))
+    monkeypatch.setattr(post_import_finalizer, "_require_authority", lambda _a: None)
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "relocate_post_import_album",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            changed=True,
+            operation_id="d" * 64,
+            ownership_receipt={"exact": True},
+            published_files=1,
+            destination=destination,
+            reason="kept 1 existing destination name(s)",
+        ),
+    )
+
+    with pytest.raises(OSError, match="no exact move"):
+        post_import_finalizer._settle_action(saved, retirement, object())
+    assert saved.retirements[0].action is action
+    assert conflict.read_bytes() == b"source conflict"
+    assert not (destination / MANIFEST_NAME).exists()
+
+
 def test_late_cancel_refuses_durable_identity_publication(monkeypatch):
     item_id = "b" * 64
     planned = SimpleNamespace(phase=journal.PostImportActionPhase.PLANNED)

@@ -105,6 +105,40 @@ def test_relocation_is_additive_and_keeps_destination_conflicts(
     assert artwork == str(destination_art)
 
 
+def test_identity_bound_split_refuses_conflicts_before_partial_move(
+    tmp_path, monkeypatch
+):
+    music, _data, database = _configure(tmp_path, monkeypatch)
+    source = music / "Artist, Other" / "Album"
+    destination = music / "Artist" / "Album"
+    source.mkdir(parents=True)
+    destination.mkdir(parents=True)
+    moving = source / "01 - New.flac"
+    conflict = source / "02 - Conflict.flac"
+    moving.write_bytes(b"new track")
+    conflict.write_bytes(b"source version")
+    (destination / conflict.name).write_bytes(b"destination version")
+    _database(database, tracks=(moving, conflict))
+
+    authority = run_lock.acquire()
+    try:
+        result = relocation.relocate_post_import_album(
+            source,
+            destination,
+            kind=relocation.RelocationKind.SPLIT_GAP_FILL,
+            authority=authority,
+            require_no_conflicts=True,
+        )
+    finally:
+        authority.close()
+
+    assert result.changed is False
+    assert result.reason == "the destination contains conflicting names"
+    assert moving.read_bytes() == b"new track"
+    assert conflict.read_bytes() == b"source version"
+    assert not (destination / moving.name).exists()
+
+
 def test_whole_album_conflict_keeps_the_source_album_intact(
     tmp_path, monkeypatch
 ):
@@ -322,5 +356,4 @@ def _queue_consumer():
         "item_id": "2" * 64,
         "action_id": "3" * 64,
     }
-
 

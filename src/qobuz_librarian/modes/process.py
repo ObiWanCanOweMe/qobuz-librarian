@@ -233,6 +233,7 @@ def _split_relocation_allows_identity(result) -> bool:
         getattr(result, "changed", False) is True
         and type(getattr(result, "published_files", None)) is int
         and result.published_files > 0
+        and getattr(result, "reason", None) is None
     )
 
 
@@ -1704,6 +1705,7 @@ def process_album(album, args, *, allow_force=True, label=None,
                         post_dir,
                         kind=RelocationKind.SPLIT_GAP_FILL,
                         authority=run_lock.current_lease(),
+                        require_no_conflicts=True,
                     )
                 except PostImportRelocationAttention:
                     raise
