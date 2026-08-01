@@ -31,6 +31,7 @@ from qobuz_librarian.completion import (
     parse_completion_input_record,
     parse_completion_record,
 )
+from qobuz_librarian.library.release_identity import ReleaseIdentity
 
 
 def test_completion_input_is_canonical_owner_bound_and_append_only():
@@ -51,6 +52,8 @@ def test_completion_input_is_canonical_owner_bound_and_append_only():
         origin=CompletionOrigin(CompletionOriginKind.WEB_JOB, "abcd1234"),
         expectation=expectation,
         effective_tier=4,
+        release_identity=ReleaseIdentity("qobuz", "42"),
+        placement_destination="/music/Artist/Album [qobuz-42]",
     )
     first = StagedReceipt(
         "/staging/01.flac", (1, 11, 0o100644, 100, 1_000, 2_000))
@@ -72,6 +75,13 @@ def test_completion_input_is_canonical_owner_bound_and_append_only():
     )
     record = complete.to_record()
 
+    assert record["release_identity"] == {
+        "provider": "qobuz",
+        "release_id": "42",
+    }
+    assert record["placement_destination"] == (
+        "/music/Artist/Album [qobuz-42]"
+    )
     assert parse_completion_input_record(
         record, expected_owner=owner) == complete
     assert completion_input_extends(initial, complete)
@@ -92,6 +102,39 @@ def test_completion_input_is_canonical_owner_bound_and_append_only():
     noncanonical = copy.deepcopy(record)
     noncanonical["download"]["lineages"].reverse()
     assert parse_completion_input_record(noncanonical) is None
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda record: record["release_identity"].update(extra="refuse"),
+        lambda record: record["release_identity"].update(provider="other"),
+        lambda record: record["release_identity"].update(release_id=" 42"),
+        lambda record: record.update(placement_destination="music/Artist/Album"),
+        lambda record: record.pop("placement_destination"),
+    ],
+)
+def test_completion_input_rejects_noncanonical_release_placement(mutate):
+    owner = RecoveryOwner("a" * 64, "b" * 64)
+    slot = "qobuz:101"
+    value = CompletionInput(
+        owner=owner,
+        origin=CompletionOrigin(CompletionOriginKind.CLI, "test-queue"),
+        expectation=CompletionExpectation(
+            album_id="42",
+            scope=CompletionScope.ALBUM,
+            catalogue_slots=(slot,),
+            requested_slots=(slot,),
+            quality_targets=(QualityTarget(slot, 16, 44_100),),
+        ),
+        effective_tier=2,
+        release_identity=ReleaseIdentity("qobuz", "42"),
+        placement_destination="/music/Artist/Album",
+    )
+    record = value.to_record()
+    mutate(record)
+
+    assert parse_completion_input_record(record, expected_owner=owner) is None
 
 
 @pytest.mark.parametrize(

@@ -1,3 +1,4 @@
+import hashlib
 from argparse import Namespace
 from contextlib import contextmanager
 
@@ -28,6 +29,10 @@ from qobuz_librarian.integrations.beets import (
 from qobuz_librarian.integrations.staging import (
     StagingReferenceInspection,
     StagingReferenceStatus,
+)
+from qobuz_librarian.library.release_identity import (
+    ReleaseIdentity,
+    read_release_identity,
 )
 from qobuz_librarian.queue import durable_runner
 from qobuz_librarian.queue import journal as queue_state
@@ -297,6 +302,8 @@ def test_durable_collision_suffix_reaches_managed_import_with_completion_proof(
     monkeypatch.setattr(cfg, "QUEUE_JOURNAL_DIR", tmp_path / "journals")
     monkeypatch.setattr(cfg, "BEETS_DB_PATH", beets_dir / "library.db")
     monkeypatch.setattr(cfg, "MUSIC_ROOT", tmp_path / "music")
+    final_dir = tmp_path / "music" / "Artist" / "Safe Album [qobuz-42]"
+    final_dir.mkdir(parents=True)
 
     item = _single_track_item("Safe Album")
     queue = [item]
@@ -305,6 +312,8 @@ def test_durable_collision_suffix_reaches_managed_import_with_completion_proof(
         item,
         args,
         album_path_suffix=" [qobuz-42]",
+        release_identity=ReleaseIdentity("qobuz", "42"),
+        placement_destination=final_dir,
     )
     assert plan is not None
 
@@ -417,20 +426,36 @@ def test_durable_collision_suffix_reaches_managed_import_with_completion_proof(
                 "carrier": carrier,
             }
         )
+        final_audio = final_dir / "01.flac"
+        final_audio.write_bytes(b"durable collision audio")
+        audio_identity = final_audio.stat()
+        final_identity = final_dir.stat()
         managed = ManagedImportEvidence(
             owner=RecoveryOwner(owner["operation_id"], owner["item_id"]),
             library_root=str(tmp_path / "music"),
             library_root_identity=(8, 9, 0, 10, 11),
-            album_path="Artist/Safe Album",
-            album_identity=(8, 10, 0, 12, 13),
+            album_path="Artist/Safe Album [qobuz-42]",
+            album_identity=(
+                final_identity.st_dev,
+                final_identity.st_ino,
+                final_identity.st_size,
+                final_identity.st_mtime_ns,
+                final_identity.st_ctime_ns,
+            ),
             manifest_hash="c" * 64,
             mappings=(
                 ManagedMapping(
                     slot,
                     bindings[0]["path"],
                     tuple(bindings[0]["identity"]),
-                    "Artist/Safe Album/01.flac",
-                    (8, 11, 100, 14, 15),
+                    "Artist/Safe Album [qobuz-42]/01.flac",
+                    (
+                        audio_identity.st_dev,
+                        audio_identity.st_ino,
+                        audio_identity.st_size,
+                        audio_identity.st_mtime_ns,
+                        audio_identity.st_ctime_ns,
+                    ),
                 ),
             ),
         )
@@ -494,7 +519,7 @@ def test_durable_collision_suffix_reaches_managed_import_with_completion_proof(
             mapping.slot,
             mapping.destination_path,
             mapping.destination_identity,
-            "e" * 64,
+            hashlib.sha256((final_dir / "01.flac").read_bytes()).hexdigest(),
         )
         target = expectation.quality_targets[0]
         assessment = assess_completion(
@@ -545,5 +570,6 @@ def test_durable_collision_suffix_reaches_managed_import_with_completion_proof(
     assert observed["active_before_download"] is True
     assert observed["album_path_suffix"] == " [qobuz-42]"
     assert observed["live_queue"] and observed["live_queue"][0] is True
+    assert read_release_identity(final_dir) == ReleaseIdentity("qobuz", "42")
     assert queue == []
     assert queue_state.list_queue_journals() == ()

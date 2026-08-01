@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from qobuz_librarian.library.release_identity import ReleaseIdentity
 from qobuz_librarian.queue.builder import _build_queue_item
 from qobuz_librarian.queue.persistence import (
     QueueLoadStatus,
@@ -45,7 +46,11 @@ def _legacy_executor_runtime(monkeypatch):
     if acquired_here:
         lease = run_lock.acquire()
     assert lease is not None
-    monkeypatch.setattr(executor, "plan_durable_new_album", lambda *_a: None)
+    monkeypatch.setattr(
+        executor,
+        "plan_durable_new_album",
+        lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(
         executor,
         "queue_item_may_create_library_backup",
@@ -483,7 +488,10 @@ def test_executor_per_album_isolation_one_album_failure_keeps_others(monkeypatch
         executor,
         "resolve_album_import_placement",
         lambda album, _token: SimpleNamespace(
-            suffix=" [qobuz-B]" if album["id"] == "B" else ""),
+            suffix=" [qobuz-B]" if album["id"] == "B" else "",
+            identity=ReleaseIdentity("qobuz", album["id"]),
+            destination=Path(f"/music/Artist-{album['id']}/Album"),
+        ),
     )
     monkeypatch.setattr(
         executor,
@@ -546,11 +554,27 @@ def test_collision_eligible_album_uses_durable_lane_with_frozen_suffix(
     monkeypatch.setattr(
         executor,
         "resolve_album_import_placement",
-        lambda _album, _token: SimpleNamespace(suffix=" [qobuz-200]"),
+        lambda _album, _token: SimpleNamespace(
+            suffix=" [qobuz-200]",
+            identity=ReleaseIdentity("qobuz", "200"),
+            destination=post_dir,
+        ),
     )
 
-    def freeze_plan(_item, _args, *, album_path_suffix=""):
-        seen.append(("plan", album_path_suffix))
+    def freeze_plan(
+        _item,
+        _args,
+        *,
+        album_path_suffix="",
+        release_identity=None,
+        placement_destination=None,
+    ):
+        seen.append((
+            "plan",
+            album_path_suffix,
+            release_identity,
+            placement_destination,
+        ))
         return plan
 
     def durable(current_queue, current_item, _args, **kwargs):
@@ -578,7 +602,12 @@ def test_collision_eligible_album_uses_durable_lane_with_frozen_suffix(
     results, drained = executor._execute_download_queue(queue, args, token="tok")
 
     assert seen == [
-        ("plan", " [qobuz-200]"),
+        (
+            "plan",
+            " [qobuz-200]",
+            ReleaseIdentity("qobuz", "200"),
+            post_dir,
+        ),
         ("durable", " [qobuz-200]"),
     ]
     assert results[0]["imported"] is True

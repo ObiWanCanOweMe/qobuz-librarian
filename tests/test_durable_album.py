@@ -8,6 +8,7 @@ from qobuz_librarian.completion import (
     RecoveryOwner,
     StagedBinding,
 )
+from qobuz_librarian.library.release_identity import ReleaseIdentity
 from qobuz_librarian.queue.durable_album import (
     completion_input_from_download,
     initial_completion_input,
@@ -74,10 +75,22 @@ def test_durable_new_album_plan_freezes_collision_suffix():
         _item(album),
         Namespace(no_import=False),
         album_path_suffix=" [qobuz-200]",
+        release_identity=ReleaseIdentity("qobuz", "42"),
+        placement_destination="/music/Artist/Album [qobuz-42]",
     )
 
     assert plan is not None
     assert plan.album_path_suffix == " [qobuz-200]"
+    assert plan.release_identity == ReleaseIdentity("qobuz", "42")
+    assert plan.placement_destination == "/music/Artist/Album [qobuz-42]"
+    assert initial_completion_input(
+        plan,
+        RecoveryOwner("a" * 64, "b" * 64),
+        CompletionOrigin(CompletionOriginKind.CLI, "album queue"),
+    ).to_record()["release_identity"] == {
+        "provider": "qobuz",
+        "release_id": "42",
+    }
 
 
 def test_durable_input_becomes_ready_only_for_exact_zero_remainder_download():
@@ -115,4 +128,3 @@ def test_durable_input_becomes_ready_only_for_exact_zero_remainder_download():
         counts=DownloadCounts(failed=1),
     )
     assert completion_input_from_download(initial, incomplete) is None
-

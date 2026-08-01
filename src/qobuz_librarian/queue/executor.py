@@ -2393,11 +2393,13 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
                 initial_identity_review = ("identity_attention", exc)
         if initial_identity_review is not None:
             plan = None
-        elif initial_placement is not None and initial_placement.suffix:
+        elif initial_placement is not None:
             plan = plan_durable_new_album(
                 item,
                 args,
                 album_path_suffix=initial_placement.suffix,
+                release_identity=initial_placement.identity,
+                placement_destination=initial_placement.destination,
             )
         else:
             plan = plan_durable_new_album(item, args)
@@ -2589,9 +2591,14 @@ def _execute_download_queue(queue, args, token, *, on_progress=None,
                     on_sources_changed=checkpoint_sources,
                 )
                 current_placement = resolve_album_import_placement(album, token)
-                if current_placement.suffix != plan.album_path_suffix:
+                if (
+                    current_placement.suffix != plan.album_path_suffix
+                    or current_placement.identity != plan.release_identity
+                    or os.fspath(current_placement.destination)
+                    != plan.placement_destination
+                ):
                     raise AlbumPlacementAttention(
-                        "collision routing changed during durable preparation"
+                        "release placement changed during durable preparation"
                     )
                 return prepared
 

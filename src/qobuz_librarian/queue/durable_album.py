@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from qobuz_librarian import config as cfg
@@ -23,6 +24,7 @@ from qobuz_librarian.completion import (
 )
 from qobuz_librarian.download import album_track_slots
 from qobuz_librarian.library.catalog import is_lossless_album
+from qobuz_librarian.library.release_identity import ReleaseIdentity
 from qobuz_librarian.quality.decision import album_max_quality
 
 
@@ -34,6 +36,8 @@ class DurableNewAlbumPlan:
     effective_tier: int
     library_backup_kind: str | None = None
     album_path_suffix: str = ""
+    release_identity: ReleaseIdentity | None = None
+    placement_destination: str | None = None
 
 
 def _full_album_gap_fill(item, tracks) -> bool:
@@ -91,11 +95,14 @@ def queue_item_may_create_library_backup(item) -> bool:
 
 
 def plan_durable_new_album(
-        item, args, *, album_path_suffix: str = "") -> DurableNewAlbumPlan | None:
+        item, args, *, album_path_suffix: str = "",
+        release_identity: ReleaseIdentity | None = None,
+        placement_destination=None) -> DurableNewAlbumPlan | None:
     """Freeze one full-album lane the live completion proof can authorise."""
     if (
         type(item) is not dict
         or type(album_path_suffix) is not str
+        or (release_identity is None) != (placement_destination is None)
         or getattr(args, "no_import", False)
         or getattr(args, "consolidate", False)
         or (
@@ -137,6 +144,21 @@ def plan_durable_new_album(
     effective_tier = item.get("quality") or cfg.STREAMRIP_QUALITY
     if album_id is None or type(effective_tier) is not int:
         return None
+    if release_identity is not None:
+        try:
+            placement_destination = os.fspath(placement_destination)
+        except TypeError:
+            return None
+        if (
+            type(release_identity) is not ReleaseIdentity
+            or release_identity.provider != "qobuz"
+            or release_identity.release_id != album_id
+            or type(placement_destination) is not str
+            or not os.path.isabs(placement_destination)
+            or os.path.abspath(placement_destination)
+            != placement_destination
+        ):
+            return None
     if effective_tier not in (2, 3, 4):
         return None
     bits, rate = album_max_quality(album, effective_tier)
@@ -162,6 +184,8 @@ def plan_durable_new_album(
         effective_tier,
         backup_kind,
         album_path_suffix,
+        release_identity,
+        placement_destination,
     )
 
 
@@ -178,6 +202,8 @@ def initial_completion_input(
         origin=origin,
         expectation=plan.expectation,
         effective_tier=plan.effective_tier,
+        release_identity=plan.release_identity,
+        placement_destination=plan.placement_destination,
     )
     value.to_record()
     return value
@@ -211,6 +237,8 @@ def completion_input_from_download(
         origin=initial.origin,
         expectation=expectation,
         effective_tier=initial.effective_tier,
+        release_identity=initial.release_identity,
+        placement_destination=initial.placement_destination,
         lineages=tuple(
             SourceLineage(
                 slot,
@@ -275,6 +303,8 @@ def advance_completion_sources(
         origin=previous.origin,
         expectation=previous.expectation,
         effective_tier=previous.effective_tier,
+        release_identity=previous.release_identity,
+        placement_destination=previous.placement_destination,
         lineages=tuple(lineages),
         counts=previous.counts,
     )

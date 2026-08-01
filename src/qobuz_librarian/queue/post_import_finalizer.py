@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import errno
+import hashlib
+import os
 import secrets
-from pathlib import Path
+import stat
+from pathlib import Path, PurePosixPath
 
+from qobuz_librarian import config as cfg
 from qobuz_librarian.completion import (
     CompletionOriginKind,
     RecoveryOwner,
@@ -26,6 +30,11 @@ from qobuz_librarian.library.post_import_relocation import (
     release_post_import_relocation,
     relocate_post_import_album,
     seal_post_import_relocation_handoff,
+)
+from qobuz_librarian.library.release_identity import (
+    ReleaseManifestError,
+    publish_release_identity,
+    read_release_identity,
 )
 from qobuz_librarian.queue import journal as queue_state
 from qobuz_librarian.run_lock import RunLockLease
@@ -286,6 +295,198 @@ def _acknowledge_completion(journal, retirement, acknowledge_completion):
     )
 
 
+def _current_inventory_matches(evidence, final_path: str, *, relocated: bool) -> bool:
+    """Recheck exact audio bytes at the settled path immediately before publish."""
+    inventory = evidence.inventory
+    if inventory is None or inventory.path != evidence.album_path:
+        return False
+    album_parts = PurePosixPath(evidence.album_path).parts
+    expected = {}
+    for receipt in inventory.audio:
+        parts = PurePosixPath(receipt.path).parts
+        if len(parts) <= len(album_parts) or parts[:len(album_parts)] != album_parts:
+            return False
+        relative = PurePosixPath(*parts[len(album_parts):]).as_posix()
+        if relative in expected:
+            return False
+        expected[relative] = receipt
+    try:
+        actual = {
+            path.relative_to(final_path).as_posix(): path
+            for path in Path(final_path).rglob("*")
+            if path.suffix.lower() in cfg.AUDIO_EXTS and path.is_file()
+        }
+    except OSError:
+        return False
+    if set(actual) != set(expected):
+        return False
+    for relative, path in actual.items():
+        receipt = expected[relative]
+        descriptor = None
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+                return False
+            digest_value = hashlib.sha256()
+            while chunk := os.read(descriptor, 1024 * 1024):
+                digest_value.update(chunk)
+            digest = digest_value.hexdigest()
+            after = os.fstat(descriptor)
+            named = os.lstat(path)
+        except OSError:
+            return False
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        identity = (
+            after.st_dev, after.st_ino, after.st_size,
+            after.st_mtime_ns, after.st_ctime_ns,
+        )
+        if (
+            (before.st_dev, before.st_ino, before.st_size,
+             before.st_mtime_ns, before.st_ctime_ns) != identity
+            or (named.st_dev, named.st_ino) != identity[:2]
+            or digest != receipt.sha256
+            or (not relocated and identity != receipt.identity)
+        ):
+            return False
+    return True
+
+
+def _publish_retirement_identity(journal, retirement, *, authority) -> bool:
+    """Publish only from the retained exact completion and destination proof."""
+    if (
+        retirement.planned is None
+        and retirement.completion_input is None
+        and retirement.completion_evidence is None
+        and retirement.final_path is None
+    ):
+        # Legacy carrier-only retirements predate durable completion records.
+        return False
+    owner = RecoveryOwner(journal.operation_id, retirement.item_id)
+    completion_input = parse_completion_input_record(
+        retirement.completion_input,
+        expected_owner=owner,
+    )
+    if (
+        completion_input is None
+        or not completion_input_ready(completion_input)
+    ):
+        raise PostImportFinalizationUnavailable(
+            errno.EINVAL, "the saved release identity plan is invalid"
+        )
+    if (
+        completion_input.release_identity is None
+        and completion_input.placement_destination is None
+    ):
+        # Pre-identity journals have no authority to invent a manifest. They
+        # retain the previous retirement contract while all newly admitted
+        # durable work carries the version-2 release plan below.
+        return False
+    evidence = parse_completion_record(
+        retirement.completion_evidence,
+        expected_owner=owner,
+        expected_expectation=completion_input.expectation,
+        expected_download=completion_input.download_coverage(),
+    )
+    if evidence is None:
+        raise PostImportFinalizationUnavailable(
+            errno.EINVAL, "the saved completion evidence is invalid"
+        )
+    completion_path = os.path.abspath(os.path.join(
+        evidence.library_root,
+        evidence.album_path,
+    ))
+    if completion_path != completion_input.placement_destination:
+        raise PostImportFinalizationUnavailable(
+            errno.EINVAL, "the completed album missed its planned destination"
+        )
+    final_path = retirement.final_path
+    if (
+        type(final_path) is not str
+        or not os.path.isabs(final_path)
+        or os.path.abspath(final_path) != final_path
+    ):
+        raise PostImportFinalizationUnavailable(
+            errno.EINVAL, "the settled release path is invalid"
+        )
+    action = retirement.action
+    if (
+        action is not None
+        and action.phase is not queue_state.PostImportActionPhase.COMMITTED
+    ):
+        raise PostImportFinalizationUnavailable(
+            errno.EBUSY, "the post-import relocation is not committed"
+        )
+    if action is not None and action.destination != final_path:
+        raise PostImportFinalizationUnavailable(
+            errno.EINVAL, "the settled release path does not match relocation"
+        )
+    try:
+        directory = os.lstat(final_path)
+    except OSError as exc:
+        raise ReleaseManifestError("release destination is unavailable") from exc
+    if not stat.S_ISDIR(directory.st_mode) or stat.S_ISLNK(directory.st_mode):
+        raise ReleaseManifestError(
+            "release destination does not match completed album identity"
+        )
+    relocated_after_publication = action is None and final_path != completion_path
+    if relocated_after_publication:
+        if not _current_inventory_matches(evidence, final_path, relocated=True):
+            raise ReleaseManifestError("release destination audio inventory changed")
+        _require_authority(authority)
+        existing = read_release_identity(Path(final_path))
+        after_read = os.lstat(final_path)
+        if (
+            existing != completion_input.release_identity
+            or not stat.S_ISDIR(after_read.st_mode)
+            or stat.S_ISLNK(after_read.st_mode)
+            or (after_read.st_dev, after_read.st_ino)
+            != (directory.st_dev, directory.st_ino)
+        ):
+            # A committed whole-album relocation can clear its retained receipt
+            # only after publication. Once cleared, the held same-directory
+            # manifest is the sole authority for an acknowledgement retry;
+            # never recreate one at a path no longer bound to live evidence.
+            raise ReleaseManifestError(
+                "relocated release identity is unavailable after publication"
+            )
+        _require_authority(authority)
+        return False
+    node_matches_completion = (
+        (directory.st_dev, directory.st_ino)
+        == evidence.album_identity[:2]
+    )
+    committed_whole_album = (
+        action is not None
+        and action.kind == RelocationKind.WHOLE_ALBUM.value
+    )
+    if (
+        not node_matches_completion
+        and not committed_whole_album
+    ):
+        raise ReleaseManifestError(
+            "release destination does not match completed album identity"
+        )
+    if not _current_inventory_matches(
+        evidence, final_path, relocated=committed_whole_album
+    ):
+        raise ReleaseManifestError("release destination audio inventory changed")
+    _require_authority(authority)
+    changed = publish_release_identity(
+        Path(final_path),
+        completion_input.release_identity,
+        expected_directory=(directory.st_dev, directory.st_ino),
+    )
+    _require_authority(authority)
+    if not _current_inventory_matches(
+        evidence, final_path, relocated=committed_whole_album
+    ):
+        raise ReleaseManifestError("release destination audio inventory changed")
+    return changed
+
+
 def finalize_carrier_retirement(
     journal,
     item_id,
@@ -298,11 +499,19 @@ def finalize_carrier_retirement(
     action_was_pending = _retirement(journal, item_id).action is not None
     for _unused in range(4):
         retirement = _retirement(journal, item_id)
-        if retirement.action is None:
+        if (
+            retirement.action is None
+            or retirement.action.phase
+            is queue_state.PostImportActionPhase.COMMITTED
+        ):
             break
         journal = _settle_action(journal, retirement, authority)
     retirement = _retirement(journal, item_id)
-    if retirement.action is not None:
+    if (
+        retirement.action is not None
+        and retirement.action.phase
+        is not queue_state.PostImportActionPhase.COMMITTED
+    ):
         raise PostImportFinalizationUnavailable(
             errno.EBUSY, "the post-import action did not settle"
         )
@@ -310,6 +519,15 @@ def finalize_carrier_retirement(
         from qobuz_librarian.library.scanner import clear_scan_caches
 
         clear_scan_caches()
+
+    _publish_retirement_identity(journal, retirement, authority=authority)
+    if retirement.action is not None:
+        journal = _settle_action(journal, retirement, authority)
+        retirement = _retirement(journal, item_id)
+        if retirement.action is not None:
+            raise PostImportFinalizationUnavailable(
+                errno.EBUSY, "the post-import relocation could not be released"
+            )
     journal = _acknowledge_completion(
         journal,
         retirement,

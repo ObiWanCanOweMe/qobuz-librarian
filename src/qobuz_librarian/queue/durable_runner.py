@@ -114,6 +114,8 @@ def _require_current_plan(item, args, plan: DurableNewAlbumPlan) -> None:
             item,
             args,
             album_path_suffix=plan.album_path_suffix,
+            release_identity=plan.release_identity,
+            placement_destination=plan.placement_destination,
         ) != plan
     ):
         raise DurableAlbumUnavailable("the album no longer matches the durable download plan")

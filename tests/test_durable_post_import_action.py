@@ -1,16 +1,442 @@
 """Focused guards for durable post-import action integration."""
 
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from qobuz_librarian.completion import (
+    AlbumInventory,
+    CompletionExpectation,
+    CompletionInput,
+    CompletionOrigin,
+    CompletionOriginKind,
+    CompletionScope,
+    DownloadCounts,
+    LandingReceipt,
+    ManagedImportEvidence,
+    ManagedMapping,
+    QualityTarget,
+    RecoveryOwner,
+    SourceLineage,
+    StagedReceipt,
+    TrackQuality,
+    assess_completion,
+)
 from qobuz_librarian.integrations.beets import ManagedCarrierRetirementOutcome
-from qobuz_librarian.queue import durable_runner, journal, startup_recovery
+from qobuz_librarian.library.release_identity import (
+    MANIFEST_NAME,
+    ReleaseIdentity,
+    ReleaseManifestError,
+    publish_release_identity,
+    read_release_identity,
+)
+from qobuz_librarian.queue import (
+    durable_runner,
+    journal,
+    post_import_finalizer,
+    startup_recovery,
+)
 
 
 class _StopAfterPolicyCapture(RuntimeError):
     pass
+
+
+def test_carrier_retirement_publishes_identity_before_acknowledgement(
+    monkeypatch,
+):
+    item_id = "b" * 64
+    retirement = SimpleNamespace(
+        item_id=item_id,
+        action=SimpleNamespace(phase=journal.PostImportActionPhase.PLANNED),
+        final_path="/music/a",
+    )
+    saved = SimpleNamespace(retirements=(retirement,))
+    settled_retirement = SimpleNamespace(
+        item_id=item_id,
+        action=None,
+        final_path="/music/a",
+    )
+    settled = SimpleNamespace(retirements=(settled_retirement,))
+    events = []
+
+    authority_checks = []
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "_require_authority",
+        lambda _a: authority_checks.append("check"),
+    )
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "_settle_action",
+        lambda *_args: events.append("settle") or settled,
+    )
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "_publish_retirement_identity",
+        lambda *_args, **_kwargs: events.append("identity"),
+    )
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "_acknowledge_completion",
+        lambda current, *_args: events.append("acknowledge") or current,
+    )
+    monkeypatch.setattr(
+        post_import_finalizer.queue_state,
+        "process_carrier_retirement",
+        lambda current, **_kwargs: (
+            events.append("carrier") or current,
+            SimpleNamespace(outcome=ManagedCarrierRetirementOutcome.RETIRED),
+        ),
+    )
+
+    post_import_finalizer.finalize_carrier_retirement(
+        saved,
+        item_id,
+        authority=object(),
+        acknowledge_completion=None,
+    )
+
+    assert events == ["settle", "identity", "acknowledge", "carrier"]
+
+
+def test_identity_publication_failure_preserves_retirement_evidence(monkeypatch):
+    item_id = "b" * 64
+    action = SimpleNamespace(phase=journal.PostImportActionPhase.COMMITTED)
+    retirement = SimpleNamespace(item_id=item_id, action=action, final_path="/music/a")
+    saved = SimpleNamespace(retirements=(retirement,))
+    events = []
+
+    authority_checks = []
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "_require_authority",
+        lambda _a: authority_checks.append("check"),
+    )
+
+    def refuse(*_args, **_kwargs):
+        events.append("identity")
+        raise ReleaseManifestError("release manifest identifies a different release")
+
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "_publish_retirement_identity",
+        refuse,
+    )
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "_acknowledge_completion",
+        lambda *_args: events.append("acknowledge"),
+    )
+    monkeypatch.setattr(
+        post_import_finalizer.queue_state,
+        "process_carrier_retirement",
+        lambda *_args, **_kwargs: events.append("carrier"),
+    )
+
+    with pytest.raises(ReleaseManifestError, match="different release"):
+        post_import_finalizer.finalize_carrier_retirement(
+            saved,
+            item_id,
+            authority=object(),
+            acknowledge_completion=None,
+        )
+
+    assert saved.retirements == (retirement,)
+    assert events == ["identity"]
+
+
+def test_unacknowledged_relocation_never_publishes_identity(monkeypatch):
+    item_id = "b" * 64
+    action = SimpleNamespace(phase=journal.PostImportActionPhase.HANDOFF)
+    retirement = SimpleNamespace(item_id=item_id, action=action, final_path="/music/a")
+    saved = SimpleNamespace(retirements=(retirement,))
+    events = []
+
+    monkeypatch.setattr(post_import_finalizer, "_require_authority", lambda _a: None)
+
+    def unavailable(*_args):
+        events.append("settle")
+        raise post_import_finalizer.PostImportFinalizationUnavailable(
+            "relocation handoff is unavailable"
+        )
+
+    monkeypatch.setattr(post_import_finalizer, "_settle_action", unavailable)
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "_publish_retirement_identity",
+        lambda *_args: events.append("identity"),
+    )
+
+    with pytest.raises(
+        post_import_finalizer.PostImportFinalizationUnavailable,
+        match="relocation handoff",
+    ):
+        post_import_finalizer.finalize_carrier_retirement(
+            saved,
+            item_id,
+            authority=object(),
+            acknowledge_completion=None,
+        )
+
+    assert saved.retirements == (retirement,)
+    assert events == ["settle"]
+
+
+def test_conflicting_identity_keeps_completion_carrier_and_beets_rows(
+    monkeypatch,
+    tmp_path,
+):
+    operation_id = "a" * 64
+    item_id = "b" * 64
+    owner = RecoveryOwner(operation_id, item_id)
+    final_dir = tmp_path / "music" / "Artist" / "Album [qobuz-200]"
+    final_dir.mkdir(parents=True)
+    audio = final_dir / "01.flac"
+    audio.write_bytes(b"audio")
+    source = StagedReceipt(
+        "/staging/01.flac",
+        (1, 2, 0o100600, 5, 6, 7),
+    )
+    slot = "qobuz:track-1"
+    completion_input = CompletionInput(
+        owner=owner,
+        origin=CompletionOrigin(CompletionOriginKind.CLI, "test-queue"),
+        expectation=CompletionExpectation(
+            album_id="200",
+            scope=CompletionScope.ALBUM,
+            catalogue_slots=(slot,),
+            requested_slots=(slot,),
+            quality_targets=(QualityTarget(slot, 16, 44_100),),
+        ),
+        effective_tier=2,
+        release_identity=ReleaseIdentity("qobuz", "200"),
+        placement_destination=str(final_dir),
+        lineages=(SourceLineage(slot, source),),
+        counts=DownloadCounts(),
+    )
+    album_stat = final_dir.stat()
+    audio_stat = audio.stat()
+    album_identity = (
+        album_stat.st_dev,
+        album_stat.st_ino,
+        album_stat.st_size,
+        album_stat.st_mtime_ns,
+        album_stat.st_ctime_ns,
+    )
+    destination_identity = (
+        audio_stat.st_dev,
+        audio_stat.st_ino,
+        audio_stat.st_size,
+        audio_stat.st_mtime_ns,
+        audio_stat.st_ctime_ns,
+    )
+    relative_album = "Artist/Album [qobuz-200]"
+    relative_audio = f"{relative_album}/01.flac"
+    landing = LandingReceipt(
+        slot,
+        relative_audio,
+        destination_identity,
+        hashlib.sha256(audio.read_bytes()).hexdigest(),
+    )
+    assessment = assess_completion(
+        owner=owner,
+        expectation=completion_input.expectation,
+        download=completion_input.download_coverage(),
+        managed=ManagedImportEvidence(
+            owner=owner,
+            library_root=str(tmp_path / "music"),
+            library_root_identity=(2, 10, 0, 1_000, 2_000),
+            album_path=relative_album,
+            album_identity=album_identity,
+            manifest_hash="c" * 64,
+            mappings=(ManagedMapping(
+                slot,
+                source.path,
+                source.identity,
+                relative_audio,
+                destination_identity,
+            ),),
+        ),
+        landings=(landing,),
+        inventory=AlbumInventory(
+            relative_album,
+            album_identity,
+            (landing,),
+        ),
+        quality=(TrackQuality(
+            slot,
+            relative_audio,
+            destination_identity,
+            landing.sha256,
+            16,
+            44_100,
+        ),),
+    )
+    assert assessment.evidence is not None
+    retirement = SimpleNamespace(
+        item_id=item_id,
+        action=None,
+        final_path=str(final_dir),
+        planned={"album": {"id": "200"}},
+        completion_input=completion_input.to_record(),
+        completion_evidence=assessment.evidence.to_record(),
+        completion_acknowledged=False,
+    )
+    saved = SimpleNamespace(operation_id=operation_id, retirements=(retirement,))
+    publish_release_identity(final_dir, ReleaseIdentity("qobuz", "100"))
+    manifest_before = (final_dir / MANIFEST_NAME).read_bytes()
+    beets_db = tmp_path / "beets" / "library.db"
+    beets_db.parent.mkdir()
+    beets_db.write_bytes(b"beets rows before conflict")
+    rows_before = beets_db.read_bytes()
+    events = []
+
+    monkeypatch.setattr(post_import_finalizer, "_require_authority", lambda _a: None)
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "_acknowledge_completion",
+        lambda *_args: events.append("acknowledge"),
+    )
+    monkeypatch.setattr(
+        post_import_finalizer.queue_state,
+        "process_carrier_retirement",
+        lambda *_args, **_kwargs: events.append("carrier"),
+    )
+
+    with pytest.raises(ReleaseManifestError, match="different release"):
+        post_import_finalizer.finalize_carrier_retirement(
+            saved,
+            item_id,
+            authority=object(),
+            acknowledge_completion=None,
+        )
+
+    assert saved.retirements == (retirement,)
+    assert retirement.completion_evidence == assessment.evidence.to_record()
+    assert (final_dir / MANIFEST_NAME).read_bytes() == manifest_before
+    assert beets_db.read_bytes() == rows_before
+    assert events == []
+
+
+def test_committed_whole_album_relocation_publishes_at_new_directory_identity(
+    monkeypatch,
+    tmp_path,
+):
+    source = tmp_path / "music" / "Artist" / "Album"
+    destination = tmp_path / "music" / "Various Artists" / "Album"
+    source.mkdir(parents=True)
+    destination.mkdir(parents=True)
+    source_stat = source.stat()
+    identity = ReleaseIdentity("qobuz", "200")
+    completion_input = SimpleNamespace(
+        release_identity=identity,
+        placement_destination=str(source),
+        expectation=object(),
+        download_coverage=lambda: object(),
+    )
+    evidence = SimpleNamespace(
+        library_root=str(tmp_path / "music"),
+        album_path="Artist/Album",
+        album_identity=(
+            source_stat.st_dev,
+            source_stat.st_ino,
+            source_stat.st_size,
+            source_stat.st_mtime_ns,
+            source_stat.st_ctime_ns,
+        ),
+    )
+    action = SimpleNamespace(
+        phase=journal.PostImportActionPhase.COMMITTED,
+        kind=post_import_finalizer.RelocationKind.WHOLE_ALBUM.value,
+        destination=str(destination),
+    )
+    retirement = SimpleNamespace(
+        item_id="b" * 64,
+        action=action,
+        final_path=str(destination),
+        planned={"album": {"id": "200"}},
+        completion_input={"frozen": True},
+        completion_evidence={"exact": True},
+    )
+    saved = SimpleNamespace(operation_id="a" * 64)
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "parse_completion_input_record",
+        lambda *_args, **_kwargs: completion_input,
+    )
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "completion_input_ready",
+        lambda value: value is completion_input,
+    )
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "parse_completion_record",
+        lambda *_args, **_kwargs: evidence,
+    )
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "_current_inventory_matches",
+        lambda *_args, **_kwargs: True,
+    )
+    authority_checks = []
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "_require_authority",
+        lambda _a: authority_checks.append("check"),
+    )
+
+    assert post_import_finalizer._publish_retirement_identity(
+        saved, retirement, authority=object()
+    )
+    assert (destination.stat().st_dev, destination.stat().st_ino) != (
+        source_stat.st_dev,
+        source_stat.st_ino,
+    )
+    assert read_release_identity(destination) == identity
+
+    retirement.action = None
+    assert not post_import_finalizer._publish_retirement_identity(
+        saved, retirement, authority=object()
+    )
+    assert authority_checks == ["check", "check", "check", "check"]
+
+
+def test_current_identity_inventory_rejects_extra_and_replaced_audio(tmp_path):
+    final_dir = tmp_path / "music" / "Artist" / "Album"
+    final_dir.mkdir(parents=True)
+    audio = final_dir / "01.flac"
+    audio.write_bytes(b"completed audio")
+    value = audio.stat()
+    identity = (
+        value.st_dev, value.st_ino, value.st_size,
+        value.st_mtime_ns, value.st_ctime_ns,
+    )
+    receipt = SimpleNamespace(
+        path="Artist/Album/01.flac",
+        identity=identity,
+        sha256=hashlib.sha256(audio.read_bytes()).hexdigest(),
+    )
+    evidence = SimpleNamespace(
+        album_path="Artist/Album",
+        inventory=SimpleNamespace(path="Artist/Album", audio=(receipt,)),
+    )
+
+    assert post_import_finalizer._current_inventory_matches(
+        evidence, str(final_dir), relocated=False
+    )
+    (final_dir / "99.flac").write_bytes(b"contradictory")
+    assert not post_import_finalizer._current_inventory_matches(
+        evidence, str(final_dir), relocated=False
+    )
+    (final_dir / "99.flac").unlink()
+    audio.write_bytes(b"replaced audio")
+    assert not post_import_finalizer._current_inventory_matches(
+        evidence, str(final_dir), relocated=False
+    )
 
 
 def test_new_durable_item_freezes_multi_artist_filing_policy(monkeypatch):

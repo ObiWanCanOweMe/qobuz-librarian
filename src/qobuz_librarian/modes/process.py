@@ -1,6 +1,9 @@
 """Core album processing — detect gaps, prompt, download, import, consolidate."""
 import math
+import os
+import stat
 from datetime import datetime, timezone
+from pathlib import Path
 
 from qobuz_librarian import config as cfg
 from qobuz_librarian import run_lock
@@ -54,6 +57,11 @@ from qobuz_librarian.library.catalog import (
     prompt_and_migrate_multi_artist_folder,
     track_signatures_for_album_dirs,
 )
+from qobuz_librarian.library.release_identity import (
+    ReleaseManifestError,
+    identity_from_album,
+    publish_release_identity,
+)
 from qobuz_librarian.library.scanner import (
     clear_scan_caches,
     drop_artist_subdirs_cache,
@@ -91,6 +99,65 @@ from qobuz_librarian.ui_cli.prompts import (
     print_album_summary,
     prompt_edition_pick,
 )
+
+
+def finalize_release_identity(
+    album: dict,
+    final_dir: Path,
+    *,
+    expected_destination: Path,
+) -> bool:
+    """Publish one Qobuz identity only at its exact completed destination."""
+    identity = identity_from_album(album)
+    tracks = (album.get("tracks") or {}).get("items") if type(album) is dict else None
+    try:
+        final_path = os.fspath(final_dir)
+        expected_path = os.fspath(expected_destination)
+    except TypeError as exc:
+        raise ReleaseManifestError("release finalization has an invalid path") from exc
+    if (
+        identity is None
+        or not isinstance(tracks, list)
+        or not tracks
+    ):
+        raise ReleaseManifestError("release finalization has no canonical identity")
+    if (
+        not os.path.isabs(final_path)
+        or os.path.abspath(final_path) != final_path
+        or not os.path.isabs(expected_path)
+        or os.path.abspath(expected_path) != expected_path
+        or final_path != expected_path
+    ):
+        raise ReleaseManifestError(
+            "release finalization did not reach the planned destination"
+        )
+    try:
+        directory = os.lstat(final_path)
+    except OSError as exc:
+        raise ReleaseManifestError("release destination is unavailable") from exc
+    if not stat.S_ISDIR(directory.st_mode) or stat.S_ISLNK(directory.st_mode):
+        raise ReleaseManifestError("release destination is not an exact directory")
+    return publish_release_identity(
+        Path(final_path),
+        identity,
+        expected_directory=(directory.st_dev, directory.st_ino),
+    )
+
+
+def _folder_holds_exact_tracks(folder: Path, qobuz_tracks) -> bool:
+    """Require a complete one-to-one album inventory with no extra audio."""
+    try:
+        audio = [
+            path for path in folder.rglob("*")
+            if path.suffix.lower() in cfg.AUDIO_EXTS
+            and path.is_file()
+            and not path.is_symlink()
+        ]
+    except OSError:
+        return False
+    return len(audio) == len(qobuz_tracks) and folder_holds_all_tracks(
+        folder, qobuz_tracks, destructive=True
+    )
 
 
 def _recover_incomplete_upgrade_backup(backup, album_dir, *, operation):
@@ -1026,6 +1093,8 @@ def process_album(album, args, *, allow_force=True, label=None,
     download_result = {}
     quality_verdict = None
     _gap_fill_not_located = False  # gap-fill succeeded on paper but album not found on disk
+    placement = None
+    release_identity_attention = False
 
     try:
         snapshot = snapshot_staging()
@@ -1563,6 +1632,27 @@ def process_album(album, args, *, allow_force=True, label=None,
                             "  ⚠  Split-folder detected, but every source name "
                             "already exists at the destination; both were kept.",
                         ))
+            if (
+                strict_success
+                and post_dir_exact
+                and placement is not None
+                and post_import_signatures
+                and len(post_import_signatures) == n_ok
+                and n_ok == len(missing)
+                and _folder_holds_exact_tracks(post_dir, qobuz_tracks)
+            ):
+                try:
+                    finalize_release_identity(
+                        album,
+                        post_dir,
+                        expected_destination=placement.destination,
+                    )
+                except ReleaseManifestError as exc:
+                    release_identity_attention = True
+                    log.info(fmt(
+                        C.RED,
+                        f"  ✗  identity-review: {exc}",
+                    ))
             # Resolve transient-lyric signatures captured pre-beets
             if transient_lyric_sigs:
                 resolved = _resolve_signatures_to_paths(
@@ -1630,7 +1720,9 @@ def process_album(album, args, *, allow_force=True, label=None,
                 log.info(f"     {truncate(t, 60)}")
         log.info("")
 
-    if n_ok and n_fail:
+    if release_identity_attention:
+        result_status = "identity_attention"
+    elif n_ok and n_fail:
         result_status = "partial"
     elif n_ok and not imported and not args.no_import:
         # Tracks ripped but didn't make it into the library (a beets failure, or
@@ -1686,4 +1778,5 @@ def process_album(album, args, *, allow_force=True, label=None,
         "upgrade_unverified": upgrade_unverified,
         "auto_upgrade": bool(auto_upgrade_active),
         "quality_verdict": quality_verdict,
+        "release_identity_attention": release_identity_attention,
     }
