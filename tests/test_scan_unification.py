@@ -571,6 +571,7 @@ def test_resumed_baseline_scan_can_complete_saved_library_state(
         tmp_path, monkeypatch):
     from qobuz_librarian import config as cfg
     from qobuz_librarian.library import downsample_state, library_scan_state
+    from qobuz_librarian.library import hidden as hidden_mod
     from qobuz_librarian.quality import upgrade_state
     from qobuz_librarian.web import flows
 
@@ -578,25 +579,35 @@ def test_resumed_baseline_scan_can_complete_saved_library_state(
                         tmp_path / "library_scan.json")
     monkeypatch.setattr(cfg, "SCAN_CHECKPOINT_FILE",
                         tmp_path / "checkpoint.json")
+    monkeypatch.setattr(cfg, "HIDDEN_FILE", tmp_path / "hidden.json")
     good_dir = tmp_path / "Good"
     next_dir = tmp_path / "Next"
     good_dir.mkdir()
     next_dir.mkdir()
+    attention = {
+        "kind": "identity_attention",
+        "title": "Album",
+        "artist": "Good",
+        "detail": "Release identity needs manual review",
+        "payload": {"non_actionable": True, "_artist_dir": "Good"},
+        "selected": False,
+    }
     cfg.SCAN_CHECKPOINT_FILE.write_text(json.dumps({
         "missing": {
             "scanned": ["Good"],
-            "candidates": [],
+            "candidates": [attention],
             "seen": {"good-id": ["good-album"]},
             "artists": {
                 "Good": {
                     "fingerprint": "good-fp",
-                    "candidates": [],
+                    "candidates": [attention],
                     "artist_id": "good-id",
                     "catalog_ids": ["good-album"],
                 },
             },
         },
     }), encoding="utf-8")
+    hidden_mod.hide(hidden_mod.SCOPE_MISSING, [("Good", "Album", "")])
 
     def fake_downsample_refresh(_artists, **_kwargs):
         return downsample_state.RefreshResult(
@@ -628,11 +639,13 @@ def test_resumed_baseline_scan_can_complete_saved_library_state(
             (ad.name, ad.name, [], "next-id", ["next-album"]),
     )
 
-    flows.scan_library(jm.Job(title="baseline"), "tok")
+    job = jm.Job(title="baseline")
+    flows.scan_library(job, "tok")
 
     state = library_scan_state.kind_state("missing")
     assert state["complete"] is True
     assert sorted(state["artists"]) == ["Good", "Next"]
+    assert [c["kind"] for c in job.candidates] == ["identity_attention"]
     assert flows.scan_checkpoint.load("missing") is None
 
 
@@ -711,6 +724,7 @@ def test_scan_library_reuses_unchanged_artist_snapshot(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         cfg, "LIBRARY_SCAN_STATE_FILE", tmp_path / "library_scan.json")
+    monkeypatch.setattr(cfg, "HIDDEN_FILE", tmp_path / "hidden.json")
     artist_dir = tmp_path / "Artist"
     album_dir = artist_dir / "Album"
     album_dir.mkdir(parents=True)
@@ -722,13 +736,22 @@ def test_scan_library_reuses_unchanged_artist_snapshot(tmp_path, monkeypatch):
         "payload": {"album_id": "saved", "_artist_dir": "Artist"},
         "selected": False,
     }
+    attention = {
+        "kind": "identity_attention",
+        "title": "Album",
+        "artist": "Artist",
+        "detail": "Release identity needs manual review",
+        "payload": {"non_actionable": True, "_artist_dir": "Artist"},
+        "selected": False,
+    }
+    hidden_mod.hide(hidden_mod.SCOPE_MISSING, [("Artist", "Album", "")])
     hidden = hidden_mod.load()
     library_scan_state.save_kind(
         "missing",
         artists={
             "Artist": {
                 "fingerprint": "same",
-                "candidates": [saved_candidate],
+                "candidates": [saved_candidate, attention],
                 "artist_id": "artist-id",
                 "catalog_ids": ["saved"],
             },
@@ -789,7 +812,7 @@ def test_scan_library_reuses_unchanged_artist_snapshot(tmp_path, monkeypatch):
 
     assert downsample_skip == [True]
     assert upgrade_skip == [True]
-    assert [c["title"] for c in job.candidates] == ["Saved Album"]
+    assert [c["title"] for c in job.candidates] == ["Saved Album", "Album"]
 
 
 def test_scan_library_force_full_ignores_saved_artist_snapshot(

@@ -84,10 +84,10 @@
     {# Tab scoping: on a library review the bulk bar acts on the ACTIVE tab
        only, so its counts come from the tab, not the whole set. #}
     {% if review_tab %}
-    {% set _bar_total = review_tab_counts['gaps' if review_tab == 'gaps' else 'missing'] %}
+    {% set _bar_total = review_tab_counts['gaps_actionable' if review_tab == 'gaps' else 'missing_actionable'] %}
     {% set _bar_selected = review_tab_counts['gaps_selected' if review_tab == 'gaps' else 'missing_selected'] %}
     {% else %}
-    {% set _bar_total = review_counts.total %}
+    {% set _bar_total = review_counts.actionable_total %}
     {% set _bar_selected = review_counts.selected %}
     {% endif %}
     <form id="review-form" action="/jobs/{{ job.id }}/approve" method="post"

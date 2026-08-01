@@ -488,6 +488,9 @@ class Job:
         # thread may be reading/dropping candidates via the review screen.
         capped = False
         cid = None
+        payload = payload or {}
+        if payload.get("non_actionable"):
+            selected = False
         with self._lock:
             # Bound the in-memory (and persisted) candidate list so a runaway
             # whole-library scan can't exhaust memory.
@@ -503,7 +506,7 @@ class Job:
                 self._cand_seq += 1
                 self.candidates.append({
                     "cid": f"c{seq}", "seq": seq, "kind": kind, "title": title,
-                    "artist": artist, "detail": detail, "payload": payload or {},
+                    "artist": artist, "detail": detail, "payload": payload,
                     "selected": selected,
                 })
                 cid = f"c{seq}"
@@ -522,7 +525,11 @@ class Job:
         return self._candidate_cap_noted
 
     def selected_candidates(self) -> list:
-        return [c for c in self.candidates if c.get("selected")]
+        return [
+            c for c in self.candidates
+            if c.get("selected")
+            and not (c.get("payload") or {}).get("non_actionable")
+        ]
 
     # ── selection (server-backed; the review UI reads ticks here, not the form) ──
     def set_selected(self, cid: str, on: bool) -> Optional[bool]:
@@ -536,6 +543,10 @@ class Job:
                 return None
             for c in self.candidates:
                 if c.get("cid") == cid:
+                    if (c.get("payload") or {}).get("non_actionable"):
+                        changed = bool(c.get("selected"))
+                        c["selected"] = False
+                        return changed
                     changed = bool(c.get("selected")) != bool(on)
                     c["selected"] = bool(on)
                     return changed
@@ -554,6 +565,11 @@ class Job:
             for c in self.candidates:
                 if want is not None and c.get("cid") not in want:
                     continue
+                if (c.get("payload") or {}).get("non_actionable"):
+                    if c.get("selected"):
+                        c["selected"] = False
+                        n += 1
+                    continue
                 if bool(c.get("selected")) != bool(on):
                     c["selected"] = bool(on)
                     n += 1
@@ -566,12 +582,20 @@ class Job:
         candidates for the downsample review's "space reclaimed" figure."""
         with self._lock:
             cands = list(self.candidates)
-        selected = [c for c in cands if c.get("selected")]
+        actionable = [
+            c for c in cands
+            if not (c.get("payload") or {}).get("non_actionable")
+        ]
+        selected = [
+            c for c in actionable
+            if c.get("selected")
+        ]
         artists = {c.get("artist") for c in cands}
         reclaimable = sum(int((c.get("payload") or {}).get("est_saving") or 0)
                           for c in selected)
         return {
             "total": len(cands),
+            "actionable_total": len(actionable),
             "artists": len(artists),
             "selected": len(selected),
             "reclaimable": reclaimable,
@@ -1340,6 +1364,8 @@ def approve(
         selected = set(selected_ids) if selected_ids is not None else None
 
         def _will_select(candidate):
+            if (candidate.get("payload") or {}).get("non_actionable"):
+                return False
             chosen = (
                 candidate.get("cid") in selected
                 if selected is not None
@@ -1364,7 +1390,10 @@ def approve(
         prior_consumed = getattr(job, "_consumed_whole_review", _MISSING)
         if selected is not None:
             for c in job.candidates:
-                c["selected"] = c.get("cid") in selected
+                c["selected"] = (
+                    c.get("cid") in selected
+                    and not (c.get("payload") or {}).get("non_actionable")
+                )
         if split_review is not None:
             parked = split_review(job)
             if parked is not None and type(parked) is not Job:

@@ -1,17 +1,18 @@
 {% import "_job_labels.html" as labels %}
-{% set group_selected = items | selectattr('selected') | list | length %}
+{% set actionable_items = items | rejectattr('payload.non_actionable') | list %}
+{% set group_selected = actionable_items | selectattr('selected') | list | length %}
 
 {# The dismiss button must stay tappable while the group is COLLAPSED, and a
    <details> hides every non-summary child when closed — so the button lives
    beside the details in a positioning shell, not inside it. #}
 <div class="ql-review-group-shell">
 <details class="ql-review-group{% if triage %} ql-review-group--triage{% endif %}" data-artist="{{ artist }}"
-         data-group-total="{{ items | length }}" data-group-selected="{{ group_selected }}"{% if open %} open{% endif %}>
+         data-group-total="{{ actionable_items | length }}" data-group-selected="{{ group_selected }}"{% if open %} open{% endif %}>
   <summary class="ql-review-summary">
     <span class="ql-review-chevron" aria-hidden="true"></span>
-    {% if triage %}
+    {% if triage and actionable_items %}
     <input type="checkbox" class="ql-checkbox ql-review-artist-check" data-artist-select value="{{ artist }}"
-           {% if items and group_selected == (items | length) %}checked{% endif %}
+           {% if actionable_items and group_selected == (actionable_items | length) %}checked{% endif %}
            aria-label="Select shown {{ labels.review_item_plural(job) }} by {{ artist or 'this artist' }} to {{ job.review_verb | lower }}">
     {% endif %}
     <span class="ql-review-title">
@@ -30,7 +31,7 @@
   </div>
   {% endif %}
 </details>
-{% if triage %}
+{% if triage and actionable_items %}
 <button type="button" data-hide data-artist="{{ artist }}"
         title="{{ 'Keep unselected hi-res' if job.execute_kind == 'downsample' else 'Dismiss unselected' }}"
         aria-label="{% if job.execute_kind == 'downsample' %}Keep unselected albums by {{ artist or 'this artist' }} hi-res{% elif job.execute_kind == 'upgrade' %}Dismiss unselected upgrades by {{ artist or 'this artist' }}{% elif job.execute_kind == 'library' %}Dismiss unselected albums and Gap Fill candidates by {{ artist or 'this artist' }}{% else %}Dismiss unselected albums by {{ artist or 'this artist' }}{% endif %}"

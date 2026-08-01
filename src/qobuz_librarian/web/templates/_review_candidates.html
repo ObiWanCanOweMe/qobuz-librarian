@@ -2,10 +2,13 @@
      class="ql-review-candidates"
      data-job-id="{{ job.id }}"
      data-review-total="{{ review_counts.total }}"
+     data-review-actionable-total="{{ review_counts.actionable_total }}"
      data-review-selected="{{ review_counts.selected }}"
      {% if review_tab %}data-review-missing-total="{{ review_tab_counts.missing }}"
+     data-review-missing-actionable="{{ review_tab_counts.missing_actionable }}"
      data-review-missing-selected="{{ review_tab_counts.missing_selected }}"
      data-review-gap-total="{{ review_tab_counts.gaps }}"
+     data-review-gap-actionable="{{ review_tab_counts.gaps_actionable }}"
      data-review-gap-selected="{{ review_tab_counts.gaps_selected }}"{% endif %}
      data-review-item-singular="{{ labels.review_item_singular(job) }}"
      data-review-item-plural="{{ labels.review_item_plural(job) }}"
@@ -68,7 +71,7 @@
          on a tabbed library review (the JS re-scopes it after a tab switch;
          this keeps the FIRST render honest too — the action is already
          tab-scoped server-side). #}
-      {% set _rest_total = review_tab_counts.missing if review_tab == 'missing' else review_tab_counts.gaps if review_tab == 'gaps' else review_counts.total %}
+      {% set _rest_total = review_tab_counts.missing_actionable if review_tab == 'missing' else review_tab_counts.gaps_actionable if review_tab == 'gaps' else review_counts.actionable_total %}
       {% set _rest_selected = review_tab_counts.missing_selected if review_tab == 'missing' else review_tab_counts.gaps_selected if review_tab == 'gaps' else review_counts.selected %}
       <button type="button" id="review-dismiss-rest"
               class="ql-review-tool{% if _rest_selected >= _rest_total %} hidden{% endif %}">{{ 'Keep hi-res' if job.execute_kind == 'downsample' else 'Dismiss unselected' }} ({{ _rest_total - _rest_selected }})</button>

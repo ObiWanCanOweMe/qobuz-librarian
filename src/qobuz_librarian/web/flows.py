@@ -38,6 +38,7 @@ from qobuz_librarian.library.discovery import (
     flush_resolve_cache,
     resolve_artist_dir,
 )
+from qobuz_librarian.library.release_identity import normalise_release_id
 from qobuz_librarian.library.scanner import (
     clear_scan_caches,
     list_artist_album_dirs,
@@ -250,10 +251,76 @@ def _gap_candidate_spec(
     album = gap.qobuz_album
     if gap.on_disk_dir is not None:
         album = {**album, "_partial_missing_count": gap.missing_count}
-    extra_payload = {"_artist_dir": artist_key} if artist_key else None
+    extra_payload = {}
+    if artist_key:
+        extra_payload["_artist_dir"] = artist_key
+    if gap.edition_badge:
+        extra_payload["edition_badge"] = gap.edition_badge
     return _album_candidate_spec(
         album, artist_name, selected=selected, is_new=is_new,
-        extra_payload=extra_payload)
+        extra_payload=extra_payload or None)
+
+
+_IDENTITY_ATTENTION_DETAILS = {
+    "identity_ambiguous": "Multiple Qobuz editions match",
+    "identity_invalid": "Release identity manifest is invalid or unsupported",
+    "identity_conflict": "Release identity conflicts with the requested edition",
+    "identity_path_occupied": "The collision path belongs to another release",
+    "identity_changed": "Release identity changed while it was being reviewed",
+}
+
+
+def _identity_attention_spec(item: dict, artist_name: str,
+                             artist_key: str) -> dict:
+    """Build one durable, display-only release-identity review card.
+
+    The payload deliberately has no ``album_id``: it cannot satisfy the album
+    download admission boundary even if a stale or forged client submits its
+    candidate id. Candidate release IDs are normalized, deduplicated, sorted,
+    and retained in full for deterministic checkpoint and restart rendering.
+    """
+    item = item if isinstance(item, dict) else {}
+    raw_reason = item.get("reason")
+    reason = raw_reason if isinstance(raw_reason, str) else ""
+    detail = _IDENTITY_ATTENTION_DETAILS.get(
+        reason, "Release identity needs manual review")
+
+    candidate_ids = set()
+    releases = item.get("candidate_releases")
+    if isinstance(releases, list):
+        for release in releases:
+            if not isinstance(release, dict):
+                continue
+            raw_id = release.get("id")
+            if type(raw_id) not in (int, str):
+                continue
+            release_id = normalise_release_id(raw_id)
+            if release_id is not None:
+                candidate_ids.add(release_id)
+    candidate_ids = sorted(candidate_ids)
+    if candidate_ids:
+        detail += " · Qobuz IDs " + ", ".join(candidate_ids)
+
+    raw_dir = item.get("dir")
+    try:
+        title = Path(raw_dir).name if isinstance(raw_dir, (str, Path)) else ""
+    except (OSError, TypeError, ValueError):
+        title = ""
+    payload = {
+        "non_actionable": True,
+        "identity_reason": reason if reason in _IDENTITY_ATTENTION_DETAILS else "",
+        "candidate_ids": candidate_ids,
+    }
+    if artist_key:
+        payload["_artist_dir"] = artist_key
+    return {
+        "kind": "identity_attention",
+        "title": title or "Release identity",
+        "artist": artist_name,
+        "detail": detail,
+        "payload": payload,
+        "selected": False,
+    }
 
 
 def _add_gap_candidate(job, gap, artist_name, selected=False, is_new=False):
@@ -280,11 +347,37 @@ def is_gap_candidate(c):
     return "gap-fill:" in (c.get("detail") or "")
 
 
+def candidate_is_hidden_missing(c, hidden):
+    """Whether an actionable missing-album candidate is durably hidden.
+
+    Release-identity attention cards are diagnostic filesystem state, not
+    album choices, so an album dismissal with the same artist/title must not
+    suppress them during checkpoint or saved-state restoration.
+    """
+    if (c.get("payload") or {}).get("non_actionable"):
+        return False
+    return hidden_mod.is_hidden(
+        hidden_mod.SCOPE_MISSING,
+        c.get("artist") or "",
+        c.get("title") or "",
+        hidden,
+    )
+
+
 def fold_key(c):
     """A candidate's merge identity: Qobuz album id, falling back to
     artist+title for keyless carry-overs. Shared by the fold and its caller's
     before/after arithmetic so the summary counts what actually changed."""
-    album_id = str((c.get("payload") or {}).get("album_id") or "")
+    payload = c.get("payload") or {}
+    if payload.get("non_actionable"):
+        return (
+            "non_actionable",
+            c.get("kind") or "",
+            payload.get("_artist_dir") or "",
+            (c.get("artist") or "").lower(),
+            (c.get("title") or "").lower(),
+        )
+    album_id = str(payload.get("album_id") or "")
     if album_id:
         return album_id
     return ((c.get("artist") or "").lower(), (c.get("title") or "").lower())
@@ -323,6 +416,23 @@ def fold_new_candidates(parked, cands):
             key = _key(c)
             fresh = fresh_by_key.get(key)
             if (fresh is not None
+                    and (c.get("payload") or {}).get("non_actionable")
+                    and (fresh.get("payload") or {}).get("non_actionable")):
+                fields = {
+                    "kind": fresh.get("kind", "identity_attention"),
+                    "title": fresh.get("title") or "?",
+                    "artist": fresh.get("artist") or "",
+                    "detail": fresh.get("detail") or "",
+                    "payload": fresh.get("payload") or {},
+                    "selected": False,
+                }
+                if any(c.get(name) != value for name, value in fields.items()):
+                    keep.append({**c, **fields})
+                    updated += 1
+                else:
+                    keep.append(c)
+                continue
+            if (fresh is not None
                     and is_gap_candidate(fresh) != is_gap_candidate(c)):
                 # Disk reality changed class — the fresh row replaces this one
                 # below, wearing the user's tick.
@@ -337,9 +447,10 @@ def fold_new_candidates(parked, cands):
             key = _key(c)
             if key in seen:
                 continue
-            if key not in swapped_ticks and hidden_mod.is_hidden(
+            if (not (c.get("payload") or {}).get("non_actionable")
+                    and key not in swapped_ticks and hidden_mod.is_hidden(
                     hidden_mod.SCOPE_MISSING, c.get("artist") or "",
-                    c.get("title") or "", hidden):
+                    c.get("title") or "", hidden)):
                 continue
             seen.add(key)
             # Class swaps ride past the cap: their old row was just removed,
@@ -357,7 +468,10 @@ def fold_new_candidates(parked, cands):
                 "artist": c.get("artist") or "",
                 "detail": c.get("detail") or "",
                 "payload": c.get("payload") or {},
-                "selected": swapped_ticks.get(key, bool(c.get("selected"))),
+                "selected": (
+                    False if (c.get("payload") or {}).get("non_actionable")
+                    else swapped_ticks.get(key, bool(c.get("selected")))
+                ),
             })
             if key not in swapped_ticks:
                 added += 1
@@ -580,7 +694,9 @@ def drop_owned_missing_candidates(job):
                      {"id": (c.get("payload") or {}).get("album_id"),
                       "title": c.get("title") or "",
                       "artist": {"name": c.get("artist") or ""}})
-                    for c in job.candidates if not is_gap_candidate(c)]
+                    for c in job.candidates
+                    if not is_gap_candidate(c)
+                    and not (c.get("payload") or {}).get("non_actionable")]
     # Disk probes happen outside the lock; a live scan can keep appending.
     owned = {}
     for cid, selected, alb in snapshot:
@@ -647,6 +763,8 @@ def _flag_new_since_last_scan(job, mode):
     seen_now = set()
     fps = {}
     for c in candidates:
+        if (c.get("payload") or {}).get("non_actionable"):
+            continue
         fp = hidden_mod.album_fingerprint(c.get("artist"), c.get("title"))
         if fp:
             seen_now.add(fp)
@@ -707,6 +825,7 @@ def _dismiss_albums_locked(job, artist, scope=hidden_mod.SCOPE_MISSING,
             return None
         to_hide = [c for c in job.candidates
                    if c.get("artist") == artist and not c.get("selected")
+                   and not (c.get("payload") or {}).get("non_actionable")
                    and (gap_only is None or is_gap_candidate(c) == gap_only)
                    and (not query or candidate_matches_query(c, query))]
         if not to_hide:
@@ -744,10 +863,10 @@ def _dismiss_albums_locked(job, artist, scope=hidden_mod.SCOPE_MISSING,
 
 def _scan_library_artist(artist_dir, token, partial_only, hidden):
     """Worker: find one artist's gaps. Runs in a pool thread (its own HTTP
-    session); returns plain data so the caller adds candidates serially —
-    keeping job.candidates single-writer. Also returns the artist's id and its
-    lossless catalog ids so the caller can seed the new-release baseline (the
-    discography is already fetched here)."""
+    session); returns gaps and identity-attention inputs as plain data so the
+    caller adds every candidate serially — keeping job.candidates single-writer.
+    Also returns the artist's id and its lossless catalog ids so the caller can
+    seed the new-release baseline (the discography is already fetched here)."""
     result = find_missing_for_artist(
         artist_dir.name, token=token,
         opts=DiscoveryOpts(prefer_hires=cfg.PREFER_HIRES),
@@ -761,7 +880,14 @@ def _scan_library_artist(artist_dir, token, partial_only, hidden):
     catalog_ids = None if result.catalog_incomplete else [
         str(a["id"]) for a in result.catalog
         if is_lossless_album(a) and a.get("id") is not None]
-    return artist_dir.name, result.artist_name, result.gaps, artist_id, catalog_ids
+    identity_attention = [
+        item for item in getattr(result, "skipped", [])
+        if isinstance(item, dict)
+        and isinstance(item.get("reason"), str)
+        and item.get("reason") in _IDENTITY_ATTENTION_DETAILS
+    ]
+    return (artist_dir.name, result.artist_name, result.gaps, artist_id,
+            catalog_ids, identity_attention)
 
 
 _CHECKPOINT_EVERY = 15  # artists between progress saves (resume granularity)
@@ -906,8 +1032,7 @@ def scan_library(job, token, partial_only=False, force_full=False):
             artist_key = (c.get("payload") or {}).get("_artist_dir") or c.get("artist")
             if artist_key not in scanned:
                 continue
-            if hidden_mod.is_hidden(hidden_mod.SCOPE_MISSING,
-                                    c.get("artist"), c.get("title"), hidden):
+            if candidate_is_hidden_missing(c, hidden):
                 continue
             _readd_candidate(job, c)
             total += 1
@@ -922,12 +1047,7 @@ def scan_library(job, token, partial_only=False, force_full=False):
                 continue
             candidates = [
                 c for c in saved.get("candidates", [])
-                if not hidden_mod.is_hidden(
-                    hidden_mod.SCOPE_MISSING,
-                    c.get("artist"),
-                    c.get("title"),
-                    hidden,
-                )
+                if not candidate_is_hidden_missing(c, hidden)
             ]
             state_artists[name] = {
                 "fingerprint": saved.get("fingerprint") or fingerprints.get(name, ""),
@@ -955,12 +1075,7 @@ def scan_library(job, token, partial_only=False, force_full=False):
         ):
             candidates = [
                 c for c in saved.get("candidates", [])
-                if not hidden_mod.is_hidden(
-                    hidden_mod.SCOPE_MISSING,
-                    c.get("artist"),
-                    c.get("title"),
-                    hidden,
-                )
+                if not candidate_is_hidden_missing(c, hidden)
             ]
             for c in candidates:
                 _readd_candidate(job, c)
@@ -1003,7 +1118,14 @@ def scan_library(job, token, partial_only=False, force_full=False):
                 break
             done += 1
             try:
-                name, artist_name, gaps, artist_id, catalog_ids = fut.result()
+                worker_result = fut.result()
+                if len(worker_result) == 5:
+                    (name, artist_name, gaps, artist_id,
+                     catalog_ids) = worker_result
+                    identity_attention = []
+                else:
+                    (name, artist_name, gaps, artist_id, catalog_ids,
+                     identity_attention) = worker_result
             except (AuthLost, QobuzUnavailable):
                 # A lost token or an unreachable API isn't a per-artist hiccup
                 # — cancel the rest and fail the scan rather than silently
@@ -1031,6 +1153,12 @@ def scan_library(job, token, partial_only=False, force_full=False):
                 if _add_candidate_spec(job, spec) is not None:
                     artist_candidates.append(spec)
                     total += 1
+            for item in identity_attention:
+                spec = _identity_attention_spec(
+                    item, artist_name or name, artist_key=name)
+                if _add_candidate_spec(job, spec) is not None:
+                    artist_candidates.append(spec)
+                    total += 1
             if catalog_ids is not None:
                 state_artists[name] = {
                     "fingerprint": fingerprints.get(name, ""),
@@ -1040,13 +1168,19 @@ def scan_library(job, token, partial_only=False, force_full=False):
                 }
             # Add the albums before the progress tick so a hit lands the live
             # preview the same moment the running total moves.
-            hit = ({"artist": artist_name or name, "albums": len(gaps)}
-                   if gaps else None)
+            found_for_artist = len(gaps) + len(identity_attention)
+            hit = ({"artist": artist_name or name, "albums": found_for_artist}
+                   if found_for_artist else None)
             job.push_progress("Scanning library", done, n, artist_name or name,
                               found=total, hit=hit, unit="artist")
             if gaps:
                 tail = "with Gap Fill candidates" if partial_only else "to fill"
                 log.info(f"  {artist_name} — {plural(len(gaps), 'album')} {tail}")
+            if identity_attention:
+                log.info(
+                    f"  {artist_name or name} — "
+                    f"{plural(len(identity_attention), 'release identity')} "
+                    "needs manual review")
             since_save += 1
             if since_save >= _CHECKPOINT_EVERY:
                 since_save = 0

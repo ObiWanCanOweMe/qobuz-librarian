@@ -167,6 +167,75 @@ def test_partial_owned_album_reports_the_real_track_gap(monkeypatch, tmp_path, b
     assert len(gap.missing) == 4
 
 
+def test_missing_and_gap_fill_receive_badges_from_catalog_family(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(cfg, "MISSING_ALBUMS_MIN_TRACKS", 1)
+    standard = _album("100", "Album", "Artist", 2020,
+                      [_qt("one", "A"), _qt("two", "B")])
+    deluxe = _album("200", "Album (Deluxe Edition)", "Artist", 2020,
+                    [_qt("remixed", "Z"), _qt("bonus", "C")])
+    missing_standard = _album("300", "Other", "Artist", 2021,
+                              [_qt("x", "X")])
+    missing_deluxe = _album("400", "Other (Deluxe Edition)", "Artist", 2021,
+                            [_qt("x", "X"), _qt("y", "Y")])
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        query="Artist",
+        artist_folder="Artist",
+        layout={"Artist": {"Album (2020)": [_et("one", "A")]}},
+        catalog=[standard, deluxe, missing_standard, missing_deluxe],
+        artists=[{"name": "Artist", "id": "artist", "albums_count": 4}],
+    )
+
+    gap_fill = next(g for g in result.gaps if g.on_disk_dir is not None)
+    missing = next(g for g in result.gaps if g.qobuz_album["id"] == "300")
+    assert gap_fill.edition_badge == "Standard Edition · Qobuz 100"
+    assert missing.edition_badge == "Standard Edition · Qobuz 300"
+
+
+def test_unambiguous_catalog_album_has_no_badge(monkeypatch, tmp_path):
+    monkeypatch.setattr(cfg, "MISSING_ALBUMS_MIN_TRACKS", 1)
+    only = _album("100", "Only Album", "Artist", 2020, [_qt("one", "A")])
+    result = _run(
+        monkeypatch, tmp_path, query="Artist", artist_folder="Artist",
+        layout={"Artist": {}}, catalog=[only],
+        artists=[{"name": "Artist", "id": "artist", "albums_count": 1}],
+    )
+    assert result.gaps[0].edition_badge == ""
+
+
+def test_incomplete_catalog_never_attaches_edition_badges(monkeypatch, tmp_path):
+    standard = _album("100", "Album", "Artist", 2020,
+                      [_qt("one", "A"), _qt("two", "B")])
+    deluxe = _album("200", "Album (Deluxe Edition)", "Artist", 2020,
+                    [_qt("one", "A"), _qt("two", "B"), _qt("bonus", "C")])
+    result = _run(
+        monkeypatch, tmp_path, query="Artist", artist_folder="Artist",
+        layout={"Artist": {}}, catalog=[standard, deluxe], total=3,
+        artists=[{"name": "Artist", "id": "artist", "albums_count": 3}],
+    )
+
+    assert result.catalog_incomplete is True
+    assert all(gap.edition_badge == "" for gap in result.gaps)
+
+
+def test_capped_catalog_never_attaches_edition_badges(monkeypatch, tmp_path):
+    monkeypatch.setattr(cfg, "ARTIST_CATALOG_LIMIT", 2)
+    monkeypatch.setattr(cfg, "MISSING_ALBUMS_MIN_TRACKS", 1)
+    standard = _album("100", "Album", "Artist", 2020, [_qt("one", "A")])
+    deluxe = _album("200", "Album (Deluxe Edition)", "Artist", 2020,
+                    [_qt("one", "A"), _qt("bonus", "B")])
+    result = _run(
+        monkeypatch, tmp_path, query="Artist", artist_folder="Artist",
+        layout={"Artist": {}}, catalog=[standard, deluxe], total=3,
+        artists=[{"name": "Artist", "id": "artist", "albums_count": 3}],
+    )
+
+    assert result.catalog_incomplete is False
+    assert all(gap.edition_badge == "" for gap in result.gaps)
+
+
 def test_manifest_selects_exact_release_even_when_title_rank_prefers_another(
         monkeypatch, tmp_path):
     standard = _album("100", "Album", "Artist", 2020, [_qt("one", "A")])

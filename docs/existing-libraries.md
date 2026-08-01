@@ -23,6 +23,35 @@ The scanner expects a two-level tree under your music library. In Docker, this i
 
 The album folder name is flexible: `Album`, `Album (2017)`, `Album [2017]`, and `2017 - Album` all work. The year is optional; matching uses track tags, not folder names. Per-disc subdirs (`CD1/`, `CD2/`) are recursed into; hidden directories and the staging dir are skipped. Flat (`/music/<track>.flac`) and extra-nested (`/music/<Genre>/<Artist>/...`) layouts are not detected, so point `QL_MUSIC_DIR` at the folder that contains the artist folders.
 
+## Qobuz release identity in existing folders
+
+Qobuz Librarian reserves a hidden file named
+`.qobuz-librarian-release.json` inside a managed album folder. It records the
+exact Qobuz release ID so a standard album, deluxe edition, remaster, or other
+same-named release cannot later be merged into the wrong folder. The file is
+internal metadata, not an audio or companion file, and library scans exclude
+it from track counts.
+
+There is no eager rewrite when you upgrade. Existing folders remain valid and
+receive a manifest lazily only after Qobuz Librarian proves that the observed
+tracks identify one Qobuz release. A partial folder can be adopted when its
+tracks uniquely identify the release. If shared tracks could belong to both a
+standard and deluxe edition, the folder and its audio remain unchanged and a
+non-actionable manual-review card lists the possible Qobuz IDs. The card never
+authorizes a download, merge, manifest replacement, or overwrite.
+
+Ordinary album paths remain friendly. A folder gains a complete
+`[qobuz-ID]` suffix only when another release already owns the friendly path;
+the suffix is a collision disambiguator, not the source of identity. The
+manifest remains authoritative.
+
+The **Missing Albums** and **Gap Fill** review tabs show an edition badge such
+as `Standard Edition · Qobuz 100` or `Deluxe Edition · Qobuz 200` when a
+complete, trustworthy Qobuz catalogue contains multiple releases in the same
+album family. A single-release family has no badge. The label is informational:
+the complete Qobuz ID remains separately attached to the candidate used for a
+download.
+
 ## Migrating into the layout
 
 If your library is not already organised as artist folders with album folders inside them, the **Migrate** tool can build the expected structure. It is a one-time local-library preparation step.

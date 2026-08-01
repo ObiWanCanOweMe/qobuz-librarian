@@ -1189,10 +1189,7 @@ def _review_job_from_library_state():
     specs = []
     for name, entry in (mstate.get("artists") or {}).items():
         for spec in (entry or {}).get("candidates") or []:
-            artist = spec.get("artist") or name
-            title = spec.get("title") or ""
-            if hidden_mod.is_hidden(
-                    hidden_mod.SCOPE_MISSING, artist, title, hidden):
+            if flows.candidate_is_hidden_missing(spec, hidden):
                 continue
             specs.append(spec)
     if not specs:
@@ -6909,6 +6906,7 @@ def _selection_payload(job, *, persist_failed=False):
     payload = {
         "selected": c["selected"],
         "total": c["total"],
+        "actionable_total": c["actionable_total"],
         "artists": c["artists"],
         "reclaimable": c["reclaimable"],
         "reclaimable_label": format_size(c["reclaimable"]) if c["reclaimable"] else "",
@@ -6919,6 +6917,8 @@ def _selection_payload(job, *, persist_failed=False):
         totals = _review_tab_totals(job)
         payload["missing_total"] = totals["missing"]
         payload["gap_total"] = totals["gaps"]
+        payload["missing_actionable"] = totals["missing_actionable"]
+        payload["gap_actionable"] = totals["gaps_actionable"]
         payload["missing_selected"] = totals["missing_selected"]
         payload["gap_selected"] = totals["gaps_selected"]
     return payload
@@ -6930,16 +6930,24 @@ def _review_tab_totals(job):
     truthful. Selected counts feed the tab-scoped bulk bar: what the user sees
     on the active tab is exactly what Download/Dismiss will act on."""
     from qobuz_librarian.web import flows
-    gaps = gaps_sel = missing_sel = 0
+    gaps = gaps_actionable = gaps_sel = 0
+    missing_actionable = missing_sel = 0
     with job._lock:
         total = len(job.candidates)
         for c in job.candidates:
+            non_actionable = bool(
+                (c.get("payload") or {}).get("non_actionable"))
             if flows.is_gap_candidate(c):
                 gaps += 1
-                gaps_sel += 1 if c.get("selected") else 0
-            elif c.get("selected"):
-                missing_sel += 1
+                if not non_actionable:
+                    gaps_actionable += 1
+                    gaps_sel += 1 if c.get("selected") else 0
+            elif not non_actionable:
+                missing_actionable += 1
+                missing_sel += 1 if c.get("selected") else 0
     return {"missing": total - gaps, "gaps": gaps,
+            "missing_actionable": missing_actionable,
+            "gaps_actionable": gaps_actionable,
             "missing_selected": missing_sel, "gaps_selected": gaps_sel}
 
 
@@ -7145,6 +7153,8 @@ async def job_dismiss_rest(request: Request, job_id: str):
         artists, seen = [], set()
         for c in job.candidates:
             if c.get("selected"):
+                continue
+            if (c.get("payload") or {}).get("non_actionable"):
                 continue
             if gap_only is not None and flows.is_gap_candidate(c) != gap_only:
                 continue

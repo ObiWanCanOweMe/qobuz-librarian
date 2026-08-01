@@ -44,10 +44,12 @@ from qobuz_librarian.library.catalog import (
     find_qobuz_album_candidates_for_dir,
     is_lossless_album,
 )
+from qobuz_librarian.library.edition_badges import build_edition_badges
 from qobuz_librarian.library.release_identity import (
     MANIFEST_NAME,
     ReleaseIdentity,
     ReleaseManifestError,
+    normalise_release_id,
     publish_release_identity,
     read_release_identity,
 )
@@ -262,6 +264,7 @@ class AlbumGap:
     on_disk_dir: Path | None
     missing: list = field(default_factory=list)
     present: list = field(default_factory=list)
+    edition_badge: str = ""
 
     @property
     def fully_missing(self) -> bool:
@@ -719,6 +722,16 @@ def find_missing_for_artist(query, *, token, opts=None, artist_dir=None,
             artist_name, catalog, opts, hidden=hidden, handled_ids=handled_ids,
             resolved_dirs=resolved_dirs, owned_titles=owned_titles, token=token,
             single_store=single_store))
+
+    # Edition labels are meaningful only when the complete catalogue is
+    # trustworthy. A transient short page can omit a sibling release and must
+    # never invent the impression that the visible row is unambiguous.
+    if not result.catalog_incomplete and not truncated:
+        badges = build_edition_badges(catalog)
+        for gap in result.gaps:
+            release_id = normalise_release_id(gap.qobuz_album.get("id"))
+            if release_id is not None:
+                gap.edition_badge = badges.get(release_id, "")
 
     vlog(f"  discovery({artist_name!r}): {len(result.partials)} partial, "
          f"{len(result.fully_missing)} fully-missing, "
