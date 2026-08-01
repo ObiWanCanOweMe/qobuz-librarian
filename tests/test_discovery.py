@@ -19,6 +19,12 @@ from qobuz_librarian.library.discovery import (
     find_missing_for_artist,
     find_new_releases_for_artist,
 )
+from qobuz_librarian.library.release_identity import (
+    MANIFEST_NAME,
+    ReleaseIdentity,
+    publish_release_identity,
+    read_release_identity,
+)
 from qobuz_librarian.library.scanner import clear_scan_caches
 
 # ── Fixture library + fake Qobuz ────────────────────────────────────────────────
@@ -159,6 +165,68 @@ def test_partial_owned_album_reports_the_real_track_gap(monkeypatch, tmp_path, b
     assert gap.on_disk_dir.name == "Abbey Road (1969)"
     assert len(gap.present) == 6
     assert len(gap.missing) == 4
+
+
+def test_manifest_selects_exact_release_even_when_title_rank_prefers_another(
+        monkeypatch, tmp_path):
+    standard = _album("100", "Album", "Artist", 2020, [_qt("one", "A")])
+    deluxe = _album("200", "Album (Deluxe Edition)", "Artist", 2020,
+                    [_qt("one", "A"), _qt("bonus", "B")])
+    _library(monkeypatch, tmp_path,
+             {"Artist": {"Album (2020)": [_et("one", "A"), _et("bonus", "B")]}})
+    folder = tmp_path / "Artist" / "Album (2020)"
+    publish_release_identity(folder, ReleaseIdentity("qobuz", "200"))
+    FakeQobuz(artists=[], catalog=[standard, deluxe]).install(monkeypatch)
+
+    match = discovery.match_album_dir(
+        folder, "Artist", "tok",
+        catalog=[_catalog_entry(standard), _catalog_entry(deluxe)],
+        prefer_hires=False,
+    )
+
+    assert match.qobuz_album["id"] == "200"
+    assert match.status == "complete"
+
+
+def test_unique_partial_legacy_match_publishes_manifest(monkeypatch, tmp_path):
+    wanted = _album("100", "Album", "Artist", 2020,
+                    [_qt("one", "A"), _qt("two", "B")])
+    wrong = _album("200", "Album (Deluxe Edition)", "Artist", 2020,
+                   [_qt("other", "Z")])
+    _library(monkeypatch, tmp_path,
+             {"Artist": {"Album (2020)": [_et("one", "A")]}})
+    folder = tmp_path / "Artist" / "Album (2020)"
+    FakeQobuz(artists=[], catalog=[wanted, wrong]).install(monkeypatch)
+
+    match = discovery.match_album_dir(
+        folder, "Artist", "tok",
+        catalog=[_catalog_entry(wanted), _catalog_entry(wrong)],
+        prefer_hires=False,
+    )
+
+    assert match.status == "partial"
+    assert read_release_identity(folder) == ReleaseIdentity("qobuz", "100")
+
+
+def test_shared_standard_tracks_leave_legacy_folder_ambiguous(monkeypatch, tmp_path):
+    standard = _album("100", "Album", "Artist", 2020,
+                      [_qt("one", "A"), _qt("two", "B")])
+    deluxe = _album("200", "Album (Deluxe Edition)", "Artist", 2020,
+                    [_qt("one", "A"), _qt("two", "B"), _qt("bonus", "C")])
+    _library(monkeypatch, tmp_path,
+             {"Artist": {"Album (2020)": [_et("one", "A")]}})
+    folder = tmp_path / "Artist" / "Album (2020)"
+    FakeQobuz(artists=[], catalog=[standard, deluxe]).install(monkeypatch)
+
+    match = discovery.match_album_dir(
+        folder, "Artist", "tok",
+        catalog=[_catalog_entry(standard), _catalog_entry(deluxe)],
+        prefer_hires=False,
+    )
+
+    assert match.status == "identity_ambiguous"
+    assert [str(album["id"]) for album in match.candidate_releases] == ["100", "200"]
+    assert not (folder / MANIFEST_NAME).exists()
 
 
 def test_deluxe_edition_gap_measured_against_the_owned_edition(monkeypatch, tmp_path, beatles_search):

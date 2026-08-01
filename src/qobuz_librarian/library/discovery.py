@@ -21,6 +21,7 @@ prefers the deepest catalog over a bare-name twin, cached to disk).
 import json
 import os
 import re
+import stat
 import tempfile
 import threading
 from dataclasses import dataclass, field
@@ -32,19 +33,26 @@ from qobuz_librarian.api.search import get_album, get_artist_albums, search_arti
 from qobuz_librarian.library import hidden as hidden_mod
 from qobuz_librarian.library.catalog import (
     _dir_year,
-    _paths_equal,
     album_released_within,
     compute_missing,
     dedup_album_versions,
     filter_compilation_albums,
     filter_owned_albums,
     filter_short_releases,
-    find_album_dir_filesystem,
     find_existing_tracks,
-    find_qobuz_album_for_dir,
+    find_extras_in_existing,
+    find_qobuz_album_candidates_for_dir,
     is_lossless_album,
 )
+from qobuz_librarian.library.release_identity import (
+    MANIFEST_NAME,
+    ReleaseIdentity,
+    ReleaseManifestError,
+    publish_release_identity,
+    read_release_identity,
+)
 from qobuz_librarian.library.scanner import (
+    iter_tree_no_symlinks,
     list_artist_album_dirs,
     list_library_artists,
 )
@@ -301,6 +309,15 @@ class NewReleaseResult:
     fetch_failed: bool = False
 
 
+@dataclass
+class LegacyReleaseEvidence:
+    """One candidate release compatible with a legacy folder's tracks."""
+    album: dict
+    present: list
+    missing: list
+    extras: list
+
+
 def _record_owned_title(owned_titles, album_dir):
     from qobuz_librarian.library.tags import strip_album_decorations
     key = normalize(strip_leading_article(strip_album_decorations(album_dir.name)))
@@ -376,6 +393,89 @@ class DirMatch:
     missing: list = field(default_factory=list)
     present: list = field(default_factory=list)
     existing: list = field(default_factory=list)
+    candidate_releases: list[dict] = field(default_factory=list)
+
+
+def select_legacy_release(existing: list[dict], candidates: list[dict]):
+    """Select a legacy folder's sole compatible release, if it has one.
+
+    A partial folder proves an edition only if it has at least one matching
+    track and no local tracks absent from that edition.  Missing tracks are
+    allowed: an incomplete copy must still be adoptable when the evidence is
+    otherwise unique.
+    """
+    compatible = []
+    for album in candidates:
+        tracks = (album.get("tracks") or {}).get("items") or []
+        if not tracks:
+            continue
+        missing, present = compute_missing(tracks, existing)
+        extras = find_extras_in_existing(tracks, existing)
+        if present and not extras:
+            compatible.append(LegacyReleaseEvidence(
+                album, list(present), list(missing), list(extras)))
+    return (compatible[0] if len(compatible) == 1 else None, compatible)
+
+
+def _directory_identity(album_dir: Path) -> tuple[int, int]:
+    value = album_dir.stat()
+    if not stat.S_ISDIR(value.st_mode):
+        raise OSError(f"album path is not a directory: {album_dir}")
+    return value.st_dev, value.st_ino
+
+
+def _reviewed_audio_inventory(album_dir: Path):
+    """Signature every audio file the legacy comparison can review.
+
+    Track matching reads the scanner's complete no-symlink walk.  Recording
+    the same set of files and their stable identities lets adoption refuse a
+    folder whose contents move while that comparison is in flight.
+    """
+    inventory = []
+    errors = []
+    audio_exts = set(cfg.AUDIO_EXTS)
+    for path in iter_tree_no_symlinks(album_dir, errors=errors):
+        if path.name == MANIFEST_NAME or path.suffix.lower() not in audio_exts:
+            continue
+        try:
+            value = path.stat()
+        except OSError as exc:
+            errors.append(exc)
+            continue
+        if not stat.S_ISREG(value.st_mode):
+            continue
+        inventory.append((str(path.relative_to(album_dir)), value.st_dev,
+                          value.st_ino, value.st_size,
+                          getattr(value, "st_mtime_ns", None)))
+    if errors:
+        raise OSError("unable to review complete album audio inventory")
+    return tuple(sorted(inventory))
+
+
+def _legacy_identity_invalid(album_dir, candidates, existing):
+    return DirMatch("identity_invalid", album_dir, existing=existing,
+                    candidate_releases=list(candidates))
+
+
+def _compare_matched_album(album_dir, album, existing, candidates=()):
+    tracks = (album.get("tracks") or {}).get("items") or []
+    if not tracks:
+        return DirMatch("no_tracks", album_dir, album, existing=existing,
+                        candidate_releases=list(candidates))
+    missing, present = compute_missing(tracks, existing)
+    if existing and not present:
+        return DirMatch("false_match", album_dir, album, existing=existing,
+                        candidate_releases=list(candidates))
+    # Resolution can land a different but similarly-named album here when the
+    # fuzzy match is symmetric (this album resolves back to this folder), so
+    # the predicted-path recheck above agrees even though it's the wrong album.
+    if missing and len(present) * 2 < len(existing):
+        return DirMatch("low_overlap", album_dir, album, existing=existing,
+                        candidate_releases=list(candidates))
+    status = "partial" if missing else "complete"
+    return DirMatch(status, album_dir, album,
+                    list(missing), list(present), existing,
+                    list(candidates))
 
 
 def match_album_dir(album_dir, artist_name, token, *, catalog, prefer_hires):
@@ -387,30 +487,82 @@ def match_album_dir(album_dir, artist_name, token, *, catalog, prefer_hires):
     folder); the redundant predicted-path recheck is kept because a folder that
     fuzz-matches a differently-located album is the classic false match.
     """
-    album = find_qobuz_album_for_dir(
-        album_dir, artist_name, token, prefer_hires=prefer_hires,
-        catalog=catalog, target_dir=album_dir)
-    if album is None:
+    try:
+        identity = read_release_identity(album_dir)
+    except (ReleaseManifestError, OSError):
+        return _legacy_identity_invalid(album_dir, [], [])
+
+    try:
+        candidates = find_qobuz_album_candidates_for_dir(
+            album_dir, artist_name, token, prefer_hires=prefer_hires,
+            catalog=catalog, target_dir=album_dir)
+    except (ReleaseManifestError, OSError):
+        return _legacy_identity_invalid(album_dir, [], [])
+    if not candidates:
         return DirMatch("no_match", album_dir)
-    predicted = find_album_dir_filesystem(album)
-    if predicted is None or not _paths_equal(predicted, album_dir):
-        return DirMatch("predicted_path_mismatch", album_dir, album)
-    tracks = (album.get("tracks") or {}).get("items") or []
-    if not tracks:
-        return DirMatch("no_tracks", album_dir, album)
-    existing, _ = find_existing_tracks(album, album_dir=album_dir)
-    missing, present = compute_missing(tracks, existing)
-    if existing and not present:
-        return DirMatch("false_match", album_dir, album, existing=existing)
-    # Resolution can land a different but similarly-named album here when the
-    # fuzzy match is symmetric (this album resolves back to this folder), so
-    # the predicted-path recheck above agrees even though it's the wrong
-    # album.
-    if missing and len(present) * 2 < len(existing):
-        return DirMatch("low_overlap", album_dir, album, existing=existing)
-    status = "partial" if missing else "complete"
-    return DirMatch(status, album_dir, album,
-                    list(missing), list(present), existing)
+
+    # The manifest chooses the release exactly, bypassing title/path ranking.
+    if identity is not None:
+        album = candidates[0]
+        existing, _ = find_existing_tracks(album, album_dir=album_dir)
+        return _compare_matched_album(album_dir, album, existing, candidates)
+
+    # A legacy folder gains an identity only when its observed tracks rule out
+    # every other viable release.  Hold a filesystem snapshot over the review
+    # and validate it again before the one irreversible side effect.
+    try:
+        expected_directory = _directory_identity(album_dir)
+        initial_inventory = _reviewed_audio_inventory(album_dir)
+        existing, _ = find_existing_tracks(candidates[0], album_dir=album_dir)
+    except OSError:
+        return _legacy_identity_invalid(album_dir, candidates, [])
+
+    selected, compatible = select_legacy_release(existing, candidates)
+    compatible_albums = [evidence.album for evidence in compatible]
+    if selected is None:
+        if compatible:
+            return DirMatch("identity_ambiguous", album_dir, existing=existing,
+                            candidate_releases=compatible_albums)
+        # There is no edition choice to guess for a sole candidate.  Preserve
+        # the established false-match/low-overlap diagnostics, but never stamp
+        # a manifest when its tracks contradict the folder.
+        if len(candidates) == 1:
+            return _compare_matched_album(
+                album_dir, candidates[0], existing, candidates)
+        return _legacy_identity_invalid(album_dir, candidates, existing)
+
+    try:
+        refreshed_existing, _ = find_existing_tracks(
+            selected.album, album_dir=album_dir)
+        current_directory = _directory_identity(album_dir)
+        current_inventory = _reviewed_audio_inventory(album_dir)
+    except OSError:
+        return _legacy_identity_invalid(album_dir, candidates, existing)
+    if (current_directory != expected_directory
+            or current_inventory != initial_inventory):
+        return _legacy_identity_invalid(album_dir, candidates, existing)
+
+    refreshed, refreshed_compatible = select_legacy_release(
+        refreshed_existing, candidates)
+    if refreshed is None:
+        if refreshed_compatible:
+            return DirMatch(
+                "identity_ambiguous", album_dir, existing=refreshed_existing,
+                candidate_releases=[evidence.album for evidence in refreshed_compatible])
+        return _legacy_identity_invalid(album_dir, candidates, refreshed_existing)
+    if refreshed.album.get("id") != selected.album.get("id"):
+        return _legacy_identity_invalid(album_dir, candidates, refreshed_existing)
+
+    try:
+        publish_release_identity(
+            album_dir,
+            ReleaseIdentity("qobuz", str(selected.album["id"])),
+            expected_directory=expected_directory,
+        )
+    except (ReleaseManifestError, OSError, KeyError):
+        return _legacy_identity_invalid(album_dir, candidates, refreshed_existing)
+    return _compare_matched_album(album_dir, selected.album,
+                                  refreshed_existing, candidates)
 
 
 def discover_fully_missing(artist_name, catalog, opts, *, hidden=None,
@@ -650,6 +802,18 @@ def classify_owned_match(result, m, hidden, single_store, artist_name,
     ad = m.album_dir
     if m.status == "no_match":
         result.unmatched_dirs.append(ad)
+        return
+    if m.status in {"identity_ambiguous", "identity_invalid"}:
+        candidates = [
+            {"id": album.get("id"), "title": album.get("title") or "?"}
+            for album in m.candidate_releases
+        ]
+        for candidate in candidates:
+            if candidate["id"] is not None:
+                handled_ids.add(candidate["id"])
+        resolved_dirs.add(str(ad))
+        result.skipped.append({"dir": ad, "reason": m.status,
+                               "candidate_releases": candidates})
         return
     if m.status == "predicted_path_mismatch":
         result.skipped.append({"dir": ad, "reason": "predicted_path_mismatch",
