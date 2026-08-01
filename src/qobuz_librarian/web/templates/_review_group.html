@@ -1,5 +1,5 @@
 {% import "_job_labels.html" as labels %}
-{% set actionable_items = items | rejectattr('payload.non_actionable') | list %}
+{% set actionable_items = items | actionable_candidates %}
 {% set group_selected = actionable_items | selectattr('selected') | list | length %}
 
 {# The dismiss button must stay tappable while the group is COLLAPSED, and a

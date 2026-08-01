@@ -54,15 +54,18 @@ def _catalog_entry(album):
     return {k: v for k, v in album.items() if k != "tracks"}
 
 
+_AUTO_TOTAL = object()
+
+
 class FakeQobuz:
     """Stands in for the Qobuz search/catalog API. Holds artist search hits,
     one catalog per artist id, and full album dicts keyed by id."""
 
-    def __init__(self, *, artists, catalog, total=None):
+    def __init__(self, *, artists, catalog, total=_AUTO_TOTAL):
         self._artists = artists                       # search_artists results
         self._full = {a["id"]: a for a in catalog}    # get_album by id
         self._catalog = [_catalog_entry(a) for a in catalog]
-        self._total = total if total is not None else len(catalog)
+        self._total = len(catalog) if total is _AUTO_TOTAL else total
 
     def search_artists(self, query, token, limit=5):
         return self._artists
@@ -111,7 +114,7 @@ def beatles_search():
 
 
 def _run(monkeypatch, tmp_path, *, layout, catalog, artists,
-         query="The Beatles", artist_folder="The Beatles", total=None,
+         query="The Beatles", artist_folder="The Beatles", total=_AUTO_TOTAL,
          hidden=None, want_missing=True, prefer_hires=True):
     _library(monkeypatch, tmp_path, layout)
     FakeQobuz(artists=artists, catalog=catalog, total=total).install(monkeypatch)
@@ -230,6 +233,23 @@ def test_capped_catalog_never_attaches_edition_badges(monkeypatch, tmp_path):
         monkeypatch, tmp_path, query="Artist", artist_folder="Artist",
         layout={"Artist": {}}, catalog=[standard, deluxe], total=3,
         artists=[{"name": "Artist", "id": "artist", "albums_count": 3}],
+    )
+
+    assert result.catalog_incomplete is False
+    assert all(gap.edition_badge == "" for gap in result.gaps)
+
+
+def test_limit_sized_catalog_without_total_never_attaches_edition_badges(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(cfg, "ARTIST_CATALOG_LIMIT", 2)
+    monkeypatch.setattr(cfg, "MISSING_ALBUMS_MIN_TRACKS", 1)
+    standard = _album("100", "Album", "Artist", 2020, [_qt("one", "A")])
+    deluxe = _album("200", "Album (Deluxe Edition)", "Artist", 2020,
+                    [_qt("one", "A"), _qt("bonus", "B")])
+    result = _run(
+        monkeypatch, tmp_path, query="Artist", artist_folder="Artist",
+        layout={"Artist": {}}, catalog=[standard, deluxe], total=None,
+        artists=[{"name": "Artist", "id": "artist", "albums_count": 2}],
     )
 
     assert result.catalog_incomplete is False

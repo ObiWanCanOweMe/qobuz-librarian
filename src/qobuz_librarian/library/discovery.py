@@ -726,7 +726,8 @@ def find_missing_for_artist(query, *, token, opts=None, artist_dir=None,
     # Edition labels are meaningful only when the complete catalogue is
     # trustworthy. A transient short page can omit a sibling release and must
     # never invent the impression that the visible row is unambiguous.
-    if not result.catalog_incomplete and not truncated:
+    catalog_capped = len(catalog) >= cfg.ARTIST_CATALOG_LIMIT
+    if not result.catalog_incomplete and not truncated and not catalog_capped:
         badges = build_edition_badges(catalog)
         for gap in result.gaps:
             release_id = normalise_release_id(gap.qobuz_album.get("id"))

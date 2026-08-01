@@ -50,6 +50,12 @@ from qobuz_librarian.ui_cli.colors import format_size
 from qobuz_librarian.ui_cli.errors import plural
 from qobuz_librarian.ui_cli.logging import log
 from qobuz_librarian.web import job_persistence, review_badges
+from qobuz_librarian.web.review_candidates import (
+    candidate_album_dir_relative,
+    candidate_payload,
+    is_non_actionable,
+    safe_album_dir_relative,
+)
 
 
 def build_args():
@@ -213,12 +219,14 @@ def _album_candidate_spec(
 
 
 def _add_candidate_spec(job, spec):
+    if type(spec) is not dict:
+        return None
     return job.add_candidate(
         kind=spec.get("kind", "album"),
         title=spec.get("title") or "?",
         artist=spec.get("artist") or "",
         detail=spec.get("detail") or "",
-        payload=spec.get("payload") or {},
+        payload=candidate_payload(spec),
         selected=bool(spec.get("selected")),
     )
 
@@ -313,6 +321,11 @@ def _identity_attention_spec(item: dict, artist_name: str,
     }
     if artist_key:
         payload["_artist_dir"] = artist_key
+    relative = safe_album_dir_relative(item.get("_album_dir_rel"))
+    if not relative:
+        relative = safe_album_dir_relative(title)
+    if relative:
+        payload["_album_dir_rel"] = relative
     return {
         "kind": "identity_attention",
         "title": title or "Release identity",
@@ -342,7 +355,7 @@ def is_gap_candidate(c):
     an owned album) rather than a fully missing album. New scans stamp the
     payload; candidates carried forward from older checkpoints only say so in
     their detail line, so fall back to that."""
-    if (c.get("payload") or {}).get("gap_fill"):
+    if candidate_payload(c).get("gap_fill"):
         return True
     return "gap-fill:" in (c.get("detail") or "")
 
@@ -354,7 +367,7 @@ def candidate_is_hidden_missing(c, hidden):
     album choices, so an album dismissal with the same artist/title must not
     suppress them during checkpoint or saved-state restoration.
     """
-    if (c.get("payload") or {}).get("non_actionable"):
+    if is_non_actionable(c):
         return False
     return hidden_mod.is_hidden(
         hidden_mod.SCOPE_MISSING,
@@ -368,14 +381,15 @@ def fold_key(c):
     """A candidate's merge identity: Qobuz album id, falling back to
     artist+title for keyless carry-overs. Shared by the fold and its caller's
     before/after arithmetic so the summary counts what actually changed."""
-    payload = c.get("payload") or {}
-    if payload.get("non_actionable"):
+    payload = candidate_payload(c)
+    if is_non_actionable(c):
         return (
             "non_actionable",
             c.get("kind") or "",
-            payload.get("_artist_dir") or "",
-            (c.get("artist") or "").lower(),
-            (c.get("title") or "").lower(),
+            (payload.get("_artist_dir")
+             if isinstance(payload.get("_artist_dir"), str)
+             else c.get("artist") or ""),
+            candidate_album_dir_relative(c),
         )
     album_id = str(payload.get("album_id") or "")
     if album_id:
@@ -416,14 +430,14 @@ def fold_new_candidates(parked, cands):
             key = _key(c)
             fresh = fresh_by_key.get(key)
             if (fresh is not None
-                    and (c.get("payload") or {}).get("non_actionable")
-                    and (fresh.get("payload") or {}).get("non_actionable")):
+                    and is_non_actionable(c)
+                    and is_non_actionable(fresh)):
                 fields = {
                     "kind": fresh.get("kind", "identity_attention"),
                     "title": fresh.get("title") or "?",
                     "artist": fresh.get("artist") or "",
                     "detail": fresh.get("detail") or "",
-                    "payload": fresh.get("payload") or {},
+                    "payload": candidate_payload(fresh),
                     "selected": False,
                 }
                 if any(c.get(name) != value for name, value in fields.items()):
@@ -447,7 +461,7 @@ def fold_new_candidates(parked, cands):
             key = _key(c)
             if key in seen:
                 continue
-            if (not (c.get("payload") or {}).get("non_actionable")
+            if (not is_non_actionable(c)
                     and key not in swapped_ticks and hidden_mod.is_hidden(
                     hidden_mod.SCOPE_MISSING, c.get("artist") or "",
                     c.get("title") or "", hidden)):
@@ -467,9 +481,9 @@ def fold_new_candidates(parked, cands):
                 "title": c.get("title") or "?",
                 "artist": c.get("artist") or "",
                 "detail": c.get("detail") or "",
-                "payload": c.get("payload") or {},
+                "payload": candidate_payload(c),
                 "selected": (
-                    False if (c.get("payload") or {}).get("non_actionable")
+                    False if is_non_actionable(c)
                     else swapped_ticks.get(key, bool(c.get("selected")))
                 ),
             })
@@ -590,7 +604,7 @@ def _park_library_failures(failed_cands, execute_kind="library",
             title=c.get("title") or "?",
             artist=c.get("artist") or "",
             detail=c.get("detail") or "",
-            payload=c.get("payload") or {},
+            payload=candidate_payload(c),
             selected=True if ticked else bool(c.get("selected")),
         )
     n = len(job.candidates)
@@ -620,7 +634,8 @@ def _return_new_release_picks(picks):
         _park_library_failures(picks, execute_kind="new_releases")
 
 
-def _fold_partial_gap_fill(full_album, artist_name, n_missing):
+def _fold_partial_gap_fill(
+        full_album, artist_name, n_missing, *, edition_badge=""):
     """A partial download (some tracks failed) leaves the album on disk with
     gaps. Fold it into the living Library review as an unticked Gap Fill
     candidate right away — the app tracks its own downloads, so the gap must
@@ -628,9 +643,12 @@ def _fold_partial_gap_fill(full_album, artist_name, n_missing):
     review parked, a fresh one is parked so /library shows it. Runs after
     prune_library_review_candidates, which just dropped the album's stale
     Missing candidates — this replaces them with the honest remainder."""
+    extra_payload = None
+    if isinstance(edition_badge, str) and edition_badge:
+        extra_payload = {"edition_badge": edition_badge}
     spec = _album_candidate_spec(
         {**full_album, "_partial_missing_count": n_missing},
-        artist_name, selected=False)
+        artist_name, selected=False, extra_payload=extra_payload)
     if refold_into_living_review([spec], ticked=False) is None:
         _park_library_failures(
             [spec], ticked=False,
@@ -658,7 +676,8 @@ def prune_library_review_candidates(album):
         try:
             with job._lock:
                 keep = [c for c in job.candidates
-                        if str((c.get("payload") or {}).get("album_id") or "")
+                        if is_non_actionable(c)
+                        or str(candidate_payload(c).get("album_id") or "")
                         != album_id]
                 n = len(job.candidates) - len(keep)
                 if not n:
@@ -691,12 +710,12 @@ def drop_owned_missing_candidates(job):
     from qobuz_librarian.web import job_persistence
     with job._lock:
         snapshot = [(c["cid"], bool(c.get("selected")),
-                     {"id": (c.get("payload") or {}).get("album_id"),
+                     {"id": candidate_payload(c).get("album_id"),
                       "title": c.get("title") or "",
                       "artist": {"name": c.get("artist") or ""}})
                     for c in job.candidates
                     if not is_gap_candidate(c)
-                    and not (c.get("payload") or {}).get("non_actionable")]
+                    and not is_non_actionable(c)]
     # Disk probes happen outside the lock; a live scan can keep appending.
     owned = {}
     for cid, selected, alb in snapshot:
@@ -763,7 +782,7 @@ def _flag_new_since_last_scan(job, mode):
     seen_now = set()
     fps = {}
     for c in candidates:
-        if (c.get("payload") or {}).get("non_actionable"):
+        if is_non_actionable(c):
             continue
         fp = hidden_mod.album_fingerprint(c.get("artist"), c.get("title"))
         if fp:
@@ -825,13 +844,13 @@ def _dismiss_albums_locked(job, artist, scope=hidden_mod.SCOPE_MISSING,
             return None
         to_hide = [c for c in job.candidates
                    if c.get("artist") == artist and not c.get("selected")
-                   and not (c.get("payload") or {}).get("non_actionable")
+                   and not is_non_actionable(c)
                    and (gap_only is None or is_gap_candidate(c) == gap_only)
                    and (not query or candidate_matches_query(c, query))]
         if not to_hide:
             return 0
         specs = [(c.get("artist"), c.get("title"),
-                  (c.get("payload") or {}).get("year")) for c in to_hide]
+                  candidate_payload(c).get("year")) for c in to_hide]
     # Record the dismissals durably FIRST, outside the lock (disk I/O mustn't
     # stall the scan thread's next add_candidate).
     hidden_mod.hide(scope, specs)
@@ -880,12 +899,23 @@ def _scan_library_artist(artist_dir, token, partial_only, hidden):
     catalog_ids = None if result.catalog_incomplete else [
         str(a["id"]) for a in result.catalog
         if is_lossless_album(a) and a.get("id") is not None]
-    identity_attention = [
-        item for item in getattr(result, "skipped", [])
-        if isinstance(item, dict)
-        and isinstance(item.get("reason"), str)
-        and item.get("reason") in _IDENTITY_ATTENTION_DETAILS
-    ]
+    identity_attention = []
+    for original in getattr(result, "skipped", []):
+        if (not isinstance(original, dict)
+                or not isinstance(original.get("reason"), str)
+                or original.get("reason") not in _IDENTITY_ATTENTION_DETAILS):
+            continue
+        item = dict(original)
+        raw_dir = item.get("dir")
+        if isinstance(raw_dir, (str, Path)):
+            try:
+                relative = Path(raw_dir).relative_to(artist_dir).as_posix()
+            except (OSError, TypeError, ValueError):
+                relative = ""
+            relative = safe_album_dir_relative(relative)
+            if relative:
+                item["_album_dir_rel"] = relative
+        identity_attention.append(item)
     return (artist_dir.name, result.artist_name, result.gaps, artist_id,
             catalog_ids, identity_attention)
 
@@ -1024,12 +1054,24 @@ def scan_library(job, token, partial_only=False, force_full=False):
         if _i % 25 == 0 or _i == len(artists):
             job.push_progress("Fingerprinting artist folders", _i, len(artists),
                               _ad.name, unit="folder")
+    if resuming:
+        changed = {
+            name for name in scanned
+            if (checkpoint_artists.get(name) or {}).get("fingerprint")
+            != fingerprints.get(name)
+        }
+        for name in changed:
+            scanned.discard(name)
+            saved_artist_id = (
+                checkpoint_artists.get(name) or {}).get("artist_id") or ""
+            if saved_artist_id:
+                baseline_seen.pop(str(saved_artist_id), None)
     previous_artists = (previous_scan.get("artists") or {}) if cheap_refresh else {}
     state_artists: dict[str, dict] = {}
     if resuming:
         restored_by_artist: dict[str, list[dict]] = {}
         for c in cp["candidates"]:
-            artist_key = (c.get("payload") or {}).get("_artist_dir") or c.get("artist")
+            artist_key = candidate_payload(c).get("_artist_dir") or c.get("artist")
             if artist_key not in scanned:
                 continue
             if candidate_is_hidden_missing(c, hidden):
@@ -1439,6 +1481,8 @@ def execute_albums(job, chosen, token):
     from qobuz_librarian.modes.process import process_album
     from qobuz_librarian.web.jobs import staging_lock
 
+    chosen = [c for c in chosen if not is_non_actionable(c)]
+
     # The web worker runs jobs back-to-back; a directory listing cached by
     # a previous job would otherwise be reused even though folders may
     # have moved since.
@@ -1479,7 +1523,7 @@ def execute_albums(job, chosen, token):
         if job.cancel_requested:
             break
         processed = i
-        album_id = cand["payload"].get("album_id")
+        album_id = candidate_payload(cand).get("album_id")
         label = f"[{i}/{len(chosen)}] {cand.get('artist','')} — {cand['title']}"
         log.info(label)
         job._progress_scope = (i, len(chosen), "album")
@@ -1533,8 +1577,13 @@ def execute_albums(job, chosen, token):
                 if is_nr_run:
                     _return_new_release_picks([cand])
                 elif is_library_run:
-                    _fold_partial_gap_fill(full, cand.get("artist") or "",
-                                           result.get("n_fail", 0))
+                    badge = candidate_payload(cand).get("edition_badge")
+                    _fold_partial_gap_fill(
+                        full,
+                        cand.get("artist") or "",
+                        result.get("n_fail", 0),
+                        edition_badge=(badge if isinstance(badge, str) else ""),
+                    )
             else:
                 ok += 1
         elif not (result and result.get("result") in _benign):

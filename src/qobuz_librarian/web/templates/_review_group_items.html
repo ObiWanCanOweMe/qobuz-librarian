@@ -1,5 +1,5 @@
 {% for c in items %}
-{% if c.payload.non_actionable %}
+{% if is_non_actionable(c) %}
 <div class="ql-review-candidate ql-review-candidate--attention"
      data-identity-attention role="note"
      aria-label="Release identity needs manual review">

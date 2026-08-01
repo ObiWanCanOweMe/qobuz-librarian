@@ -3185,6 +3185,46 @@ def test_identity_attention_fold_keeps_distinct_filesystem_artist_folders():
         "Artist", "Artist [local]"]
 
 
+def test_identity_attention_fold_preserves_case_sensitive_album_siblings():
+    from qobuz_librarian.web import flows
+
+    parked = jm.Job(
+        title="Library scan", status=jm.JobStatus.AWAITING_REVIEW)
+    specs = [
+        flows._identity_attention_spec(
+            {
+                "dir": Path(f"/music/Artist/{folder}"),
+                "reason": "identity_ambiguous",
+            },
+            "Qobuz Artist",
+            "Artist",
+        )
+        for folder in ("Album", "album")
+    ]
+
+    assert flows.fold_new_candidates(parked, specs) == (2, 0)
+    assert [c["payload"]["_album_dir_rel"] for c in parked.candidates] == [
+        "Album", "album"]
+
+
+def test_restored_legacy_attention_migrates_exact_folder_identity():
+    legacy = {
+        "cid": "c4",
+        "seq": 4,
+        "kind": "identity_attention",
+        "title": "Album [LOCAL]",
+        "artist": "Qobuz Artist",
+        "detail": "manual review",
+        "payload": {"_artist_dir": "Artist"},
+        "selected": True,
+    }
+
+    job = jm.Job(candidates=[legacy])
+
+    assert job.candidates[0]["payload"]["_album_dir_rel"] == "Album [LOCAL]"
+    assert job.candidates[0]["selected"] is False
+
+
 def test_scan_worker_returns_only_relevant_identity_attention_items(monkeypatch):
     from qobuz_librarian.library.discovery import DiscoveryResult
     from qobuz_librarian.web import flows
@@ -3210,7 +3250,10 @@ def test_scan_worker_returns_only_relevant_identity_attention_items(monkeypatch)
     worker_result = flows._scan_library_artist(
         artist_dir, "token", partial_only=False, hidden={})
 
-    assert worker_result[5] == [ambiguous, invalid]
+    assert [item["reason"] for item in worker_result[5]] == [
+        "identity_ambiguous", "identity_invalid"]
+    assert [item["_album_dir_rel"] for item in worker_result[5]] == [
+        "Album", "Other"]
 
 
 def test_identity_attention_spec_round_trips_through_scan_checkpoint(
@@ -3247,7 +3290,7 @@ def test_non_actionable_candidate_cannot_enter_execution_selection():
     job.status = jm.JobStatus.AWAITING_REVIEW
     cid = job.add_candidate(
         "identity_attention", "Album", "Artist",
-        payload={"non_actionable": True}, selected=True,
+        payload=None, selected=True,
     )
 
     assert job.candidates[0]["selected"] is False
@@ -3258,6 +3301,70 @@ def test_non_actionable_candidate_cannot_enter_execution_selection():
     assert job.selected_candidates() == []
 
 
+@pytest.mark.parametrize("flag", [True, 1, " YES ", "on"])
+def test_non_actionable_predicate_normalizes_kind_and_truthy_flags(flag):
+    from qobuz_librarian.web.review_candidates import is_non_actionable
+
+    assert is_non_actionable({"kind": "identity_attention", "payload": None})
+    assert is_non_actionable({"kind": "album", "payload": {
+        "non_actionable": flag}})
+    assert not is_non_actionable({"kind": "album", "payload": {
+        "non_actionable": "false"}})
+    assert not is_non_actionable({"kind": "album", "payload": []})
+
+
+def test_restored_kind_only_attention_is_sanitized_before_review_actions():
+    restored = {
+        "cid": "c7",
+        "seq": "7",
+        "kind": "identity_attention",
+        "title": "Album",
+        "artist": "Artist",
+        "detail": "manual review",
+        "payload": "malformed",
+        "selected": True,
+    }
+
+    job = jm.Job(
+        title="Library scan",
+        status=jm.JobStatus.AWAITING_REVIEW,
+        candidates=[restored],
+    )
+
+    assert job.candidates[0]["payload"] == {"_album_dir_rel": "Album"}
+    assert job.candidates[0]["seq"] == 7
+    assert job.candidates[0]["selected"] is False
+    assert job.selection_counts()["actionable_total"] == 0
+    assert job.set_selected("c7", True) is False
+    assert job.selected_candidates() == []
+
+
+def test_execute_albums_rejects_kind_only_attention_with_forged_album_id(
+        monkeypatch):
+    from qobuz_librarian.web import flows
+
+    fetched = []
+    monkeypatch.setattr(
+        flows,
+        "get_album",
+        lambda album_id, _token: fetched.append(album_id) or {
+            "id": album_id, "title": "Forged"},
+    )
+    job = jm.Job(title="Library scan")
+    job.execute_kind = "library"
+    forged = {
+        "kind": "identity_attention",
+        "title": "Album",
+        "artist": "Artist",
+        "payload": {"album_id": "forged"},
+        "selected": True,
+    }
+
+    flows.execute_albums(job, [forged], "token")
+
+    assert fetched == []
+
+
 def test_owned_album_prune_leaves_identity_attention_card(monkeypatch):
     from qobuz_librarian.library import catalog
     from qobuz_librarian.web import flows
@@ -3265,13 +3372,37 @@ def test_owned_album_prune_leaves_identity_attention_card(monkeypatch):
     job = jm.Job(title="Library scan")
     job.add_candidate(
         "identity_attention", "Album", "Artist",
-        payload={"non_actionable": True}, selected=False,
+        payload=None, selected=False,
     )
     monkeypatch.setattr(catalog, "find_album_dir_filesystem", lambda _album: Path("/owned"))
     monkeypatch.setattr(catalog, "_count_audio_files_in", lambda _path: 10)
 
     assert flows.drop_owned_missing_candidates(job) == 0
     assert [c["kind"] for c in job.candidates] == ["identity_attention"]
+
+
+def test_download_prune_keeps_kind_only_attention_with_forged_album_id():
+    from qobuz_librarian.web import flows
+
+    job = jm.Job(
+        title="Library scan",
+        status=jm.JobStatus.AWAITING_REVIEW,
+        execute_kind="library",
+    )
+    job.add_candidate(
+        "identity_attention", "Warning", "Artist",
+        payload={"album_id": "100"}, selected=False,
+    )
+    job.add_candidate(
+        "album", "Download", "Artist",
+        payload={"album_id": "100"}, selected=False,
+    )
+    jm.registry.add(job)
+    try:
+        assert flows.prune_library_review_candidates({"id": "100"}) == 1
+        assert [c["kind"] for c in job.candidates] == ["identity_attention"]
+    finally:
+        _remove_job(job)
 
 
 def test_dismiss_album_keeps_identity_attention_out_of_hidden_store(
@@ -3284,7 +3415,7 @@ def test_dismiss_album_keeps_identity_attention_out_of_hidden_store(
     job = jm.Job(title="Library scan", status=jm.JobStatus.AWAITING_REVIEW)
     job.add_candidate(
         "identity_attention", "Album (2020)", "Artist",
-        payload={"non_actionable": True}, selected=False,
+        payload=None, selected=False,
     )
     job.add_candidate(
         "album", "Other", "Artist", payload={"album_id": "100"},
@@ -3304,7 +3435,7 @@ def test_identity_attention_is_displayed_but_excluded_from_bulk_totals(client):
     job.execute_kind = "library"
     job.add_candidate(
         "identity_attention", "Album (2020)", "Artist",
-        payload={"non_actionable": True}, selected=False,
+        payload=None, selected=False,
     )
     job.add_candidate(
         "album", "Other", "Artist", payload={"album_id": "100"},
@@ -3340,7 +3471,7 @@ def test_dismiss_rest_endpoint_keeps_identity_attention_card(
     job.execute_kind = "library"
     job.add_candidate(
         "identity_attention", "Album (2020)", "Artist",
-        payload={"non_actionable": True}, selected=False,
+        payload=None, selected=False,
     )
     job.add_candidate(
         "album", "Other", "Artist", payload={"album_id": "100"},
@@ -3367,7 +3498,7 @@ def test_direct_approval_cannot_consume_identity_attention_only_review():
     job._execute_fn = lambda _job, _chosen: None
     cid = job.add_candidate(
         "identity_attention", "Album (2020)", "Artist",
-        payload={"non_actionable": True}, selected=True,
+        payload=None, selected=True,
     )
 
     assert jm.approve(job, selected_ids=[cid]) is jm.APPROVAL_NO_SELECTION
@@ -5136,6 +5267,86 @@ def test_partial_import_folds_an_instant_gap_fill_candidate():
         assert "gap-fill: 3 missing of 10" in (gap.get("detail") or "")
     finally:
         _remove_job(parked)
+
+
+def test_partial_gap_fill_preserves_edition_badge_in_persisted_review(
+        monkeypatch):
+    from qobuz_librarian.web import flows, job_persistence
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+    parked = jm.Job(
+        title="Library scan", kind="scan", execute_kind="library",
+        status=jm.JobStatus.AWAITING_REVIEW)
+    parked.add_candidate(
+        "album", "Existing", "Y", payload={"album_id": "L1"})
+    jm.registry.add(parked)
+    try:
+        flows._fold_partial_gap_fill(
+            {"id": "a9", "title": "Short Album", "tracks_count": 10},
+            "Artist", 3,
+            edition_badge="Deluxe Edition · Qobuz a9",
+        )
+
+        gap = next(c for c in parked.candidates if c["title"] == "Short Album")
+        assert gap["payload"]["edition_badge"] == (
+            "Deluxe Edition · Qobuz a9")
+        restored = job_persistence.load_one(parked.id)
+        saved = next(c for c in restored["candidates"]
+                     if c["title"] == "Short Album")
+        assert saved["payload"]["edition_badge"] == (
+            "Deluxe Edition · Qobuz a9")
+    finally:
+        _remove_job(parked)
+
+
+def test_partial_library_execution_carries_original_edition_badge(monkeypatch):
+    from qobuz_librarian.modes import process as process_mod
+    from qobuz_librarian.web import flows
+
+    running = jm.Job(title="Library scan", status=jm.JobStatus.RUNNING)
+    running.execute_kind = "library"
+    running.add_candidate(
+        "album", "Deluxe Album", "Artist",
+        payload={
+            "album_id": "a9",
+            "edition_badge": "Deluxe Edition · Qobuz a9",
+        },
+        selected=True,
+    )
+    captured = []
+    monkeypatch.setattr(flows.cfg, "ARTIST_API_DELAY", 0)
+    monkeypatch.setattr(
+        flows, "get_album",
+        lambda _album_id, _token: {
+            "id": "a9", "title": "Deluxe Album", "tracks_count": 10},
+    )
+    monkeypatch.setattr(flows, "clear_scan_caches", lambda: None)
+    monkeypatch.setattr(flows, "_refresh_after_local_album_change",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(flows, "prune_library_review_candidates",
+                        lambda *_a, **_k: 0)
+    monkeypatch.setattr(
+        flows,
+        "_fold_partial_gap_fill",
+        lambda album, artist, missing, edition_badge="": captured.append(
+            edition_badge),
+    )
+    monkeypatch.setattr(
+        process_mod,
+        "process_album",
+        lambda *_a, **_k: {
+            "imported": True,
+            "n_ok": 7,
+            "n_fail": 3,
+            "result": "downloaded",
+        },
+    )
+
+    flows.execute_albums(running, list(running.candidates), "token")
+
+    assert captured == ["Deluxe Edition · Qobuz a9"]
 
 
 def test_partial_new_release_download_returns_to_the_nr_review(monkeypatch):

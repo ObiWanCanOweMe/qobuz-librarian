@@ -37,6 +37,11 @@ from qobuz_librarian.integrations import rip as rip_module
 from qobuz_librarian.ui_cli.errors import plural
 from qobuz_librarian.ui_cli.logging import set_progress_reporter, set_thread_wrapper
 from qobuz_librarian.web import job_persistence, review_badges
+from qobuz_librarian.web.review_candidates import (
+    candidate_payload,
+    is_non_actionable,
+    normalize_candidate,
+)
 
 # Thread-local pointer to the job currently being run on this worker.
 _TLS = threading.local()
@@ -304,9 +309,14 @@ class Job:
         candidates. Must be re-run by any code that assigns ``candidates``
         after construction."""
         highest = -1
-        for c in self.candidates:
+        normalized_candidates = []
+        for raw in self.candidates:
+            c = normalize_candidate(raw)
+            if c is None:
+                continue
+            normalized_candidates.append(c)
             seq = c.get("seq")
-            if seq is None:
+            if type(seq) is not int or seq < 0:
                 # Legacy rows persisted before seq existed: recover it from
                 # the cid ("c57" → 57).
                 cid = str(c.get("cid") or "")
@@ -314,8 +324,12 @@ class Job:
                     seq = int(cid.lstrip("c"))
                 except ValueError:
                     continue
+                if seq < 0:
+                    continue
+                c["seq"] = seq
             if seq > highest:
                 highest = seq
+        self.candidates = normalized_candidates
         if highest >= self._cand_seq - 1:
             self._cand_seq = highest + 1
 
@@ -488,9 +502,14 @@ class Job:
         # thread may be reading/dropping candidates via the review screen.
         capped = False
         cid = None
-        payload = payload or {}
-        if payload.get("non_actionable"):
-            selected = False
+        candidate = normalize_candidate({
+            "kind": kind,
+            "title": title,
+            "artist": artist,
+            "detail": detail,
+            "payload": payload,
+            "selected": selected,
+        })
         with self._lock:
             # Bound the in-memory (and persisted) candidate list so a runaway
             # whole-library scan can't exhaust memory.
@@ -505,9 +524,7 @@ class Job:
                 seq = self._cand_seq
                 self._cand_seq += 1
                 self.candidates.append({
-                    "cid": f"c{seq}", "seq": seq, "kind": kind, "title": title,
-                    "artist": artist, "detail": detail, "payload": payload,
-                    "selected": selected,
+                    "cid": f"c{seq}", "seq": seq, **candidate,
                 })
                 cid = f"c{seq}"
         if capped:  # log once, outside the lock (push_line takes it itself)
@@ -528,7 +545,7 @@ class Job:
         return [
             c for c in self.candidates
             if c.get("selected")
-            and not (c.get("payload") or {}).get("non_actionable")
+            and not is_non_actionable(c)
         ]
 
     # ── selection (server-backed; the review UI reads ticks here, not the form) ──
@@ -543,7 +560,7 @@ class Job:
                 return None
             for c in self.candidates:
                 if c.get("cid") == cid:
-                    if (c.get("payload") or {}).get("non_actionable"):
+                    if is_non_actionable(c):
                         changed = bool(c.get("selected"))
                         c["selected"] = False
                         return changed
@@ -565,7 +582,7 @@ class Job:
             for c in self.candidates:
                 if want is not None and c.get("cid") not in want:
                     continue
-                if (c.get("payload") or {}).get("non_actionable"):
+                if is_non_actionable(c):
                     if c.get("selected"):
                         c["selected"] = False
                         n += 1
@@ -584,14 +601,14 @@ class Job:
             cands = list(self.candidates)
         actionable = [
             c for c in cands
-            if not (c.get("payload") or {}).get("non_actionable")
+            if not is_non_actionable(c)
         ]
         selected = [
             c for c in actionable
             if c.get("selected")
         ]
         artists = {c.get("artist") for c in cands}
-        reclaimable = sum(int((c.get("payload") or {}).get("est_saving") or 0)
+        reclaimable = sum(int(candidate_payload(c).get("est_saving") or 0)
                           for c in selected)
         return {
             "total": len(cands),
@@ -1364,7 +1381,7 @@ def approve(
         selected = set(selected_ids) if selected_ids is not None else None
 
         def _will_select(candidate):
-            if (candidate.get("payload") or {}).get("non_actionable"):
+            if is_non_actionable(candidate):
                 return False
             chosen = (
                 candidate.get("cid") in selected
@@ -1392,7 +1409,7 @@ def approve(
             for c in job.candidates:
                 c["selected"] = (
                     c.get("cid") in selected
-                    and not (c.get("payload") or {}).get("non_actionable")
+                    and not is_non_actionable(c)
                 )
         if split_review is not None:
             parked = split_review(job)

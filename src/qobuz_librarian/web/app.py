@@ -45,6 +45,10 @@ from qobuz_librarian.web.csrf import (
     SecurityHeadersMiddleware,
     StripServerHeaderMiddleware,
 )
+from qobuz_librarian.web.review_candidates import (
+    candidate_payload,
+    is_non_actionable,
+)
 
 # Held for the lifetime of the web process. Module-level so Python won't
 # garbage-collect it (which would silently release the flock).
@@ -1627,6 +1631,9 @@ templates.env.globals["now_ts"] = time.time
 templates.env.globals["keeps_ds_originals"] = lambda: cfg.DOWNSAMPLE_KEEP_ORIGINALS == "keep"
 templates.env.globals["ds_originals_chosen"] = lambda: cfg.DOWNSAMPLE_KEEP_ORIGINALS in ("keep", "delete")
 templates.env.globals["backup_retention_days"] = cfg.UPGRADE_BACKUP_RETENTION_DAYS
+templates.env.globals["is_non_actionable"] = is_non_actionable
+templates.env.filters["actionable_candidates"] = lambda values: [
+    value for value in values if not is_non_actionable(value)]
 
 
 def _fmt_clock(ts):
@@ -2055,7 +2062,9 @@ def _find_job_touching_album(album_id: str, skip_single_track: bool = False):
         # Snapshot: a SCANNING job appends to candidates from the worker thread,
         # and iterating it live can raise "list changed size during iteration".
         for cand in list(j.candidates or []):
-            payload = cand.get("payload") or {}
+            if is_non_actionable(cand):
+                continue
+            payload = candidate_payload(cand)
             if payload.get("album_id") == album_id:
                 return j
             qa = (payload.get("candidate") or {}).get("qobuz_album") or {}
@@ -6721,6 +6730,8 @@ async def job_approve(request: Request, job_id: str):
             admission_decisions = {}
 
             def selection_filter(candidate):
+                if is_non_actionable(candidate):
+                    return False
                 key = candidate.get("cid")
                 if not isinstance(key, str) or not key:
                     return False
@@ -6733,7 +6744,7 @@ async def job_approve(request: Request, job_id: str):
                         return False
                 if job.execute_kind in ("library", "new_releases"):
                     album_id = normalise_album_id(
-                        (candidate.get("payload") or {}).get("album_id")
+                        candidate_payload(candidate).get("album_id")
                     )
                     if album_id is None:
                         admission_decisions[key] = False
@@ -6935,8 +6946,7 @@ def _review_tab_totals(job):
     with job._lock:
         total = len(job.candidates)
         for c in job.candidates:
-            non_actionable = bool(
-                (c.get("payload") or {}).get("non_actionable"))
+            non_actionable = is_non_actionable(c)
             if flows.is_gap_candidate(c):
                 gaps += 1
                 if not non_actionable:
@@ -7154,7 +7164,7 @@ async def job_dismiss_rest(request: Request, job_id: str):
         for c in job.candidates:
             if c.get("selected"):
                 continue
-            if (c.get("payload") or {}).get("non_actionable"):
+            if is_non_actionable(c):
                 continue
             if gap_only is not None and flows.is_gap_candidate(c) != gap_only:
                 continue
