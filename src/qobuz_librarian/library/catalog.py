@@ -34,6 +34,7 @@ from qobuz_librarian import config
 from qobuz_librarian.api.auth import QobuzError
 from qobuz_librarian.api.search import get_album, search_albums
 from qobuz_librarian.library.release_identity import (
+    ReleaseManifestError,
     normalise_release_id,
     read_release_identity,
 )
@@ -142,6 +143,19 @@ def _paths_equal(a: Path, b: Path) -> bool:
         return os.path.normpath(str(a)) == os.path.normpath(str(b))
 
 
+def release_merge_allowed(left: Path, right: Path) -> bool:
+    """Return whether two existing album folders may enter one merge plan."""
+    try:
+        left_identity = read_release_identity(Path(left))
+        right_identity = read_release_identity(Path(right))
+    except (ReleaseManifestError, TypeError, ValueError):
+        return False
+    return (
+        left_identity is None and right_identity is None
+        or left_identity is not None and left_identity == right_identity
+    )
+
+
 _DECORATION_YEAR_RE = re.compile(
     r"[(\[](\d{4})[)\]]\s*$"      # trailing '(2010)' / '[2010]'
     r"|^\[(\d{4})\]\s+"          # leading '[2010] Title'
@@ -173,6 +187,8 @@ def _is_split_album_merge(album_dir, post_dir, qartist):
     except OSError:
         return False
     if _paths_equal(post_dir, album_dir) or not qartist:
+        return False
+    if not release_merge_allowed(album_dir, post_dir):
         return False
     a = normalize(strip_year_decoration(album_dir.name))
     if not a or a != normalize(strip_year_decoration(post_dir.name)):

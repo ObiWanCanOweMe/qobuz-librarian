@@ -12,6 +12,7 @@ from qobuz_librarian import config
 from qobuz_librarian.file_exclusion import acquire_inode_write_exclusion
 from qobuz_librarian.integrations import beets as beets_integration
 from qobuz_librarian.library import scanner
+from qobuz_librarian.library.catalog import release_merge_allowed
 from qobuz_librarian.library.scanner import parse_track_num, read_album_dir
 from qobuz_librarian.library.sqlite_atomic import (
     AtomicSQLiteWrite,
@@ -1092,6 +1093,10 @@ class _ConsolidationBinding:
 
 
 def _bind_summary(summary, primary, sibling):
+    if not release_merge_allowed(primary.path, sibling.path):
+        raise OSError("release identities do not permit consolidation")
+    if not primary.matches() or not sibling.matches():
+        raise OSError("album changed while release identity was checked")
     files = []
     seen = set()
     for track, _primary_track in summary["overlap"]:
@@ -1149,6 +1154,8 @@ def find_sibling_album_dirs(album, primary_dir):
             if d.resolve() == primary_dir.resolve():
                 continue
         except OSError:
+            continue
+        if not release_merge_allowed(primary_dir, d):
             continue
         d_years = _years_in(d.name)
         if primary_years and d_years and primary_years.isdisjoint(d_years):
@@ -1337,9 +1344,12 @@ def _sealed_sibling_albums(album, primary):
         )
         if score < config.CONSOLIDATE_THRESH:
             continue
+        sibling_path = primary.path.parent / name
+        if not release_merge_allowed(primary.path, sibling_path):
+            continue
         try:
             sibling = _seal_album(
-                primary.path.parent / name,
+                sibling_path,
                 expected_identity=identity,
             )
         except OSError as exc:
@@ -1348,11 +1358,17 @@ def _sealed_sibling_albums(album, primary):
                 f"  ⚠  Couldn't safely inspect {name} ({exc}); left it untouched.",
             ))
             continue
+        if not release_merge_allowed(primary.path, sibling.path):
+            sibling.close()
+            continue
         if not primary.matches():
             sibling.close()
             for old, _score in candidates:
                 old.close()
             raise OSError("primary album changed while siblings were inspected")
+        if not sibling.matches():
+            sibling.close()
+            continue
         candidates.append((sibling, score))
     return sorted(candidates, key=lambda item: -item[1])
 
