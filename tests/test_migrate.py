@@ -397,7 +397,26 @@ def test_execute_refuses_plan_with_release_identity_channel_removed(tmp_path):
     result = m.execute_plan(plan)
 
     assert result.copied == 0 and result.failed == 1
-    assert "reviewed plan seal" in result.outcomes[0][3]
+    assert "reviewed plan" in result.outcomes[0][3]
+    assert not destination.exists()
+    assert (source_album / "track0.flac").exists()
+
+
+def test_plan_authority_cannot_be_forged_from_plan_data(tmp_path):
+    plan, source_album = _release_identity_plan(tmp_path)
+    destination = plan.dest_root / plan.placed[0].dest_rel
+    plan.release_identities = []
+    old_issuer = getattr(m, "_seal_reviewed_plan", None)
+    if old_issuer is not None:
+        old_issuer(plan)
+    if hasattr(plan, "_reviewed_plan_seal"):
+        plan._reviewed_plan_seal = m._canonical_digest(
+            m._reviewed_plan_evidence(plan))
+
+    result = m.execute_plan(plan)
+
+    assert result.copied == 0 and result.failed == 1
+    assert "reviewed plan" in result.outcomes[0][3]
     assert not destination.exists()
     assert (source_album / "track0.flac").exists()
 
@@ -406,10 +425,45 @@ def test_write_manifest_cannot_reseal_truncated_plan(tmp_path):
     plan, _source_album = _release_identity_plan(tmp_path)
     plan.release_identities = []
 
-    with pytest.raises(OSError, match="reviewed plan seal"):
+    with pytest.raises(OSError, match="reviewed plan"):
         m.write_manifest(plan)
 
     assert not plan.dest_root.exists()
+
+
+def test_write_manifest_uses_claimed_snapshot_during_caller_mutation(
+        tmp_path, monkeypatch):
+    plan, source_album = _release_identity_plan(tmp_path)
+    original_write = m._write_csv_for_plan
+
+    def mutate_after_claim(reviewed_plan, *args, **kwargs):
+        plan.release_identities = []
+        return original_write(reviewed_plan, *args, **kwargs)
+
+    monkeypatch.setattr(m, "_write_csv_for_plan", mutate_after_claim)
+
+    artifact = m.write_manifest(plan)
+    result = m.execute_plan(plan)
+
+    assert artifact["context"]["release_identities"][0]["identity"] == {
+        "provider": "qobuz", "release_id": "100"}
+    assert result.copied == 0 and result.failed == 1
+    assert "reviewed plan" in result.outcomes[0][3]
+    assert not (plan.dest_root / plan.placed[0].dest_rel).exists()
+    assert (source_album / "track0.flac").exists()
+
+
+def test_manifest_artifact_context_cannot_mutate_authoritative_snapshot(
+        tmp_path):
+    plan, _source_album = _release_identity_plan(tmp_path)
+    first = m.write_manifest(plan)
+
+    first["context"]["release_identities"].clear()
+    second = m.write_manifest(plan)
+
+    assert plan.release_identities[0]["identity"]["release_id"] == "100"
+    assert second["context"]["release_identities"][0]["identity"] == {
+        "provider": "qobuz", "release_id": "100"}
 
 
 def test_execute_refuses_plan_with_one_album_entry_removed(tmp_path):
@@ -420,7 +474,7 @@ def test_execute_refuses_plan_with_one_album_entry_removed(tmp_path):
 
     destination_album = plan.dest_root / "Artist" / "Album (2017)"
     assert result.copied == 0 and result.failed == 1
-    assert "reviewed plan seal" in result.outcomes[0][3]
+    assert "reviewed plan" in result.outcomes[0][3]
     assert not (plan.dest_root / plan.placed[0].dest_rel).exists()
     assert not (destination_album / MANIFEST_NAME).exists()
     assert (source_album / removed.source.name).exists()
@@ -444,7 +498,7 @@ def test_exact_unsealed_plan_requires_audit_before_direct_execution(tmp_path):
     refused = m.execute_plan(plan)
 
     assert refused.copied == 0 and refused.failed == 1
-    assert "reviewed plan seal" in refused.outcomes[0][3]
+    assert "reviewed plan" in refused.outcomes[0][3]
     assert not destination.exists()
     assert m.verify_audit_artifact(plan, artifact) is True
 
@@ -452,6 +506,149 @@ def test_exact_unsealed_plan_requires_audit_before_direct_execution(tmp_path):
 
     assert accepted.copied == 1 and accepted.failed == 0
     assert destination.exists()
+
+
+@pytest.mark.parametrize("in_place", [False, True])
+def test_progress_callback_cannot_redirect_authorized_plan(
+        tmp_path, in_place):
+    source_album = tmp_path / "src" / "Album"
+    source_album.mkdir(parents=True)
+    approved_source = source_album / "approved.flac"
+    unreviewed_source = source_album / "unreviewed.flac"
+    approved_source.write_bytes(b"approved audio")
+    unreviewed_source.write_bytes(b"unreviewed audio")
+    publish_release_identity(
+        source_album, ReleaseIdentity("qobuz", "100"))
+    destination_root = tmp_path / "dest"
+    plan = m.build_plan([
+        (approved_source, _meta(title="Approved", track=1), "tags"),
+    ], destination_root)
+    redirect_plan = m.build_plan([
+        (unreviewed_source, _meta(title="Unreviewed", track=2), "tags"),
+    ], destination_root)
+    approved_entry = plan.placed[0]
+    redirect_entry = redirect_plan.placed[0]
+    approved_relative = approved_entry.dest_rel
+    approved_destination = destination_root / approved_relative
+    redirect_destination = destination_root / redirect_entry.dest_rel
+    mutated = False
+
+    def redirect_from_progress(*_args):
+        nonlocal mutated
+        if mutated:
+            return
+        mutated = True
+        approved_entry.dest_rel = redirect_entry.dest_rel
+        approved_entry.destination_path_receipt = (
+            redirect_entry.destination_path_receipt)
+
+    result = m.execute_plan(
+        plan, in_place=in_place, progress=redirect_from_progress)
+
+    assert mutated is True
+    assert result.copied == 1 and result.failed == 0
+    assert result.outcomes[0][:3] == (
+        approved_source, approved_relative, m.COPIED)
+    assert approved_destination.read_bytes() == b"approved audio"
+    assert not redirect_destination.exists()
+    assert unreviewed_source.read_bytes() == b"unreviewed audio"
+    assert approved_source.exists() is (not in_place)
+    assert read_release_identity(
+        destination_root / "Artist" / "Album (2017)"
+    ) == ReleaseIdentity("qobuz", "100")
+
+
+@pytest.mark.parametrize("in_place", [False, True])
+def test_progress_callback_cannot_redirect_or_retire_at_unreviewed_destination(
+        tmp_path, in_place):
+    source_album = tmp_path / "src" / "Album"
+    source_album.mkdir(parents=True)
+    approved_source = source_album / "approved.flac"
+    unreviewed_source = source_album / "unreviewed.flac"
+    approved_source.write_bytes(b"approved audio")
+    unreviewed_source.write_bytes(b"unreviewed audio")
+    destination_root = tmp_path / "dest"
+    plan = m.build_plan([
+        (approved_source, _meta(title="Approved", track=1), "tags"),
+    ], destination_root)
+    redirect_plan = m.build_plan([
+        (unreviewed_source, _meta(title="Unreviewed", track=2), "tags"),
+    ], destination_root)
+    approved_entry = plan.placed[0]
+    redirect_entry = redirect_plan.placed[0]
+    approved_relative = approved_entry.dest_rel
+    approved_destination = destination_root / approved_relative
+    redirect_destination = destination_root / redirect_entry.dest_rel
+
+    def redirect_from_progress(*_args):
+        approved_entry.dest_rel = redirect_entry.dest_rel
+        approved_entry.destination_path_receipt = (
+            redirect_entry.destination_path_receipt)
+
+    result = m.execute_plan(
+        plan, in_place=in_place, progress=redirect_from_progress)
+
+    assert result.copied == 1 and result.failed == 0
+    assert result.outcomes[0][:3] == (
+        approved_source, approved_relative, m.COPIED)
+    assert approved_destination.read_bytes() == b"approved audio"
+    assert not redirect_destination.exists()
+    assert unreviewed_source.read_bytes() == b"unreviewed audio"
+    assert approved_source.exists() is (not in_place)
+
+
+def test_plan_authority_is_single_use_during_progress_callback(tmp_path):
+    (tmp_path / "dest").mkdir()
+    plan, _source_album = _release_identity_plan(tmp_path)
+    nested_results = []
+
+    def execute_again(*_args):
+        if not nested_results:
+            nested_results.append(m.execute_plan(plan))
+
+    result = m.execute_plan(plan, progress=execute_again)
+
+    assert result.copied == 1 and result.failed == 0
+    assert len(nested_results) == 1
+    assert nested_results[0].copied == 0 and nested_results[0].failed == 1
+    assert "reviewed plan" in nested_results[0].outcomes[0][3]
+
+
+def test_resume_selection_binding_does_not_use_post_claim_entry_order(tmp_path):
+    source_album = tmp_path / "src" / "Album"
+    source_album.mkdir(parents=True)
+    first = source_album / "first.flac"
+    second = source_album / "second.flac"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    items = [
+        (first, _meta(title="First", track=1), "tags"),
+        (second, _meta(title="Second", track=2), "tags"),
+    ]
+    destination_root = tmp_path / "dest"
+    initial = m.build_plan(items, destination_root)
+    assert m.execute_plan(initial).copied == 2
+    plan = m.build_plan(items, destination_root)
+    resumes = m.verified_resume_entries(plan)
+    selected = resumes[0]
+
+    class ReorderingEntries(list):
+        iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            values = list(list.__iter__(self))
+            yield from values
+            if self.iterations == 2:
+                self.reverse()
+
+    plan.entries = ReorderingEntries(plan.entries)
+
+    result = m.execute_plan(plan, resume_entries=[selected])
+
+    assert result.skipped == 1 and result.failed == 0
+    assert result.outcomes[0][:3] == (
+        selected.source, selected.dest_rel, m.SKIPPED)
 
 
 def test_unverified_album_collision_blocks_every_album_track(tmp_path):

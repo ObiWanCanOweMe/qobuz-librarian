@@ -24,6 +24,7 @@ second stage that only runs against the files tags couldn't place, so a
 mostly-tagged library finishes fast and offline.
 """
 import base64
+import copy
 import csv
 import ctypes
 import errno
@@ -37,7 +38,9 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import unicodedata
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -117,11 +120,6 @@ class MigrationPlan:
     # Each record binds one sealed source manifest to one destination album.
     release_identities: list = field(default_factory=list)
     destination_name_semantics: Optional[dict] = None
-    # In-memory executor authority issued only by build_plan() or by exact
-    # verification of a durable preview artifact. It is intentionally absent
-    # from serialized payloads: reconstructed sub-plans must earn a fresh seal.
-    _reviewed_plan_seal: Optional[str] = field(
-        default=None, init=False, repr=False, compare=False)
 
     @property
     def placed(self) -> list:
@@ -2092,7 +2090,7 @@ def build_plan(items, dest_root: Path) -> MigrationPlan:
         finally:
             source_binding.close()
 
-    plan = MigrationPlan(
+    return MigrationPlan(
         dest_root=dest_root,
         entries=entries,
         source_root=source_root,
@@ -2102,8 +2100,6 @@ def build_plan(items, dest_root: Path) -> MigrationPlan:
         release_identities=release_identities,
         destination_name_semantics=destination_name_semantics,
     )
-    _seal_reviewed_plan(plan)
-    return plan
 
 
 # ── AcoustID second stage (opt-in, container-only) ───────────────────────────
@@ -4749,23 +4745,6 @@ def _reviewed_plan_evidence(plan: MigrationPlan) -> dict:
     }
 
 
-def _seal_reviewed_plan(plan: MigrationPlan) -> None:
-    plan._reviewed_plan_seal = _canonical_digest(
-        _reviewed_plan_evidence(plan))
-
-
-def _reviewed_plan_seal_matches(plan: MigrationPlan) -> bool:
-    try:
-        expected = _canonical_digest(_reviewed_plan_evidence(plan))
-        actual = plan._reviewed_plan_seal
-        return (
-            isinstance(actual, str)
-            and secrets.compare_digest(actual, expected)
-        )
-    except (AttributeError, OSError, TypeError, ValueError):
-        return False
-
-
 def _validate_root_receipt(receipt, expected_path) -> None:
     if not isinstance(receipt, dict):
         raise OSError("migration root receipt is missing")
@@ -5488,13 +5467,6 @@ def _execute_plan(plan: MigrationPlan, *, in_place: bool = False,
             (),
             f"selected migration resume entries are malformed: {exc}",
         )
-    if not _reviewed_plan_seal_matches(plan):
-        return _record_plan_refusal(
-            result,
-            plan,
-            supplied_resume_entries,
-            "migration reviewed plan seal is missing or no longer matches",
-        )
     try:
         resume_entries, entry_map, release_identity_map = _validate_plan(
             plan, supplied_resume_entries)
@@ -6020,7 +5992,9 @@ def _write_csv_for_plan(plan, path, prefix, header, row_builder) -> dict:
                 return {
                     "path": os.fspath(binding.path / candidate_name),
                     "receipt": receipt,
-                    "context": context,
+                    # Callers persist and may transform this payload. Never
+                    # expose the plan/snapshot's nested mutable objects.
+                    "context": copy.deepcopy(context),
                 }
             except BaseException:
                 if (
@@ -6065,10 +6039,7 @@ def _manifest_rows(plan, context_seal) -> list:
 
 def write_manifest(plan: MigrationPlan, path: Optional[Path] = None) -> dict:
     """Durably publish the full reviewed plan and return its exact receipt."""
-    if not _reviewed_plan_seal_matches(plan):
-        raise OSError(
-            "migration reviewed plan seal is missing or no longer matches")
-    artifact = _write_csv_for_plan(
+    return _write_csv_for_plan(
         plan,
         path,
         "migration-manifest",
@@ -6078,8 +6049,6 @@ def write_manifest(plan: MigrationPlan, path: Optional[Path] = None) -> dict:
         ],
         lambda context_seal, _entry_map: _manifest_rows(plan, context_seal),
     )
-    _seal_reviewed_plan(plan)
-    return artifact
 
 
 def _result_entry_seal(entry_map, source, destination) -> str:
@@ -6360,13 +6329,10 @@ def verify_audit_artifact(plan: MigrationPlan, artifact) -> bool:
         if any(count != 1 for count in entry_counts.values()):
             return False
         selected_seals = [_entry_seal(entry) for entry in plan.entries]
-        verified = (
+        return (
             len(set(selected_seals)) == len(selected_seals)
             and all(entry_counts.get(seal) == 1 for seal in selected_seals)
         )
-        if verified:
-            _seal_reviewed_plan(plan)
-        return verified
     except (
         KeyError,
         OSError,
@@ -6381,3 +6347,365 @@ def verify_audit_artifact(plan: MigrationPlan, artifact) -> bool:
             opened.close()
         if binding is not None:
             binding.close()
+
+
+def _make_plan_authority_wrappers():
+    """Return one-shot authority wrappers backed by non-exported state.
+
+    Registry membership and an opaque live grant provide authority. The
+    deterministic evidence digest only detects mutation; it cannot mint a
+    grant. Issuer decorators are deleted after installation below, and the
+    installed wrappers do not retain a callable registrar in their closure.
+
+    This is an integrity boundary for supported APIs, serialized/crafted plan
+    data, ordinary mutation, callbacks, and concurrent claims. It is not a
+    security sandbox against arbitrary trusted Python code that deliberately
+    introspects frames/closures or monkeypatches module functions/state.
+    """
+    registry = {}
+    live_grants = set()
+    active_plan_ids = set()
+    authority_lock = threading.RLock()
+
+    def decorate_build(function):
+        def authorized_build(*args, **kwargs):
+            plan = function(*args, **kwargs)
+            source_entries = tuple(plan.entries)
+            snapshot = copy.deepcopy(plan)
+            evidence = _canonical_digest(_reviewed_plan_evidence(snapshot))
+            entry_positions = {
+                id(entry): index
+                for index, entry in enumerate(source_entries)
+            }
+            if (
+                len(entry_positions) != len(source_entries)
+                or any(
+                    current is not expected
+                    for current, expected in zip(
+                        plan.entries, source_entries, strict=True)
+                )
+            ):
+                raise OSError("migration plan changed while authority was issued")
+            grant = object()
+            key = id(plan)
+
+            def retire(reference):
+                with authority_lock:
+                    current = registry.get(key)
+                    if (
+                        current is not None
+                        and current[0] is reference
+                        and current[1] is grant
+                    ):
+                        registry.pop(key, None)
+                        live_grants.discard(grant)
+
+            reference = weakref.ref(plan, retire)
+            with authority_lock:
+                previous = registry.pop(key, None)
+                if previous is not None:
+                    live_grants.discard(previous[1])
+                if key in active_plan_ids:
+                    raise OSError("migration plan authority is already active")
+                live_grants.add(grant)
+                registry[key] = (
+                    reference, grant, evidence, snapshot, entry_positions)
+            return plan
+
+        authorized_build.__name__ = function.__name__
+        authorized_build.__qualname__ = function.__qualname__
+        authorized_build.__doc__ = function.__doc__
+        authorized_build.__module__ = function.__module__
+        return authorized_build
+
+    def decorate_write(function):
+        def authorized_write(plan, *args, **kwargs):
+            key = id(plan)
+            try:
+                current_evidence = _canonical_digest(
+                    _reviewed_plan_evidence(plan))
+            except (AttributeError, OSError, TypeError, ValueError) as exc:
+                raise OSError("migration reviewed plan authority is invalid") \
+                    from exc
+            with authority_lock:
+                current = registry.get(key)
+                try:
+                    stored_snapshot_matches = (
+                        current is not None
+                        and _canonical_digest(
+                            _reviewed_plan_evidence(current[3])
+                        ) == current[2]
+                    )
+                except (AttributeError, OSError, TypeError, ValueError):
+                    stored_snapshot_matches = False
+                if (
+                    current is None
+                    or current[0]() is not plan
+                    or current[1] not in live_grants
+                    or current[2] != current_evidence
+                    or key in active_plan_ids
+                    or not stored_snapshot_matches
+                ):
+                    raise OSError(
+                        "migration reviewed plan authority is missing or "
+                        "no longer matches")
+                registry.pop(key, None)
+                live_grants.discard(current[1])
+                active_plan_ids.add(key)
+                reviewed_snapshot = copy.deepcopy(current[3])
+                authorized_evidence = current[2]
+                entry_positions = dict(current[4])
+
+            succeeded = False
+            try:
+                artifact = function(reviewed_snapshot, *args, **kwargs)
+                refreshed_evidence = _canonical_digest(
+                    _reviewed_plan_evidence(reviewed_snapshot))
+                try:
+                    unchanged = _canonical_digest(
+                        _reviewed_plan_evidence(plan)
+                    ) == authorized_evidence
+                except (AttributeError, OSError, TypeError, ValueError):
+                    unchanged = False
+                rebound = False
+                if unchanged:
+                    plan.dest_root_receipt = copy.deepcopy(
+                        reviewed_snapshot.dest_root_receipt)
+                    expected_entry_ids = tuple(
+                        entry_id for entry_id, _index in sorted(
+                            entry_positions.items(),
+                            key=lambda item: item[1],
+                        )
+                    )
+                    try:
+                        rebound = (
+                            _canonical_digest(
+                                _reviewed_plan_evidence(plan)
+                            ) == refreshed_evidence
+                            and tuple(
+                                id(entry) for entry in plan.entries
+                            ) == expected_entry_ids
+                        )
+                    except (
+                        AttributeError,
+                        OSError,
+                        TypeError,
+                        ValueError,
+                    ):
+                        rebound = False
+                with authority_lock:
+                    active_plan_ids.discard(key)
+                    if rebound:
+                        grant = object()
+
+                        def retire(reference):
+                            with authority_lock:
+                                saved = registry.get(key)
+                                if (
+                                    saved is not None
+                                    and saved[0] is reference
+                                    and saved[1] is grant
+                                ):
+                                    registry.pop(key, None)
+                                    live_grants.discard(grant)
+
+                        reference = weakref.ref(plan, retire)
+                        live_grants.add(grant)
+                        registry[key] = (
+                            reference,
+                            grant,
+                            refreshed_evidence,
+                            reviewed_snapshot,
+                            entry_positions,
+                        )
+                succeeded = True
+                return artifact
+            finally:
+                if not succeeded:
+                    with authority_lock:
+                        active_plan_ids.discard(key)
+
+        authorized_write.__name__ = function.__name__
+        authorized_write.__qualname__ = function.__qualname__
+        authorized_write.__doc__ = function.__doc__
+        authorized_write.__module__ = function.__module__
+        return authorized_write
+
+    def decorate_verify(function):
+        def authorized_verify(plan, artifact):
+            try:
+                source_entries = tuple(plan.entries)
+                snapshot = copy.deepcopy(plan)
+            except (AttributeError, OSError, TypeError, ValueError):
+                return False
+            if not function(snapshot, artifact):
+                return False
+            try:
+                evidence = _canonical_digest(
+                    _reviewed_plan_evidence(snapshot))
+                if _canonical_digest(
+                        _reviewed_plan_evidence(plan)) != evidence:
+                    return False
+                if any(
+                    current is not expected
+                    for current, expected in zip(
+                        plan.entries, source_entries, strict=True)
+                ):
+                    return False
+            except (AttributeError, OSError, TypeError, ValueError):
+                return False
+            entry_positions = {
+                id(entry): index
+                for index, entry in enumerate(source_entries)
+            }
+            if len(entry_positions) != len(source_entries):
+                return False
+            grant = object()
+            key = id(plan)
+
+            def retire(reference):
+                with authority_lock:
+                    current = registry.get(key)
+                    if (
+                        current is not None
+                        and current[0] is reference
+                        and current[1] is grant
+                    ):
+                        registry.pop(key, None)
+                        live_grants.discard(grant)
+
+            reference = weakref.ref(plan, retire)
+            with authority_lock:
+                if key in active_plan_ids:
+                    return False
+                previous = registry.pop(key, None)
+                if previous is not None:
+                    live_grants.discard(previous[1])
+                live_grants.add(grant)
+                registry[key] = (
+                    reference, grant, evidence, snapshot, entry_positions)
+            return True
+
+        authorized_verify.__name__ = function.__name__
+        authorized_verify.__qualname__ = function.__qualname__
+        authorized_verify.__doc__ = function.__doc__
+        authorized_verify.__module__ = function.__module__
+        return authorized_verify
+
+    def decorate_execute(function):
+        def authorized_execute(
+            plan,
+            *,
+            in_place=False,
+            cancel_check=None,
+            progress=None,
+            resume_entries=None,
+        ):
+            try:
+                supplied_resumes = list(resume_entries or ())
+                current_evidence = _canonical_digest(
+                    _reviewed_plan_evidence(plan))
+            except (AttributeError, OSError, TypeError, ValueError) as exc:
+                return _record_plan_refusal(
+                    ExecResult(),
+                    plan,
+                    (),
+                    f"migration reviewed plan authority is invalid: {exc}",
+                )
+
+            key = id(plan)
+            with authority_lock:
+                current = registry.get(key)
+                if (
+                    current is None
+                    or current[0]() is not plan
+                    or current[1] not in live_grants
+                    or current[2] != current_evidence
+                    or key in active_plan_ids
+                ):
+                    return _record_plan_refusal(
+                        ExecResult(),
+                        plan,
+                        supplied_resumes,
+                        "migration reviewed plan authority is missing or "
+                        "no longer matches",
+                    )
+                if _canonical_digest(
+                        _reviewed_plan_evidence(current[3])) != current[2]:
+                    return _record_plan_refusal(
+                        ExecResult(),
+                        plan,
+                        supplied_resumes,
+                        "migration reviewed plan authority is invalid",
+                    )
+                registry.pop(key, None)
+                live_grants.discard(current[1])
+                active_plan_ids.add(key)
+                snapshot = copy.deepcopy(current[3])
+                authorized_evidence = current[2]
+                entry_positions = dict(current[4])
+            if (
+                any(
+                    id(entry) not in entry_positions
+                    for entry in supplied_resumes
+                )
+            ):
+                with authority_lock:
+                    active_plan_ids.discard(key)
+                return _record_plan_refusal(
+                    ExecResult(),
+                    plan,
+                    supplied_resumes,
+                    "selected migration resume entries are not in the plan",
+                )
+            snapshot_resumes = [
+                snapshot.entries[entry_positions[id(entry)]]
+                for entry in supplied_resumes
+            ]
+            try:
+                return function(
+                    snapshot,
+                    in_place=in_place,
+                    cancel_check=cancel_check,
+                    progress=progress,
+                    resume_entries=snapshot_resumes,
+                )
+            finally:
+                try:
+                    unchanged = _canonical_digest(
+                        _reviewed_plan_evidence(plan)
+                    ) == authorized_evidence
+                except (AttributeError, OSError, TypeError, ValueError):
+                    unchanged = False
+                if unchanged:
+                    plan.dest_root_receipt = copy.deepcopy(
+                        snapshot.dest_root_receipt)
+                with authority_lock:
+                    active_plan_ids.discard(key)
+
+        authorized_execute.__name__ = function.__name__
+        authorized_execute.__qualname__ = function.__qualname__
+        authorized_execute.__doc__ = function.__doc__
+        authorized_execute.__module__ = function.__module__
+        return authorized_execute
+
+    return decorate_build, decorate_write, decorate_verify, decorate_execute
+
+
+(
+    _decorate_authorized_build,
+    _decorate_authorized_write,
+    _decorate_authorized_verify,
+    _decorate_authorized_execute,
+) = _make_plan_authority_wrappers()
+build_plan = _decorate_authorized_build(build_plan)
+write_manifest = _decorate_authorized_write(write_manifest)
+verify_audit_artifact = _decorate_authorized_verify(verify_audit_artifact)
+execute_plan = _decorate_authorized_execute(execute_plan)
+del (
+    _decorate_authorized_build,
+    _decorate_authorized_write,
+    _decorate_authorized_verify,
+    _decorate_authorized_execute,
+    _make_plan_authority_wrappers,
+)
