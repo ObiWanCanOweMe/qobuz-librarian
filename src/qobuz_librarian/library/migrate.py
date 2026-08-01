@@ -117,6 +117,11 @@ class MigrationPlan:
     # Each record binds one sealed source manifest to one destination album.
     release_identities: list = field(default_factory=list)
     destination_name_semantics: Optional[dict] = None
+    # In-memory executor authority issued only by build_plan() or by exact
+    # verification of a durable preview artifact. It is intentionally absent
+    # from serialized payloads: reconstructed sub-plans must earn a fresh seal.
+    _reviewed_plan_seal: Optional[str] = field(
+        default=None, init=False, repr=False, compare=False)
 
     @property
     def placed(self) -> list:
@@ -2087,7 +2092,7 @@ def build_plan(items, dest_root: Path) -> MigrationPlan:
         finally:
             source_binding.close()
 
-    return MigrationPlan(
+    plan = MigrationPlan(
         dest_root=dest_root,
         entries=entries,
         source_root=source_root,
@@ -2097,6 +2102,8 @@ def build_plan(items, dest_root: Path) -> MigrationPlan:
         release_identities=release_identities,
         destination_name_semantics=destination_name_semantics,
     )
+    _seal_reviewed_plan(plan)
+    return plan
 
 
 # ── AcoustID second stage (opt-in, container-only) ───────────────────────────
@@ -4735,6 +4742,30 @@ def _plan_context(plan: MigrationPlan) -> dict:
     }
 
 
+def _reviewed_plan_evidence(plan: MigrationPlan) -> dict:
+    return {
+        "context": _plan_context(plan),
+        "entries": [_entry_evidence(entry) for entry in plan.entries],
+    }
+
+
+def _seal_reviewed_plan(plan: MigrationPlan) -> None:
+    plan._reviewed_plan_seal = _canonical_digest(
+        _reviewed_plan_evidence(plan))
+
+
+def _reviewed_plan_seal_matches(plan: MigrationPlan) -> bool:
+    try:
+        expected = _canonical_digest(_reviewed_plan_evidence(plan))
+        actual = plan._reviewed_plan_seal
+        return (
+            isinstance(actual, str)
+            and secrets.compare_digest(actual, expected)
+        )
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
 def _validate_root_receipt(receipt, expected_path) -> None:
     if not isinstance(receipt, dict):
         raise OSError("migration root receipt is missing")
@@ -5457,6 +5488,13 @@ def _execute_plan(plan: MigrationPlan, *, in_place: bool = False,
             (),
             f"selected migration resume entries are malformed: {exc}",
         )
+    if not _reviewed_plan_seal_matches(plan):
+        return _record_plan_refusal(
+            result,
+            plan,
+            supplied_resume_entries,
+            "migration reviewed plan seal is missing or no longer matches",
+        )
     try:
         resume_entries, entry_map, release_identity_map = _validate_plan(
             plan, supplied_resume_entries)
@@ -6027,7 +6065,10 @@ def _manifest_rows(plan, context_seal) -> list:
 
 def write_manifest(plan: MigrationPlan, path: Optional[Path] = None) -> dict:
     """Durably publish the full reviewed plan and return its exact receipt."""
-    return _write_csv_for_plan(
+    if not _reviewed_plan_seal_matches(plan):
+        raise OSError(
+            "migration reviewed plan seal is missing or no longer matches")
+    artifact = _write_csv_for_plan(
         plan,
         path,
         "migration-manifest",
@@ -6037,6 +6078,8 @@ def write_manifest(plan: MigrationPlan, path: Optional[Path] = None) -> dict:
         ],
         lambda context_seal, _entry_map: _manifest_rows(plan, context_seal),
     )
+    _seal_reviewed_plan(plan)
+    return artifact
 
 
 def _result_entry_seal(entry_map, source, destination) -> str:
@@ -6317,10 +6360,13 @@ def verify_audit_artifact(plan: MigrationPlan, artifact) -> bool:
         if any(count != 1 for count in entry_counts.values()):
             return False
         selected_seals = [_entry_seal(entry) for entry in plan.entries]
-        return (
+        verified = (
             len(set(selected_seals)) == len(selected_seals)
             and all(entry_counts.get(seal) == 1 for seal in selected_seals)
         )
+        if verified:
+            _seal_reviewed_plan(plan)
+        return verified
     except (
         KeyError,
         OSError,

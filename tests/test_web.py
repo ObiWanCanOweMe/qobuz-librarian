@@ -7,6 +7,7 @@ one search + one approve endpoint, and a few genuinely tricky bits of logic.
 """
 import asyncio
 import concurrent.futures
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -1896,6 +1897,125 @@ def test_migration_payload_schema_upgrade_preserves_existing_rows(monkeypatch):
         "('job', 'candidate', 'release_identity', 0, NULL, NULL, '{}', NULL)"
     )
     conn.commit()
+
+
+def _replace_migration_entries_with_v6_schema(conn, *, leftover=False):
+    conn.execute("DROP INDEX IF EXISTS idx_migration_candidate_entries")
+    conn.execute("DROP TABLE IF EXISTS migration_candidate_entries_v6")
+    conn.execute("DROP TABLE IF EXISTS migration_candidate_entries")
+    table = (
+        "migration_candidate_entries_v6"
+        if leftover else "migration_candidate_entries"
+    )
+    conn.execute(
+        f"CREATE TABLE {table} ("
+        "job_id TEXT NOT NULL, candidate_id TEXT NOT NULL, "
+        "entry_kind TEXT NOT NULL CHECK (entry_kind IN "
+        "('entry', 'resume', 'companion')), "
+        "ordinal INTEGER NOT NULL CHECK (ordinal >= 0), "
+        "source TEXT, destination TEXT, source_receipt TEXT NOT NULL, "
+        "destination_receipt TEXT, "
+        "PRIMARY KEY (job_id, candidate_id, entry_kind, ordinal))"
+    )
+    conn.execute(
+        f"INSERT INTO {table} VALUES "
+        "('job', 'candidate', 'companion', 0, NULL, NULL, '{}', NULL)"
+    )
+    if leftover:
+        conn.execute(
+            "CREATE INDEX idx_migration_candidate_entries "
+            "ON migration_candidate_entries_v6("
+            "job_id, candidate_id, entry_kind, ordinal)"
+        )
+    conn.execute("PRAGMA user_version = 6")
+    conn.commit()
+
+
+def test_migration_payload_schema_upgrade_rolls_back_after_rename_fault(
+        monkeypatch):
+    from qobuz_librarian.web import job_persistence
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+    conn = job_persistence._get_conn()
+    _replace_migration_entries_with_v6_schema(conn)
+
+    renamed = False
+    denied = False
+
+    def observe_rename(statement):
+        nonlocal renamed
+        if statement.lstrip().upper().startswith(
+                "ALTER TABLE MIGRATION_CANDIDATE_ENTRIES RENAME TO"):
+            renamed = True
+
+    def deny_new_entries_table(action, argument, *_unused):
+        nonlocal denied
+        if (
+            renamed and action == sqlite3.SQLITE_CREATE_TABLE
+            and argument == "migration_candidate_entries"
+        ):
+            denied = True
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    conn.set_trace_callback(observe_rename)
+    conn.set_authorizer(deny_new_entries_table)
+    job_persistence.init()
+    conn.set_authorizer(None)
+    conn.set_trace_callback(None)
+
+    assert renamed is True
+    assert denied is True
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert conn.execute(
+        "SELECT entry_kind, source_receipt "
+        "FROM migration_candidate_entries"
+    ).fetchall() == [("companion", "{}")]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master "
+        "WHERE type='table' AND name='migration_candidate_entries_v6'"
+    ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("stranded_version", [6, 7])
+def test_migration_payload_schema_upgrade_recovers_leftover_v6_table(
+        monkeypatch, stranded_version):
+    from qobuz_librarian.web import job_persistence
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+    conn = job_persistence._get_conn()
+    _replace_migration_entries_with_v6_schema(conn, leftover=True)
+    conn.execute(f"PRAGMA user_version = {stranded_version}")
+    conn.commit()
+    conn.close()
+    job_persistence._conn = None
+
+    job_persistence.init()
+    conn = job_persistence._get_conn()
+
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert conn.execute(
+        "SELECT entry_kind, source_receipt "
+        "FROM migration_candidate_entries"
+    ).fetchall() == [("companion", "{}")]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master "
+        "WHERE type='table' AND name='migration_candidate_entries_v6'"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT tbl_name FROM sqlite_master "
+        "WHERE type='index' AND name='idx_migration_candidate_entries'"
+    ).fetchone() == ("migration_candidate_entries",)
+
+    job_persistence.init()
+    assert conn.execute(
+        "SELECT entry_kind, source_receipt "
+        "FROM migration_candidate_entries"
+    ).fetchall() == [("companion", "{}")]
 
 
 def test_migration_payload_stores_and_hydrates_one_shared_artifact(monkeypatch):

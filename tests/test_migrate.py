@@ -389,6 +389,71 @@ def test_release_identity_publishes_only_after_all_album_audio_succeeds(
     )]
 
 
+def test_execute_refuses_plan_with_release_identity_channel_removed(tmp_path):
+    plan, source_album = _release_identity_plan(tmp_path)
+    destination = plan.dest_root / plan.placed[0].dest_rel
+    plan.release_identities = []
+
+    result = m.execute_plan(plan)
+
+    assert result.copied == 0 and result.failed == 1
+    assert "reviewed plan seal" in result.outcomes[0][3]
+    assert not destination.exists()
+    assert (source_album / "track0.flac").exists()
+
+
+def test_write_manifest_cannot_reseal_truncated_plan(tmp_path):
+    plan, _source_album = _release_identity_plan(tmp_path)
+    plan.release_identities = []
+
+    with pytest.raises(OSError, match="reviewed plan seal"):
+        m.write_manifest(plan)
+
+    assert not plan.dest_root.exists()
+
+
+def test_execute_refuses_plan_with_one_album_entry_removed(tmp_path):
+    plan, source_album = _release_identity_plan(tmp_path, tracks=2)
+    removed = plan.entries.pop()
+
+    result = m.execute_plan(plan)
+
+    destination_album = plan.dest_root / "Artist" / "Album (2017)"
+    assert result.copied == 0 and result.failed == 1
+    assert "reviewed plan seal" in result.outcomes[0][3]
+    assert not (plan.dest_root / plan.placed[0].dest_rel).exists()
+    assert not (destination_album / MANIFEST_NAME).exists()
+    assert (source_album / removed.source.name).exists()
+
+
+def test_exact_unsealed_plan_requires_audit_before_direct_execution(tmp_path):
+    original, _source_album = _release_identity_plan(tmp_path)
+    artifact = m.write_manifest(original)
+    plan = m.MigrationPlan(
+        dest_root=original.dest_root,
+        entries=list(original.entries),
+        source_root=original.source_root,
+        source_root_receipt=original.source_root_receipt,
+        dest_root_receipt=original.dest_root_receipt,
+        companion_receipts=list(original.companion_receipts),
+        release_identities=list(original.release_identities),
+        destination_name_semantics=original.destination_name_semantics,
+    )
+    destination = plan.dest_root / plan.placed[0].dest_rel
+
+    refused = m.execute_plan(plan)
+
+    assert refused.copied == 0 and refused.failed == 1
+    assert "reviewed plan seal" in refused.outcomes[0][3]
+    assert not destination.exists()
+    assert m.verify_audit_artifact(plan, artifact) is True
+
+    accepted = m.execute_plan(plan)
+
+    assert accepted.copied == 1 and accepted.failed == 0
+    assert destination.exists()
+
+
 def test_unverified_album_collision_blocks_every_album_track(tmp_path):
     destination_album = tmp_path / "dest" / "Artist" / "Album (2017)"
     destination_album.mkdir(parents=True)
