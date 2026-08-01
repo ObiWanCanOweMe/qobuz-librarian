@@ -268,7 +268,7 @@ derived from the title decoration when possible, such as `Deluxe Edition`,
 `20th Anniversary`, or `2011 Remaster`. The undecorated member is labeled
 `Standard Edition`. If two releases produce the same human label, the minimum
 additional differentiators needed to make the badges distinct are appended in
-this order: original-release year, track count, then quality. The release ID
+this order: edition publication year, track count, then quality. The release ID
 remains visible regardless of whether those fallbacks are needed.
 
 Examples include:

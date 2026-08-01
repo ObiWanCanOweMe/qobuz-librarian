@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Give every managed album a portable Qobuz release identity, keep ordinary friendly paths unchanged, and route only real edition collisions to deterministic Qobuz-ID-suffixed directories.
+**Goal:** Give every managed album a portable Qobuz release identity, keep ordinary friendly paths unchanged, route only real edition collisions to deterministic Qobuz-ID-suffixed directories, and visibly distinguish confusing editions in both Library review tabs.
 
-**Architecture:** A focused release-identity module owns the reserved JSON manifest and a placement module resolves friendly versus suffixed destinations. Discovery uses a valid manifest first and adopts an unmarked legacy folder only when exactly one compatible Qobuz release remains; Beets receives a one-run path override for known collisions so editions never share a destination. Generic scanners exclude the manifest, while migration and backup transfer it through explicit validated metadata handling.
+**Architecture:** A focused release-identity module owns the reserved JSON manifest, a placement module resolves friendly versus suffixed destinations, and a pure edition-badge module labels only multi-release album families. Discovery uses a valid manifest first and adopts an unmarked legacy folder only when exactly one compatible Qobuz release remains; Beets receives a one-run path override for known collisions so editions never share a destination. Generic scanners exclude the manifest, migration and backup transfer it through explicit validated metadata handling, and the shared Library review row renders the saved badge payload on both tabs.
 
 **Tech Stack:** Python 3.12+, `pathlib`, descriptor-relative POSIX filesystem APIs, JSON, existing Beets 2.12 integration, SQLite-backed Beets relocation, pytest, Ruff.
 
@@ -22,6 +22,10 @@
 - Identity-aware moves, migration, backup, export, and restore preserve the validated manifest explicitly.
 - Manifest reads and writes never follow symlinks; writes are same-directory, durable, atomic, and no-replace.
 - A failed or cancelled import never publishes a manifest for an unverified album directory.
+- Missing Albums and Gap Fill show an edition badge only when a trustworthy catalogue contains at least two distinct Qobuz release IDs in the same normalized artist, edition-stripped title, and original-release-year family.
+- Every displayed edition badge contains a human label and the complete visible Qobuz release ID.
+- Duplicate human labels use edition publication year, track count, then quality as ordered fallback differentiators.
+- Edition badges are informational and never change selection, grouping, download scope, or the submitted release ID.
 - No new runtime dependency is added.
 
 ---
@@ -30,15 +34,17 @@
 
 - Create `src/qobuz_librarian/library/release_identity.py`: identity value object, strict manifest codec, safe no-follow reads, atomic no-replace publication, and reserved-artifact predicates.
 - Create `src/qobuz_librarian/library/album_placement.py`: deterministic collision suffixing and filesystem placement decisions.
+- Create `src/qobuz_librarian/library/edition_badges.py`: pure edition-family grouping, human-label extraction, and visible Qobuz-ID badge generation.
 - Create `tests/test_release_identity.py`: manifest and reserved-artifact unit tests.
 - Create `tests/test_album_placement.py`: ordinary, repeated, legacy, collision, and path-length placement tests.
+- Create `tests/test_edition_badges.py`: multi-release grouping, label fallback, and single-release suppression tests.
 - Modify `src/qobuz_librarian/library/scanner.py`, `census.py`, `migrate.py`, `repair_log.py`, `integrations/beets.py`, and `modes/consolidate.py`: enforce generic manifest exclusion at each non-identity enumeration boundary.
 - Modify `src/qobuz_librarian/library/catalog.py` and `discovery.py`: retain distinct release IDs, prefer manifest identity, and require unique evidence for legacy adoption.
 - Modify `src/qobuz_librarian/integrations/beets.py`: obtain effective path templates, append a literal collision suffix to the album component for one import, and refuse unsupported templates safely.
 - Modify `src/qobuz_librarian/modes/process.py`, `queue/durable_album.py`, `queue/post_import_finalizer.py`, and `library/post_import_relocation.py`: carry the intended identity and placement through durable import completion and publish the manifest only after exact completion proof.
 - Modify `src/qobuz_librarian/library/migrate.py` and `tests/test_migrate.py`: carry release identity separately from audio and companion receipts.
 - Modify `src/qobuz_librarian/library/backup.py`, `modes/process.py`, and backup tests: retain or restore release identity through whole-album replacement without treating it as a companion.
-- Modify `src/qobuz_librarian/web/flows.py`, `_review_group_items.html`, and discovery/web tests: expose stable, non-actionable identity-review cards.
+- Modify `src/qobuz_librarian/web/flows.py`, `_review_group_items.html`, and discovery/web tests: attach edition badges to Missing Albums and Gap Fill candidates and expose stable, non-actionable identity-review cards.
 - Modify `docs/existing-libraries.md` and `docs/troubleshooting.md`: document manifests, collision paths, and review recovery.
 
 ### Task 1: Implement the Strict Release Manifest
@@ -1204,26 +1210,217 @@ git add src/qobuz_librarian/library/backup.py \
 git commit -m "feat: preserve release identity in album backups"
 ```
 
-### Task 11: Surface Identity Review Cards and Document Operations
+### Task 11: Compute Edition Badges for Confusable Release Families
+
+**Files:**
+
+- Create: `src/qobuz_librarian/library/edition_badges.py`
+- Create: `tests/test_edition_badges.py`
+
+**Interfaces:**
+
+- Consumes: `normalise_release_id(value) -> str | None` from Task 1.
+- Consumes: `normalize()`, `strip_album_decorations()`, and `album_quality_label()` from existing library helpers.
+- Produces: `edition_family_key(album: dict) -> tuple[str, str, str] | None`.
+- Produces: `edition_label(album: dict) -> str`, returning a human marker or `Standard Edition`.
+- Produces: `build_edition_badges(albums: list[dict]) -> dict[str, str]`, keyed by normalized Qobuz release ID.
+
+- [ ] **Step 1: Write the failing pure badge tests**
+
+Create `tests/test_edition_badges.py` with deterministic catalogue records:
+
+```python
+from datetime import datetime, timezone
+
+from qobuz_librarian.library.edition_badges import build_edition_badges
+
+
+def _released(year):
+    return datetime(year, 1, 1, tzinfo=timezone.utc).timestamp()
+
+
+def _album(album_id, title, original_year, *, published=2020, tracks=10,
+           bits=16, sample_rate=44.1, artist="Artist"):
+    return {
+        "id": album_id,
+        "title": title,
+        "artist": {"name": artist},
+        "release_date_original": f"{original_year}-01-01",
+        "released_at": _released(published),
+        "tracks_count": tracks,
+        "maximum_bit_depth": bits,
+        "maximum_sampling_rate": sample_rate,
+    }
+
+
+def test_standard_and_deluxe_family_get_visible_qobuz_ids():
+    badges = build_edition_badges([
+        _album("100", "Album", 2020),
+        _album("200", "Album (Deluxe Edition)", 2020, tracks=14),
+    ])
+
+    assert badges == {
+        "100": "Standard Edition · Qobuz 100",
+        "200": "Deluxe Edition · Qobuz 200",
+    }
+
+
+def test_single_release_and_different_original_years_are_not_badged():
+    assert build_edition_badges([_album("100", "Album", 2020)]) == {}
+    assert build_edition_badges([
+        _album("100", "Artist", 1990),
+        _album("200", "Artist", 2020),
+    ]) == {}
+
+
+def test_duplicate_labels_use_ordered_minimum_differentiators():
+    badges = build_edition_badges([
+        _album("100", "Album (Deluxe Edition)", 2020, published=2021),
+        _album("200", "Album (Deluxe Edition)", 2020, published=2022),
+    ])
+    assert badges["100"] == "Deluxe Edition · 2021 · Qobuz 100"
+    assert badges["200"] == "Deluxe Edition · 2022 · Qobuz 200"
+
+    track_badges = build_edition_badges([
+        _album("300", "Other (Remastered)", 2020, published=2022, tracks=10),
+        _album("400", "Other (Remastered)", 2020, published=2022, tracks=12),
+    ])
+    assert track_badges["300"] == "Remastered · 10 tracks · Qobuz 300"
+    assert track_badges["400"] == "Remastered · 12 tracks · Qobuz 400"
+
+    quality_badges = build_edition_badges([
+        _album("500", "Third (Expanded Edition)", 2020, published=2022,
+               tracks=12, bits=16, sample_rate=44.1),
+        _album("600", "Third (Expanded Edition)", 2020, published=2022,
+               tracks=12, bits=24, sample_rate=96),
+    ])
+    assert quality_badges["500"] == "Expanded Edition · 16-bit/44.1kHz · Qobuz 500"
+    assert quality_badges["600"] == "Expanded Edition · 24-bit/96kHz · Qobuz 600"
+```
+
+- [ ] **Step 2: Run the badge tests and verify RED**
+
+```bash
+pytest -q tests/test_edition_badges.py
+```
+
+Expected: FAIL because `library.edition_badges` does not exist.
+
+- [ ] **Step 3: Implement family grouping and ordered labels**
+
+Use these public boundaries and marker patterns:
+
+```python
+_EDITION_MARKER = re.compile(
+    r"(?ix)\b("
+    r"(?:\d{4}\s+)?remaster(?:ed)?|"
+    r"deluxe(?:\s+edition)?|expanded(?:\s+edition)?|"
+    r"special(?:\s+edition)?|collector(?:'s)?(?:\s+edition)?|"
+    r"(?:\d{1,3}(?:st|nd|rd|th)\s+)?anniversary(?:\s+edition)?"
+    r")\b"
+)
+
+
+def edition_family_key(album):
+    artist = normalize(((album.get("artist") or {}).get("name") or ""))
+    title = normalize(strip_album_decorations(album.get("title") or ""))
+    original_year = _original_release_year(album)
+    return (artist, title, original_year) if artist and title and original_year else None
+
+
+def edition_label(album):
+    title = album.get("title") or ""
+    match = _EDITION_MARKER.search(title)
+    return " ".join(match.group(1).split()) if match else "Standard Edition"
+```
+
+`build_edition_badges()` normalizes IDs, removes duplicate API rows for the
+same ID, groups by `edition_family_key()`, and skips groups with fewer than two
+IDs. Within each repeated human label, append the first publication-year value
+that makes labels distinct; if it does not, append track count; if that still
+does not, append `album_quality_label()`. Finish every badge with
+` · Qobuz ` followed by the complete normalized release ID. Missing fallback metadata is skipped rather than
+displayed as `?`, and the Qobuz ID remains the final unique differentiator.
+
+- [ ] **Step 4: Run badge and tag/catalog tests**
+
+```bash
+pytest -q tests/test_edition_badges.py tests/test_tags.py tests/test_catalog.py
+ruff check src/qobuz_librarian/library/edition_badges.py \
+  tests/test_edition_badges.py
+```
+
+Expected: all tests PASS and unrelated title normalization remains unchanged.
+
+- [ ] **Step 5: Commit the pure badge component**
+
+```bash
+git add src/qobuz_librarian/library/edition_badges.py tests/test_edition_badges.py
+git commit -m "feat: label confusable qobuz editions"
+```
+
+### Task 12: Attach Edition Badges and Surface Identity Review Cards
 
 **Files:**
 
 - Modify: `src/qobuz_librarian/web/flows.py`
 - Modify: `src/qobuz_librarian/web/templates/_review_group_items.html`
+- Modify: `src/qobuz_librarian/web/static/src/app.css`
+- Modify: `src/qobuz_librarian/library/discovery.py`
+- Modify: `tests/test_discovery.py`
 - Modify: `tests/test_web.py`
 - Modify: `docs/existing-libraries.md`
 - Modify: `docs/troubleshooting.md`
 
 **Interfaces:**
 
+- Consumes: `build_edition_badges(albums: list[dict]) -> dict[str, str]` from Task 11.
+- Extends: `AlbumGap` with `edition_badge: str = ""`.
+- Adds `payload.edition_badge` to both Missing Albums and Gap Fill review candidates when non-empty.
 - Produces: `_identity_attention_spec(item: dict, artist_name: str, artist_key: str) -> dict`, a persisted review candidate with `kind="identity_attention"`, `selected=False`, and `payload.non_actionable=True`.
 - Extends `_scan_library_artist()` to return identity-related `DiscoveryResult.skipped` entries alongside gaps.
 - The review template renders these entries without a checkbox, so they inform but can never authorize an overwrite or download.
 - Documents the reserved manifest, collision suffix, lazy adoption, and manual-review safety behavior.
 
-- [ ] **Step 1: Add identity-attention candidate and rendering tests**
+- [ ] **Step 1: Add discovery, persistence, rendering, and identity-attention tests**
 
 ```python
+def test_missing_and_gap_fill_receive_badges_from_catalog_family(
+        monkeypatch, tmp_path):
+    standard = _album("100", "Album", "Artist", 2020,
+                      [_qt("one", "A"), _qt("two", "B")])
+    deluxe = _album("200", "Album (Deluxe Edition)", "Artist", 2020,
+                    [_qt("remixed", "Z"), _qt("bonus", "C")])
+    missing_standard = _album("300", "Other", "Artist", 2021,
+                              [_qt("x", "X")])
+    missing_deluxe = _album("400", "Other (Deluxe Edition)", "Artist", 2021,
+                            [_qt("x", "X"), _qt("y", "Y")])
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        query="Artist",
+        artist_folder="Artist",
+        layout={"Artist": {"Album (2020)": [_et("one", "A")]}},
+        catalog=[standard, deluxe, missing_standard, missing_deluxe],
+        artists=[{"name": "Artist", "id": "artist", "albums_count": 4}],
+    )
+
+    gap_fill = next(g for g in result.gaps if g.on_disk_dir is not None)
+    missing = next(g for g in result.gaps if g.qobuz_album["id"] == "300")
+    assert gap_fill.edition_badge == "Standard Edition · Qobuz 100"
+    assert missing.edition_badge == "Standard Edition · Qobuz 300"
+
+
+def test_unambiguous_catalog_album_has_no_badge(monkeypatch, tmp_path):
+    only = _album("100", "Only Album", "Artist", 2020, [_qt("one", "A")])
+    result = _run(
+        monkeypatch, tmp_path, query="Artist", artist_folder="Artist",
+        layout={"Artist": {}}, catalog=[only],
+        artists=[{"name": "Artist", "id": "artist", "albums_count": 1}],
+    )
+    assert result.gaps[0].edition_badge == ""
+
+
 def test_identity_attention_spec_is_non_actionable():
     spec = flows._identity_attention_spec(
         {
@@ -1265,7 +1462,54 @@ def test_identity_attention_review_card_has_no_checkbox(client):
         assert 'name="cid"' not in card
     finally:
         _remove_job(job)
+
+
+def test_library_review_renders_and_persists_edition_badges(client, monkeypatch):
+    from qobuz_librarian.web import job_persistence
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+
+    job = jm.Job(title="Library scan")
+    job.execute_kind = "library"
+    job.status = jm.JobStatus.AWAITING_REVIEW
+    for gap_fill, album_id, title, badge in (
+        (False, "100", "Album", "Standard Edition · Qobuz 100"),
+        (True, "200", "Album (Deluxe Edition)",
+         "Deluxe Edition · Qobuz 200"),
+    ):
+        job.add_candidate(
+            "album", title, "Artist", "2020 · 16-bit/44.1kHz · 10 tracks",
+            {"album_id": album_id, "gap_fill": 1 if gap_fill else 0,
+             "edition_badge": badge},
+            selected=False,
+        )
+    jm.registry.add(job)
+    try:
+        job_persistence.persist(job)
+        restored = job_persistence.load_one(job.id)
+        assert restored is not None
+        assert [c["payload"]["edition_badge"] for c in restored["candidates"]] == [
+            "Standard Edition · Qobuz 100",
+            "Deluxe Edition · Qobuz 200",
+        ]
+        assert [c["payload"]["album_id"] for c in restored["candidates"]] == [
+            "100", "200"]
+
+        for tab, expected in (
+            ("missing", "Standard Edition · Qobuz 100"),
+            ("gaps", "Deluxe Edition · Qobuz 200"),
+        ):
+            response = client.get(f"/jobs/{job.id}/review", params={"tab": tab})
+            assert expected in response.text
+    finally:
+        _remove_job(job)
 ```
+
+The setup matches the existing persistence tests in that file. The separate
+`album_id` assertion proves badge text does not replace the release ID carried
+into execution.
 
 - [ ] **Step 2: Run web review tests and verify RED**
 
@@ -1273,9 +1517,15 @@ def test_identity_attention_review_card_has_no_checkbox(client):
 pytest -q tests/test_web.py
 ```
 
-Expected: `_identity_attention_spec` is missing and every candidate renders a checkbox.
+Expected: `AlbumGap` has no `edition_badge`, `_identity_attention_spec` is missing, and the template renders no edition badge.
 
 - [ ] **Step 3: Add non-actionable review cards and documentation**
+
+In `find_missing_for_artist()`, call `build_edition_badges(catalog)` only when
+`result.catalog_incomplete` is false, then assign the string matching each
+gap's normalized release ID to `gap.edition_badge`. `_gap_candidate_spec()`
+copies a non-empty value into `payload["edition_badge"]`; it does not recompute
+catalogue grouping in the web layer.
 
 Map `identity_ambiguous`, `identity_invalid`, `identity_conflict`,
 `identity_path_occupied`, and `identity_changed` to stable detail strings in
@@ -1286,17 +1536,32 @@ render a `<div class="ql-review-candidate">` instead of a checkbox `<label>`
 when `c.payload.non_actionable` is true, and stamp it with the
 `data-identity-attention` attribute used by the rendering test.
 
+For ordinary album candidates, render `c.payload.edition_badge` beside the
+title with existing badge primitives and a `ql-badge-edition` class. In
+`app.css`, allow that class to wrap and never truncate its Qobuz ID:
+
+```css
+.ql-badge-edition {
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+```
+
 In `existing-libraries.md`, document that manifests are created lazily after a
-proven match and that ambiguous standard/deluxe folders remain unchanged. In
-`troubleshooting.md`, document how to inspect the manifest, why `[qobuz-ID]`
-appears only on collisions, and that users must not edit or copy a manifest
-between releases.
+proven match and that ambiguous standard/deluxe folders remain unchanged. Also
+document that Missing Albums and Gap Fill show a human edition label plus the
+complete Qobuz ID only when a trustworthy catalogue exposes multiple releases
+in the same family. In `troubleshooting.md`, document how to inspect the
+manifest, why `[qobuz-ID]` appears only on collisions, and that users must not
+edit or copy a manifest between releases.
 
 - [ ] **Step 4: Run documentation-adjacent tests and lint**
 
 ```bash
-pytest -q tests/test_web.py tests/test_discovery.py
-ruff check src/qobuz_librarian/web/flows.py tests/test_web.py
+pytest -q tests/test_edition_badges.py tests/test_web.py tests/test_discovery.py
+ruff check src/qobuz_librarian/library/discovery.py \
+  src/qobuz_librarian/web/flows.py tests/test_discovery.py tests/test_web.py
 ```
 
 Expected: all tests PASS.
@@ -1305,12 +1570,15 @@ Expected: all tests PASS.
 
 ```bash
 git add src/qobuz_librarian/web/flows.py \
-  src/qobuz_librarian/web/templates/_review_group_items.html tests/test_web.py \
+  src/qobuz_librarian/web/templates/_review_group_items.html \
+  src/qobuz_librarian/web/static/src/app.css \
+  src/qobuz_librarian/library/discovery.py \
+  tests/test_discovery.py tests/test_web.py \
   docs/existing-libraries.md docs/troubleshooting.md
-git commit -m "feat: surface qobuz identity review cards"
+git commit -m "feat: show qobuz editions in library reviews"
 ```
 
-### Task 12: Run End-to-End Regression and Safety Verification
+### Task 13: Run End-to-End Regression and Safety Verification
 
 **Files:**
 
@@ -1325,7 +1593,8 @@ git commit -m "feat: surface qobuz identity review cards"
 
 ```bash
 pytest -q tests/test_release_identity.py tests/test_album_placement.py \
-  tests/test_catalog.py tests/test_discovery.py tests/test_integrations.py \
+  tests/test_edition_badges.py tests/test_catalog.py tests/test_discovery.py \
+  tests/test_integrations.py \
   tests/test_post_import_relocation.py tests/test_migrate.py \
   tests/test_backup_and_catalog_helpers.py tests/test_capped_durability.py
 ```
@@ -1352,11 +1621,13 @@ Expected: Ruff reports no errors.
 
 ```bash
 git status --short
-git diff --check main~11..HEAD
-git log --oneline --decorate -12
+git diff --check main~12..HEAD
+git log --oneline --decorate -13
 ```
 
 Verify from the test names and diff that ordinary paths are unchanged, the
 complete Qobuz ID suffix appears only on collisions, manifests are absent from
 generic enumerations, migration and backup retain them explicitly, and no
-different-release merge path remains.
+different-release merge path remains. Verify edition badges appear on both
+Library tabs only for multi-ID release families, contain the complete Qobuz ID,
+survive persistence, and never replace the `album_id` used for execution.
