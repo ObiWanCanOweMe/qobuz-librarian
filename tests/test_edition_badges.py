@@ -261,3 +261,140 @@ def test_results_are_sorted_and_inputs_are_not_mutated():
     assert badges["10"].endswith("Qobuz 10")
     assert badges["20"].endswith("Qobuz 20")
     assert albums == original
+
+
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    [
+        (
+            "released_at",
+            {
+                "100": "Deluxe Edition · Qobuz 100",
+                "200": "Deluxe Edition · 2020 · Qobuz 200",
+            },
+        ),
+        (
+            "tracks_count",
+            {
+                "100": "Deluxe Edition · Qobuz 100",
+                "200": "Deluxe Edition · 10 tracks · Qobuz 200",
+            },
+        ),
+        (
+            "maximum_bit_depth",
+            {
+                "100": "Deluxe Edition · Qobuz 100",
+                "200": "Deluxe Edition · 16-bit/44.1kHz · Qobuz 200",
+            },
+        ),
+        (
+            "maximum_sampling_rate",
+            {
+                "100": "Deluxe Edition · Qobuz 100",
+                "200": "Deluxe Edition · 16-bit/44.1kHz · Qobuz 200",
+            },
+        ),
+    ],
+)
+def test_huge_fallback_numbers_are_omitted_without_crashing(field, expected):
+    malformed = _album("100", "Album (Deluxe Edition)", 2020)
+    malformed[field] = 10**10000
+
+    assert build_edition_badges(
+        [malformed, _album("200", "Album (Deluxe Edition)", 2020)]
+    ) == expected
+
+
+class _UnstableReleaseId:
+    def __str__(self):
+        raise AssertionError("an arbitrary release ID object must not be rendered")
+
+
+@pytest.mark.parametrize(
+    "album_id",
+    [
+        1.0,
+        float("nan"),
+        float("inf"),
+        [],
+        {},
+        _UnstableReleaseId(),
+        10**10000,
+        "9" * 10000,
+    ],
+    ids=[
+        "float",
+        "nan",
+        "infinity",
+        "list",
+        "dict",
+        "arbitrary-object",
+        "huge-integer",
+        "huge-string",
+    ],
+)
+def test_non_qobuz_release_id_scalars_are_ignored_without_rendering(album_id):
+    assert (
+        build_edition_badges(
+            [
+                _album(album_id, "Album", 2020),
+                _album("200", "Album (Deluxe Edition)", 2020),
+            ]
+        )
+        == {}
+    )
+
+
+def test_integer_and_trimmed_string_qobuz_ids_are_normalized_deterministically():
+    assert build_edition_badges(
+        [
+            _album(100, "Album", 2020),
+            _album(" 00200 ", "Album (Deluxe Edition)", 2020),
+        ]
+    ) == {
+        "00200": "Deluxe Edition · Qobuz 00200",
+        "100": "Standard Edition · Qobuz 100",
+    }
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "Album (Part II)",
+        "Album (Original Motion Picture Soundtrack)",
+        "Album (The Soundtrack)",
+    ],
+)
+def test_genuine_parenthetical_title_variants_do_not_join_the_standard_family(variant):
+    assert edition_family_key(_album("200", variant, 2020))[1] != "album"
+    assert build_edition_badges(
+        [_album("100", "Album", 2020), _album("200", variant, 2020)]
+    ) == {}
+
+
+def test_only_the_recognized_trailing_edition_decoration_is_removed():
+    assert edition_family_key(
+        _album("100", "Album (Part II) (Deluxe Edition)", 2020)
+    ) == ("artist", "albumpartii", "2020")
+    assert edition_family_key(
+        _album("200", "Album (Part II)", 2020)
+    ) == ("artist", "albumpartii", "2020")
+    assert edition_family_key(
+        _album("300", "X-Y - Deluxe Edition", 2020)
+    ) == ("artist", "xy", "2020")
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ("The Anniversary", "Standard Edition"),
+        ("The Anniversary (Part II)", "Standard Edition"),
+        ("The Anniversary (Deluxe Edition)", "Deluxe Edition"),
+        ("The Anniversary - 2011 Remaster", "2011 Remaster"),
+        ("The Anniversary-2011 Remaster", "2011 Remaster"),
+        ("The Anniversary: Deluxe Edition", "Deluxe Edition"),
+        ("Album (Collector’s Edition)", "Collector’s Edition"),
+    ],
+)
+def test_edition_labels_come_from_the_trailing_edition_decoration(title, expected):
+    assert edition_label({"title": title}) == expected

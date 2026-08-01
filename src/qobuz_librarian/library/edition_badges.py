@@ -14,11 +14,23 @@ _EDITION_MARKER = re.compile(
     r"(?ix)\b("
     r"(?:\d{4}\s+)?remaster(?:ed)?|"
     r"deluxe(?:\s+edition)?|expanded(?:\s+edition)?|"
-    r"special(?:\s+edition)?|collector(?:'s)?(?:\s+edition)?|"
+    r"special(?:\s+edition)?|collector(?:['’]s)?(?:\s+edition)?|"
     r"(?:\d{1,3}(?:st|nd|rd|th)\s+)?anniversary(?:\s+edition)?"
     r")\b"
 )
 _ORIGINAL_DATE = re.compile(r"(\d{4})(?:-(\d{2})-(\d{2}))?\Z")
+_TRAILING_WRAPPED_DECORATION = re.compile(
+    r"\s*(?:\((?P<parenthesized>[^()]*)\)|\[(?P<bracketed>[^\[\]]*)\])\s*\Z"
+)
+_TRAILING_DELIMITED_DECORATION = re.compile(
+    r"\s*[-–—:]\s*(?P<suffix>[^-:–—]*)\s*\Z"
+)
+_RELEASE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
+_MAX_RELEASE_ID_INTEGER = 10**128 - 1
+_MAX_RAW_RELEASE_ID_LENGTH = 256
+_MAX_TRACK_COUNT = 100_000
+_MAX_BIT_DEPTH = 1024
+_MAX_SAMPLE_RATE = 10_000_000
 
 
 def _original_release_year(album):
@@ -52,7 +64,7 @@ def edition_family_key(album):
         return None
 
     artist = normalize(artist_name)
-    title = normalize(strip_album_decorations(title_value))
+    title = normalize(_edition_base_title(title_value))
     original_year = _original_release_year(album)
     return (artist, title, original_year) if artist and title and original_year else None
 
@@ -62,15 +74,47 @@ def edition_label(album):
     title = album.get("title") if isinstance(album, dict) else ""
     if not isinstance(title, str):
         return "Standard Edition"
-    match = _EDITION_MARKER.search(title)
+    decoration = _edition_decoration(title)
+    match = decoration[1] if decoration else None
     return " ".join(match.group(1).split()) if match else "Standard Edition"
+
+
+def _edition_decoration(title):
+    wrapped = _TRAILING_WRAPPED_DECORATION.search(title)
+    if wrapped:
+        contents = wrapped.group("parenthesized") or wrapped.group("bracketed") or ""
+        marker = _EDITION_MARKER.search(contents)
+        if marker:
+            return wrapped.start(), marker
+
+    delimited = _TRAILING_DELIMITED_DECORATION.search(title)
+    if delimited:
+        marker = _EDITION_MARKER.search(delimited.group("suffix"))
+        if marker:
+            return delimited.start(), marker
+    return None
+
+
+def _edition_base_title(title):
+    base = title
+    while decoration := _edition_decoration(base):
+        candidate = base[: decoration[0]].rstrip()
+        if not candidate:
+            break
+        base = candidate
+
+    # Preserve the shared helper's established result when it agrees with the
+    # marker-scoped parse. Its broad parenthetical fallback is never allowed to
+    # remove additional genuine title text such as ``(Part II)``.
+    stripped = strip_album_decorations(title)
+    return stripped if stripped == base else base
 
 
 def _publication_year(album):
     released_at = album.get("released_at")
-    if isinstance(released_at, bool) or not isinstance(released_at, (int, float)):
+    if type(released_at) not in (int, float):
         return None
-    if not math.isfinite(released_at):
+    if type(released_at) is float and not math.isfinite(released_at):
         return None
     try:
         return str(datetime.fromtimestamp(released_at, tz=timezone.utc).year)
@@ -80,7 +124,7 @@ def _publication_year(album):
 
 def _track_count(album):
     count = album.get("tracks_count")
-    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+    if type(count) is not int or not 0 < count <= _MAX_TRACK_COUNT:
         return None
     return f"{count} tracks"
 
@@ -88,10 +132,13 @@ def _track_count(album):
 def _quality(album):
     bit_depth = album.get("maximum_bit_depth")
     sample_rate = album.get("maximum_sampling_rate")
-    values = (bit_depth, sample_rate)
-    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
+    if type(bit_depth) is not int or not 0 < bit_depth <= _MAX_BIT_DEPTH:
         return None
-    if any(not math.isfinite(value) or value <= 0 for value in values):
+    if type(sample_rate) not in (int, float):
+        return None
+    if type(sample_rate) is float and not math.isfinite(sample_rate):
+        return None
+    if not 0 < sample_rate <= _MAX_SAMPLE_RATE:
         return None
 
     # Imported lazily so catalog.py can consume this module without a cycle.
@@ -105,6 +152,20 @@ def _canonical_album(album, release_id):
     return {**album, "id": release_id}
 
 
+def _badge_release_id(value):
+    if type(value) is int:
+        if not 0 <= value <= _MAX_RELEASE_ID_INTEGER:
+            return None
+    elif type(value) is str:
+        if len(value) > _MAX_RAW_RELEASE_ID_LENGTH:
+            return None
+    else:
+        return None
+
+    release_id = normalise_release_id(value)
+    return release_id if release_id and _RELEASE_ID.fullmatch(release_id) else None
+
+
 def _distinct_catalogue_rows(albums):
     rows = {}
     comparable = {}
@@ -112,7 +173,7 @@ def _distinct_catalogue_rows(albums):
     for album in albums:
         if not isinstance(album, dict):
             continue
-        release_id = normalise_release_id(album.get("id"))
+        release_id = _badge_release_id(album.get("id"))
         if release_id is None:
             continue
         candidate = _canonical_album(album, release_id)
