@@ -79,9 +79,54 @@ def test_finalize_release_identity_rejects_wrong_destination_identity(
             expected_destination=final_dir,
             authority=authority,
         )
-
     assert (final_dir / MANIFEST_NAME).read_bytes() == before
 
+
+def test_non_audio_carry_publishes_identity_before_generic_companions(
+        tmp_path, monkeypatch):
+    from qobuz_librarian.modes import process as proc
+
+    replacement = tmp_path / "music" / "Artist" / "Album"
+    replacement.mkdir(parents=True)
+    backup = SimpleNamespace(path=tmp_path / "backups" / "Album")
+    identity_receipt = {"receipt": "after-identity"}
+    final_receipt = {"receipt": "after-companions"}
+    calls = []
+
+    def carry_identity(actual_backup, path, identity):
+        calls.append(("identity", actual_backup, path, identity))
+        return identity_receipt
+
+    def carry_companions(actual_backup, path, *, expected_replacement_receipt):
+        calls.append((
+            "companions",
+            actual_backup,
+            path,
+            expected_replacement_receipt,
+        ))
+        return final_receipt
+
+    monkeypatch.setattr(
+        proc, "carry_backup_release_identity", carry_identity, raising=False)
+    monkeypatch.setattr(proc, "carry_backup_companions", carry_companions)
+
+    carried = proc._carry_non_audio_from_backup(
+        {"id": "100"},
+        replacement,
+        backup,
+        replacement_dir=replacement,
+    )
+
+    assert carried == (replacement, final_receipt)
+    assert calls == [
+        (
+            "identity",
+            backup,
+            replacement,
+            ReleaseIdentity("qobuz", "100"),
+        ),
+        ("companions", backup, replacement, identity_receipt),
+    ]
 
 def test_finalize_release_identity_requires_the_exact_planned_destination(
     tmp_path, authority,

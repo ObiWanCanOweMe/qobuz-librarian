@@ -39,6 +39,7 @@ from qobuz_librarian.library.backup import (
     backup_album_dir,
     capture_album_source_receipt,
     carry_backup_companions,
+    carry_backup_release_identity,
     dispose_backup,
     pin_unverified_upgrade_backup,
     restore_gap_fill_backup,
@@ -688,7 +689,14 @@ def _carry_non_audio_from_backup(album, album_dir, backup_path,
         dest = album_dir
     if not dest or not dest.exists():
         return None
-    receipt = capture_album_source_receipt(dest)
+    expected_identity = identity_from_album(album)
+    if expected_identity is None:
+        return None
+    receipt = carry_backup_release_identity(
+        backup_path,
+        dest,
+        expected_identity,
+    )
     if receipt is None:
         return None
     updated = carry_backup_companions(
