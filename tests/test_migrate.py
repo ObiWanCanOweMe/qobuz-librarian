@@ -402,6 +402,25 @@ def test_execute_refuses_plan_with_release_identity_channel_removed(tmp_path):
     assert (source_album / "track0.flac").exists()
 
 
+def test_raw_executor_name_cannot_bypass_reviewed_plan_authority(tmp_path):
+    plan, source_album = _release_identity_plan(tmp_path)
+    source = source_album / "track0.flac"
+    destination = plan.dest_root / plan.placed[0].dest_rel
+    plan.release_identities = []
+
+    raw_executor = getattr(m, "_execute_plan", None)
+    bypass_result = (
+        raw_executor(plan, in_place=True)
+        if callable(raw_executor)
+        else None
+    )
+
+    assert not callable(raw_executor)
+    assert bypass_result is None
+    assert source.exists()
+    assert not destination.exists()
+
+
 def test_plan_authority_cannot_be_forged_from_plan_data(tmp_path):
     plan, source_album = _release_identity_plan(tmp_path)
     destination = plan.dest_root / plan.placed[0].dest_rel

@@ -5399,51 +5399,6 @@ def _settle_identity_audio(
             opened.close()
 
 
-def execute_plan(plan: MigrationPlan, *, in_place: bool = False,
-                 cancel_check: Optional[Callable[[], bool]] = None,
-                 progress: Optional[Callable] = None,
-                 resume_entries=None) -> ExecResult:
-    from qobuz_librarian.file_exclusion import inode_write_exclusion_scope
-
-    result = None
-    try:
-        with inode_write_exclusion_scope() as available:
-            if not available:
-                result = _record_plan_refusal(
-                    ExecResult(),
-                    plan,
-                    resume_entries,
-                    "migration could not initialise writer protection",
-                )
-            else:
-                result = _execute_plan(
-                    plan,
-                    in_place=in_place,
-                    cancel_check=cancel_check,
-                    progress=progress,
-                    resume_entries=resume_entries,
-                )
-    except BaseException as exc:
-        existing_abort = _migration_abort_in_chain(exc)
-        if existing_abort is not None:
-            if existing_abort is exc:
-                raise
-            existing_abort.note_cleanup_failure(
-                "writer-protection teardown", exc)
-            raise existing_abort from existing_abort.cause
-        if result is None:
-            result = ExecResult()
-        result.cancelled = True
-        if isinstance(exc, KeyboardInterrupt):
-            _record_cleanup_failure(
-                result, "writer-protection teardown", exc)
-            return result
-        abort = MigrationExecutionAbort(result, exc)
-        abort.note_cleanup_failure("writer-protection teardown", exc)
-        raise abort from exc
-    return result
-
-
 def _execute_plan(plan: MigrationPlan, *, in_place: bool = False,
                   cancel_check: Optional[Callable[[], bool]] = None,
                   progress: Optional[Callable] = None,
@@ -6592,7 +6547,59 @@ def _make_plan_authority_wrappers():
         authorized_verify.__module__ = function.__module__
         return authorized_verify
 
-    def decorate_execute(function):
+    def decorate_execute(raw_executor):
+        def execute_claimed_plan(
+            plan,
+            *,
+            in_place=False,
+            cancel_check=None,
+            progress=None,
+            resume_entries=None,
+        ):
+            from qobuz_librarian.file_exclusion import (
+                inode_write_exclusion_scope,
+            )
+
+            result = None
+            try:
+                with inode_write_exclusion_scope() as available:
+                    if not available:
+                        result = _record_plan_refusal(
+                            ExecResult(),
+                            plan,
+                            resume_entries,
+                            "migration could not initialise writer "
+                            "protection",
+                        )
+                    else:
+                        result = raw_executor(
+                            plan,
+                            in_place=in_place,
+                            cancel_check=cancel_check,
+                            progress=progress,
+                            resume_entries=resume_entries,
+                        )
+            except BaseException as exc:
+                existing_abort = _migration_abort_in_chain(exc)
+                if existing_abort is not None:
+                    if existing_abort is exc:
+                        raise
+                    existing_abort.note_cleanup_failure(
+                        "writer-protection teardown", exc)
+                    raise existing_abort from existing_abort.cause
+                if result is None:
+                    result = ExecResult()
+                result.cancelled = True
+                if isinstance(exc, KeyboardInterrupt):
+                    _record_cleanup_failure(
+                        result, "writer-protection teardown", exc)
+                    return result
+                abort = MigrationExecutionAbort(result, exc)
+                abort.note_cleanup_failure(
+                    "writer-protection teardown", exc)
+                raise abort from exc
+            return result
+
         def authorized_execute(
             plan,
             *,
@@ -6663,7 +6670,7 @@ def _make_plan_authority_wrappers():
                 for entry in supplied_resumes
             ]
             try:
-                return function(
+                return execute_claimed_plan(
                     snapshot,
                     in_place=in_place,
                     cancel_check=cancel_check,
@@ -6683,10 +6690,10 @@ def _make_plan_authority_wrappers():
                 with authority_lock:
                     active_plan_ids.discard(key)
 
-        authorized_execute.__name__ = function.__name__
-        authorized_execute.__qualname__ = function.__qualname__
-        authorized_execute.__doc__ = function.__doc__
-        authorized_execute.__module__ = function.__module__
+        authorized_execute.__name__ = "execute_plan"
+        authorized_execute.__qualname__ = "execute_plan"
+        authorized_execute.__doc__ = raw_executor.__doc__
+        authorized_execute.__module__ = raw_executor.__module__
         return authorized_execute
 
     return decorate_build, decorate_write, decorate_verify, decorate_execute
@@ -6701,11 +6708,12 @@ def _make_plan_authority_wrappers():
 build_plan = _decorate_authorized_build(build_plan)
 write_manifest = _decorate_authorized_write(write_manifest)
 verify_audit_artifact = _decorate_authorized_verify(verify_audit_artifact)
-execute_plan = _decorate_authorized_execute(execute_plan)
+execute_plan = _decorate_authorized_execute(_execute_plan)
 del (
     _decorate_authorized_build,
     _decorate_authorized_write,
     _decorate_authorized_verify,
     _decorate_authorized_execute,
+    _execute_plan,
     _make_plan_authority_wrappers,
 )
