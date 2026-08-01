@@ -23,14 +23,24 @@ _TRAILING_WRAPPED_DECORATION = re.compile(
     r"\s*(?:\((?P<parenthesized>[^()]*)\)|\[(?P<bracketed>[^\[\]]*)\])\s*\Z"
 )
 _TRAILING_DELIMITED_DECORATION = re.compile(
-    r"\s*[-–—:]\s*(?P<suffix>[^-:–—]*)\s*\Z"
+    r"\s*[-‑–—:]\s*(?P<suffix>[^-‑:–—]*)\s*\Z"
 )
 _RELEASE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _MAX_RELEASE_ID_INTEGER = 10**128 - 1
 _MAX_RAW_RELEASE_ID_LENGTH = 256
-_MAX_TRACK_COUNT = 100_000
-_MAX_BIT_DEPTH = 1024
-_MAX_SAMPLE_RATE = 10_000_000
+
+# Display bounds are deliberately generous around real catalogue data: 1800
+# retains historical recordings, two future years permit announced releases,
+# 10,000 tracks leaves ample room for box sets, and 16-32 bit / 16-768 kHz
+# covers lossless through modern DXD-class hi-res. Qobuz sample rates occur in
+# both kHz and Hz-shaped responses, so both representations use the same range.
+_MIN_PUBLICATION_YEAR = 1800
+_PUBLICATION_YEAR_FUTURE_ALLOWANCE = 2
+_MAX_TRACK_COUNT = 10_000
+_MIN_BIT_DEPTH = 16
+_MAX_BIT_DEPTH = 32
+_MIN_SAMPLE_RATE_KHZ = 16
+_MAX_SAMPLE_RATE_KHZ = 768
 
 
 def _original_release_year(album):
@@ -83,13 +93,13 @@ def _edition_decoration(title):
     wrapped = _TRAILING_WRAPPED_DECORATION.search(title)
     if wrapped:
         contents = wrapped.group("parenthesized") or wrapped.group("bracketed") or ""
-        marker = _EDITION_MARKER.search(contents)
+        marker = _EDITION_MARKER.fullmatch(contents.strip())
         if marker:
             return wrapped.start(), marker
 
     delimited = _TRAILING_DELIMITED_DECORATION.search(title)
     if delimited:
-        marker = _EDITION_MARKER.search(delimited.group("suffix"))
+        marker = _EDITION_MARKER.fullmatch(delimited.group("suffix").strip())
         if marker:
             return delimited.start(), marker
     return None
@@ -117,9 +127,11 @@ def _publication_year(album):
     if type(released_at) is float and not math.isfinite(released_at):
         return None
     try:
-        return str(datetime.fromtimestamp(released_at, tz=timezone.utc).year)
+        year = datetime.fromtimestamp(released_at, tz=timezone.utc).year
     except (ValueError, OSError, OverflowError):
         return None
+    maximum_year = datetime.now(timezone.utc).year + _PUBLICATION_YEAR_FUTURE_ALLOWANCE
+    return str(year) if _MIN_PUBLICATION_YEAR <= year <= maximum_year else None
 
 
 def _track_count(album):
@@ -132,13 +144,24 @@ def _track_count(album):
 def _quality(album):
     bit_depth = album.get("maximum_bit_depth")
     sample_rate = album.get("maximum_sampling_rate")
-    if type(bit_depth) is not int or not 0 < bit_depth <= _MAX_BIT_DEPTH:
+    if (
+        type(bit_depth) is not int
+        or not _MIN_BIT_DEPTH <= bit_depth <= _MAX_BIT_DEPTH
+    ):
         return None
     if type(sample_rate) not in (int, float):
         return None
     if type(sample_rate) is float and not math.isfinite(sample_rate):
         return None
-    if not 0 < sample_rate <= _MAX_SAMPLE_RATE:
+    if sample_rate >= 1000:
+        valid_sample_rate = (
+            _MIN_SAMPLE_RATE_KHZ * 1000
+            <= sample_rate
+            <= _MAX_SAMPLE_RATE_KHZ * 1000
+        )
+    else:
+        valid_sample_rate = _MIN_SAMPLE_RATE_KHZ <= sample_rate <= _MAX_SAMPLE_RATE_KHZ
+    if not valid_sample_rate:
         return None
 
     # Imported lazily so catalog.py can consume this module without a cycle.

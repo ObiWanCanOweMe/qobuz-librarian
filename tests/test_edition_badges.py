@@ -398,3 +398,145 @@ def test_only_the_recognized_trailing_edition_decoration_is_removed():
 )
 def test_edition_labels_come_from_the_trailing_edition_decoration(title, expected):
     assert edition_label({"title": title}) == expected
+
+
+@pytest.mark.parametrize(
+    ("title", "normalized_title"),
+    [
+        ("Album (The Anniversary Soundtrack)", "albumtheanniversarysoundtrack"),
+        ("Album (Deluxe Part II)", "albumdeluxepartii"),
+        ("Album: The Special Relationship", "albumthespecialrelationship"),
+    ],
+)
+def test_partial_marker_phrases_remain_genuine_title_components(
+    title, normalized_title
+):
+    assert edition_label({"title": title}) == "Standard Edition"
+    assert edition_family_key(_album("100", title, 2020)) == (
+        "artist",
+        normalized_title,
+        "2020",
+    )
+    assert build_edition_badges(
+        [_album("100", "Album", 2020), _album("200", title, 2020)]
+    ) == {}
+
+
+def test_exact_edition_suffix_after_genuine_component_is_the_only_part_removed():
+    title = "Album (The Anniversary Soundtrack) (Deluxe Edition)"
+
+    assert edition_label({"title": title}) == "Deluxe Edition"
+    assert edition_family_key(_album("100", title, 2020)) == (
+        "artist",
+        "albumtheanniversarysoundtrack",
+        "2020",
+    )
+
+
+def test_repeated_exact_edition_suffixes_are_removed_and_last_label_is_visible():
+    title = "Album (Deluxe Edition) (2011 Remaster)"
+
+    assert edition_label({"title": title}) == "2011 Remaster"
+    assert edition_family_key(_album("100", title, 2020)) == (
+        "artist",
+        "album",
+        "2020",
+    )
+
+
+def test_publication_year_bounds_include_history_and_small_future_allowance():
+    current_year = datetime.now(timezone.utc).year
+
+    historical = _album(
+        "100", "Album (Deluxe Edition)", 2020, published=1800
+    )
+    too_old = _album(
+        "200", "Album (Deluxe Edition)", 2020, published=1799
+    )
+    assert build_edition_badges([historical, too_old]) == {
+        "100": "Deluxe Edition · 1800 · Qobuz 100",
+        "200": "Deluxe Edition · Qobuz 200",
+    }
+
+    announced = _album(
+        "300", "Other (Deluxe Edition)", 2020, published=current_year + 2
+    )
+    too_future = _album(
+        "400", "Other (Deluxe Edition)", 2020, published=current_year + 3
+    )
+    assert build_edition_badges([announced, too_future]) == {
+        "300": f"Deluxe Edition · {current_year + 2} · Qobuz 300",
+        "400": "Deluxe Edition · Qobuz 400",
+    }
+
+    year_9999 = _album("500", "Third (Deluxe Edition)", 2020)
+    year_9999["released_at"] = _released(9999)
+    assert build_edition_badges(
+        [year_9999, _album("600", "Third (Deluxe Edition)", 2020, published=2020)]
+    ) == {
+        "500": "Deluxe Edition · Qobuz 500",
+        "600": "Deluxe Edition · 2020 · Qobuz 600",
+    }
+
+
+@pytest.mark.parametrize("invalid_count", [10_001, 100_000])
+def test_track_count_bounds_preserve_large_box_sets_and_omit_implausible_values(
+    invalid_count,
+):
+    assert build_edition_badges(
+        [
+            _album("100", "Album (Deluxe Edition)", 2020, tracks=10_000),
+            _album("200", "Album (Deluxe Edition)", 2020, tracks=invalid_count),
+        ]
+    ) == {
+        "100": "Deluxe Edition · 10000 tracks · Qobuz 100",
+        "200": "Deluxe Edition · Qobuz 200",
+    }
+
+
+@pytest.mark.parametrize(
+    ("valid_bits", "valid_rate", "invalid_bits", "invalid_rate", "valid_label"),
+    [
+        (16, 16, 15, 16, "16-bit/16kHz"),
+        (32, 768, 33, 768, "32-bit/768kHz"),
+        (32, 768_000, 32, 769_000, "32-bit/768kHz"),
+        (24, 96, 1024, 96, "24-bit/96kHz"),
+        (24, 96, 24, 10_000, "24-bit/96kHz"),
+    ],
+)
+def test_quality_bounds_preserve_supported_hires_and_omit_implausible_metadata(
+    valid_bits, valid_rate, invalid_bits, invalid_rate, valid_label
+):
+    assert build_edition_badges(
+        [
+            _album(
+                "100",
+                "Album (Deluxe Edition)",
+                2020,
+                bits=valid_bits,
+                sample_rate=valid_rate,
+            ),
+            _album(
+                "200",
+                "Album (Deluxe Edition)",
+                2020,
+                bits=invalid_bits,
+                sample_rate=invalid_rate,
+            ),
+        ]
+    ) == {
+        "100": f"Deluxe Edition · {valid_label} · Qobuz 100",
+        "200": "Deluxe Edition · Qobuz 200",
+    }
+
+
+def test_nonbreaking_hyphen_delimits_editions_without_splitting_the_base_title():
+    title = "X‑Y ‑ Deluxe Edition"
+
+    assert edition_label({"title": "Album‑2011 Remaster"}) == "2011 Remaster"
+    assert edition_label({"title": "X‑Y"}) == "Standard Edition"
+    assert edition_family_key(_album("100", title, 2020)) == (
+        "artist",
+        "xy",
+        "2020",
+    )
