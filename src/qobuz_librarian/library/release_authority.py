@@ -10,7 +10,7 @@ import stat
 import sys
 import threading
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from qobuz_librarian.file_exclusion import (
@@ -54,6 +54,10 @@ class _DirectoryBinding:
     parent_descriptor: int | None
     name: str | None
     version: FileVersion
+    owned_descriptor: int | None = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.owned_descriptor = self.descriptor
 
 
 @dataclass(slots=True)
@@ -62,6 +66,12 @@ class _FileBinding:
     parents: tuple[_DirectoryBinding, ...]
     parent_descriptor: int
     name: str
+    owned_descriptor: int | None = field(init=False, repr=False)
+    owned_exclusion: InodeWriteExclusion | None = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.owned_descriptor = self.held.descriptor
+        self.owned_exclusion = self.held.exclusion
 
 
 def file_version(value: os.stat_result) -> FileVersion:
@@ -150,16 +160,25 @@ def _close_with_retry(close) -> BaseException | None:
     return error
 
 
-def _close_descriptor(descriptor: int) -> BaseException | None:
-    try:
-        original = os.fstat(descriptor)
-    except OSError as exc:
-        if exc.errno == errno.EBADF:
-            return None
-        original = None
-
+def _close_descriptor(
+    descriptor: int,
+    expected_identity: tuple[int, int] | None = None,
+) -> BaseException | None:
     error = None
     for _attempt in range(_CLOSE_ATTEMPTS):
+        try:
+            current = os.fstat(descriptor)
+        except BaseException as exc:
+            if isinstance(exc, OSError) and exc.errno == errno.EBADF:
+                return None
+            error = exc
+            continue
+
+        if expected_identity is None:
+            expected_identity = _identity(current)
+        elif _identity(current) != expected_identity:
+            return None
+
         try:
             os.close(descriptor)
             return None
@@ -168,14 +187,30 @@ def _close_descriptor(descriptor: int) -> BaseException | None:
 
         try:
             current = os.fstat(descriptor)
-        except OSError as exc:
-            if exc.errno == errno.EBADF:
+        except BaseException as exc:
+            if isinstance(exc, OSError) and exc.errno == errno.EBADF:
                 return None
-            return error
+            error = exc
+            continue
 
-        if original is None or _identity(current) != _identity(original):
+        if _identity(current) != expected_identity:
             return None
 
+    return error
+
+
+def _close_directory_binding(
+    binding: _DirectoryBinding,
+) -> BaseException | None:
+    descriptor = binding.owned_descriptor
+    if descriptor is None:
+        return None
+    error = _close_descriptor(
+        descriptor,
+        (binding.version.device, binding.version.inode),
+    )
+    if error is None:
+        binding.owned_descriptor = None
     return error
 
 
@@ -188,7 +223,7 @@ def _close_partial_file_resources(exclusion, descriptor, parents):
         if error is None and caught is not None:
             error = caught
     for binding in reversed(parents):
-        caught = _close_descriptor(binding.descriptor)
+        caught = _close_directory_binding(binding)
         if error is None and caught is not None:
             error = caught
     return error
@@ -630,21 +665,38 @@ class AlbumAuthority:
         error = None
         retained_files = []
         for binding in reversed(self._files):
-            binding_error = _close_with_retry(binding.held.exclusion.close)
-            if error is None and binding_error is not None:
-                error = binding_error
-            caught = _close_descriptor(binding.held.descriptor)
-            if binding_error is None and caught is not None:
-                binding_error = caught
-            if error is None and caught is not None:
-                error = caught
+            exclusion = binding.owned_exclusion
+            if exclusion is not None:
+                caught = _close_with_retry(exclusion.close)
+                if caught is None:
+                    binding.owned_exclusion = None
+                elif error is None:
+                    error = caught
+
+            descriptor = binding.owned_descriptor
+            if descriptor is not None:
+                caught = _close_descriptor(
+                    descriptor,
+                    (binding.held.version.device, binding.held.version.inode),
+                )
+                if caught is None:
+                    binding.owned_descriptor = None
+                elif error is None:
+                    error = caught
+
             for parent in reversed(binding.parents):
-                caught = _close_descriptor(parent.descriptor)
-                if binding_error is None and caught is not None:
-                    binding_error = caught
+                caught = _close_directory_binding(parent)
                 if error is None and caught is not None:
                     error = caught
-            if binding_error is not None:
+
+            if (
+                binding.owned_exclusion is not None
+                or binding.owned_descriptor is not None
+                or any(
+                    parent.owned_descriptor is not None
+                    for parent in binding.parents
+                )
+            ):
                 retained_files.append(binding)
         self._files = list(reversed(retained_files))
         self._files_by_relative = {
@@ -652,7 +704,7 @@ class AlbumAuthority:
         }
         retained_directories = []
         for binding in reversed(self._directories):
-            caught = _close_descriptor(binding.descriptor)
+            caught = _close_directory_binding(binding)
             if error is None and caught is not None:
                 error = caught
             if caught is not None:

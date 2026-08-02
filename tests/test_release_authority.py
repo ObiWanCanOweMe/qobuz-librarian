@@ -251,10 +251,27 @@ def test_album_authority_bounds_cleanup_retry_and_retains_failed_ownership(
     assert close_calls == 2
     assert [binding.held for binding in authority._files] == [held]
     assert _nonblocking_writer_errno(track) == errno.EAGAIN
+    _assert_descriptor_closed(held.descriptor)
 
-    monkeypatch.setattr(held.exclusion, "close", real_close)
-    assert authority._close_resources() is None
-    assert authority._files == []
+    outsider = tmp_path / "outsider"
+    outsider.write_bytes(b"outsider")
+    outsider_descriptor = os.open(outsider, os.O_RDONLY)
+    if outsider_descriptor != held.descriptor:
+        os.dup2(outsider_descriptor, held.descriptor)
+        os.close(outsider_descriptor)
+        outsider_descriptor = held.descriptor
+    try:
+        monkeypatch.setattr(held.exclusion, "close", real_close)
+        assert authority._close_resources() is None
+        assert authority._files == []
+        assert os.pread(outsider_descriptor, 8, 0) == b"outsider"
+    finally:
+        try:
+            os.close(outsider_descriptor)
+        except OSError as exc:
+            if exc.errno != errno.EBADF:
+                raise
+
     writer = os.open(track, os.O_WRONLY | os.O_NONBLOCK)
     os.close(writer)
 
@@ -298,6 +315,76 @@ def test_album_authority_retries_interrupted_descriptor_cleanup(
 
     assert close_calls == 2
     _assert_descriptor_closed(target)
+
+
+@pytest.mark.parametrize("probe_position", ["initial", "post-close"])
+def test_album_authority_contains_interrupted_descriptor_cleanup_probe(
+    tmp_path, live_run_lock, monkeypatch, probe_position
+):
+    from qobuz_librarian.library import release_authority
+
+    lease, _lock_file = live_run_lock
+    album = _album(tmp_path)
+    track = album / "01.flac"
+    track.write_bytes(b"one")
+    real_fstat = release_authority.os.fstat
+    real_close = release_authority.os.close
+    target = -1
+    cleanup_started = False
+    interrupt_post_close_probe = False
+    probe_interruptions = 0
+    close_calls = 0
+
+    def interrupt_probe_once(descriptor):
+        nonlocal probe_interruptions
+        if (
+            descriptor == target
+            and cleanup_started
+            and probe_interruptions == 0
+            and (
+                probe_position == "initial"
+                or interrupt_post_close_probe
+            )
+        ):
+            probe_interruptions += 1
+            raise KeyboardInterrupt
+        return real_fstat(descriptor)
+
+    def interrupt_close_once(descriptor):
+        nonlocal close_calls, interrupt_post_close_probe
+        if descriptor == target:
+            close_calls += 1
+            if probe_position == "post-close" and close_calls == 1:
+                interrupt_post_close_probe = True
+                raise KeyboardInterrupt
+        real_close(descriptor)
+
+    with pytest.raises(RuntimeError, match="original body failure"):
+        with open_album_authority(album, lease) as authority:
+            held = authority.open_file(Path("01.flac"))
+            target = held.descriptor
+            root_descriptor = authority._directories[0].descriptor
+            real_validate = authority._validate_namespace_locked
+
+            def validate_then_start_cleanup(*args, **kwargs):
+                nonlocal cleanup_started
+                real_validate(*args, **kwargs)
+                cleanup_started = True
+
+            monkeypatch.setattr(
+                authority,
+                "_validate_namespace_locked",
+                validate_then_start_cleanup,
+            )
+            monkeypatch.setattr(release_authority.os, "fstat", interrupt_probe_once)
+            monkeypatch.setattr(release_authority.os, "close", interrupt_close_once)
+            raise RuntimeError("original body failure")
+
+    assert probe_interruptions == 1
+    assert close_calls == (1 if probe_position == "initial" else 2)
+    assert authority._closed is True
+    _assert_descriptor_closed(held.descriptor)
+    _assert_descriptor_closed(root_descriptor)
 
 
 def test_album_authority_opens_files_in_required_bytewise_order_and_cleans_reverse(
