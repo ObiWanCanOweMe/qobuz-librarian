@@ -143,6 +143,8 @@ def _refresh_plan_after_upgrade_backup(
     item,
     args,
     plan: DurableNewAlbumPlan,
+    *,
+    authority: RunLockLease | None = None,
 ) -> DurableNewAlbumPlan:
     """Carry the placement across this runner's committed source retirement."""
     if plan.placement is None:
@@ -180,6 +182,8 @@ def _refresh_plan_after_upgrade_backup(
         raise DurableAlbumUnavailable(
             "the release placement is not bound to the committed backup"
         )
+    if authority is not None:
+        _require_authority(authority)
     try:
         placement = resolve_album_placement(
             plan.placement.friendly_path,
@@ -189,6 +193,8 @@ def _refresh_plan_after_upgrade_backup(
         raise DurableAlbumUnavailable(
             "the release placement could not be rebound after backup"
         ) from exc
+    if authority is not None:
+        _require_authority(authority)
     current_receipt = placement.destination_receipt
     expected_missing = (Path(plan.placement_destination).name,)
     if (
@@ -842,7 +848,12 @@ def execute_durable_new_album(
                 operation_id=operation_id,
                 item_id=item_id,
             )
-        plan = _refresh_plan_after_upgrade_backup(item, args, plan)
+        plan = _refresh_plan_after_upgrade_backup(
+            item,
+            args,
+            plan,
+            authority=authority,
+        )
 
     _require_authority(authority)
     item["snapshot_before"] = snapshot_staging()

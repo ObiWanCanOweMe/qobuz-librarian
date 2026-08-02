@@ -118,7 +118,7 @@ def test_durable_import_refuses_a_changed_planned_path_before_mutation(
 
 
 def test_durable_upgrade_rebinds_placement_after_owned_source_retirement(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, authority):
     item = _single_track_item("Upgrade Album")
     music = tmp_path / "music"
     friendly = music / "Artist" / "Upgrade Album"
@@ -151,6 +151,7 @@ def test_durable_upgrade_rebinds_placement_after_owned_source_retirement(
         item,
         args,
         plan,
+        authority=authority,
     )
 
     assert refreshed.placement is not None
@@ -158,6 +159,57 @@ def test_durable_upgrade_rebinds_placement_after_owned_source_retirement(
     assert refreshed.placement.destination_receipt is not None
     assert refreshed.placement.destination_receipt.exists is False
     durable_runner._require_current_plan(item, args, refreshed)
+
+
+def test_durable_upgrade_rebind_refuses_lost_authority_before_resolution(
+    tmp_path, monkeypatch, authority
+):
+    item = _single_track_item("Upgrade Album")
+    music = tmp_path / "music"
+    friendly = music / "Artist" / "Upgrade Album"
+    friendly.mkdir(parents=True)
+    (friendly / "01.flac").write_bytes(b"reviewed release audio")
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    monkeypatch.setattr(cfg, "DOWNSAMPLE_HIRES_ENABLED", False)
+    args = Namespace(no_import=False, no_downsample=True)
+    identity = ReleaseIdentity("qobuz", "42")
+    publish_release_identity(friendly, identity)
+    placement = resolve_album_placement(friendly, identity)
+    item["album_dir"] = friendly
+    item["auto_upgrade"] = True
+    plan = plan_durable_new_album(
+        item,
+        args,
+        album_path_suffix=placement.suffix,
+        release_identity=placement.identity,
+        placement_destination=placement.destination,
+        placement=placement,
+    )
+    assert plan is not None
+    backup = backup_album_dir(friendly)
+    assert backup is not None and backup.complete is True
+    item["backup_path"] = backup
+    resolved = []
+    monkeypatch.setattr(
+        durable_runner,
+        "resolve_album_placement",
+        lambda *_args: resolved.append(True),
+    )
+    authority.close()
+
+    with pytest.raises(
+        durable_runner.DurableAlbumUnavailable,
+        match="authority",
+    ):
+        durable_runner._refresh_plan_after_upgrade_backup(
+            item,
+            args,
+            plan,
+            authority=authority,
+        )
+
+    assert resolved == []
 
 
 def test_download_quarantine_checkpoint_is_persisted_before_error_propagates(

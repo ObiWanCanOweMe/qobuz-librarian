@@ -1,3 +1,7 @@
+import errno
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +20,46 @@ from qobuz_librarian.library.release_identity import (
     publish_release_identity,
     read_release_identity,
 )
+
+
+def _nonblocking_writer_errno(path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os,sys; "
+                "\ntry: descriptor=os.open(sys.argv[1], os.O_WRONLY|os.O_NONBLOCK)"
+                "\nexcept OSError as error: sys.exit(error.errno)"
+                "\nelse: os.close(descriptor); sys.exit(0)"
+            ),
+            os.fspath(path),
+        ],
+        check=False,
+    )
+    return result.returncode
+
+
+def _nonblocking_manifest_aba_errno(path, canonical):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os,sys; data=bytes.fromhex(sys.argv[2]); "
+                "\ntry: fd=os.open(sys.argv[1], os.O_WRONLY|os.O_NONBLOCK)"
+                "\nexcept OSError as error: sys.exit(error.errno)"
+                "\nelse:"
+                "\n os.ftruncate(fd,0); os.write(fd,b'corrupt'); os.fsync(fd)"
+                "\n os.ftruncate(fd,0); os.write(fd,data); os.fsync(fd)"
+                "\n os.close(fd); sys.exit(0)"
+            ),
+            os.fspath(path),
+            canonical.hex(),
+        ],
+        check=False,
+    )
+    return result.returncode
 
 
 def _patch_download_receipts(monkeypatch, download, added, run_root):
@@ -189,6 +233,118 @@ def test_finalize_release_identity_refuses_lost_authority(tmp_path, authority):
             authority=authority,
         )
     assert read_release_identity(final_dir) is None
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="Linux inode leases are the authoritative write-exclusion backend",
+)
+def test_finalize_release_identity_refuses_existing_audio_writer(
+    tmp_path, monkeypatch, authority
+):
+    from qobuz_librarian.library.release_identity import (
+        capture_directory_path_receipt,
+    )
+    from qobuz_librarian.modes import process as proc
+
+    final_dir = tmp_path / "Artist" / "Album"
+    final_dir.mkdir(parents=True)
+    audio = final_dir / "01.flac"
+    audio.write_bytes(b"completed audio")
+    receipt = capture_directory_path_receipt(final_dir)
+    monkeypatch.setattr(
+        proc, "_final_release_inventory_matches", lambda *_args: True
+    )
+
+    writer = os.open(audio, os.O_RDWR)
+    try:
+        with pytest.raises(OSError, match="protect|authority|writer"):
+            proc.finalize_release_identity(
+                {"id": "200", "tracks": {"items": [{"title": "one"}]}},
+                final_dir,
+                expected_destination=final_dir,
+                expected_path_receipt=receipt,
+                frozen_slots={"qobuz:1": ("artist", "album", 1, 1, "one")},
+                authority=authority,
+            )
+    finally:
+        os.close(writer)
+
+    assert read_release_identity(final_dir) is None
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="Linux inode leases are the authoritative write-exclusion backend",
+)
+def test_finalize_release_identity_preserves_idempotent_change_result(
+    tmp_path, monkeypatch, authority
+):
+    from qobuz_librarian.library.release_identity import (
+        capture_directory_path_receipt,
+    )
+    from qobuz_librarian.modes import process as proc
+
+    final_dir = tmp_path / "Artist" / "Album"
+    final_dir.mkdir(parents=True)
+    (final_dir / "01.flac").write_bytes(b"completed audio")
+    receipt = capture_directory_path_receipt(final_dir)
+    monkeypatch.setattr(
+        proc, "_final_release_inventory_matches", lambda *_args: True
+    )
+    arguments = dict(
+        album={"id": "200", "tracks": {"items": [{"title": "one"}]}},
+        final_dir=final_dir,
+        expected_destination=final_dir,
+        expected_path_receipt=receipt,
+        frozen_slots={"qobuz:1": ("artist", "album", 1, 1, "one")},
+        authority=authority,
+    )
+
+    assert proc.finalize_release_identity(**arguments) is True
+    arguments["expected_path_receipt"] = capture_directory_path_receipt(final_dir)
+    assert proc.finalize_release_identity(**arguments) is False
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="Linux inode leases are the authoritative write-exclusion backend",
+)
+def test_finalize_release_identity_fails_closed_for_writer_after_final_audit(
+    tmp_path, monkeypatch, authority
+):
+    from qobuz_librarian.library.release_identity import (
+        capture_directory_path_receipt,
+    )
+    from qobuz_librarian.modes import process as proc
+
+    final_dir = tmp_path / "Artist" / "Album"
+    final_dir.mkdir(parents=True)
+    audio = final_dir / "01.flac"
+    audio.write_bytes(b"completed audio")
+    receipt = capture_directory_path_receipt(final_dir)
+    writer_errors = []
+
+    def final_audit(*_args):
+        writer_errors.append(_nonblocking_writer_errno(audio))
+        return True
+
+    monkeypatch.setattr(proc, "_final_release_inventory_matches", final_audit)
+
+    with pytest.raises(OSError, match="authority|namespace|writer"):
+        proc.finalize_release_identity(
+            {"id": "200", "tracks": {"items": [{"title": "one"}]}},
+            final_dir,
+            expected_destination=final_dir,
+            expected_path_receipt=receipt,
+            frozen_slots={"qobuz:1": ("artist", "album", 1, 1, "one")},
+            authority=authority,
+        )
+
+    assert writer_errors == [errno.EAGAIN]
+    assert read_release_identity(final_dir) is None
+    descriptor = os.open(audio, os.O_WRONLY | os.O_NONBLOCK)
+    os.close(descriptor)
 
 
 def test_final_slot_proof_rejects_same_count_substitution(monkeypatch, tmp_path):
@@ -450,26 +606,42 @@ def test_process_publishes_identity_only_after_exact_import_proof(
         assert not (final_dir / MANIFEST_NAME).exists()
 
 
-def test_finalize_release_identity_reaudits_after_publication(
+def test_finalize_release_identity_rejects_post_publish_namespace_replacement(
         tmp_path, monkeypatch, authority):
     from qobuz_librarian.library.release_identity import (
         capture_directory_path_receipt,
     )
     from qobuz_librarian.modes import process as proc
+    from qobuz_librarian.queue import post_import_finalizer
 
     final_dir = tmp_path / "Artist" / "Album"
     final_dir.mkdir(parents=True)
     (final_dir / "01.flac").write_bytes(b"completed audio")
     receipt = capture_directory_path_receipt(final_dir)
-    checks = iter((True, False))
     monkeypatch.setattr(
         proc,
         "_final_release_inventory_matches",
-        lambda *_args, **_kwargs: next(checks),
+        lambda *_args, **_kwargs: True,
         raising=False,
     )
+    displaced = tmp_path / "Artist" / "displaced"
+    real_publish = (
+        post_import_finalizer.publish_release_identity_authorized_retained
+    )
 
-    with pytest.raises(ReleaseManifestError, match="audio inventory changed"):
+    def publish_then_replace(album, identity):
+        retained = real_publish(album, identity)
+        final_dir.rename(displaced)
+        final_dir.mkdir()
+        return retained
+
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "publish_release_identity_authorized_retained",
+        publish_then_replace,
+    )
+
+    with pytest.raises(OSError, match="changed"):
         proc.finalize_release_identity(
             {"id": "200", "tracks": {"items": [{"title": "one"}]}},
             final_dir,
@@ -479,7 +651,72 @@ def test_finalize_release_identity_reaudits_after_publication(
             authority=authority,
         )
 
+    assert read_release_identity(final_dir) is None
+    assert read_release_identity(displaced) == ReleaseIdentity("qobuz", "200")
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="Linux inode leases are the authoritative write-exclusion backend",
+)
+def test_manifest_authority_transfers_without_an_aba_writer_gap(
+    tmp_path, monkeypatch, authority
+):
+    from qobuz_librarian.library import release_identity
+    from qobuz_librarian.library.release_identity import (
+        capture_directory_path_receipt,
+    )
+    from qobuz_librarian.modes import process as proc
+    from qobuz_librarian.queue import post_import_finalizer
+
+    final_dir = tmp_path / "Artist" / "Album"
+    final_dir.mkdir(parents=True)
+    (final_dir / "01.flac").write_bytes(b"completed audio")
+    receipt = capture_directory_path_receipt(final_dir)
+    monkeypatch.setattr(
+        proc,
+        "_final_release_inventory_matches",
+        lambda *_args, **_kwargs: True,
+    )
+    real_publish = (
+        release_identity.publish_release_identity_authorized_retained
+    )
+    writer_errors = []
+
+    def publish_then_attempt_aba(album, identity):
+        retained = real_publish(album, identity)
+        writer_errors.append(
+            _nonblocking_manifest_aba_errno(
+                final_dir / MANIFEST_NAME,
+                b'{"schema_version":1,"provider":"qobuz",'
+                b'"release_id":"200"}\n',
+            )
+        )
+        return retained
+
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "publish_release_identity_authorized_retained",
+        publish_then_attempt_aba,
+    )
+
+    with pytest.raises(OSError, match="authority|namespace|manifest"):
+        proc.finalize_release_identity(
+            {"id": "200", "tracks": {"items": [{"title": "one"}]}},
+            final_dir,
+            expected_destination=final_dir,
+            expected_path_receipt=receipt,
+            frozen_slots={"qobuz:1": ("artist", "album", 1, 1, "one")},
+            authority=authority,
+        )
+
+    assert writer_errors == [errno.EAGAIN]
     assert read_release_identity(final_dir) == ReleaseIdentity("qobuz", "200")
+    descriptor = os.open(
+        final_dir / MANIFEST_NAME,
+        os.O_WRONLY | os.O_NONBLOCK,
+    )
+    os.close(descriptor)
 
 
 def test_force_stops_after_an_interrupted_backup(monkeypatch, tmp_path):

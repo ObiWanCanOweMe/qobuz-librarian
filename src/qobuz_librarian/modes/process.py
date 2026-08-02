@@ -74,7 +74,6 @@ from qobuz_librarian.library.release_identity import (
     _open_album_directory,
     capture_directory_path_receipt,
     identity_from_album,
-    publish_release_identity,
 )
 from qobuz_librarian.library.scanner import (
     clear_scan_caches,
@@ -102,6 +101,9 @@ from qobuz_librarian.quality.verify import (
 )
 from qobuz_librarian.queue.executor import (
     _pre_import_staging_hooks,
+)
+from qobuz_librarian.queue.post_import_finalizer import (
+    open_verified_album_inventory,
 )
 from qobuz_librarian.repair_log import warn_if_download_truncated
 from qobuz_librarian.ui_cli.colors import C, fmt, format_size, section, truncate
@@ -161,28 +163,38 @@ def finalize_release_identity(
         raise ReleaseManifestError("the shared run lock was lost before publication")
     if cancel_check is not None and cancel_check():
         raise ReleaseManifestError("release identity publication was cancelled")
-    if not _final_release_inventory_matches(
+    try:
+        expected_audio = {
+            candidate.relative_to(Path(final_path)): (None, None)
+            for candidate in Path(final_path).rglob("*")
+            if candidate.suffix.lower() in cfg.AUDIO_EXTS
+        }
+    except (OSError, ValueError) as exc:
+        raise ReleaseManifestError(
+            "release destination audio inventory changed"
+        ) from exc
+    with open_verified_album_inventory(
         Path(final_path),
-        tracks,
-        frozen_slots,
+        authority,
         path_receipt,
-    ):
-        raise ReleaseManifestError("release destination audio inventory changed")
-    changed = publish_release_identity(
-        Path(final_path),
-        identity,
-        expected_directory=path_receipt.directory_identity,
-        expected_path_receipt=path_receipt,
-    )
-    if authority.intact() is not True:
-        raise ReleaseManifestError("the shared run lock was lost during publication")
-    if not _final_release_inventory_matches(
-        Path(final_path),
-        tracks,
-        frozen_slots,
-        path_receipt,
-    ):
-        raise ReleaseManifestError("release destination audio inventory changed")
+        expected_audio,
+    ) as inventory:
+        if not _final_release_inventory_matches(
+            Path(final_path),
+            tracks,
+            frozen_slots,
+            path_receipt,
+        ):
+            raise ReleaseManifestError(
+                "release destination audio inventory changed"
+            )
+        if cancel_check is not None and cancel_check():
+            raise ReleaseManifestError(
+                "release identity publication was cancelled"
+            )
+        changed = inventory.read_identity() != identity
+        inventory.publish(identity)
+        inventory.validate_namespace()
     return changed
 
 

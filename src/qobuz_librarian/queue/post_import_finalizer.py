@@ -7,6 +7,9 @@ import hashlib
 import os
 import secrets
 import stat
+import sys
+from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from qobuz_librarian import config as cfg
@@ -31,15 +34,22 @@ from qobuz_librarian.library.post_import_relocation import (
     relocate_post_import_album,
     seal_post_import_relocation_handoff,
 )
+from qobuz_librarian.library.release_authority import (
+    AlbumAuthority,
+    AlbumAuthorityUnavailable,
+    FileVersion,
+    file_version,
+    open_album_authority,
+)
 from qobuz_librarian.library.release_identity import (
     ReleaseManifestError,
     _close_descriptors,
     _directory_chain_matches,
     _open_album_directory,
     capture_directory_path_receipt,
-    directory_path_receipt_matches,
-    publish_release_identity,
-    read_release_identity_with_receipt,
+    publish_release_identity_authorized_retained,
+    reconcile_release_manifest_transaction,
+    retain_release_identity_authorized,
 )
 from qobuz_librarian.queue import journal as queue_state
 from qobuz_librarian.run_lock import RunLockLease
@@ -47,6 +57,405 @@ from qobuz_librarian.run_lock import RunLockLease
 
 class PostImportFinalizationUnavailable(OSError):
     """A durable queue completion cannot yet be finalised safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ExpectedAudio:
+    relative: Path
+    identity: tuple[int, int, int, int, int] | None
+    digest: str | None
+
+
+@dataclass(slots=True)
+class _HeldInventoryDirectory:
+    descriptor: int
+    parent_descriptor: int
+    name: str
+    version: FileVersion
+    entries: tuple[str, ...]
+
+
+def _inventory_directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | os.O_DIRECTORY
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _normalise_expected_audio(expected_audio) -> tuple[_ExpectedAudio, ...]:
+    if type(expected_audio) is not dict:
+        raise AlbumAuthorityUnavailable("verified audio inventory is invalid")
+    values = []
+    for relative, evidence in expected_audio.items():
+        if not isinstance(relative, Path) or relative.is_absolute():
+            raise AlbumAuthorityUnavailable("verified audio inventory is invalid")
+        try:
+            identity, digest = evidence
+        except (TypeError, ValueError) as exc:
+            raise AlbumAuthorityUnavailable(
+                "verified audio inventory is invalid"
+            ) from exc
+        if identity is not None:
+            if (
+                type(identity) not in {tuple, list}
+                or len(identity) != 5
+                or any(type(value) is not int for value in identity)
+            ):
+                raise AlbumAuthorityUnavailable("verified audio inventory is invalid")
+            identity = tuple(identity)
+        if digest is not None and (
+            type(digest) is not str
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise AlbumAuthorityUnavailable("verified audio inventory is invalid")
+        values.append(_ExpectedAudio(relative, identity, digest))
+    values.sort(key=lambda value: os.fsencode(value.relative.as_posix()))
+    if len({value.relative for value in values}) != len(values):
+        raise AlbumAuthorityUnavailable("verified audio inventory is invalid")
+    return tuple(values)
+
+
+class VerifiedAlbumInventory(AbstractContextManager):
+    """One live exact audio proof retained through final retirement."""
+
+    def __init__(self, path, authority, expected_receipt, expected_audio):
+        self._path = Path(path)
+        self._run_lock = authority
+        self._expected_receipt = expected_receipt
+        self._expected_audio = _normalise_expected_audio(expected_audio)
+        self._album_context = None
+        self._album: AlbumAuthority | None = None
+        self._manifest = None
+        self._directories: list[_HeldInventoryDirectory] = []
+        self._entered = False
+
+    @staticmethod
+    def _entry_names(descriptor: int) -> tuple[str, ...]:
+        return tuple(sorted(os.listdir(descriptor), key=os.fsencode))
+
+    def _scan_audio_tree(
+        self,
+        descriptor: int,
+        prefix: tuple[str, ...] = (),
+    ) -> set[Path]:
+        audio = set()
+        for name in self._entry_names(descriptor):
+            named_before = os.stat(
+                name, dir_fd=descriptor, follow_symlinks=False
+            )
+            relative = Path(*prefix, name)
+            if stat.S_ISDIR(named_before.st_mode):
+                child = os.open(
+                    name,
+                    _inventory_directory_flags(),
+                    dir_fd=descriptor,
+                )
+                try:
+                    held_before = os.fstat(child)
+                    entries = self._entry_names(child)
+                    version = file_version(held_before)
+                    if (
+                        not stat.S_ISDIR(held_before.st_mode)
+                        or file_version(named_before) != version
+                    ):
+                        raise AlbumAuthorityUnavailable(
+                            "album directory changed during inventory proof"
+                        )
+                    nested_audio = self._scan_audio_tree(
+                        child, (*prefix, name)
+                    )
+                    named_after = os.stat(
+                        name, dir_fd=descriptor, follow_symlinks=False
+                    )
+                    held_after = os.fstat(child)
+                    if (
+                        not stat.S_ISDIR(named_after.st_mode)
+                        or not stat.S_ISDIR(held_after.st_mode)
+                        or file_version(named_after) != version
+                        or file_version(held_after) != version
+                        or self._entry_names(child) != entries
+                    ):
+                        raise AlbumAuthorityUnavailable(
+                            "album directory changed during inventory proof"
+                        )
+                    audio.update(nested_audio)
+                finally:
+                    if child >= 0:
+                        os.close(child)
+                continue
+            if relative.suffix.lower() in cfg.AUDIO_EXTS:
+                if not stat.S_ISREG(named_before.st_mode):
+                    raise AlbumAuthorityUnavailable(
+                        "verified audio inventory contains an unsafe entry"
+                    )
+                audio.add(relative)
+        return audio
+
+    def _hold_directories(self, descriptor: int) -> None:
+        for name in self._entry_names(descriptor):
+            named_before = os.stat(
+                name, dir_fd=descriptor, follow_symlinks=False
+            )
+            if not stat.S_ISDIR(named_before.st_mode):
+                continue
+            child = os.open(
+                name,
+                _inventory_directory_flags(),
+                dir_fd=descriptor,
+            )
+            try:
+                held_before = os.fstat(child)
+                entries = self._entry_names(child)
+                version = file_version(held_before)
+                if (
+                    not stat.S_ISDIR(held_before.st_mode)
+                    or file_version(named_before) != version
+                ):
+                    raise AlbumAuthorityUnavailable(
+                        "album directory changed during inventory proof"
+                    )
+                binding = _HeldInventoryDirectory(
+                    child, descriptor, name, version, entries
+                )
+                self._directories.append(binding)
+                child = -1
+                self._hold_directories(binding.descriptor)
+                named_after = os.stat(
+                    name, dir_fd=descriptor, follow_symlinks=False
+                )
+                if (
+                    not stat.S_ISDIR(named_after.st_mode)
+                    or file_version(named_after) != version
+                    or file_version(os.fstat(binding.descriptor)) != version
+                    or self._entry_names(binding.descriptor) != entries
+                ):
+                    raise AlbumAuthorityUnavailable(
+                        "album directory changed during inventory proof"
+                    )
+            finally:
+                if child >= 0:
+                    os.close(child)
+
+    def _validate_directories(self) -> None:
+        for binding in self._directories:
+            try:
+                held = os.fstat(binding.descriptor)
+                named = os.stat(
+                    binding.name,
+                    dir_fd=binding.parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise AlbumAuthorityUnavailable(
+                    "album directory changed under verified inventory"
+                ) from exc
+            if (
+                not stat.S_ISDIR(held.st_mode)
+                or not stat.S_ISDIR(named.st_mode)
+                or file_version(held) != binding.version
+                or file_version(named) != binding.version
+                or self._entry_names(binding.descriptor) != binding.entries
+            ):
+                raise AlbumAuthorityUnavailable(
+                    "album directory changed under verified inventory"
+                )
+
+    def __enter__(self):
+        if self._entered:
+            raise AlbumAuthorityUnavailable(
+                "verified album inventory context is one-shot"
+            )
+        self._entered = True
+        self._album_context = open_album_authority(
+            self._path,
+            self._run_lock,
+            expected_path=self._expected_receipt,
+        )
+        try:
+            self._album = self._album_context.__enter__()
+            found = self._scan_audio_tree(self._album.directory_descriptor)
+            expected = {value.relative for value in self._expected_audio}
+            if found != expected:
+                raise AlbumAuthorityUnavailable(
+                    "release destination audio inventory changed"
+                )
+            for item in self._expected_audio:
+                held = self._album.open_file(
+                    item.relative,
+                    expected_digest=item.digest,
+                )
+                version = (
+                    held.version.device,
+                    held.version.inode,
+                    held.version.size,
+                    held.version.mtime_ns,
+                    held.version.ctime_ns,
+                )
+                if item.identity is not None and version != item.identity:
+                    raise AlbumAuthorityUnavailable(
+                        "release destination audio identity changed"
+                    )
+            self._hold_directories(self._album.directory_descriptor)
+            self.validate_namespace()
+            return self
+        except BaseException:
+            self.__exit__(*sys.exc_info())
+            raise
+
+    def validate_namespace(self) -> None:
+        if self._album is None:
+            raise AlbumAuthorityUnavailable("verified album inventory is not live")
+        self._album.validate_namespace()
+        self._validate_directories()
+        found = self._current_audio_paths(
+            self._album.directory_descriptor,
+        )
+        if found != {value.relative for value in self._expected_audio}:
+            raise AlbumAuthorityUnavailable(
+                "release destination audio inventory changed"
+            )
+        self._validate_directories()
+        self._album.validate_namespace()
+        if self._manifest is not None:
+            self._manifest.validate_namespace()
+
+    def retain_manifest(self, identity) -> None:
+        if self._album is None:
+            raise AlbumAuthorityUnavailable("verified album inventory is not live")
+        if self._manifest is not None:
+            self._manifest.validate_namespace()
+            return
+        self._manifest = retain_release_identity_authorized(
+            self._album,
+            identity,
+        )
+        self.validate_namespace()
+
+    def _current_audio_paths(
+        self,
+        descriptor: int,
+        prefix: tuple[str, ...] = (),
+    ) -> set[Path]:
+        audio = set()
+        before = os.fstat(descriptor)
+        for name in self._entry_names(descriptor):
+            named = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            relative = Path(*prefix, name)
+            if stat.S_ISDIR(named.st_mode):
+                child = os.open(
+                    name,
+                    _inventory_directory_flags(),
+                    dir_fd=descriptor,
+                )
+                try:
+                    child_version = file_version(os.fstat(child))
+                    if child_version != file_version(named):
+                        raise AlbumAuthorityUnavailable(
+                            "album directory changed under verified inventory"
+                        )
+                    audio.update(self._current_audio_paths(
+                        child, (*prefix, name)
+                    ))
+                    if child_version != file_version(os.fstat(child)):
+                        raise AlbumAuthorityUnavailable(
+                            "album directory changed under verified inventory"
+                        )
+                finally:
+                    os.close(child)
+            elif relative.suffix.lower() in cfg.AUDIO_EXTS:
+                if not stat.S_ISREG(named.st_mode):
+                    raise AlbumAuthorityUnavailable(
+                        "verified audio inventory contains an unsafe entry"
+                    )
+                audio.add(relative)
+        if file_version(os.fstat(descriptor)) != file_version(before):
+            raise AlbumAuthorityUnavailable(
+                "album directory changed under verified inventory"
+            )
+        return audio
+
+    def publish(self, identity) -> None:
+        self.validate_namespace()
+        assert self._album is not None
+        if self._manifest is not None:
+            raise AlbumAuthorityUnavailable(
+                "release manifest authority is already retained"
+            )
+        self._manifest = publish_release_identity_authorized_retained(
+            self._album,
+            identity,
+        )
+        self.validate_namespace()
+
+    def read_identity(self):
+        self.validate_namespace()
+        assert self._album is not None
+        identity = reconcile_release_manifest_transaction(self._album)
+        self.validate_namespace()
+        return identity
+
+    def __exit__(self, exc_type, exc, traceback):
+        cleanup_error = None
+        if exc_type is None and self._album is not None:
+            try:
+                self.validate_namespace()
+            except BaseException as caught:
+                cleanup_error = caught
+        manifest = self._manifest
+        self._manifest = None
+        if manifest is not None:
+            try:
+                manifest.close()
+            except BaseException as caught:
+                if cleanup_error is None:
+                    cleanup_error = caught
+        for binding in reversed(self._directories):
+            try:
+                os.close(binding.descriptor)
+            except OSError as caught:
+                if cleanup_error is None:
+                    cleanup_error = caught
+        self._directories = []
+        album_context = self._album_context
+        self._album = None
+        self._album_context = None
+        if album_context is not None:
+            context_error_type = (
+                exc_type
+                if exc_type is not None
+                else type(cleanup_error)
+                if cleanup_error is not None
+                else None
+            )
+            try:
+                album_context.__exit__(
+                    context_error_type,
+                    exc if exc_type is not None else cleanup_error,
+                    traceback,
+                )
+            except BaseException as caught:
+                if cleanup_error is None:
+                    cleanup_error = caught
+        if exc_type is None and cleanup_error is not None:
+            raise cleanup_error
+        return False
+
+
+def open_verified_album_inventory(
+    path,
+    authority,
+    expected_receipt,
+    expected_audio,
+) -> AbstractContextManager[VerifiedAlbumInventory]:
+    return VerifiedAlbumInventory(
+        path,
+        authority,
+        expected_receipt,
+        expected_audio,
+    )
 
 
 def _require_authority(authority: RunLockLease) -> None:
@@ -138,7 +547,13 @@ def _handoff_consumer(journal, retirement):
     }
 
 
-def _settle_action(journal, retirement, authority):
+def _settle_action(
+    journal,
+    retirement,
+    authority,
+    *,
+    validate_before_commit=None,
+):
     action = retirement.action
     if action is None:
         return journal
@@ -228,6 +643,8 @@ def _settle_action(journal, retirement, authority):
             authority=authority,
         )
         _require_authority(authority)
+        if validate_before_commit is not None:
+            validate_before_commit()
         return queue_state.clear_committed_post_import_action(
             journal,
             item_id=retirement.item_id,
@@ -238,8 +655,17 @@ def _settle_action(journal, retirement, authority):
     )
 
 
-def _acknowledge_completion(journal, retirement, acknowledge_completion):
+def _acknowledge_completion(
+    journal,
+    retirement,
+    acknowledge_completion,
+    *,
+    validate_before_commit=None,
+    persist=True,
+):
     if retirement.completion_acknowledged:
+        if validate_before_commit is not None:
+            validate_before_commit()
         return journal
     owner = RecoveryOwner(journal.operation_id, retirement.item_id)
     completion_input = parse_completion_input_record(
@@ -267,10 +693,14 @@ def _acknowledge_completion(journal, retirement, acknowledge_completion):
         # The queue journal is the CLI queue's durable authority.  Completed
         # removal already deleted this exact item in the same CAS that created
         # the retirement, so no second store needs to acknowledge it.
-        return queue_state.acknowledge_carrier_retirement_completion(
-            journal,
-            item_id=retirement.item_id,
-        )
+        if validate_before_commit is not None:
+            validate_before_commit()
+        if persist:
+            return queue_state.acknowledge_carrier_retirement_completion(
+                journal,
+                item_id=retirement.item_id,
+            )
+        return journal
     if not callable(acknowledge_completion):
         raise PostImportFinalizationUnavailable(
             errno.EAGAIN, "the completion owner is not available to acknowledge"
@@ -302,10 +732,14 @@ def _acknowledge_completion(journal, retirement, acknowledge_completion):
         raise PostImportFinalizationUnavailable(
             errno.EAGAIN, "the completion owner did not acknowledge"
         )
-    return queue_state.acknowledge_carrier_retirement_completion(
-        journal,
-        item_id=retirement.item_id,
-    )
+    if validate_before_commit is not None:
+        validate_before_commit()
+    if persist:
+        return queue_state.acknowledge_carrier_retirement_completion(
+            journal,
+            item_id=retirement.item_id,
+        )
+    return journal
 
 
 def _current_inventory_matches(
@@ -519,10 +953,43 @@ def _audit_audio_tree_at(
     )
 
 
-def _publish_retirement_identity(
-    journal, retirement, *, authority, cancel_check=None
-) -> bool:
-    """Publish only from the retained exact completion and destination proof."""
+@dataclass(frozen=True, slots=True)
+class _RetirementPublication:
+    completion_input: object
+    evidence: object
+    completion_path: str
+    final_path: str
+    path_receipt: object
+    committed_whole_album: bool
+    relocated_after_publication: bool
+    expected_audio: dict
+
+
+def _retirement_expected_audio(evidence, *, relocated: bool) -> dict:
+    inventory = evidence.inventory
+    if inventory is None or inventory.path != evidence.album_path:
+        raise ReleaseManifestError("release destination audio inventory changed")
+    album_parts = PurePosixPath(evidence.album_path).parts
+    expected = {}
+    for receipt in inventory.audio:
+        parts = PurePosixPath(receipt.path).parts
+        if len(parts) <= len(album_parts) or parts[:len(album_parts)] != album_parts:
+            raise ReleaseManifestError(
+                "release destination audio inventory changed"
+            )
+        relative = Path(*parts[len(album_parts):])
+        if relative in expected:
+            raise ReleaseManifestError(
+                "release destination audio inventory changed"
+            )
+        expected[relative] = (
+            None if relocated else receipt.identity,
+            receipt.sha256,
+        )
+    return expected
+
+
+def _retirement_publication(journal, retirement):
     if (
         retirement.planned is None
         and retirement.completion_input is None
@@ -530,7 +997,7 @@ def _publish_retirement_identity(
         and retirement.final_path is None
     ):
         # Legacy carrier-only retirements predate durable completion records.
-        return False
+        return None
     owner = RecoveryOwner(journal.operation_id, retirement.item_id)
     completion_input = parse_completion_input_record(
         retirement.completion_input,
@@ -550,7 +1017,7 @@ def _publish_retirement_identity(
         # Pre-identity journals have no authority to invent a manifest. They
         # retain the previous retirement contract while all newly admitted
         # durable work carries the version-2 release plan below.
-        return False
+        return None
     evidence = parse_completion_record(
         retirement.completion_evidence,
         expected_owner=owner,
@@ -600,41 +1067,6 @@ def _publish_retirement_identity(
             "release destination does not match completed album identity"
         )
     relocated_after_publication = action is None and final_path != completion_path
-    if relocated_after_publication:
-        if not _current_inventory_matches(
-            evidence,
-            final_path,
-            relocated=True,
-            path_receipt=path_receipt,
-        ):
-            raise ReleaseManifestError("release destination audio inventory changed")
-        _require_authority(authority)
-        existing, identity_receipt = read_release_identity_with_receipt(
-            Path(final_path)
-        )
-        if (
-            not directory_path_receipt_matches(path_receipt)
-            or identity_receipt != path_receipt
-            or existing != completion_input.release_identity
-        ):
-            # A committed whole-album relocation can clear its retained receipt
-            # only after publication. Once cleared, the held same-directory
-            # manifest is the sole authority for an acknowledgement retry;
-            # never recreate one at a path no longer bound to live evidence.
-            raise ReleaseManifestError(
-                "relocated release identity is unavailable after publication"
-            )
-        _require_authority(authority)
-        if not _current_inventory_matches(
-            evidence,
-            final_path,
-            relocated=True,
-            path_receipt=path_receipt,
-        ):
-            raise ReleaseManifestError(
-                "release destination audio inventory changed"
-            )
-        return False
     node_matches_completion = (
         directory_identity == evidence.album_identity[:2]
     )
@@ -645,36 +1077,73 @@ def _publish_retirement_identity(
     if (
         not node_matches_completion
         and not committed_whole_album
+        and not relocated_after_publication
     ):
         raise ReleaseManifestError(
             "release destination does not match completed album identity"
         )
-    if not _current_inventory_matches(
+    relocated = committed_whole_album or relocated_after_publication
+    return _RetirementPublication(
+        completion_input,
         evidence,
+        completion_path,
         final_path,
-        relocated=committed_whole_album,
-        path_receipt=path_receipt,
-    ):
-        raise ReleaseManifestError("release destination audio inventory changed")
+        path_receipt,
+        committed_whole_album,
+        relocated_after_publication,
+        _retirement_expected_audio(evidence, relocated=relocated),
+    )
+
+
+def _publish_retirement_identity(
+    journal,
+    retirement,
+    *,
+    authority,
+    cancel_check=None,
+    inventory=None,
+    publication=None,
+) -> bool:
+    """Publish only while the exact completion inventory remains live."""
+    if publication is None:
+        publication = _retirement_publication(journal, retirement)
+    if publication is None:
+        return False
+    if inventory is None:
+        with open_verified_album_inventory(
+            Path(publication.final_path),
+            authority,
+            publication.path_receipt,
+            publication.expected_audio,
+        ) as held:
+            return _publish_retirement_identity(
+                journal,
+                retirement,
+                authority=authority,
+                cancel_check=cancel_check,
+                inventory=held,
+                publication=publication,
+            )
     if cancel_check is not None and cancel_check():
         raise PostImportFinalizationUnavailable(
             errno.ECANCELED, "queue finalisation was cancelled"
         )
     _require_authority(authority)
-    changed = publish_release_identity(
-        Path(final_path),
-        completion_input.release_identity,
-        expected_directory=directory_identity,
-        expected_path_receipt=path_receipt,
+    inventory.validate_namespace()
+    if publication.relocated_after_publication:
+        if inventory.read_identity() != publication.completion_input.release_identity:
+            raise ReleaseManifestError(
+                "relocated release identity is unavailable after publication"
+            )
+        inventory.retain_manifest(publication.completion_input.release_identity)
+        return False
+    changed = (
+        inventory.read_identity()
+        != publication.completion_input.release_identity
     )
+    inventory.publish(publication.completion_input.release_identity)
     _require_authority(authority)
-    if not _current_inventory_matches(
-        evidence,
-        final_path,
-        relocated=committed_whole_album,
-        path_receipt=path_receipt,
-    ):
-        raise ReleaseManifestError("release destination audio inventory changed")
+    inventory.validate_namespace()
     return changed
 
 
@@ -724,30 +1193,78 @@ def finalize_carrier_retirement(
         raise PostImportFinalizationUnavailable(
             errno.ECANCELED, "queue finalisation was cancelled"
         )
-    _publish_retirement_identity(
-        journal,
-        retirement,
-        authority=authority,
-        cancel_check=cancel_check,
+    publication = _retirement_publication(journal, retirement)
+    inventory_context = (
+        nullcontext(None)
+        if publication is None
+        else open_verified_album_inventory(
+            Path(publication.final_path),
+            authority,
+            publication.path_receipt,
+            publication.expected_audio,
+        )
     )
-    if retirement.action is not None:
-        journal = _settle_action(journal, retirement, authority)
-        retirement = _retirement(journal, item_id)
-        if retirement.action is not None:
+    with inventory_context as inventory:
+        _publish_retirement_identity(
+            journal,
+            retirement,
+            authority=authority,
+            cancel_check=cancel_check,
+            inventory=inventory,
+            publication=publication,
+        )
+        if inventory is not None:
+            inventory.validate_namespace()
+        if cancel_check is not None and cancel_check():
             raise PostImportFinalizationUnavailable(
-                errno.EBUSY, "the post-import relocation could not be released"
+                errno.ECANCELED,
+                "queue finalisation was cancelled",
             )
-    journal = _acknowledge_completion(
-        journal,
-        retirement,
-        acknowledge_completion,
-    )
-    retirement = _retirement(journal, item_id)
-    final_path = Path(retirement.final_path) if retirement.final_path else None
-    _require_authority(authority)
-    journal, carrier_result = queue_state.process_carrier_retirement(
-        journal,
-        item_id=item_id,
-    )
-    _require_authority(authority)
+        if retirement.action is not None:
+            if inventory is None:
+                journal = _settle_action(journal, retirement, authority)
+            else:
+                journal = _settle_action(
+                    journal,
+                    retirement,
+                    authority,
+                    validate_before_commit=inventory.validate_namespace,
+                )
+            retirement = _retirement(journal, item_id)
+            if retirement.action is not None:
+                raise PostImportFinalizationUnavailable(
+                    errno.EBUSY,
+                    "the post-import relocation could not be released",
+                )
+        if inventory is not None:
+            inventory.validate_namespace()
+        if inventory is None:
+            journal = _acknowledge_completion(
+                journal,
+                retirement,
+                acknowledge_completion,
+            )
+        else:
+            journal = _acknowledge_completion(
+                journal,
+                retirement,
+                acknowledge_completion,
+                validate_before_commit=inventory.validate_namespace,
+                persist=False,
+            )
+        retirement = _retirement(journal, item_id)
+        final_path = Path(retirement.final_path) if retirement.final_path else None
+        if inventory is not None:
+            inventory.validate_namespace()
+        _require_authority(authority)
+        journal, carrier_result = queue_state.process_carrier_retirement(
+            journal,
+            item_id=item_id,
+            pre_commit_validator=(
+                inventory.validate_namespace
+                if inventory is not None
+                else None
+            ),
+        )
+        _require_authority(authority)
     return journal, final_path, carrier_result

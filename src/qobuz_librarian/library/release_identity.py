@@ -10,6 +10,7 @@ import os
 import secrets
 import stat
 import sys
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -496,6 +497,8 @@ class _HeldManifest:
     exclusion: InodeWriteExclusion
 
     def close(self) -> None:
+        if self.descriptor < 0:
+            return
         owns_descriptor = self.exclusion.owns_source_descriptor
         error = None
         for _attempt in range(2):
@@ -523,6 +526,61 @@ class _HeldManifest:
                 error = exc
         if error is not None and sys.exc_info()[0] is None:
             raise error
+
+
+class _RetainedReleaseManifestLifetime:
+    def __init__(self, held: _HeldManifest):
+        self.held: _HeldManifest | None = held
+
+    def close(self) -> None:
+        held = self.held
+        if held is None:
+            return
+        held.close()
+        self.held = None
+
+
+class RetainedReleaseManifestAuthority:
+    """The publisher's exact manifest descriptor and exclusion owner."""
+
+    def __init__(self, album, identity: ReleaseIdentity, held: _HeldManifest):
+        self._album = album
+        self._identity = identity
+        self._lifetime = _RetainedReleaseManifestLifetime(held)
+        self._finalizer = weakref.finalize(
+            self,
+            self._lifetime.close,
+        )
+
+    @property
+    def descriptor(self) -> int:
+        held = self._lifetime.held
+        if held is None:
+            _manifest_error("release manifest authority is closed")
+        return held.descriptor
+
+    def validate_namespace(self) -> None:
+        held = self._lifetime.held
+        if held is None:
+            _manifest_error("release manifest authority is closed")
+        self._album.validate_namespace()
+        if (
+            held.name != MANIFEST_NAME
+            or _manifest_identity_from_bytes(held.contents) != self._identity
+            or not _held_manifest_is_authoritative(
+                self._album.directory_descriptor,
+                MANIFEST_NAME,
+                held,
+            )
+        ):
+            _manifest_error("release manifest changed under retained authority")
+        self._album.validate_namespace()
+
+    def close(self) -> None:
+        if not self._finalizer.alive:
+            return
+        self._lifetime.close()
+        self._finalizer.detach()
 
 
 def _rename_noreplace(
@@ -992,7 +1050,10 @@ def _install_manifest_transaction(album, snapshot, held: _HeldManifest) -> None:
         _manifest_error("cannot publish release manifest transaction", exc)
 
 
-def _publish_release_identity_authorized(album, identity: ReleaseIdentity) -> bool:
+def _publish_release_identity_authorized_retained(
+    album,
+    identity: ReleaseIdentity,
+) -> tuple[bool, RetainedReleaseManifestAuthority]:
     from qobuz_librarian.library.release_authority import AlbumAuthority
 
     if type(album) is not AlbumAuthority:
@@ -1025,22 +1086,79 @@ def _publish_release_identity_authorized(album, identity: ReleaseIdentity) -> bo
                     _manifest_error(
                         "release manifest changed during idempotent publication"
                     )
-                return False
+                retained = RetainedReleaseManifestAuthority(
+                    album,
+                    identity,
+                    held,
+                )
+                retained.validate_namespace()
+                held = None
+                return False, retained
             _manifest_error("release manifest identifies a different release")
         finally:
-            held.close()
+            if held is not None:
+                held.close()
     contents = _manifest_bytes(identity)
     held = _create_manifest_transaction(directory_descriptor, contents)
     try:
         _install_manifest_transaction(album, snapshot, held)
+        retained = RetainedReleaseManifestAuthority(album, identity, held)
+        retained.validate_namespace()
+        held = None
+        return True, retained
     finally:
-        held.close()
-    return True
+        if held is not None:
+            held.close()
+
+
+def _publish_release_identity_authorized(album, identity: ReleaseIdentity) -> bool:
+    changed, retained = _publish_release_identity_authorized_retained(
+        album,
+        identity,
+    )
+    retained.close()
+    return changed
 
 
 def publish_release_identity_authorized(album, identity: ReleaseIdentity) -> None:
     """Publish canonical identity bytes while *album* authority remains live."""
     _publish_release_identity_authorized(album, identity)
+
+
+def publish_release_identity_authorized_retained(
+    album,
+    identity: ReleaseIdentity,
+) -> RetainedReleaseManifestAuthority:
+    """Publish and transfer the exact live manifest authority to the caller."""
+    _changed, retained = _publish_release_identity_authorized_retained(
+        album,
+        identity,
+    )
+    return retained
+
+
+def retain_release_identity_authorized(
+    album,
+    identity: ReleaseIdentity,
+) -> RetainedReleaseManifestAuthority:
+    """Retain an existing exact manifest without reopening the album path."""
+    from qobuz_librarian.library.release_authority import AlbumAuthority
+
+    if type(album) is not AlbumAuthority:
+        _manifest_error("release manifest retention requires live album authority")
+    identity = _validated_identity(identity)
+    album.validate_namespace()
+    held = _open_held_manifest(album.directory_descriptor, MANIFEST_NAME)
+    try:
+        if _manifest_identity_from_bytes(held.contents) != identity:
+            _manifest_error("release manifest identifies a different release")
+        retained = RetainedReleaseManifestAuthority(album, identity, held)
+        retained.validate_namespace()
+        held = None
+        return retained
+    finally:
+        if held is not None:
+            held.close()
 
 
 def reconcile_release_manifest_transaction(album) -> ReleaseIdentity | None:

@@ -1,11 +1,14 @@
 """Focused guards for durable post-import action integration."""
 
 import hashlib
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from qobuz_librarian import config as cfg
+from qobuz_librarian import run_lock
 from qobuz_librarian.completion import (
     AlbumInventory,
     CompletionExpectation,
@@ -78,6 +81,9 @@ def test_carrier_retirement_publishes_identity_before_acknowledgement(
 
     monkeypatch.setattr(post_import_finalizer, "_settle_action", settle)
     monkeypatch.setattr(
+        post_import_finalizer, "_retirement_publication", lambda *_args: None
+    )
+    monkeypatch.setattr(
         post_import_finalizer,
         "_publish_retirement_identity",
         lambda *_args, **_kwargs: events.append("identity"),
@@ -130,6 +136,9 @@ def test_identity_publication_failure_preserves_retirement_evidence(monkeypatch)
         post_import_finalizer,
         "_publish_retirement_identity",
         refuse,
+    )
+    monkeypatch.setattr(
+        post_import_finalizer, "_retirement_publication", lambda *_args: None
     )
     monkeypatch.setattr(
         post_import_finalizer,
@@ -191,6 +200,10 @@ def test_unacknowledged_relocation_never_publishes_identity(monkeypatch):
     assert events == ["settle"]
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="Linux inode leases are the authoritative write-exclusion backend",
+)
 def test_conflicting_identity_keeps_completion_carrier_and_beets_rows(
     monkeypatch,
     tmp_path,
@@ -299,8 +312,9 @@ def test_conflicting_identity_keeps_completion_carrier_and_beets_rows(
     beets_db.write_bytes(b"beets rows before conflict")
     rows_before = beets_db.read_bytes()
     events = []
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "run.lock")
+    authority = run_lock.acquire()
 
-    monkeypatch.setattr(post_import_finalizer, "_require_authority", lambda _a: None)
     monkeypatch.setattr(
         post_import_finalizer,
         "_acknowledge_completion",
@@ -312,13 +326,16 @@ def test_conflicting_identity_keeps_completion_carrier_and_beets_rows(
         lambda *_args, **_kwargs: events.append("carrier"),
     )
 
-    with pytest.raises(ReleaseManifestError, match="different release"):
-        post_import_finalizer.finalize_carrier_retirement(
-            saved,
-            item_id,
-            authority=object(),
-            acknowledge_completion=None,
-        )
+    try:
+        with pytest.raises(ReleaseManifestError, match="different release"):
+            post_import_finalizer.finalize_carrier_retirement(
+                saved,
+                item_id,
+                authority=authority,
+                acknowledge_completion=None,
+            )
+    finally:
+        authority.close()
 
     assert saved.retirements == (retirement,)
     assert retirement.completion_evidence == assessment.evidence.to_record()
@@ -327,6 +344,10 @@ def test_conflicting_identity_keeps_completion_carrier_and_beets_rows(
     assert events == []
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="Linux inode leases are the authoritative write-exclusion backend",
+)
 def test_committed_whole_album_relocation_publishes_at_new_directory_identity(
     monkeypatch,
     tmp_path,
@@ -335,7 +356,10 @@ def test_committed_whole_album_relocation_publishes_at_new_directory_identity(
     destination = tmp_path / "music" / "Various Artists" / "Album"
     source.mkdir(parents=True)
     destination.mkdir(parents=True)
+    audio = destination / "01.flac"
+    audio.write_bytes(b"relocated audio")
     source_stat = source.stat()
+    audio_stat = audio.stat()
     identity = ReleaseIdentity("qobuz", "200")
     completion_input = SimpleNamespace(
         release_identity=identity,
@@ -352,6 +376,20 @@ def test_committed_whole_album_relocation_publishes_at_new_directory_identity(
             source_stat.st_size,
             source_stat.st_mtime_ns,
             source_stat.st_ctime_ns,
+        ),
+        inventory=SimpleNamespace(
+            path="Artist/Album",
+            audio=(SimpleNamespace(
+                path="Artist/Album/01.flac",
+                identity=(
+                    audio_stat.st_dev,
+                    audio_stat.st_ino,
+                    audio_stat.st_size,
+                    audio_stat.st_mtime_ns,
+                    audio_stat.st_ctime_ns,
+                ),
+                sha256=hashlib.sha256(audio.read_bytes()).hexdigest(),
+            ),),
         ),
     )
     action = SimpleNamespace(
@@ -383,74 +421,38 @@ def test_committed_whole_album_relocation_publishes_at_new_directory_identity(
         "parse_completion_record",
         lambda *_args, **_kwargs: evidence,
     )
-    monkeypatch.setattr(
-        post_import_finalizer,
-        "_current_inventory_matches",
-        lambda *_args, **_kwargs: True,
-    )
-    authority_checks = []
-    monkeypatch.setattr(
-        post_import_finalizer,
-        "_require_authority",
-        lambda _a: authority_checks.append("check"),
-    )
-
-    assert post_import_finalizer._publish_retirement_identity(
-        saved, retirement, authority=object()
-    )
-    assert (destination.stat().st_dev, destination.stat().st_ino) != (
-        source_stat.st_dev,
-        source_stat.st_ino,
-    )
-    assert read_release_identity(destination) == identity
-
-    retirement.action = None
-    assert not post_import_finalizer._publish_retirement_identity(
-        saved, retirement, authority=object()
-    )
-
-    # A retry must bind the identity read to the same public path receipt.
-    # Swap a manifested B into A for the read, then restore unmarked A before
-    # the final pathname check: comparing only the identity and old receipt
-    # would acknowledge B's identity as though it had been read from A.
-    (destination / MANIFEST_NAME).unlink()
-    alternate = tmp_path / "alternate"
-    held_destination = tmp_path / "held-destination"
-    alternate.mkdir()
-    publish_release_identity(alternate, identity)
-    real_receipt_matches = (
-        post_import_finalizer.directory_path_receipt_matches
-    )
-
-    def swap_for_identity_read(*_args, **_kwargs):
-        destination.rename(held_destination)
-        alternate.rename(destination)
-        return True
-
-    def restore_then_match(receipt):
-        destination.rename(alternate)
-        held_destination.rename(destination)
-        return real_receipt_matches(receipt)
-
-    monkeypatch.setattr(
-        post_import_finalizer,
-        "_current_inventory_matches",
-        swap_for_identity_read,
-    )
-    monkeypatch.setattr(
-        post_import_finalizer,
-        "directory_path_receipt_matches",
-        restore_then_match,
-    )
-
-    with pytest.raises(ReleaseManifestError, match="unavailable after publication"):
-        post_import_finalizer._publish_retirement_identity(
-            saved, retirement, authority=object()
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "run.lock")
+    authority = run_lock.acquire()
+    try:
+        assert post_import_finalizer._publish_retirement_identity(
+            saved, retirement, authority=authority
+        )
+        assert (destination.stat().st_dev, destination.stat().st_ino) != (
+            source_stat.st_dev,
+            source_stat.st_ino,
+        )
+        assert read_release_identity(destination) == identity
+        assert not post_import_finalizer._publish_retirement_identity(
+            saved, retirement, authority=authority
         )
 
+        retirement.action = None
+        assert not post_import_finalizer._publish_retirement_identity(
+            saved, retirement, authority=authority
+        )
+
+        (destination / MANIFEST_NAME).unlink()
+        with pytest.raises(
+            ReleaseManifestError,
+            match="unavailable after publication",
+        ):
+            post_import_finalizer._publish_retirement_identity(
+                saved, retirement, authority=authority
+            )
+    finally:
+        authority.close()
+
     assert read_release_identity(destination) is None
-    assert read_release_identity(alternate) == identity
-    assert authority_checks == ["check"] * 5
 
 
 def test_current_identity_inventory_rejects_extra_and_replaced_audio(

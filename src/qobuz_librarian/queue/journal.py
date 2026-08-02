@@ -3695,13 +3695,19 @@ def process_carrier_retirement(
     journal: QueueJournal,
     *,
     item_id: str,
+    pre_commit_validator=None,
 ):
     """Retire one durable carrier and acknowledge only a settled outcome."""
+    if pre_commit_validator is not None and not callable(pre_commit_validator):
+        raise QueueJournalBlocked("carrier authority validator is invalid")
     previous = _reload_matching_journal(journal)
     retirement_index, retirement = _retirement_target(previous, item_id)
     if retirement.planned is not None and (
         retirement.action is not None
-        or not retirement.completion_acknowledged
+        or (
+            not retirement.completion_acknowledged
+            and pre_commit_validator is None
+        )
     ):
         raise QueueJournalBlocked(
             "carrier retirement must settle its post-import completion first"
@@ -3723,6 +3729,8 @@ def process_carrier_retirement(
         ManagedCarrierRetirementOutcome.ALREADY_ABSENT,
     }:
         return previous, result
+    if pre_commit_validator is not None:
+        pre_commit_validator()
     retirements = list(previous.retirements)
     del retirements[retirement_index]
     saved = _compare_and_commit(
