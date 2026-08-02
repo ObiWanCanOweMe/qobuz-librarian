@@ -352,7 +352,7 @@ class AlbumAuthority:
         with self._lock:
             validation_error = None
             try:
-                self._require_run_lock()
+                self._validate_namespace_locked()
             except BaseException as caught:
                 validation_error = caught
             cleanup_error = self._close_resources()

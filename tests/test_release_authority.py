@@ -107,13 +107,14 @@ def test_album_authority_holds_write_exclusion_until_normal_context_exit(
     track.write_bytes(b"one")
 
     writer = None
-    with open_album_authority(album, lease) as authority:
-        held = authority.open_file(Path("01.flac"))
-        writer = _start_waiting_writer(track)
-        assert held.relative == Path("01.flac")
-        assert os.fstat(held.descriptor).st_ino == track.stat().st_ino
-        with pytest.raises(AlbumAuthorityUnavailable, match="namespace changed"):
-            authority.validate_namespace()
+    with pytest.raises(AlbumAuthorityUnavailable, match="namespace changed"):
+        with open_album_authority(album, lease) as authority:
+            held = authority.open_file(Path("01.flac"))
+            writer = _start_waiting_writer(track)
+            assert held.relative == Path("01.flac")
+            assert os.fstat(held.descriptor).st_ino == track.stat().st_ino
+            with pytest.raises(AlbumAuthorityUnavailable, match="namespace changed"):
+                authority.validate_namespace()
 
     assert writer is not None
     _finish_writer(writer)
@@ -137,6 +138,61 @@ def test_album_authority_releases_write_exclusion_after_body_exception(
 
     assert writer is not None
     _finish_writer(writer)
+    _assert_descriptor_closed(held.descriptor)
+
+
+def test_album_authority_clean_exit_revalidates_replaced_file(
+    tmp_path, live_run_lock
+):
+    lease, _lock_file = live_run_lock
+    album = _album(tmp_path)
+    track = album / "01.flac"
+    displaced = album / "displaced.flac"
+    track.write_bytes(b"one")
+
+    with pytest.raises(AlbumAuthorityUnavailable, match="namespace changed"):
+        with open_album_authority(album, lease) as authority:
+            held = authority.open_file(Path("01.flac"))
+            track.rename(displaced)
+            track.write_bytes(b"replacement")
+
+    _assert_descriptor_closed(held.descriptor)
+
+
+def test_album_authority_clean_exit_revalidates_broken_file_lease(
+    tmp_path, live_run_lock
+):
+    lease, _lock_file = live_run_lock
+    album = _album(tmp_path)
+    track = album / "01.flac"
+    track.write_bytes(b"one")
+
+    with pytest.raises(AlbumAuthorityUnavailable, match="namespace changed"):
+        with open_album_authority(album, lease) as authority:
+            held = authority.open_file(Path("01.flac"))
+            assert _nonblocking_writer_errno(track) == errno.EAGAIN
+
+    _assert_descriptor_closed(held.descriptor)
+    writer = os.open(track, os.O_WRONLY | os.O_NONBLOCK)
+    os.close(writer)
+
+
+def test_album_authority_body_exception_is_not_masked_by_exit_validation(
+    tmp_path, live_run_lock
+):
+    lease, _lock_file = live_run_lock
+    album = _album(tmp_path)
+    track = album / "01.flac"
+    displaced = album / "displaced.flac"
+    track.write_bytes(b"one")
+
+    with pytest.raises(RuntimeError, match="original body failure"):
+        with open_album_authority(album, lease) as authority:
+            held = authority.open_file(Path("01.flac"))
+            track.rename(displaced)
+            track.write_bytes(b"replacement")
+            raise RuntimeError("original body failure")
+
     _assert_descriptor_closed(held.descriptor)
 
 
@@ -226,12 +282,14 @@ def test_album_authority_revalidates_cached_file_name_before_return(
     displaced = album / "displaced.flac"
     track.write_bytes(b"one")
 
-    with open_album_authority(album, lease) as authority:
-        authority.open_file(Path("01.flac"))
-        track.rename(displaced)
-        track.write_bytes(b"replacement")
-        with pytest.raises(AlbumAuthorityUnavailable, match="namespace changed"):
+    with pytest.raises(RuntimeError, match="cached replacement observed"):
+        with open_album_authority(album, lease) as authority:
             authority.open_file(Path("01.flac"))
+            track.rename(displaced)
+            track.write_bytes(b"replacement")
+            with pytest.raises(AlbumAuthorityUnavailable, match="namespace changed"):
+                authority.open_file(Path("01.flac"))
+            raise RuntimeError("cached replacement observed")
 
 
 def test_album_authority_revalidates_cached_file_lease_before_return(
@@ -242,11 +300,13 @@ def test_album_authority_revalidates_cached_file_lease_before_return(
     track = album / "01.flac"
     track.write_bytes(b"one")
 
-    with open_album_authority(album, lease) as authority:
-        authority.open_file(Path("01.flac"))
-        assert _nonblocking_writer_errno(track) == errno.EAGAIN
-        with pytest.raises(AlbumAuthorityUnavailable, match="namespace changed"):
+    with pytest.raises(RuntimeError, match="cached lease break observed"):
+        with open_album_authority(album, lease) as authority:
             authority.open_file(Path("01.flac"))
+            assert _nonblocking_writer_errno(track) == errno.EAGAIN
+            with pytest.raises(AlbumAuthorityUnavailable, match="namespace changed"):
+                authority.open_file(Path("01.flac"))
+            raise RuntimeError("cached lease break observed")
 
 
 def test_album_authority_revalidates_run_lock_after_file_hashing(
@@ -292,23 +352,25 @@ def test_album_authority_revalidates_prior_files_after_new_file_hashing(
     second.write_bytes(b"two")
     real_hash = release_authority._sha256_fd
 
-    with open_album_authority(album, lease) as authority:
-        authority.open_file(Path("01.flac"))
+    with pytest.raises(RuntimeError, match="prior lease break observed"):
+        with open_album_authority(album, lease) as authority:
+            authority.open_file(Path("01.flac"))
 
-        def hash_then_break_prior_lease(descriptor):
-            digest = real_hash(descriptor)
-            assert _nonblocking_writer_errno(first) == errno.EAGAIN
-            return digest
+            def hash_then_break_prior_lease(descriptor):
+                digest = real_hash(descriptor)
+                assert _nonblocking_writer_errno(first) == errno.EAGAIN
+                return digest
 
-        monkeypatch.setattr(
-            release_authority,
-            "_sha256_fd",
-            hash_then_break_prior_lease,
-        )
-        with pytest.raises(AlbumAuthorityUnavailable, match="namespace changed"):
-            authority.open_file(Path("02.flac"))
-        writer = os.open(second, os.O_WRONLY | os.O_NONBLOCK)
-        os.close(writer)
+            monkeypatch.setattr(
+                release_authority,
+                "_sha256_fd",
+                hash_then_break_prior_lease,
+            )
+            with pytest.raises(AlbumAuthorityUnavailable, match="namespace changed"):
+                authority.open_file(Path("02.flac"))
+            writer = os.open(second, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(writer)
+            raise RuntimeError("prior lease break observed")
 
 
 def test_album_authority_serializes_concurrent_file_acquisition(
@@ -500,12 +562,14 @@ def test_album_authority_validate_namespace_rejects_file_name_replacement(
     displaced = album / "displaced.flac"
     track.write_bytes(b"one")
 
-    with open_album_authority(album, lease) as authority:
-        authority.open_file(Path("01.flac"))
-        track.rename(displaced)
-        track.write_bytes(b"replacement")
-        with pytest.raises(AlbumAuthorityUnavailable, match="namespace changed"):
-            authority.validate_namespace()
+    with pytest.raises(RuntimeError, match="replacement validation observed"):
+        with open_album_authority(album, lease) as authority:
+            authority.open_file(Path("01.flac"))
+            track.rename(displaced)
+            track.write_bytes(b"replacement")
+            with pytest.raises(AlbumAuthorityUnavailable, match="namespace changed"):
+                authority.validate_namespace()
+            raise RuntimeError("replacement validation observed")
 
 
 def test_album_authority_validate_namespace_rejects_full_version_change(
@@ -516,11 +580,13 @@ def test_album_authority_validate_namespace_rejects_full_version_change(
     track = album / "01.flac"
     track.write_bytes(b"one")
 
-    with open_album_authority(album, lease) as authority:
-        held = authority.open_file(Path("01.flac"))
-        os.fchmod(held.descriptor, 0o600)
-        with pytest.raises(AlbumAuthorityUnavailable, match="namespace changed"):
-            authority.validate_namespace()
+    with pytest.raises(RuntimeError, match="version validation observed"):
+        with open_album_authority(album, lease) as authority:
+            held = authority.open_file(Path("01.flac"))
+            os.fchmod(held.descriptor, 0o600)
+            with pytest.raises(AlbumAuthorityUnavailable, match="namespace changed"):
+                authority.validate_namespace()
+            raise RuntimeError("version validation observed")
 
 
 def test_album_authority_requires_live_exact_run_lock_at_entry_and_exit(
