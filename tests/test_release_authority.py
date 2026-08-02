@@ -196,6 +196,110 @@ def test_album_authority_body_exception_is_not_masked_by_exit_validation(
     _assert_descriptor_closed(held.descriptor)
 
 
+def test_album_authority_retries_interrupted_exclusion_cleanup_without_masking_body(
+    tmp_path, live_run_lock, monkeypatch
+):
+    lease, _lock_file = live_run_lock
+    album = _album(tmp_path)
+    track = album / "01.flac"
+    track.write_bytes(b"one")
+    close_calls = 0
+
+    with pytest.raises(RuntimeError, match="original body failure"):
+        with open_album_authority(album, lease) as authority:
+            held = authority.open_file(Path("01.flac"))
+            real_close = held.exclusion.close
+
+            def interrupt_once():
+                nonlocal close_calls
+                close_calls += 1
+                if close_calls == 1:
+                    raise KeyboardInterrupt
+                real_close()
+
+            monkeypatch.setattr(held.exclusion, "close", interrupt_once)
+            raise RuntimeError("original body failure")
+
+    assert close_calls == 2
+    _assert_descriptor_closed(held.descriptor)
+    writer = os.open(track, os.O_WRONLY | os.O_NONBLOCK)
+    os.close(writer)
+
+
+def test_album_authority_bounds_cleanup_retry_and_retains_failed_ownership(
+    tmp_path, live_run_lock, monkeypatch
+):
+    lease, _lock_file = live_run_lock
+    album = _album(tmp_path)
+    track = album / "01.flac"
+    track.write_bytes(b"one")
+    close_calls = 0
+
+    with pytest.raises(RuntimeError, match="original body failure"):
+        with open_album_authority(album, lease) as authority:
+            held = authority.open_file(Path("01.flac"))
+            real_close = held.exclusion.close
+
+            def always_interrupt():
+                nonlocal close_calls
+                close_calls += 1
+                raise KeyboardInterrupt
+
+            monkeypatch.setattr(held.exclusion, "close", always_interrupt)
+            raise RuntimeError("original body failure")
+
+    assert close_calls == 2
+    assert [binding.held for binding in authority._files] == [held]
+    assert _nonblocking_writer_errno(track) == errno.EAGAIN
+
+    monkeypatch.setattr(held.exclusion, "close", real_close)
+    assert authority._close_resources() is None
+    assert authority._files == []
+    writer = os.open(track, os.O_WRONLY | os.O_NONBLOCK)
+    os.close(writer)
+
+
+@pytest.mark.parametrize("descriptor_kind", ["file", "root-directory"])
+def test_album_authority_retries_interrupted_descriptor_cleanup(
+    tmp_path, live_run_lock, monkeypatch, descriptor_kind
+):
+    from qobuz_librarian.library import release_authority
+
+    lease, _lock_file = live_run_lock
+    album = _album(tmp_path)
+    track = album / "01.flac"
+    track.write_bytes(b"one")
+    real_close = release_authority.os.close
+    target = -1
+    close_calls = 0
+
+    def interrupt_target_once(descriptor):
+        nonlocal close_calls
+        if descriptor == target:
+            close_calls += 1
+            if close_calls == 1:
+                raise KeyboardInterrupt
+        real_close(descriptor)
+
+    with pytest.raises(RuntimeError, match="original body failure"):
+        with open_album_authority(album, lease) as authority:
+            held = authority.open_file(Path("01.flac"))
+            target = (
+                held.descriptor
+                if descriptor_kind == "file"
+                else authority._directories[0].descriptor
+            )
+            monkeypatch.setattr(
+                release_authority.os,
+                "close",
+                interrupt_target_once,
+            )
+            raise RuntimeError("original body failure")
+
+    assert close_calls == 2
+    _assert_descriptor_closed(target)
+
+
 def test_album_authority_opens_files_in_required_bytewise_order_and_cleans_reverse(
     tmp_path, live_run_lock, monkeypatch
 ):

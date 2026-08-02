@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import secrets
@@ -135,21 +136,53 @@ def _sha256_fd(descriptor: int) -> str:
         offset += len(chunk)
 
 
+_CLOSE_ATTEMPTS = 2
+
+
+def _close_with_retry(close) -> BaseException | None:
+    error = None
+    for _attempt in range(_CLOSE_ATTEMPTS):
+        try:
+            close()
+            return None
+        except BaseException as exc:
+            error = exc
+    return error
+
+
 def _close_descriptor(descriptor: int) -> BaseException | None:
     try:
-        os.close(descriptor)
-    except BaseException as exc:
-        return exc
-    return None
+        original = os.fstat(descriptor)
+    except OSError as exc:
+        if exc.errno == errno.EBADF:
+            return None
+        original = None
+
+    error = None
+    for _attempt in range(_CLOSE_ATTEMPTS):
+        try:
+            os.close(descriptor)
+            return None
+        except BaseException as exc:
+            error = exc
+
+        try:
+            current = os.fstat(descriptor)
+        except OSError as exc:
+            if exc.errno == errno.EBADF:
+                return None
+            return error
+
+        if original is None or _identity(current) != _identity(original):
+            return None
+
+    return error
 
 
 def _close_partial_file_resources(exclusion, descriptor, parents):
     error = None
     if exclusion is not None:
-        try:
-            exclusion.close()
-        except BaseException as exc:
-            error = exc
+        error = _close_with_retry(exclusion.close)
     if descriptor >= 0:
         caught = _close_descriptor(descriptor)
         if error is None and caught is not None:
@@ -595,26 +628,36 @@ class AlbumAuthority:
 
     def _close_resources(self) -> BaseException | None:
         error = None
+        retained_files = []
         for binding in reversed(self._files):
-            try:
-                binding.held.exclusion.close()
-            except BaseException as exc:
-                if error is None:
-                    error = exc
+            binding_error = _close_with_retry(binding.held.exclusion.close)
+            if error is None and binding_error is not None:
+                error = binding_error
             caught = _close_descriptor(binding.held.descriptor)
+            if binding_error is None and caught is not None:
+                binding_error = caught
             if error is None and caught is not None:
                 error = caught
             for parent in reversed(binding.parents):
                 caught = _close_descriptor(parent.descriptor)
+                if binding_error is None and caught is not None:
+                    binding_error = caught
                 if error is None and caught is not None:
                     error = caught
-        self._files.clear()
-        self._files_by_relative.clear()
+            if binding_error is not None:
+                retained_files.append(binding)
+        self._files = list(reversed(retained_files))
+        self._files_by_relative = {
+            binding.held.relative: binding for binding in self._files
+        }
+        retained_directories = []
         for binding in reversed(self._directories):
             caught = _close_descriptor(binding.descriptor)
             if error is None and caught is not None:
                 error = caught
-        self._directories.clear()
+            if caught is not None:
+                retained_directories.append(binding)
+        self._directories = list(reversed(retained_directories))
         return error
 
 
