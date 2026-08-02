@@ -359,6 +359,7 @@ def test_execute_upgrades_refreshes_upgrade_and_downsample_state(
                         lambda album_id, token: {"id": album_id, "title": "Album"})
     monkeypatch.setattr("qobuz_librarian.modes.process.process_album",
                         lambda *a, **k: {"imported": True, "result": "downloaded",
+                                         "n_ok": 1, "n_fail": 0,
                                          "dir": album_dir})
     monkeypatch.setattr("qobuz_librarian.library.catalog.find_existing_tracks",
                         lambda album: ([], None))
@@ -403,6 +404,7 @@ def test_execute_upgrades_marks_partial_cap_before_refresh(
     monkeypatch.setattr(flows, "get_album", lambda album_id, token: album)
     monkeypatch.setattr("qobuz_librarian.modes.process.process_album",
                         lambda *a, **k: {"imported": True, "result": "downloaded",
+                                         "n_ok": 1, "n_fail": 0,
                                          "dir": album_dir,
                                          "quality_verdict": {
                                              "under": True,
@@ -463,6 +465,7 @@ def test_execute_upgrades_does_not_mark_cap_when_staging_verdict_passed(
     monkeypatch.setattr(flows, "get_album", lambda album_id, token: album)
     monkeypatch.setattr("qobuz_librarian.modes.process.process_album",
                         lambda *a, **k: {"imported": True, "result": "downloaded",
+                                         "n_ok": 1, "n_fail": 0,
                                          "dir": album_dir,
                                          "quality_verdict": {
                                              "under": False,

@@ -185,7 +185,12 @@ def test_no_isrc_redownload_keeps_an_unprovable_backup(
 
     def process_after_recovery(*_args, **_kwargs):
         assert recoveries and recoveries[-1].stage == "backup"
-        return {"imported": True, "n_ok": 1, "n_fail": 0}
+        return {
+            "result": "downloaded",
+            "imported": True,
+            "n_ok": 1,
+            "n_fail": 0,
+        }
 
     monkeypatch.setattr(
         "qobuz_librarian.modes.process.process_album",

@@ -50,6 +50,7 @@ from qobuz_librarian.ui_cli.colors import format_size
 from qobuz_librarian.ui_cli.errors import plural
 from qobuz_librarian.ui_cli.logging import log
 from qobuz_librarian.web import job_persistence, review_badges
+from qobuz_librarian.web.process_disposition import classify_process_result
 from qobuz_librarian.web.review_candidates import (
     candidate_album_dir_relative,
     candidate_payload,
@@ -1489,9 +1490,6 @@ def execute_albums(job, chosen, token):
     # have moved since.
     clear_scan_caches()
     args = build_args()
-    _benign = {"already_complete", "skipped_already_higher_quality", "dry_run",
-               "user_skipped", "lossy_only", "no_tracks", "skipped_has_extras",
-               "cancelled"}
     ok = 0
     partial = 0
     failed = 0
@@ -1546,6 +1544,7 @@ def execute_albums(job, chosen, token):
             with staging_lock():
                 result = process_album(full, args, allow_force=False,
                                        already_confirmed=True, token=token)
+                disposition = classify_process_result(result)
         except (AuthLost, QobuzUnavailable):
             _fold_back_unfinished()
             raise
@@ -1558,16 +1557,16 @@ def execute_albums(job, chosen, token):
             # Cancelled mid-download: processed already points past this album,
             # so the cancel fold-back below would drop its pick — remember it.
             cancelled_cand = cand
-        if result and result.get("result") == "identity_attention":
+        if disposition.attention == "identity":
             # Audio may have landed, but release ownership was not proven.
             # Keep the pick live and do not publish any derived library state
             # from an unverified destination.
             job._imported_any = (
-                job._imported_any or bool(result.get("imported"))
+                job._imported_any or disposition.mutated_library
             )
             identity_attention += 1
             failed_cands.append(cand)
-        elif result and result.get("imported") and result.get("n_ok", 0) > 0:
+        elif disposition.verified_success:
             job._imported_any = True
             _refresh_after_local_album_change(
                 full,
@@ -1597,7 +1596,7 @@ def execute_albums(job, chosen, token):
                     )
             else:
                 ok += 1
-        elif not (result and result.get("result") in _benign):
+        elif not disposition.consume_candidate:
             failed += 1
             failed_cands.append(cand)
         time.sleep(cfg.ARTIST_API_DELAY)
@@ -1613,10 +1612,11 @@ def execute_albums(job, chosen, token):
             refold_into_living_review(unrun)
         elif unrun and is_nr_run:
             _return_new_release_picks(unrun)
-        job.summary = (f"Stopped early. {ok} downloaded, "
-                       f"{len(chosen) - processed} not started.")
-        log.info(job.summary)
-        return
+        if not identity_attention:
+            job.summary = (f"Stopped early. {ok} downloaded, "
+                           f"{len(chosen) - processed} not started.")
+            log.info(job.summary)
+            return
     if identity_attention:
         parts = []
         if ok:
@@ -1763,6 +1763,7 @@ def execute_upgrades(job, chosen, token):
     """Re-rip the present tracks of each chosen album at higher quality."""
     from qobuz_librarian.modes.process import process_album
     from qobuz_librarian.modes.upgrade import BENIGN_UPGRADE_RESULTS
+    from qobuz_librarian.web import jobs as job_mgr
     from qobuz_librarian.web.jobs import staging_lock
 
     clear_scan_caches()
@@ -1777,6 +1778,7 @@ def execute_upgrades(job, chosen, token):
     ok = 0
     kept = 0
     failed = 0
+    identity_attention = 0
     processed = 0
     for i, cand in enumerate(chosen, 1):
         if job.cancel_requested:
@@ -1806,6 +1808,7 @@ def execute_upgrades(job, chosen, token):
                 result = process_album(album, args, allow_force=False,
                                        already_confirmed=True,
                                        upgrade_only=True, token=token)
+                disposition = classify_process_result(result)
         except (AuthLost, QobuzUnavailable):
             raise
         except Exception as e:
@@ -1813,12 +1816,17 @@ def execute_upgrades(job, chosen, token):
             failed += 1
             continue
         _res = (result or {}).get("result")
-        if result and result.get("upgrade_unverified"):
+        if disposition.attention == "identity":
+            identity_attention += 1
+            job._imported_any = (
+                job._imported_any or disposition.mutated_library
+            )
+        elif result and result.get("upgrade_unverified"):
             # Imported, but the rebuilt folder couldn't be verified as
             # complete as the original, so the backup was kept.
             kept += 1
             job._imported_any = True
-        elif result and result.get("imported") and _res not in (
+        elif disposition.verified_success and _res not in (
                 _skip | {"upgrade_aborted_backup_failed"}):
             ok += 1
             job._imported_any = True
@@ -1846,7 +1854,7 @@ def execute_upgrades(job, chosen, token):
             # The verified replace refreshed the whole album, so a parked
             # library review's candidates for it (incl. Gap Fill) are stale.
             prune_library_review_candidates(album)
-        elif result and _res in (_skip - {"cancelled", "dry_run"}):
+        elif disposition.publish_derived_state and _res in _skip:
             _refresh_after_local_album_change(
                 album,
                 result,
@@ -1856,11 +1864,11 @@ def execute_upgrades(job, chosen, token):
                 upgrade=True,
                 downsample=True,
             )
-        elif _res not in _skip:
+        elif not disposition.consume_candidate:
             failed += 1
         time.sleep(cfg.ARTIST_API_DELAY)
     job._progress_scope = None
-    if job.cancel_requested:
+    if job.cancel_requested and not identity_attention:
         job.summary = (f"Stopped early. {ok} upgraded, "
                        f"{len(chosen) - processed} not started.")
         log.info(job.summary)
@@ -1869,9 +1877,22 @@ def execute_upgrades(job, chosen, token):
     if kept:
         msg += (f" {kept} kept the original (upgrade couldn't be verified "
                 f"complete; backup retained).")
+    if identity_attention:
+        msg += (
+            f" {plural(identity_attention, 'album')} needs release-identity "
+            "attention and was not counted upgraded; its review was retained."
+        )
     job.summary = msg
     log.info(msg)
-    if failed:
+    if identity_attention:
+        job.status = job_mgr.JobStatus.FAILED
+        job.attention = "identity"
+        extra = f"; {failed} other failed" if failed else ""
+        job.error = (
+            f"{plural(identity_attention, 'album')} needs release-identity "
+            f"attention{extra}. Its review entry was retained for retry."
+        )
+    elif failed:
         job.error = f"{failed} of {plural(len(chosen), 'album')} couldn't be upgraded; see the log."
 
 
@@ -2410,6 +2431,7 @@ def _redownload_damaged_album(payload, token, *, recovery_checkpoint=None):
         with staging_lock():
             result = process_album(full, build_args(), allow_force=False,
                                    already_confirmed=True, token=token) or {}
+            disposition = classify_process_result(result)
     except Exception as exc:
         if backup:
             if restore_upgrade_backup(backup, album_dir):
@@ -2430,9 +2452,19 @@ def _redownload_damaged_album(payload, token, *, recovery_checkpoint=None):
                 )
                 raise RepairRecoveryRequired(recovery, exc) from exc
         raise
-    imported_ok = bool(result.get("imported")) and result.get("n_ok", 0) > 0
     if backup:
-        if imported_ok and _upgrade_replacement_verified(full, album_dir, backup):
+        if disposition.attention == "identity":
+            pin_repair_recovery(
+                "repair backup kept — replacement needs release-identity "
+                "attention"
+            )
+            checkpoint_recovery(
+                "identity",
+                "The replacement landed, but its release identity needs "
+                "attention before the original backup can be retired.",
+            )
+        elif disposition.retire_backup and _upgrade_replacement_verified(
+                full, album_dir, backup):
             # Carry useful companions, then retire the original's backup when
             # every file it holds is verifiably superseded in the new album.
             carried = _carry_non_audio_from_backup(
@@ -2477,7 +2509,7 @@ def _redownload_damaged_album(payload, token, *, recovery_checkpoint=None):
                     "The replacement landed, but its album or companion files "
                     "could not be flushed safely.",
                 )
-        elif imported_ok:
+        elif disposition.mutated_library:
             # Imported, but a decode pass alone doesn't prove the re-rip kept
             # every track — a truncated or short result could be WORSE than
             # the damaged original it replaced.
@@ -2586,12 +2618,14 @@ def execute_repairs(job, chosen, token):
         RepairRecoveryRequired,
         repair_album_dir,
     )
+    from qobuz_librarian.web import jobs as job_mgr
     from qobuz_librarian.web.jobs import staging_lock
 
     clear_scan_caches()
     args = build_args()
     fixed = 0
     failed = 0
+    identity_attention = 0
     processed = 0
     for i, cand in enumerate(chosen, 1):
         if job.cancel_requested:
@@ -2624,7 +2658,8 @@ def execute_repairs(job, chosen, token):
                                               recovery_checkpoint=lambda recovery: (
                                                   _checkpoint_repair_recovery(
                                                       job, recovery)
-                                              ))
+                                                  ))
+            disposition = classify_process_result(result)
         except RepairRecoveryRequired as exc:
             # The callback normally saved this before the exceptional
             # boundary.
@@ -2644,7 +2679,12 @@ def execute_repairs(job, chosen, token):
         # end up downloaded-and-imported is a real failure. A kept backup is
         # not one — a verified repair counts, and the backup is reported in
         # the summary's recovery tail.
-        if (result and result.get("n_ok", 0) > 0 and result.get("imported")
+        if disposition.attention == "identity":
+            identity_attention += 1
+            job._imported_any = (
+                job._imported_any or disposition.mutated_library
+            )
+        elif (disposition.verified_success
                 and result.get("n_fail", 0) == 0
                 and not result.get("repair_unverified")):
             fixed += 1
@@ -2663,7 +2703,7 @@ def execute_repairs(job, chosen, token):
         time.sleep(cfg.ARTIST_API_DELAY)
     job._progress_scope = None
     recovery_count = len(getattr(job, "recoveries", []) or [])
-    if job.cancel_requested:
+    if job.cancel_requested and not identity_attention:
         kept = (f", {recovery_count} kept for recovery"
                 if recovery_count else "")
         job.summary = (f"Stopped early. {fixed} repaired{kept}, "
@@ -2674,8 +2714,21 @@ def execute_repairs(job, chosen, token):
             if recovery_count else "")
     job.summary = (f"Finished. Repaired {fixed}/{plural(len(chosen), 'album')}."
                    f"{kept}")
+    if identity_attention:
+        job.summary += (
+            f" {plural(identity_attention, 'album')} needs release-identity "
+            "attention and was not counted repaired; its evidence was retained."
+        )
     log.info(job.summary)
-    if failed:
+    if identity_attention:
+        job.status = job_mgr.JobStatus.FAILED
+        job.attention = "identity"
+        extra = f"; {failed} other failed" if failed else ""
+        job.error = (
+            f"{plural(identity_attention, 'album')} needs release-identity "
+            f"attention{extra}. Its repair evidence was retained for retry."
+        )
+    elif failed:
         job.error = f"{failed} of {plural(len(chosen), 'album')} couldn't be repaired; see the log."
 
 

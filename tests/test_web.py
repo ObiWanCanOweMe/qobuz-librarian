@@ -354,6 +354,480 @@ def test_direct_album_identity_attention_is_not_published_as_success(
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    ("surface", "success_summary"),
+    [
+        ("missing_albums", "downloaded and imported"),
+        ("direct_album", "track downloaded"),
+        ("upgrade", "upgraded 1/1"),
+        ("damaged_redownload", "repaired 1/1"),
+        ("repair", "repaired 1/1"),
+    ],
+)
+def test_identity_attention_imported_result_retains_evidence_on_every_surface(
+        surface, success_summary, monkeypatch, tmp_path, request):
+    from qobuz_librarian.library import backup as backup_mod
+    from qobuz_librarian.library import hidden as hidden_mod
+    from qobuz_librarian.library import library_scan_state
+    from qobuz_librarian.modes import process as process_mod
+    from qobuz_librarian.modes import repair as repair_mod
+    from qobuz_librarian.quality import decision as quality_decision
+    from qobuz_librarian.queue import executor as queue_executor
+    from qobuz_librarian.queue import journal as queue_state
+    from qobuz_librarian.web import app as app_mod
+    from qobuz_librarian.web import flows, job_persistence
+
+    result = {
+        "result": "identity_attention",
+        "imported": True,
+        "n_ok": 1,
+        "n_fail": 0,
+        "dir": tmp_path / "Artist" / "Album",
+        "quality_verdict": {
+            "under": True,
+            "recovered": False,
+            "n_below": 1,
+        },
+    }
+    album = {
+        "id": "attention-1",
+        "title": "Album",
+        "artist": {"name": "Artist"},
+    }
+    side_effects = []
+    real_prune = flows.prune_library_review_candidates
+
+    monkeypatch.setattr(job_persistence, "_disabled", False)
+    job_persistence._reset_for_tests()
+    job_persistence.init()
+    request.addfinalizer(job_persistence._reset_for_tests)
+
+    monkeypatch.setattr(flows.cfg, "ARTIST_API_DELAY", 0)
+    monkeypatch.setattr(flows, "clear_scan_caches", lambda: None)
+    monkeypatch.setattr(flows, "get_album", lambda *_args: album)
+    monkeypatch.setattr(flows.time, "sleep", lambda *_args: None)
+    monkeypatch.setattr(
+        process_mod,
+        "process_album",
+        lambda *_args, **_kwargs: dict(result),
+    )
+    monkeypatch.setattr(
+        repair_mod,
+        "repair_album_dir",
+        lambda *_args, **_kwargs: dict(result),
+    )
+    monkeypatch.setattr(
+        flows,
+        "_refresh_after_local_album_change",
+        lambda *_args, **_kwargs: side_effects.append("refresh"),
+    )
+    monkeypatch.setattr(
+        flows,
+        "prune_library_review_candidates",
+        lambda *_args, **_kwargs: side_effects.append("prune"),
+    )
+    monkeypatch.setattr(
+        library_scan_state,
+        "mark_review_retired",
+        lambda **_kwargs: side_effects.append("review retirement"),
+    )
+    monkeypatch.setattr(
+        quality_decision,
+        "mark_album_capped",
+        lambda *_args, **_kwargs: side_effects.append("quality mark"),
+    )
+    monkeypatch.setattr(
+        hidden_mod,
+        "unmark_single",
+        lambda *_args, **_kwargs: side_effects.append("unmark"),
+    )
+    monkeypatch.setattr(
+        app_mod,
+        "_reconcile_acknowledged_job",
+        lambda *_args, **_kwargs: side_effects.append("reconciliation"),
+    )
+    monkeypatch.setattr(
+        backup_mod,
+        "retire_verified_repair_backup",
+        lambda *_args, **_kwargs: side_effects.append("backup retirement") or True,
+    )
+    monkeypatch.setattr(
+        process_mod,
+        "_upgrade_replacement_verified",
+        lambda *_args, **_kwargs: side_effects.append("replacement verification") or True,
+    )
+    monkeypatch.setattr(
+        process_mod,
+        "_carry_non_audio_from_backup",
+        lambda *_args, **_kwargs: side_effects.append("companion carry") or object(),
+    )
+
+    job = jm.Job(title="Identity attention", artist="Artist")
+    job.status = jm.JobStatus.RUNNING
+    candidate = {
+        "kind": "album",
+        "title": "Album",
+        "artist": "Artist",
+        "payload": {
+            "album_id": "attention-1",
+            "album_dir": str(tmp_path / "Artist" / "Album"),
+            "artist_name": "Artist",
+            "verified_truncated": ["01.flac"],
+        },
+        "selected": True,
+    }
+    job.candidates = [candidate]
+    assert job_persistence.persist(job)
+
+    if surface == "missing_albums":
+        job.execute_kind = "library"
+        job._consumed_whole_review = True
+        flows.execute_albums(job, [candidate], "tok")
+        parked = next(
+            review
+            for review in jm.registry.awaiting_review()
+            if review.id != job.id
+            and any(
+                (saved.get("payload") or {}).get("album_id") == "attention-1"
+                for saved in review.candidates
+            )
+        )
+        saved = job_persistence.load_one(parked.id)
+        evidence_retained = (
+            saved is not None
+            and saved["candidates"][0]["payload"]["album_id"] == "attention-1"
+            and saved["candidates"][0]["selected"] is True
+        )
+    elif surface == "direct_album":
+        parked = jm.Job(
+            title="Library scan",
+            kind="scan",
+            execute_kind="library",
+            status=jm.JobStatus.AWAITING_REVIEW,
+        )
+        parked.add_candidate(
+            kind="album",
+            title="Album",
+            artist="Artist",
+            payload={"album_id": "attention-1"},
+            selected=True,
+        )
+        jm.registry.add(parked)
+        assert job_persistence.persist(parked)
+
+        def observed_prune(*args, **kwargs):
+            side_effects.append("prune")
+            return real_prune(*args, **kwargs)
+
+        monkeypatch.setattr(
+            flows,
+            "prune_library_review_candidates",
+            observed_prune,
+        )
+        monkeypatch.setattr(
+            queue_state,
+            "_deserialize_queue_item",
+            lambda _planned: {"album": album},
+        )
+        monkeypatch.setattr(
+            queue_executor,
+            "_execute_download_queue",
+            lambda *_args, **_kwargs: ([dict(result)], False),
+        )
+        monkeypatch.setattr(app_mod, "_run_lock_intact", lambda: True)
+        monkeypatch.setattr(
+            app_mod,
+            "_record_startup_recovery",
+            lambda _authority: type(
+                "Recovery",
+                (),
+                {"status": type("Status", (), {"value": "clear"})()},
+            )(),
+        )
+        monkeypatch.setattr(
+            app_mod,
+            "_durable_completion_status",
+            lambda _job: True,
+        )
+        app_mod._make_download_run(
+            album,
+            "tok",
+            durable_planned={"saved": True},
+        )(job)
+        saved = job_persistence.load_one(parked.id)
+        evidence_retained = (
+            saved is not None
+            and saved["candidates"][0]["payload"]["album_id"] == "attention-1"
+        )
+    elif surface == "upgrade":
+        candidate["payload"] = {"album_id": "attention-1"}
+        flows.execute_upgrades(job, [candidate], "tok")
+        assert job_persistence.persist(job)
+        saved = job_persistence.load_one(job.id)
+        evidence_retained = (
+            saved is not None
+            and saved["candidates"][0]["payload"]["album_id"] == "attention-1"
+        )
+    elif surface == "damaged_redownload":
+        album_dir = tmp_path / "Artist" / "Album"
+        album_dir.mkdir(parents=True)
+        backup_dir = tmp_path / "backup"
+        backup_dir.mkdir()
+        backup = backup_mod.BackupResult(
+            backup_dir,
+            complete=True,
+            receipt={"kind": "repair"},
+            requested=1,
+            backed_up=1,
+        )
+        candidate["kind"] = "redownload"
+        monkeypatch.setattr(
+            backup_mod,
+            "backup_album_dir",
+            lambda _album_dir: backup,
+        )
+        monkeypatch.setattr(
+            backup_mod,
+            "pin_unverified_upgrade_backup",
+            lambda *_args, **_kwargs: True,
+        )
+        flows.execute_repairs(job, [candidate], "tok")
+        assert job_persistence.persist(job)
+        saved = job_persistence.load_one(job.id)
+        evidence_retained = (
+            backup_dir.is_dir()
+            and saved is not None
+            and len(saved["recoveries"]) == 1
+            and saved["recoveries"][0]["status"] == "retained"
+            and saved["recoveries"][0]["stage"] == "identity"
+            and saved["recoveries"][0]["location"] == str(backup_dir)
+        )
+    else:
+        flows.execute_repairs(job, [candidate], "tok")
+        assert job_persistence.persist(job)
+        saved = job_persistence.load_one(job.id)
+        evidence_retained = (
+            saved is not None
+            and saved["candidates"][0]["payload"]["album_id"] == "attention-1"
+        )
+
+    assert job.status == jm.JobStatus.FAILED
+    assert job.attention == "identity"
+    assert "identity" in job.error.lower()
+    assert "identity" in job.summary.lower()
+    assert success_summary not in job.summary.lower()
+    assert evidence_retained
+    assert side_effects == []
+
+
+def test_process_disposition_is_immutable_and_result_kind_is_authoritative():
+    from dataclasses import FrozenInstanceError
+
+    from qobuz_librarian.web.process_disposition import (
+        ProcessDisposition,
+        classify_process_result,
+    )
+
+    attention = classify_process_result({
+        "result": "identity_attention",
+        "imported": True,
+    })
+
+    assert attention == ProcessDisposition(
+        mutated_library=True,
+        verified_success=False,
+        publish_derived_state=False,
+        retire_backup=False,
+        consume_candidate=False,
+        attention="identity",
+    )
+    with pytest.raises(FrozenInstanceError):
+        attention.verified_success = True
+
+    rejected = ProcessDisposition(
+        mutated_library=True,
+        verified_success=False,
+        publish_derived_state=False,
+        retire_backup=False,
+        consume_candidate=False,
+        attention=None,
+    )
+    assert classify_process_result({
+        "result": "attention",
+        "imported": True,
+        "n_ok": 1,
+        "n_fail": 0,
+    }) == rejected
+    assert classify_process_result({
+        "result": "identity_ambiguous",
+        "imported": True,
+        "n_ok": 1,
+        "n_fail": 0,
+    }) == rejected
+    assert classify_process_result({
+        "result": "downloaded",
+        "imported": True,
+    }) == rejected
+    assert classify_process_result({
+        "result": "downloaded",
+        "imported": "false",
+        "n_ok": True,
+        "n_fail": 0,
+    }) == ProcessDisposition(
+        mutated_library=False,
+        verified_success=False,
+        publish_derived_state=False,
+        retire_backup=False,
+        consume_candidate=False,
+        attention=None,
+    )
+    assert classify_process_result({
+        "backup": None,
+        "imported": True,
+        "n_ok": 1,
+        "n_fail": False,
+    }) == rejected
+
+
+def test_direct_durable_unknown_attention_never_reconciles_as_success(
+        monkeypatch):
+    from qobuz_librarian.queue import executor as queue_executor
+    from qobuz_librarian.queue import journal as queue_state
+    from qobuz_librarian.web import app as app_mod
+
+    album = {
+        "id": "unknown-attention",
+        "title": "Album",
+        "artist": {"name": "Artist"},
+    }
+    result = {
+        "result": "attention",
+        "imported": True,
+        "n_ok": 1,
+        "n_fail": 0,
+    }
+    reconciled = []
+    monkeypatch.setattr(
+        queue_state,
+        "_deserialize_queue_item",
+        lambda _planned: {"album": album},
+    )
+    monkeypatch.setattr(
+        queue_executor,
+        "_execute_download_queue",
+        lambda *_args, **_kwargs: ([result], False),
+    )
+    monkeypatch.setattr(app_mod, "_run_lock_intact", lambda: True)
+    monkeypatch.setattr(
+        app_mod,
+        "_record_startup_recovery",
+        lambda _authority: type(
+            "Recovery",
+            (),
+            {"status": type("Status", (), {"value": "clear"})()},
+        )(),
+    )
+    monkeypatch.setattr(
+        app_mod,
+        "_durable_completion_status",
+        lambda _job: True,
+    )
+    monkeypatch.setattr(
+        app_mod,
+        "_reconcile_acknowledged_job",
+        lambda _job: reconciled.append(True) or True,
+    )
+
+    job = jm.Job(title="Unknown attention", artist="Artist")
+    job.status = jm.JobStatus.RUNNING
+    app_mod._make_download_run(
+        album,
+        "tok",
+        durable_planned={"saved": True},
+    )(job)
+
+    assert reconciled == []
+    assert job.status == jm.JobStatus.FAILED
+    assert "downloaded" not in job.summary.lower()
+
+
+@pytest.mark.parametrize("surface", ["missing_albums", "upgrade", "repair"])
+def test_late_cancel_does_not_override_observed_identity_attention(
+        surface, monkeypatch):
+    from qobuz_librarian.modes import process as process_mod
+    from qobuz_librarian.modes import repair as repair_mod
+    from qobuz_librarian.web import flows
+
+    job = jm.Job(title="Late cancel", artist="Artist")
+    job.status = jm.JobStatus.RUNNING
+    candidate = {
+        "kind": "album",
+        "title": "Album",
+        "artist": "Artist",
+        "payload": {
+            "album_id": "late-cancel",
+            "album_dir": "/music/Artist/Album",
+            "artist_name": "Artist",
+            "verified_truncated": ["01.flac"],
+        },
+        "selected": True,
+    }
+    job.candidates = [candidate]
+    retained = []
+    result = {
+        "result": "identity_attention",
+        "imported": True,
+        "n_ok": 1,
+        "n_fail": 0,
+    }
+
+    def late_attention(*_args, **_kwargs):
+        job.cancel_requested = True
+        return dict(result)
+
+    monkeypatch.setattr(flows.cfg, "ARTIST_API_DELAY", 0)
+    monkeypatch.setattr(flows, "clear_scan_caches", lambda: None)
+    monkeypatch.setattr(
+        flows,
+        "get_album",
+        lambda *_args: {"id": "late-cancel", "artist": {"name": "Artist"}},
+    )
+    monkeypatch.setattr(flows.time, "sleep", lambda *_args: None)
+    monkeypatch.setattr(process_mod, "process_album", late_attention)
+    monkeypatch.setattr(repair_mod, "repair_album_dir", late_attention)
+    monkeypatch.setattr(
+        flows,
+        "_refresh_after_local_album_change",
+        lambda *_args, **_kwargs: pytest.fail("attention must not refresh"),
+    )
+    monkeypatch.setattr(
+        flows,
+        "prune_library_review_candidates",
+        lambda *_args, **_kwargs: pytest.fail("attention must not prune"),
+    )
+
+    if surface == "missing_albums":
+        job.execute_kind = "library"
+        job._consumed_whole_review = True
+        monkeypatch.setattr(
+            flows,
+            "_park_library_failures",
+            lambda candidates, **_kwargs: retained.extend(candidates),
+        )
+        flows.execute_albums(job, [candidate], "tok")
+        assert retained == [candidate]
+    elif surface == "upgrade":
+        candidate["payload"] = {"album_id": "late-cancel"}
+        flows.execute_upgrades(job, [candidate], "tok")
+    else:
+        flows.execute_repairs(job, [candidate], "tok")
+
+    assert job.status == jm.JobStatus.FAILED
+    assert job.attention == "identity"
+    assert "identity" in job.summary.lower()
+    assert "identity" in job.error.lower()
+
+
 def test_direct_single_track_download_refreshes_saved_quality_state(
         monkeypatch, tmp_path):
     import qobuz_librarian.library.catalog as cat_mod
@@ -2590,7 +3064,9 @@ def test_search_download_prunes_parked_library_review(client, monkeypatch, tmp_p
     from qobuz_librarian.web import app as webapp
     monkeypatch.setattr("qobuz_librarian.config.HIDDEN_FILE", tmp_path / "h.json")
     monkeypatch.setattr("qobuz_librarian.modes.process.process_album",
-                        lambda *a, **k: {"imported": True, "n_ok": 9})
+                        lambda *a, **k: {"result": "downloaded",
+                                         "imported": True,
+                                         "n_ok": 9, "n_fail": 0})
 
     parked = _inject_job(jm.JobStatus.AWAITING_REVIEW)
     parked.execute_kind = "library"
@@ -4342,7 +4818,8 @@ def test_download_partial_album_proceeds_to_gap_fill(client, monkeypatch):
                         lambda q, e: ([{"id": 2}, {"id": 3}], [{"id": 1}]))
     monkeypatch.setattr(proc_mod, "process_album",
                         lambda *a, **k: {"result": "downloaded",
-                                         "imported": True, "n_fail": 0})
+                                         "imported": True,
+                                         "n_ok": 2, "n_fail": 0})
 
     jm.start_worker()
     r = client.post("/download", data={"album_id": "gap1"},
@@ -5470,7 +5947,7 @@ def test_partial_library_execution_carries_original_edition_badge(monkeypatch):
             "imported": True,
             "n_ok": 7,
             "n_fail": 3,
-            "result": "downloaded",
+            "result": "partial",
         },
     )
 
@@ -5504,7 +5981,7 @@ def test_partial_new_release_download_returns_to_the_nr_review(monkeypatch):
                         lambda *a, **k: None)
     monkeypatch.setattr(process_mod, "process_album",
                         lambda *_a, **_k: {"imported": True, "n_ok": 7,
-                                           "n_fail": 3, "result": "downloaded"})
+                                           "n_fail": 3, "result": "partial"})
     try:
         flows.execute_albums(running, chosen, "tok")
         titles = {c["title"] for c in parked_nr.candidates}

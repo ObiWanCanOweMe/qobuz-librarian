@@ -45,6 +45,7 @@ from qobuz_librarian.web.csrf import (
     SecurityHeadersMiddleware,
     StripServerHeaderMiddleware,
 )
+from qobuz_librarian.web.process_disposition import classify_process_result
 from qobuz_librarian.web.review_candidates import (
     candidate_payload,
     is_non_actionable,
@@ -3168,6 +3169,7 @@ def _make_download_run(
                 r = process_album(album, args, allow_force=False,
                                   already_confirmed=True, token=token,
                                   treat_as_new=treat_as_new) or {}
+                disposition = classify_process_result(r)
             else:
                 try:
                     results, drained = _execute_download_queue(
@@ -3214,11 +3216,11 @@ def _make_download_run(
                     and type(results[0]) is dict
                     else None
                 )
+                disposition = classify_process_result(result)
                 accepted = (
                     drained is True
                     and result is not None
-                    and result.get("imported") is True
-                    and result.get("result") != "identity_attention"
+                    and disposition.verified_success
                     and recovery_status == "clear"
                     and not refresh_failed
                 )
@@ -3237,7 +3239,7 @@ def _make_download_run(
                     if (
                         completion_acknowledged is True
                         and result is not None
-                        and result.get("result") != "identity_attention"
+                        and disposition.verified_success
                         and recovery_status == "clear"
                         and _run_lock_intact()
                         and _reconcile_acknowledged_job(j)
@@ -3268,11 +3270,11 @@ def _make_download_run(
                             "completion. Its recovery state was retained; "
                             "use Retry to settle it and try again."
                         )
-        benign = {"already_complete", "skipped_already_higher_quality",
-                  "skipped_has_extras", "dry_run", "user_skipped",
-                  "lossy_only", "no_tracks", "cancelled"}
-        identity_attention = r.get("result") == "identity_attention"
+        identity_attention = disposition.attention == "identity"
         if identity_attention:
+            j._imported_any = (
+                j._imported_any or disposition.mutated_library
+            )
             j.status = job_mgr.JobStatus.FAILED
             j.attention = "identity"
             j.error = (
@@ -3281,10 +3283,15 @@ def _make_download_run(
             )
         elif durable_failure:
             pass
-        elif r.get("result") not in benign and not r.get("imported"):
+        elif not disposition.consume_candidate:
             j.status = job_mgr.JobStatus.FAILED
             if r.get("n_fail"):
                 j.error = f"{plural(r['n_fail'], 'track')} failed. See job log."
+            elif disposition.mutated_library:
+                j.error = (
+                    "The library may have changed, but the result could not "
+                    "be verified. Recovery evidence was retained."
+                )
             elif r.get("n_ok"):
                 j.error = "Downloaded, but the import failed. See job log."
             else:
@@ -3294,12 +3301,20 @@ def _make_download_run(
             j.error = f"{plural(r['n_fail'], 'track')} failed. See job log."
         # Surface a one-line outcome here so the /jobs page tells the user what
         # happened without expanding the log.
-        summary = _summarize_download_result(r)
+        summary = (
+            _summarize_download_result(r)
+            if (
+                identity_attention
+                or disposition.verified_success
+                or disposition.consume_candidate
+            )
+            else ""
+        )
         if summary:
             j.summary = summary
         # Claiming/completing the album the normal way graduates it out of the
         # "downloaded single" state, so the rest stops being suppressed in scans.
-        if r.get("imported") and not identity_attention:
+        if disposition.publish_derived_state and disposition.mutated_library:
             _refresh_after_local_album_change(
                 album,
                 r,
