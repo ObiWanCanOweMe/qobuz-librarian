@@ -2,6 +2,67 @@
 
 All notable changes to Qobuz Librarian are recorded here, newest first. The project follows [semantic versioning](https://semver.org/); dates are when each version was tagged during local development.
 
+## [0.15.0](https://github.com/ObiWanCanOweMe/qobuz-librarian/compare/v0.14.0...v0.15.0) (2026-08-02)
+
+
+### Features
+
+* add durable qobuz release manifests ([2eb677f](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/2eb677f58632458e34869c009b838699fc8eeb9a))
+* add lease-bearing album authority ([a7e0709](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/a7e0709d4d665fa03793a264aa842fa4e1a22734))
+* adopt only unambiguous qobuz releases ([723b9bc](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/723b9bc1ab0b91eb3196ff609f2000f81b1af470))
+* finalize release identity after import proof ([9226fa2](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/9226fa24febc09a632b1356eff62f15aa5295bbc))
+* label confusable qobuz editions ([1036925](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/1036925d828452585100ed28965f12f7bf0934a4))
+* preserve release identity during migration ([89ad05d](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/89ad05d9ed667aefac47f9057e0c86ca6f23a2a1))
+* preserve release identity in album backups ([0df9f4a](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/0df9f4ae6eb8bdac682820b787505dc370fc7fed))
+* resolve edition collision paths ([5beb0a5](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/5beb0a501b592710666e7df774a36b125551b6c0))
+* retain qobuz editions by release id ([e78cf69](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/e78cf698e555925cd0a89f32f272a3f67aa892b5))
+* route qobuz edition collisions during import ([7783383](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/7783383390e16430ef2de210fc53565666ca1d7d))
+* show qobuz editions in library reviews ([f8012d0](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/f8012d0079b1b963d3b3c5aedaef1d5d611b822a))
+
+
+### Bug Fixes
+
+* allow full-length collision suffix ([516604e](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/516604e38eefb362f2197644f7bdcded8d2b393a))
+* bind legacy adoption to held album evidence ([ca5efdd](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/ca5efddaf6cf57985d02c5af32eab41a1c537534))
+* bind release identity to stable paths ([6082ab9](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/6082ab90bb092fb98e3f257d7b940243a6200cc0))
+* centralize web process result semantics ([68b30d0](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/68b30d0ef34f98b3ed8032c38ac3cdd84b23b942))
+* close final authority lifetime gaps ([94f1794](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/94f17945879b54f75b158837086f89b580719fd5))
+* close release identity race windows ([d0d6711](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/d0d6711aedd769f08d1e9ffc9b53ba814f87ef4d))
+* constrain qobuz edition metadata ([54b35c5](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/54b35c5ae1b00720c1b0fde1117111db93f1137f))
+* consume raw descriptor ownership ([e09d35a](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/e09d35a620dcba4449d8cc0f7a47e0fe5b8696df))
+* enforce migration plan and schema integrity ([26c5725](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/26c5725d0b84f998e169546c26fad2422683840c))
+* fingerprint reserved manifest directories ([da05c28](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/da05c28fee870774c3ff0893cdcb0a311ae92edf))
+* gate backup settlement on release identity ([61a4248](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/61a4248f6edbda47070fcb9761187d843f5e5b18))
+* harden migration execution authority ([ccc3bbc](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/ccc3bbcdf6943e2c1adf8435caa62c185907cc87))
+* harden qobuz edition badges ([706027f](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/706027f828f039e8dc1de73307ad5e2a0f492ff6))
+* harden qobuz identity review state ([fa986b5](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/fa986b5fb170bcccc0091070185b95fcd6271874))
+* harden release identity finalization proof ([1457807](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/145780758a367e02011706b4136dd91d95fdca41))
+* hide raw migration executor ([a455863](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/a455863efea332723f2eeba33eecd1ab3e079a73))
+* preserve collision routing in durable imports ([8ee093a](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/8ee093a9769451f4dc316c5e6100ddedce11fe93))
+* prevent cross-release album merges ([00a36ef](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/00a36ef3b2b6069f39229681b63e0bf430b91a4c))
+* publish release manifests under live authority ([3e2d0c0](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/3e2d0c0441fe64172fcb0dfb392c155f81737c4f))
+* require conflict-free identity relocation ([1a50ea5](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/1a50ea5774515fd080af05526e9f030bc808b09c))
+* reserve release manifests from generic indexing ([0f1c63d](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/0f1c63de26942cc31be199bb442e11c476db4cc6))
+* resume companion carry after durable rename ([4c05184](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/4c051847eaaf415e520811ab3cb6014daac6133d))
+* retain album authority through retirement ([a8ccf09](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/a8ccf09d9ad7c418e8f985025c4d54f93067f36e))
+* retain interrupted authority cleanup ([fd0e613](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/fd0e61343144837627c759498679045c81d7d894))
+* retain invalid manifest release evidence ([f33654f](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/f33654f06cc8867c722ffeda5a89421d3a618f7e))
+* retire completed authority cleanup ([9601af0](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/9601af01f505a76947922152cd3ea1888f85f283))
+* revalidate held album authority ([8bc7219](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/8bc7219cb5a9a8a429f795a587657fb27acfeee6))
+* share census reserved-artifact policy ([3663bf1](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/3663bf1f1cf6ea819e4003cfed1c56a69efcae60))
+* treat matching release manifests semantically ([cd281c0](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/cd281c0b9f22dd643bb93d9bf153833d9c34ea21))
+* validate album authority on context exit ([e10b787](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/e10b787d1033851419046421f50cfe97752c6027))
+
+
+### Documentation
+
+* design lease-bearing release authority ([dcd231f](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/dcd231f6d8b695edb33b9b084b5a2a37b8f2577e))
+* design library edition badges ([4b374fa](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/4b374fa3abac00687fbd65d2209efad69dc6a3e5))
+* design stable qobuz release identity ([ea13417](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/ea134170478b75b447042851aa53308799630589))
+* plan library edition badges ([075d819](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/075d8194364e52766ed9e5040a80fb4ca7de1443))
+* plan release authority transactions ([0143de3](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/0143de3b1956be758a07c71f78fd6c2e0c9d1a0b))
+* plan stable qobuz release identity ([4292c29](https://github.com/ObiWanCanOweMe/qobuz-librarian/commit/4292c29eb49d20684d5e44731a057f7bdc74619c))
+
 ## [0.14.0](https://github.com/ObiWanCanOweMe/qobuz-librarian/compare/v0.13.1...v0.14.0) (2026-07-27)
 
 
