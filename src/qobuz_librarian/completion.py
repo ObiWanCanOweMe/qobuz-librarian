@@ -10,6 +10,11 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import PurePosixPath
 
+from qobuz_librarian.library.release_identity import (
+    ReleaseIdentity,
+    normalise_release_id,
+)
+
 StagedIdentity = tuple[int, int, int, int, int, int]
 LibraryIdentity = tuple[int, int, int, int, int]
 
@@ -131,6 +136,8 @@ class CompletionInput:
     origin: CompletionOrigin
     expectation: CompletionExpectation
     effective_tier: int
+    release_identity: ReleaseIdentity | None = None
+    placement_destination: str | None = None
     lineages: tuple[SourceLineage, ...] = ()
     counts: DownloadCounts | None = None
 
@@ -468,6 +475,21 @@ def _valid_completion_input(value) -> bool:
         or value.counts is not None and not _valid_counts(value.counts)
     ):
         return False
+    has_release_plan = (
+        value.release_identity is not None
+        or value.placement_destination is not None
+    )
+    if has_release_plan and (
+        type(value.release_identity) is not ReleaseIdentity
+        or value.release_identity.provider != "qobuz"
+        or type(value.release_identity.provider) is not str
+        or type(value.release_identity.release_id) is not str
+        or normalise_release_id(value.release_identity.release_id)
+        != value.release_identity.release_id
+        or value.release_identity.release_id != value.expectation.album_id
+        or not _valid_absolute_path(value.placement_destination)
+    ):
+        return False
     slots = tuple(item.slot for item in value.lineages)
     slot_set = set(slots)
     if (
@@ -510,8 +532,8 @@ def _completion_input_record(value):
     if not _valid_completion_input(value):
         raise ValueError("completion input is invalid")
     expectation = value.expectation
-    return {
-        "version": 1,
+    record = {
+        "version": 2 if value.release_identity is not None else 1,
         "owner": {
             "operation_id": value.owner.operation_id,
             "item_id": value.owner.item_id,
@@ -548,6 +570,15 @@ def _completion_input_record(value):
             ],
         },
     }
+    if value.release_identity is not None:
+        record.update({
+            "release_identity": {
+                "provider": value.release_identity.provider,
+                "release_id": value.release_identity.release_id,
+            },
+            "placement_destination": value.placement_destination,
+        })
+    return record
 
 
 def parse_completion_input_record(record, *, expected_owner=None):
@@ -555,12 +586,20 @@ def parse_completion_input_record(record, *, expected_owner=None):
     if (
         type(record) is not dict
         or not _plain_record_tree(record)
-        or set(record) != {
-            "version", "owner", "origin", "expectation",
-            "effective_tier", "download",
-        }
+        or record.get("version") not in {1, 2}
+        or set(record) != (
+            {
+                "version", "owner", "origin", "expectation",
+                "effective_tier", "download",
+            }
+            if record.get("version") == 1
+            else {
+                "version", "owner", "origin", "expectation",
+                "effective_tier", "download", "release_identity",
+                "placement_destination",
+            }
+        )
         or type(record.get("version")) is not int
-        or record["version"] != 1
         or expected_owner is not None
         and type(expected_owner) is not RecoveryOwner
     ):
@@ -570,6 +609,17 @@ def parse_completion_input_record(record, *, expected_owner=None):
         origin_value = record["origin"]
         expectation_value = record["expectation"]
         download_value = record["download"]
+        release_identity = None
+        placement_destination = None
+        if record["version"] == 2:
+            release_value = record["release_identity"]
+            if set(release_value) != {"provider", "release_id"}:
+                return None
+            release_identity = ReleaseIdentity(
+                release_value["provider"],
+                release_value["release_id"],
+            )
+            placement_destination = record["placement_destination"]
         if (
             set(owner_value) != {"operation_id", "item_id"}
             or set(origin_value) != {"kind", "reference"}
@@ -643,6 +693,8 @@ def parse_completion_input_record(record, *, expected_owner=None):
             origin=origin,
             expectation=expectation,
             effective_tier=record["effective_tier"],
+            release_identity=release_identity,
+            placement_destination=placement_destination,
             lineages=tuple(lineages),
             counts=counts,
         )
@@ -662,11 +714,15 @@ def completion_input_extends(previous, current) -> bool:
             previous.origin,
             previous.expectation,
             previous.effective_tier,
+            previous.release_identity,
+            previous.placement_destination,
         ) != (
             current.owner,
             current.origin,
             current.expectation,
             current.effective_tier,
+            current.release_identity,
+            current.placement_destination,
         )
         or previous.counts is not None
         and previous.counts != current.counts

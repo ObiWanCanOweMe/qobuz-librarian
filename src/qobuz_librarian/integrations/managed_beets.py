@@ -70,12 +70,12 @@ def _inspect_config():
         "musicbrainz_enabled": (
             resolved["musicbrainz"].flatten().get("enabled")
         ),
+        "paths": resolved["paths"].flatten(),
     }
     encoded = json.dumps(
         payload,
         ensure_ascii=False,
         separators=(",", ":"),
-        sort_keys=True,
     ).encode("utf-8")
     if len(encoded) > 64 * 1024:
         raise RuntimeError("Beets config response is too large")

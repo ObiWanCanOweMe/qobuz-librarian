@@ -1,7 +1,9 @@
 """Tests for backup/restore safety and consolidation helpers."""
+import json
 import os
 import shutil
 import time
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +13,12 @@ from qobuz_librarian.library.backup import (
     cleanup_old_upgrade_backups,
     restore_gap_fill_backup,
     restore_upgrade_backup,
+)
+from qobuz_librarian.library.release_identity import (
+    MANIFEST_NAME,
+    ReleaseIdentity,
+    publish_release_identity,
+    read_release_identity,
 )
 from qobuz_librarian.modes.consolidate import (
     execute_consolidation,
@@ -34,7 +42,9 @@ def _real_flac(path, *, seconds=2):
          str(path)], check=True)
 
 
-def _seal_test_backup(bk, path, origin, *, kind="gap-fill", complete=True):
+def _seal_test_backup(
+        bk, path, origin, *, kind="gap-fill", complete=True,
+        release_identity=None):
     """Give a hand-built fixture the same carried receipt production uses."""
     descriptor = bk._open_backup_directory(path)
     try:
@@ -42,6 +52,16 @@ def _seal_test_backup(bk, path, origin, *, kind="gap-fill", complete=True):
             assert bk._write_backup_origin_durable(descriptor, origin)
         manifest = bk._tree_manifest(descriptor)
         assert manifest is not None
+        identity_record = None
+        identity_receipt = None
+        if release_identity is not None:
+            snapshot = bk._exact_tree_snapshot(descriptor)
+            assert snapshot is not None
+            identity_record = {
+                "provider": release_identity.provider,
+                "release_id": release_identity.release_id,
+            }
+            identity_receipt = snapshot["files"][MANIFEST_NAME]
         result = bk._seal_backup_result(
             path,
             descriptor,
@@ -50,11 +70,31 @@ def _seal_test_backup(bk, path, origin, *, kind="gap-fill", complete=True):
             complete=complete,
             requested=len(manifest),
             backed_up=len(manifest),
+            release_identity=identity_record,
+            release_identity_receipt=identity_receipt,
         )
         assert result.receipt is not None
         return result
     finally:
         os.close(descriptor)
+
+
+def _strip_release_identity_binding(bk, backup):
+    """Rewrite a new fixture as the exact legacy receipt shape."""
+    receipt = dict(backup.receipt)
+    receipt.pop("release_identity")
+    receipt.pop("release_identity_receipt")
+    (backup.path / bk._RECEIPT_SIDECAR).write_text(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    legacy = bk.load_backup_result(
+        backup.path,
+        expected_owner=receipt.get("owner"),
+    )
+    assert legacy is not None
+    assert "release_identity" not in legacy.receipt
+    return legacy
 
 
 def test_cross_fs_backup_rejects_same_size_corruption(tmp_path, monkeypatch):
@@ -122,6 +162,573 @@ def test_backup_album_dir_moves_and_refuses_symlinks(tmp_path, monkeypatch):
     link.symlink_to(target)
     assert backup_album_dir(link) is None
     assert target.exists()
+
+
+def test_whole_album_backup_receipt_binds_and_restores_release_identity(
+        tmp_path, monkeypatch):
+    import qobuz_librarian.library.backup as bk
+
+    music = tmp_path / "music"
+    album = music / "Artist" / "Album"
+    album.mkdir(parents=True)
+    (album / "01.flac").write_bytes(b"original audio")
+    publish_release_identity(album, ReleaseIdentity("qobuz", "100"))
+    monkeypatch.setattr(bk.cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(bk.cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+
+    backup = backup_album_dir(album)
+
+    assert backup is not None and backup.complete
+    assert backup.receipt["release_identity"] == {
+        "provider": "qobuz",
+        "release_id": "100",
+    }
+    assert backup.receipt["release_identity_receipt"] == (
+        backup.receipt["tree"]["files"][MANIFEST_NAME]
+    )
+    loaded = bk.load_backup_result(backup.path)
+    assert loaded is not None
+    assert loaded.receipt["release_identity"] == backup.receipt["release_identity"]
+    assert restore_upgrade_backup(backup, album) is True
+    assert read_release_identity(album) == ReleaseIdentity("qobuz", "100")
+
+
+def test_carry_backup_release_identity_publishes_only_the_expected_release(
+        tmp_path, monkeypatch):
+    import qobuz_librarian.library.backup as bk
+
+    music = tmp_path / "music"
+    original = music / "Artist" / "Original"
+    original.mkdir(parents=True)
+    (original / "01.flac").write_bytes(b"original")
+    publish_release_identity(original, ReleaseIdentity("qobuz", "100"))
+    monkeypatch.setattr(bk.cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(bk.cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    backup = backup_album_dir(original)
+    assert backup is not None and backup.complete
+
+    replacement = music / "Artist" / "Replacement"
+    replacement.mkdir()
+    (replacement / "01.flac").write_bytes(b"replacement")
+    updated = bk.carry_backup_release_identity(
+        backup,
+        replacement,
+        ReleaseIdentity("qobuz", "100"),
+    )
+
+    assert updated is not None
+    assert read_release_identity(replacement) == ReleaseIdentity("qobuz", "100")
+    assert updated == bk.capture_album_source_receipt(replacement)
+    assert backup.path.exists()
+
+    conflicting = music / "Artist" / "Conflicting"
+    conflicting.mkdir()
+    (conflicting / "01.flac").write_bytes(b"different replacement")
+    publish_release_identity(conflicting, ReleaseIdentity("qobuz", "200"))
+    assert bk.carry_backup_release_identity(
+        backup,
+        conflicting,
+        ReleaseIdentity("qobuz", "100"),
+    ) is None
+    assert backup.path.exists()
+    assert read_release_identity(conflicting) == ReleaseIdentity("qobuz", "200")
+
+    malformed = music / "Artist" / "MalformedReplacement"
+    malformed.mkdir()
+    (malformed / "01.flac").write_bytes(b"replacement")
+    (malformed / MANIFEST_NAME).write_text("not-json", encoding="utf-8")
+    assert bk.carry_backup_release_identity(
+        backup,
+        malformed,
+        ReleaseIdentity("qobuz", "100"),
+    ) is None
+    assert backup.path.exists()
+    assert (malformed / MANIFEST_NAME).read_text(encoding="utf-8") == "not-json"
+
+    unmarked = music / "Artist" / "Unmarked"
+    unmarked.mkdir()
+    (unmarked / "01.flac").write_bytes(b"replacement")
+    mismatched_receipt = {
+        **backup.receipt,
+        "release_identity": {"provider": "qobuz", "release_id": "200"},
+    }
+    mismatched = bk.BackupResult(
+        backup.path,
+        complete=backup.complete,
+        receipt=mismatched_receipt,
+        requested=backup.requested,
+        backed_up=backup.backed_up,
+    )
+    assert bk.carry_backup_release_identity(
+        mismatched,
+        unmarked,
+        ReleaseIdentity("qobuz", "100"),
+    ) is None
+    assert backup.path.exists()
+    assert read_release_identity(unmarked) is None
+
+
+def test_whole_album_backup_and_restore_reject_unsafe_release_manifests(
+        tmp_path, monkeypatch):
+    import qobuz_librarian.library.backup as bk
+
+    music = tmp_path / "music"
+    malformed = music / "Artist" / "Malformed"
+    malformed.mkdir(parents=True)
+    (malformed / "01.flac").write_bytes(b"audio")
+    (malformed / MANIFEST_NAME).write_text("not-json", encoding="utf-8")
+    monkeypatch.setattr(bk.cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(bk.cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+
+    assert backup_album_dir(malformed) is None
+    assert malformed.exists()
+    assert (malformed / MANIFEST_NAME).read_text(encoding="utf-8") == "not-json"
+
+    original = music / "Artist" / "Original"
+    original.mkdir()
+    (original / "01.flac").write_bytes(b"the complete original audio")
+    publish_release_identity(original, ReleaseIdentity("qobuz", "100"))
+    backup = backup_album_dir(original)
+    assert backup is not None and backup.complete
+
+    original.mkdir()
+    (original / "01.flac").write_bytes(b"x")
+    publish_release_identity(original, ReleaseIdentity("qobuz", "200"))
+    assert restore_upgrade_backup(backup, original) is False
+    assert backup.path.exists()
+    assert read_release_identity(original) == ReleaseIdentity("qobuz", "200")
+    assert (original / "01.flac").read_bytes() == b"x"
+
+
+def test_gap_fill_backup_never_carries_or_counts_release_manifest(
+        tmp_path, monkeypatch):
+    import qobuz_librarian.library.backup as bk
+
+    music = tmp_path / "music"
+    album = music / "Artist" / "Album"
+    album.mkdir(parents=True)
+    track = album / "01.flac"
+    track.write_bytes(b"audio")
+    publish_release_identity(album, ReleaseIdentity("qobuz", "100"))
+    manifest = album / MANIFEST_NAME
+    monkeypatch.setattr(bk.cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(bk.cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+
+    backup = backup_gap_fill_files([track, manifest], album)
+
+    assert backup is not None and backup.complete
+    assert backup.requested == backup.backed_up == 1
+    assert MANIFEST_NAME not in backup.receipt["tree"]["files"]
+    assert manifest.exists()
+    assert read_release_identity(album) == ReleaseIdentity("qobuz", "100")
+
+
+def test_gap_fill_companion_carry_remains_an_identity_free_noop(
+        tmp_path, monkeypatch):
+    import qobuz_librarian.library.backup as bk
+
+    music = tmp_path / "music"
+    album = music / "Artist" / "Album"
+    album.mkdir(parents=True)
+    original = album / "01.flac"
+    original.write_bytes(b"original")
+    monkeypatch.setattr(bk.cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(bk.cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    backup = backup_gap_fill_files([original], album)
+    assert backup is not None and backup.complete
+
+    (album / "01.flac").write_bytes(b"replacement")
+    receipt = bk.capture_album_source_receipt(album)
+    assert receipt is not None
+
+    assert bk.carry_backup_companions(
+        backup,
+        album,
+        expected_replacement_receipt=receipt,
+    ) == receipt
+    assert backup.path.is_dir()
+
+
+def test_generic_companion_carry_never_publishes_release_manifest(
+        tmp_path, monkeypatch):
+    import qobuz_librarian.library.backup as bk
+
+    music = tmp_path / "music"
+    original = music / "Artist" / "Original"
+    original.mkdir(parents=True)
+    (original / "01.flac").write_bytes(b"original")
+    (original / "cover.jpg").write_bytes(b"cover")
+    publish_release_identity(original, ReleaseIdentity("qobuz", "100"))
+    monkeypatch.setattr(bk.cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(bk.cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    backup = backup_album_dir(original)
+    assert backup is not None and backup.complete
+
+    replacement = music / "Artist" / "Replacement"
+    replacement.mkdir()
+    (replacement / "01.flac").write_bytes(b"replacement")
+    receipt = bk.capture_album_source_receipt(replacement)
+    assert receipt is not None
+
+    assert bk.carry_backup_companions(
+        backup,
+        replacement,
+        expected_replacement_receipt=receipt,
+    ) is None
+    assert not (replacement / "cover.jpg").exists()
+    assert read_release_identity(replacement) is None
+
+    identity_receipt = bk.carry_backup_release_identity(
+        backup,
+        replacement,
+        ReleaseIdentity("qobuz", "100"),
+    )
+    assert identity_receipt is not None
+    updated = bk.carry_backup_companions(
+        backup,
+        replacement,
+        expected_replacement_receipt=identity_receipt,
+    )
+    assert updated is not None
+    assert (replacement / "cover.jpg").read_bytes() == b"cover"
+    assert read_release_identity(replacement) == ReleaseIdentity("qobuz", "100")
+    assert MANIFEST_NAME in updated["tree"]["files"]
+    assert backup.path.exists()
+
+
+def test_release_identity_carry_reconciles_late_conflict_and_cancellation(
+        tmp_path, monkeypatch):
+    import qobuz_librarian.library.backup as bk
+
+    music = tmp_path / "music"
+    original = music / "Artist" / "Original"
+    original.mkdir(parents=True)
+    (original / "01.flac").write_bytes(b"original")
+    publish_release_identity(original, ReleaseIdentity("qobuz", "100"))
+    monkeypatch.setattr(bk.cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(bk.cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    backup = backup_album_dir(original)
+    assert backup is not None and backup.complete
+    real_publish = publish_release_identity
+
+    conflicting = music / "Artist" / "LateConflict"
+    conflicting.mkdir()
+    (conflicting / "01.flac").write_bytes(b"replacement")
+
+    def publish_conflict(path, identity, **kwargs):
+        real_publish(path, ReleaseIdentity("qobuz", "200"), **kwargs)
+        return real_publish(path, identity, **kwargs)
+
+    monkeypatch.setattr(bk, "publish_release_identity", publish_conflict)
+    assert bk.carry_backup_release_identity(
+        backup,
+        conflicting,
+        ReleaseIdentity("qobuz", "100"),
+    ) is None
+    assert backup.path.exists()
+    assert read_release_identity(conflicting) == ReleaseIdentity("qobuz", "200")
+
+    cancelled = music / "Artist" / "Cancelled"
+    cancelled.mkdir()
+    (cancelled / "01.flac").write_bytes(b"replacement")
+
+    def publish_then_cancel(path, identity, **kwargs):
+        real_publish(path, identity, **kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(bk, "publish_release_identity", publish_then_cancel)
+    with pytest.raises(KeyboardInterrupt):
+        bk.carry_backup_release_identity(
+            backup,
+            cancelled,
+            ReleaseIdentity("qobuz", "100"),
+        )
+    assert backup.path.exists()
+    assert read_release_identity(cancelled) == ReleaseIdentity("qobuz", "100")
+
+
+def test_copy_restore_validates_identity_and_legacy_receipts_remain_readable(
+        tmp_path, monkeypatch):
+    import qobuz_librarian.library.backup as bk
+
+    music = tmp_path / "music"
+    album = music / "Artist" / "Copied"
+    album.mkdir(parents=True)
+    (album / "01.flac").write_bytes(b"original")
+    publish_release_identity(album, ReleaseIdentity("qobuz", "100"))
+    monkeypatch.setattr(bk.cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(bk.cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    backup = backup_album_dir(album)
+    assert backup is not None and backup.complete
+    monkeypatch.setattr(bk, "_same_filesystem", lambda *_args: False)
+
+    assert restore_upgrade_backup(backup, album) is True
+    assert read_release_identity(album) == ReleaseIdentity("qobuz", "100")
+
+    legacy_origin = music / "Artist" / "Legacy"
+    legacy_backup_path = bk.cfg.UPGRADE_BACKUP_DIR / "legacy-receipt"
+    legacy_backup_path.mkdir()
+    (legacy_backup_path / "01.flac").write_bytes(b"legacy original")
+    publish_release_identity(
+        legacy_backup_path, ReleaseIdentity("qobuz", "300"))
+    legacy = _seal_test_backup(
+        bk,
+        legacy_backup_path,
+        legacy_origin,
+        kind="upgrade",
+    )
+    assert "release_identity" not in legacy.receipt
+    assert bk.load_backup_result(legacy.path) is not None
+
+    assert restore_upgrade_backup(legacy, legacy_origin) is True
+    assert read_release_identity(legacy_origin) == ReleaseIdentity("qobuz", "300")
+
+
+def test_legacy_upgrade_receipt_cannot_publish_release_identity(
+        tmp_path, monkeypatch):
+    import qobuz_librarian.library.backup as bk
+
+    music = tmp_path / "music"
+    original = music / "Artist" / "Original"
+    original.mkdir(parents=True)
+    (original / "01.flac").write_bytes(b"original")
+    publish_release_identity(original, ReleaseIdentity("qobuz", "100"))
+    monkeypatch.setattr(bk.cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(bk.cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    backup = backup_album_dir(original)
+    assert backup is not None and backup.complete
+    legacy = _strip_release_identity_binding(bk, backup)
+
+    replacement = music / "Artist" / "Replacement"
+    replacement.mkdir()
+    (replacement / "01.flac").write_bytes(b"replacement")
+
+    assert bk.carry_backup_release_identity(
+        legacy,
+        replacement,
+        ReleaseIdentity("qobuz", "100"),
+    ) is None
+    assert read_release_identity(replacement) is None
+    assert legacy.path.is_dir()
+
+
+def test_legacy_upgrade_receipt_cannot_derive_companion_authority(
+        tmp_path, monkeypatch):
+    import qobuz_librarian.library.backup as bk
+
+    music = tmp_path / "music"
+    original = music / "Artist" / "Original"
+    original.mkdir(parents=True)
+    (original / "01.flac").write_bytes(b"original")
+    (original / "booklet.pdf").write_bytes(b"booklet")
+    publish_release_identity(original, ReleaseIdentity("qobuz", "100"))
+    monkeypatch.setattr(bk.cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(bk.cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    backup = backup_album_dir(original)
+    assert backup is not None and backup.complete
+    legacy = _strip_release_identity_binding(bk, backup)
+
+    replacement = music / "Artist" / "Replacement"
+    replacement.mkdir()
+    (replacement / "01.flac").write_bytes(b"replacement")
+    publish_release_identity(replacement, ReleaseIdentity("qobuz", "100"))
+    receipt = bk.capture_album_source_receipt(replacement)
+    assert receipt is not None
+
+    assert bk.carry_backup_companions(
+        legacy,
+        replacement,
+        expected_replacement_receipt=receipt,
+    ) is None
+    assert not (replacement / "booklet.pdf").exists()
+    assert legacy.path.is_dir()
+
+
+def test_legacy_owned_upgrade_receipt_cannot_create_disposal_authority(
+        tmp_path, monkeypatch):
+    import qobuz_librarian.library.backup as bk
+
+    music = tmp_path / "music"
+    original = music / "Artist" / "Original"
+    original.mkdir(parents=True)
+    (original / "01.flac").write_bytes(b"original")
+    publish_release_identity(original, ReleaseIdentity("qobuz", "100"))
+    monkeypatch.setattr(bk.cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(bk.cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    owner = {"operation_id": "a" * 64, "item_id": "b" * 64}
+    backup = backup_album_dir(
+        original,
+        owner=owner,
+        on_intent=lambda _record: None,
+    )
+    assert backup is not None and backup.complete
+    legacy = _strip_release_identity_binding(bk, backup)
+
+    assert bk.library_backup_disposal_record(
+        legacy,
+        expected_owner=owner,
+    ) is None
+    assert legacy.path.is_dir()
+
+
+def test_persisted_legacy_upgrade_disposal_record_is_not_authority(
+        tmp_path, monkeypatch):
+    import qobuz_librarian.library.backup as bk
+
+    music = tmp_path / "music"
+    original = music / "Artist" / "Original"
+    original.mkdir(parents=True)
+    (original / "01.flac").write_bytes(b"original")
+    publish_release_identity(original, ReleaseIdentity("qobuz", "100"))
+    monkeypatch.setattr(bk.cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(bk.cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    owner = {"operation_id": "a" * 64, "item_id": "b" * 64}
+    backup = backup_album_dir(
+        original,
+        owner=owner,
+        on_intent=lambda _record: None,
+    )
+    assert backup is not None and backup.complete
+    legacy = _strip_release_identity_binding(bk, backup)
+    carrier = bk.library_backup_record(legacy, expected_owner=owner)
+    assert carrier is not None
+    descriptor = bk._open_backup_directory(legacy.path)
+    try:
+        snapshot = bk._receipt_disposal_snapshot(descriptor, legacy.receipt)
+    finally:
+        os.close(descriptor)
+    assert snapshot is not None
+    candidate = {
+        "version": 1,
+        "quarantine_name": bk._library_backup_disposal_quarantine_name(
+            legacy.receipt, owner),
+        "snapshot": snapshot,
+    }
+
+    assert bk.canonical_library_backup_disposal_record(
+        candidate,
+        carrier,
+        expected_owner=owner,
+    ) is None
+
+
+def test_legacy_upgrade_receipt_cannot_dispose_backup(
+        tmp_path, monkeypatch):
+    import qobuz_librarian.library.backup as bk
+
+    music = tmp_path / "music"
+    original = music / "Artist" / "Original"
+    original.mkdir(parents=True)
+    (original / "01.flac").write_bytes(b"original")
+    publish_release_identity(original, ReleaseIdentity("qobuz", "100"))
+    monkeypatch.setattr(bk.cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(bk.cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    backup = backup_album_dir(original)
+    assert backup is not None and backup.complete
+    legacy = _strip_release_identity_binding(bk, backup)
+
+    replacement = music / "Artist" / "Replacement"
+    replacement.mkdir()
+    (replacement / "01.flac").write_bytes(b"replacement")
+    publish_release_identity(replacement, ReleaseIdentity("qobuz", "100"))
+    receipt = bk.capture_album_source_receipt(replacement)
+    assert receipt is not None
+
+    assert bk.dispose_backup(
+        legacy,
+        replacement_path=replacement,
+        expected_replacement_receipt=receipt,
+        replacement_validator=lambda *_paths: True,
+    ) is False
+    assert legacy.path.is_dir()
+
+
+def test_cross_filesystem_backup_binds_the_copied_manifest_receipt(
+        tmp_path, monkeypatch):
+    import qobuz_librarian.library.backup as bk
+
+    music = tmp_path / "music"
+    album = music / "Artist" / "CopiedBackup"
+    album.mkdir(parents=True)
+    (album / "01.flac").write_bytes(b"original")
+    publish_release_identity(album, ReleaseIdentity("qobuz", "400"))
+    source_manifest_inode = (album / MANIFEST_NAME).stat().st_ino
+    monkeypatch.setattr(bk.cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(bk.cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    monkeypatch.setattr(bk, "_same_filesystem", lambda *_args: False)
+
+    backup = backup_album_dir(album)
+
+    assert backup is not None and backup.complete
+    assert backup.receipt["release_identity"] == {
+        "provider": "qobuz",
+        "release_id": "400",
+    }
+    copied = backup.receipt["tree"]["files"][MANIFEST_NAME]
+    assert backup.receipt["release_identity_receipt"] == copied
+    assert copied["identity"][2] != source_manifest_inode
+    assert read_release_identity(backup.path) == ReleaseIdentity("qobuz", "400")
+
+
+def test_cross_filesystem_backup_rejects_semantically_equal_manifest_rewrite(
+        tmp_path, monkeypatch):
+    import qobuz_librarian.library.backup as bk
+
+    music = tmp_path / "music"
+    album = music / "Artist" / "ExactManifest"
+    album.mkdir(parents=True)
+    (album / "01.flac").write_bytes(b"original")
+    publish_release_identity(album, ReleaseIdentity("qobuz", "500"))
+    original_manifest = (album / MANIFEST_NAME).read_bytes()
+    monkeypatch.setattr(bk.cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(bk.cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    monkeypatch.setattr(bk, "_same_filesystem", lambda *_args: False)
+    real_copytree = shutil.copytree
+
+    def rewrite_manifest(source, destination, *args, **kwargs):
+        result = real_copytree(source, destination, *args, **kwargs)
+        (Path(destination) / MANIFEST_NAME).write_text(
+            '{"schema_version": 1, "provider": "qobuz", '
+            '"release_id": "500"}\n',
+            encoding="utf-8",
+        )
+        return result
+
+    monkeypatch.setattr(bk.shutil, "copytree", rewrite_manifest)
+
+    assert backup_album_dir(album) is None
+    assert album.exists()
+    assert (album / MANIFEST_NAME).read_bytes() == original_manifest
+
+
+def test_identity_receipt_survives_ctime_only_manifest_metadata_drift(
+        tmp_path, monkeypatch):
+    import qobuz_librarian.library.backup as bk
+
+    music = tmp_path / "music"
+    album = music / "Artist" / "Ctime"
+    album.mkdir(parents=True)
+    (album / "01.flac").write_bytes(b"original")
+    publish_release_identity(album, ReleaseIdentity("qobuz", "600"))
+    monkeypatch.setattr(bk.cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(bk.cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    owner = {"operation_id": "a" * 64, "item_id": "b" * 64}
+    backup = backup_album_dir(
+        album, owner=owner, on_intent=lambda _record: None)
+    assert backup is not None and backup.complete
+    journal_record = bk.library_backup_record(
+        backup, expected_owner=owner)
+    assert journal_record is not None
+
+    os.chmod(backup.path / MANIFEST_NAME, 0o640)
+
+    assert bk.load_library_backup_record(
+        journal_record, expected_owner=owner) is not None
+    reloaded = bk.load_backup_result(backup.path, expected_owner=owner)
+    assert reloaded is not None and reloaded.complete
+    assert restore_upgrade_backup(
+        reloaded, album, expected_owner=owner) is True
+    assert read_release_identity(album) == ReleaseIdentity("qobuz", "600")
 
 
 def test_backup_refuses_reserved_metadata_names(tmp_path, monkeypatch):
@@ -432,11 +1039,19 @@ def test_discard_redundant_backup_requires_byte_identical_files(tmp_path, monkey
     origin.mkdir(parents=True)
     (origin / "01.flac").write_bytes(b"x" * 40_000)
     (origin / "cover.jpg").write_bytes(b"art")
+    publish_release_identity(origin, ReleaseIdentity("qobuz", "100"))
     backup = tmp_path / "kept"
     backup.mkdir()
     (backup / "01.flac").write_bytes(b"y" * 40_000)
     (backup / "cover.jpg").write_bytes(b"art")
-    result = _seal_test_backup(bkmod, backup, origin, kind="upgrade")
+    publish_release_identity(backup, ReleaseIdentity("qobuz", "100"))
+    result = _seal_test_backup(
+        bkmod,
+        backup,
+        origin,
+        kind="upgrade",
+        release_identity=ReleaseIdentity("qobuz", "100"),
+    )
     assert bkmod.pin_unverified_upgrade_backup(result)
     assert bkmod.backup_keep_markers_present(backup)
 
@@ -610,15 +1225,16 @@ def test_cleanup_old_upgrade_backups_respects_dates_and_throttle(tmp_path, monke
         origin = music / name.split("_", 2)[-1]
         origin.mkdir(parents=True, exist_ok=True)
         (origin / "01.flac").write_bytes(b"a" * 9000)
-        bk._write_backup_origin(bp, origin)
-        descriptor = bk._open_backup_directory(bp)
-        try:
-            assert bk._seal_backup_result(
-                bp, descriptor, origin, kind="upgrade", complete=True,
-                requested=1, backed_up=1,
-            ).complete
-        finally:
-            os.close(descriptor)
+        identity = ReleaseIdentity("qobuz", "100")
+        publish_release_identity(bp, identity)
+        publish_release_identity(origin, identity)
+        assert _seal_test_backup(
+            bk,
+            bp,
+            origin,
+            kind="upgrade",
+            release_identity=identity,
+        ).complete
         return bp
     old = _make_completed("20200101_120000_old_album")
     legacy = backup_root / "my_hand_restored_album"

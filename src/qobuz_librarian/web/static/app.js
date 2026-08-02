@@ -937,12 +937,15 @@
     // attributes so tab switches can re-scope the bulk bar without a request.
     var lastCounts = {
       total: parseInt(cont.dataset.reviewTotal || "0", 10),
+      actionable_total: parseInt(cont.dataset.reviewActionableTotal || "0", 10),
       selected: parseInt(cont.dataset.reviewSelected || "0", 10),
     };
     if (cont.dataset.reviewMissingTotal !== undefined) {
       lastCounts.missing_total = parseInt(cont.dataset.reviewMissingTotal || "0", 10);
+      lastCounts.missing_actionable = parseInt(cont.dataset.reviewMissingActionable || "0", 10);
       lastCounts.missing_selected = parseInt(cont.dataset.reviewMissingSelected || "0", 10);
       lastCounts.gap_total = parseInt(cont.dataset.reviewGapTotal || "0", 10);
+      lastCounts.gap_actionable = parseInt(cont.dataset.reviewGapActionable || "0", 10);
       lastCounts.gap_selected = parseInt(cont.dataset.reviewGapSelected || "0", 10);
     }
     // The active tab's share of the counts — the bulk bar acts on the active
@@ -951,11 +954,11 @@
     function tabCounts(c) {
       var tab = curTab();
       if (!tab || !c || c.missing_total === undefined) {
-        return { total: c ? c.total : 0, selected: c ? c.selected : 0 };
+        return { total: c ? (c.actionable_total !== undefined ? c.actionable_total : c.total) : 0, selected: c ? c.selected : 0 };
       }
       return tab === "gaps"
-        ? { total: c.gap_total, selected: c.gap_selected }
-        : { total: c.missing_total, selected: c.missing_selected };
+        ? { total: c.gap_actionable !== undefined ? c.gap_actionable : c.gap_total, selected: c.gap_selected }
+        : { total: c.missing_actionable !== undefined ? c.missing_actionable : c.missing_total, selected: c.missing_selected };
     }
 
     // Counts come from the server because the DOM only holds one page. The
@@ -983,7 +986,12 @@
           ? " · ~" + c.reclaimable_label + " reclaimable" : "";
       }
       cont.dataset.reviewTotal = c.total;
+      cont.dataset.reviewActionableTotal = c.actionable_total;
       cont.dataset.reviewSelected = c.selected;
+      if (c.missing_actionable !== undefined) {
+        cont.dataset.reviewMissingActionable = c.missing_actionable;
+        cont.dataset.reviewGapActionable = c.gap_actionable;
+      }
       var master = cont.querySelector("[data-select-master]");
       if (master) {
         master.checked = tc.total > 0 && tc.selected >= tc.total;

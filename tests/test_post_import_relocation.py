@@ -7,6 +7,12 @@ import pytest
 from qobuz_librarian import config as cfg
 from qobuz_librarian import run_lock
 from qobuz_librarian.library import post_import_relocation as relocation
+from qobuz_librarian.library.release_identity import (
+    MANIFEST_NAME,
+    ReleaseIdentity,
+    publish_release_identity,
+    read_release_identity,
+)
 
 
 def _configure(tmp_path, monkeypatch):
@@ -105,6 +111,40 @@ def test_relocation_is_additive_and_keeps_destination_conflicts(
     assert artwork == str(destination_art)
 
 
+def test_identity_bound_split_refuses_conflicts_before_partial_move(
+    tmp_path, monkeypatch
+):
+    music, _data, database = _configure(tmp_path, monkeypatch)
+    source = music / "Artist, Other" / "Album"
+    destination = music / "Artist" / "Album"
+    source.mkdir(parents=True)
+    destination.mkdir(parents=True)
+    moving = source / "01 - New.flac"
+    conflict = source / "02 - Conflict.flac"
+    moving.write_bytes(b"new track")
+    conflict.write_bytes(b"source version")
+    (destination / conflict.name).write_bytes(b"destination version")
+    _database(database, tracks=(moving, conflict))
+
+    authority = run_lock.acquire()
+    try:
+        result = relocation.relocate_post_import_album(
+            source,
+            destination,
+            kind=relocation.RelocationKind.SPLIT_GAP_FILL,
+            authority=authority,
+            require_no_conflicts=True,
+        )
+    finally:
+        authority.close()
+
+    assert result.changed is False
+    assert result.reason == "the destination contains conflicting names"
+    assert moving.read_bytes() == b"new track"
+    assert conflict.read_bytes() == b"source version"
+    assert not (destination / moving.name).exists()
+
+
 def test_whole_album_conflict_keeps_the_source_album_intact(
     tmp_path, monkeypatch
 ):
@@ -139,6 +179,209 @@ def test_whole_album_conflict_keeps_the_source_album_intact(
     assert destination_track.read_bytes() == b"different destination audio"
     assert not (destination / source_art.name).exists()
     assert _paths(database) == ([str(source_track)], str(source_art))
+
+
+def test_whole_album_relocation_carries_exact_release_manifest(
+    tmp_path, monkeypatch
+):
+    music, _data, database = _configure(tmp_path, monkeypatch)
+    source = music / "Artist, Other" / "Album"
+    destination = music / "Artist" / "Album"
+    source.mkdir(parents=True)
+    track = source / "01.flac"
+    track.write_bytes(b"audio")
+    _database(database, tracks=(track,))
+    publish_release_identity(source, ReleaseIdentity("qobuz", "100"))
+    source_manifest = (source / MANIFEST_NAME).read_bytes()
+
+    authority = run_lock.acquire()
+    try:
+        result = relocation.relocate_post_import_album(
+            source,
+            destination,
+            kind=relocation.RelocationKind.WHOLE_ALBUM,
+            authority=authority,
+        )
+    finally:
+        authority.close()
+
+    assert result.changed is True
+    assert read_release_identity(destination) == ReleaseIdentity("qobuz", "100")
+    assert (destination / MANIFEST_NAME).read_bytes() == source_manifest
+    assert not source.exists()
+
+
+@pytest.mark.parametrize(
+    ("kind", "require_no_conflicts"),
+    (
+        (relocation.RelocationKind.WHOLE_ALBUM, False),
+        (relocation.RelocationKind.SPLIT_GAP_FILL, True),
+    ),
+)
+def test_same_release_manifest_serializations_are_semantic_duplicates(
+    tmp_path, monkeypatch, kind, require_no_conflicts
+):
+    music, _data, database = _configure(tmp_path, monkeypatch)
+    source = music / "Artist, Other" / "Album"
+    destination = music / "Artist" / "Album"
+    source.mkdir(parents=True)
+    destination.mkdir(parents=True)
+    track = source / "01.flac"
+    track.write_bytes(b"audio")
+    _database(database, tracks=(track,))
+    publish_release_identity(source, ReleaseIdentity("qobuz", "100"))
+    destination_manifest = (
+        b'{\n  "release_id": "100",\n  "provider": "qobuz",\n'
+        b'  "schema_version": 1\n}\n'
+    )
+    (destination / MANIFEST_NAME).write_bytes(destination_manifest)
+    assert (source / MANIFEST_NAME).read_bytes() != destination_manifest
+    assert read_release_identity(source) == read_release_identity(destination)
+
+    authority = run_lock.acquire()
+    try:
+        result = relocation.relocate_post_import_album(
+            source,
+            destination,
+            kind=kind,
+            authority=authority,
+            require_no_conflicts=require_no_conflicts,
+        )
+    finally:
+        authority.close()
+
+    assert result.changed is True
+    assert (destination / track.name).read_bytes() == b"audio"
+    assert (destination / MANIFEST_NAME).read_bytes() == destination_manifest
+    assert read_release_identity(destination) == ReleaseIdentity("qobuz", "100")
+    assert not source.exists()
+    assert _paths(database)[0] == [str(destination / track.name)]
+
+
+@pytest.mark.parametrize(
+    ("source_release", "destination_release"),
+    (("100", "200"), ("malformed", None), (None, "200")),
+)
+def test_whole_album_relocation_refuses_invalid_release_boundary(
+    tmp_path, monkeypatch, source_release, destination_release
+):
+    music, data, database = _configure(tmp_path, monkeypatch)
+    source = music / "Artist, Other" / "Album"
+    destination = music / "Artist" / "Album"
+    source.mkdir(parents=True)
+    track = source / "01.flac"
+    track.write_bytes(b"audio")
+    _database(database, tracks=(track,))
+    if source_release == "malformed":
+        (source / MANIFEST_NAME).write_text("not json", encoding="utf-8")
+    elif source_release is not None:
+        publish_release_identity(
+            source, ReleaseIdentity("qobuz", source_release)
+        )
+    if destination_release is not None:
+        destination.mkdir(parents=True)
+        publish_release_identity(
+            destination, ReleaseIdentity("qobuz", destination_release)
+        )
+
+    authority = run_lock.acquire()
+    try:
+        with pytest.raises(
+            relocation.PostImportRelocationUnavailable, match="release"
+        ):
+            relocation.relocate_post_import_album(
+                source,
+                destination,
+                kind=relocation.RelocationKind.WHOLE_ALBUM,
+                authority=authority,
+            )
+    finally:
+        authority.close()
+
+    assert track.read_bytes() == b"audio"
+    assert _paths(database)[0] == [str(track)]
+    assert not list(data.glob(".qobuz_post_import_relocations/*.json"))
+    assert not list(music.glob(".qobuz-librarian-relocation-*"))
+
+
+@pytest.mark.parametrize("destination_release", ("200", "malformed"))
+def test_split_gap_fill_refuses_release_boundary_before_mutation(
+    tmp_path, monkeypatch, destination_release
+):
+    music, data, database = _configure(tmp_path, monkeypatch)
+    source = music / "Artist, Other" / "Album"
+    destination = music / "Artist" / "Album"
+    source.mkdir(parents=True)
+    destination.mkdir(parents=True)
+    track = source / "01.flac"
+    track.write_bytes(b"audio")
+    _database(database, tracks=(track,))
+    publish_release_identity(source, ReleaseIdentity("qobuz", "100"))
+    if destination_release == "malformed":
+        (destination / MANIFEST_NAME).write_text("not json", encoding="utf-8")
+    else:
+        publish_release_identity(
+            destination, ReleaseIdentity("qobuz", destination_release)
+        )
+
+    authority = run_lock.acquire()
+    try:
+        with pytest.raises(
+            relocation.PostImportRelocationUnavailable, match="release"
+        ):
+            relocation.relocate_post_import_album(
+                source,
+                destination,
+                kind=relocation.RelocationKind.SPLIT_GAP_FILL,
+                authority=authority,
+            )
+    finally:
+        authority.close()
+
+    assert track.read_bytes() == b"audio"
+    assert not (destination / track.name).exists()
+    assert _paths(database)[0] == [str(track)]
+    assert not list(data.glob(".qobuz_post_import_relocations/*.json"))
+    assert not list(music.glob(".qobuz-librarian-relocation-*"))
+
+
+def test_relocation_manifest_change_after_preflight_invalidates_snapshot(
+    tmp_path, monkeypatch
+):
+    music, data, database = _configure(tmp_path, monkeypatch)
+    source = music / "Artist, Other" / "Album"
+    destination = music / "Artist" / "Album"
+    source.mkdir(parents=True)
+    track = source / "01.flac"
+    track.write_bytes(b"audio")
+    _database(database, tracks=(track,))
+    publish_release_identity(source, ReleaseIdentity("qobuz", "100"))
+    original_build_plan = relocation._build_plan
+
+    def change_manifest_after_snapshot(source_snapshot, destination_snapshot):
+        (source / MANIFEST_NAME).write_text(
+            '{"schema_version":1,"provider":"qobuz","release_id":"200"}\n',
+            encoding="utf-8",
+        )
+        return original_build_plan(source_snapshot, destination_snapshot)
+
+    monkeypatch.setattr(relocation, "_build_plan", change_manifest_after_snapshot)
+    authority = run_lock.acquire()
+    try:
+        with pytest.raises(OSError, match="changed"):
+            relocation.relocate_post_import_album(
+                source,
+                destination,
+                kind=relocation.RelocationKind.WHOLE_ALBUM,
+                authority=authority,
+            )
+    finally:
+        authority.close()
+
+    assert track.read_bytes() == b"audio"
+    assert not destination.exists()
+    assert _paths(database)[0] == [str(track)]
+    assert not list(data.glob(".qobuz_post_import_relocations/*.json"))
 
 
 @pytest.mark.parametrize(
@@ -322,5 +565,3 @@ def _queue_consumer():
         "item_id": "2" * 64,
         "action_id": "3" * 64,
     }
-
-

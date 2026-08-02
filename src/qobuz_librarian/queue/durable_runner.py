@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 
@@ -40,8 +40,15 @@ from qobuz_librarian.integrations.staging import (
     inspect_staging_run_reference,
     isolated_staging_run_names,
 )
+from qobuz_librarian.library.album_placement import (
+    AlbumPlacementAttention,
+    require_album_placement_current,
+    resolve_album_placement,
+)
 from qobuz_librarian.library.backup import (
+    BackupResult,
     backup_album_dir,
+    canonical_album_source_receipt,
     library_backup_record,
     load_backup_result,
     load_library_backup_record,
@@ -108,8 +115,117 @@ def _require_authority(authority: RunLockLease) -> None:
 
 
 def _require_current_plan(item, args, plan: DurableNewAlbumPlan) -> None:
-    if type(plan) is not DurableNewAlbumPlan or plan_durable_new_album(item, args) != plan:
+    if type(plan) is not DurableNewAlbumPlan:
+        raise DurableAlbumUnavailable(
+            "the album no longer matches the durable download plan"
+        )
+    if plan.placement is not None:
+        try:
+            require_album_placement_current(plan.placement)
+        except OSError as exc:
+            raise DurableAlbumUnavailable(
+                "the release placement path binding changed"
+            ) from exc
+    if (
+        plan_durable_new_album(
+            item,
+            args,
+            album_path_suffix=plan.album_path_suffix,
+            release_identity=plan.release_identity,
+            placement_destination=plan.placement_destination,
+            placement=plan.placement,
+        ) != plan
+    ):
         raise DurableAlbumUnavailable("the album no longer matches the durable download plan")
+
+
+def _refresh_plan_after_upgrade_backup(
+    item,
+    args,
+    plan: DurableNewAlbumPlan,
+    *,
+    authority: RunLockLease | None = None,
+) -> DurableNewAlbumPlan:
+    """Carry the placement across this runner's committed source retirement."""
+    if plan.placement is None:
+        return plan
+    backup = item.get("backup_path") if type(item) is dict else None
+    previous_receipt = plan.placement.destination_receipt
+    receipt = backup.receipt if isinstance(backup, BackupResult) else None
+    source_receipt = (
+        canonical_album_source_receipt(
+            receipt.get("source_receipt"),
+            expected_origin=plan.placement_destination,
+        )
+        if type(receipt) is dict
+        else None
+    )
+    try:
+        source_generation = source_receipt["path_generations"][-1]
+        source_directory = (
+            int(source_generation[1]),
+            int(source_generation[2]),
+        )
+    except (IndexError, KeyError, TypeError, ValueError):
+        source_directory = None
+    if (
+        not isinstance(backup, BackupResult)
+        or backup.complete is not True
+        or type(receipt) is not dict
+        or receipt.get("kind") != "upgrade"
+        or source_receipt is None
+        or previous_receipt is None
+        or previous_receipt.exists is not True
+        or previous_receipt.directory_identity != source_directory
+        or previous_receipt.path != plan.placement_destination
+    ):
+        raise DurableAlbumUnavailable(
+            "the release placement is not bound to the committed backup"
+        )
+    if authority is not None:
+        _require_authority(authority)
+    try:
+        placement = resolve_album_placement(
+            plan.placement.friendly_path,
+            plan.placement.identity,
+        )
+    except (AlbumPlacementAttention, OSError, ValueError) as exc:
+        raise DurableAlbumUnavailable(
+            "the release placement could not be rebound after backup"
+        ) from exc
+    if authority is not None:
+        _require_authority(authority)
+    current_receipt = placement.destination_receipt
+    expected_missing = (Path(plan.placement_destination).name,)
+    if (
+        current_receipt is None
+        or current_receipt.exists is not False
+        or current_receipt.path != previous_receipt.path
+        or current_receipt.missing != expected_missing
+        or current_receipt.identities != previous_receipt.identities[:-1]
+    ):
+        raise DurableAlbumUnavailable(
+            "the release placement did not make the committed backup transition"
+        )
+    refreshed = replace(plan, placement=placement)
+    if (
+        placement.identity != plan.release_identity
+        or placement.suffix != plan.album_path_suffix
+        or str(placement.destination) != plan.placement_destination
+        or plan_durable_new_album(
+            item,
+            args,
+            album_path_suffix=refreshed.album_path_suffix,
+            release_identity=refreshed.release_identity,
+            placement_destination=refreshed.placement_destination,
+            placement=refreshed.placement,
+        )
+        != refreshed
+    ):
+        raise DurableAlbumUnavailable(
+            "the release placement changed during backup"
+        )
+    return refreshed
 
 
 def _owner_record(owner: RecoveryOwner) -> dict[str, str]:
@@ -732,6 +848,12 @@ def execute_durable_new_album(
                 operation_id=operation_id,
                 item_id=item_id,
             )
+        plan = _refresh_plan_after_upgrade_backup(
+            item,
+            args,
+            plan,
+            authority=authority,
+        )
 
     _require_authority(authority)
     item["snapshot_before"] = snapshot_staging()
@@ -1042,13 +1164,19 @@ def execute_durable_new_album(
 
     try:
         _require_authority(authority)
+        _require_current_plan(item, args, plan)
+        import_kwargs = {
+            "owner": _owner_record(owner),
+            "on_reservation": checkpoint_reservation,
+            "on_intent": checkpoint_carrier,
+            "authority_check": lambda: _require_authority(authority),
+        }
+        if plan.album_path_suffix:
+            import_kwargs["album_path_suffix"] = plan.album_path_suffix
         imported = beets_import_managed(
             album_dirs,
             binding_records,
-            owner=_owner_record(owner),
-            on_reservation=checkpoint_reservation,
-            on_intent=checkpoint_carrier,
-            authority_check=lambda: _require_authority(authority),
+            **import_kwargs,
         )
         _require_authority(authority)
     except BaseException:
@@ -1295,6 +1423,7 @@ def execute_durable_new_album(
             item_id,
             authority=authority,
             acknowledge_completion=acknowledge_completion,
+            cancel_check=is_cancel_requested,
         )
         _require_authority(authority)
     except (OSError, ValueError, queue_state.QueueJournalError):

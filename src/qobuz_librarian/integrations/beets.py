@@ -20,6 +20,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import secrets
 import select
 import shlex
@@ -39,12 +40,30 @@ from enum import Enum
 from pathlib import Path
 
 from qobuz_librarian import config as cfg
+from qobuz_librarian import run_lock
 from qobuz_librarian.completion import (
     ManagedImportEvidence,
     ManagedMapping,
     RecoveryOwner,
 )
 from qobuz_librarian.file_exclusion import acquire_inode_write_exclusion
+from qobuz_librarian.library.album_placement import (
+    AlbumPlacementAttention,
+    LegacyAdoptionScan,
+    resolve_album_placement,
+)
+from qobuz_librarian.library.catalog import (
+    find_album_dir_filesystem,
+    find_qobuz_album_candidates_for_dir,
+    predicted_album_paths,
+)
+from qobuz_librarian.library.discovery import select_legacy_release
+from qobuz_librarian.library.release_identity import (
+    ReleaseManifestError,
+    identity_from_album,
+    is_release_manifest_name,
+    read_release_identity,
+)
 from qobuz_librarian.library.scanner import clear_scan_caches
 from qobuz_librarian.library.sqlite_atomic import (
     AtomicSQLiteWrite,
@@ -1409,7 +1428,8 @@ def _managed_carrier_reservation(capture):
     }
 
 
-def _prepare_managed_override(capture, plugin_config):
+def _prepare_managed_override(
+        capture, plugin_config, *, album_path_suffix: str = ""):
     """Create a sealed anonymous config that cannot survive this process."""
     required = (
         "memfd_create",
@@ -1451,6 +1471,7 @@ def _prepare_managed_override(capture, plugin_config):
         payload = _build_import_override_yaml(
             plugin_config,
             ownership_enabled=True,
+            album_path_suffix=album_path_suffix,
         ).encode("utf-8")
         offset = 0
         while offset < len(payload):
@@ -4453,6 +4474,7 @@ def _configured_beets_plugins(runtime=None):
             "plugin_paths",
             "disabled",
             "musicbrainz_enabled",
+            "paths",
         }
         or payload["version"] != _BEETS_CONFIG_PROTOCOL_VERSION
         or payload["beets_version"] != _SUPPORTED_BEETS_VERSION
@@ -4478,15 +4500,135 @@ def _configured_beets_plugins(runtime=None):
             or any(not isinstance(value, str) or len(value) > length for value in values)
         ):
             return None
+    paths = payload["paths"]
+    if (
+        not isinstance(paths, dict)
+        or len(paths) > 256
+        or not {"default", "comp", "singleton"}.issubset(paths)
+        or any(
+            not isinstance(key, str)
+            or not key
+            or len(key) > 4096
+            or not isinstance(value, str)
+            or len(value) > 4096
+            for key, value in paths.items()
+        )
+    ):
+        return None
     return {
         "plugins": payload["plugins"],
         "plugin_paths": payload["plugin_paths"],
         "disabled": payload["disabled"],
         "musicbrainz_enabled": payload["musicbrainz_enabled"],
+        "paths": paths,
     }
 
 
-def _build_import_override_yaml(plugin_config=None, *, ownership_enabled=False):
+def append_album_path_suffix(template: str, suffix: str) -> str:
+    """Append *suffix* to the one path component that files albums."""
+    if not suffix:
+        return template
+    album_token = re.compile(r"\$album(?![A-Za-z0-9_])")
+    components = template.split("/")
+    matches = [index for index, component in enumerate(components)
+               if album_token.search(component)]
+    if len(matches) != 1:
+        raise ValueError("template must contain exactly one album path component")
+    index = matches[0]
+    components[index] += suffix
+    return "/".join(components)
+
+
+class AlbumImportIdentityAmbiguous(AlbumPlacementAttention):
+    """An occupied legacy path matches more than one release identity."""
+
+
+def resolve_album_import_placement(album, token):
+    """Resolve one intended album before Beets is allowed to move its audio."""
+    identity = identity_from_album(album)
+    if identity is None:
+        raise AlbumPlacementAttention("album has no valid Qobuz release identity")
+
+    friendly = find_album_dir_filesystem(album)
+    if friendly is None:
+        predicted = predicted_album_paths(album)
+        if not predicted:
+            raise AlbumPlacementAttention("album has no resolvable friendly path")
+        friendly = predicted[0]
+
+    try:
+        friendly.lstat()
+    except FileNotFoundError:
+        return resolve_album_placement(friendly, identity)
+    except OSError as exc:
+        raise AlbumPlacementAttention(
+            "friendly path occupancy could not be examined"
+        ) from exc
+
+    try:
+        manifested_identity = read_release_identity(friendly)
+    except (ReleaseManifestError, OSError):
+        return resolve_album_placement(friendly, identity)
+    if manifested_identity is not None:
+        return resolve_album_placement(friendly, identity)
+
+    artist_name = (album.get("artist") or {}).get("name") or ""
+    lease = run_lock.current_lease()
+    owned_lease = False
+    try:
+        if lease is None:
+            lease = run_lock.acquire()
+            owned_lease = True
+        if lease is None:
+            raise AlbumPlacementAttention(
+                "legacy adoption authority is unavailable"
+            )
+        with LegacyAdoptionScan(friendly, lease) as scan:
+            existing = scan.read_tracks()
+            candidate_state = scan.candidate_state()
+            candidates = find_qobuz_album_candidates_for_dir(
+                friendly,
+                artist_name,
+                token,
+                target_dir=friendly,
+                legacy_adoption_state=candidate_state,
+            )
+            candidate_state.validate(friendly)
+            selected, compatible = select_legacy_release(
+                existing,
+                candidates,
+                adoption_proof=scan.proof(identity),
+            )
+            if len(compatible) > 1:
+                raise AlbumImportIdentityAmbiguous(
+                    "identity_ambiguous: friendly path matches multiple Qobuz releases"
+                )
+            adopted_identity = (
+                identity_from_album(selected.album)
+                if selected is not None
+                else None
+            )
+            selected_proof = (
+                selected.adoption_proof if selected is not None else None
+            )
+            return resolve_album_placement(
+                friendly,
+                identity,
+                adopted_identity=adopted_identity,
+                adoption_proof=selected_proof,
+            )
+    except run_lock.LockBusy as exc:
+        raise AlbumPlacementAttention(
+            "legacy adoption requires the live run lock"
+        ) from exc
+    finally:
+        if owned_lease and lease is not None:
+            lease.close()
+
+
+def _build_import_override_yaml(
+        plugin_config=None, *, ownership_enabled=False,
+        album_path_suffix=""):
     """The beets config override the import runs with, as a YAML string. Forces
     the keys the import contract depends on — library/directory, non-
     interactive, non-incremental, autotag off, and move on — and lets
@@ -4512,13 +4654,33 @@ def _build_import_override_yaml(plugin_config=None, *, ownership_enabled=False):
     )
     # Path templates are deployer-supplied and can contain single quotes
     # (e.g. `$albumartist's stuff/$album`); _yaml_sq keeps the scalar safe.
+    configured_paths = {
+        "default": cfg.BEETS_PATH_DEFAULT,
+        "singleton": cfg.BEETS_PATH_SINGLETON,
+        "comp": cfg.BEETS_PATH_COMP,
+    }
+    if album_path_suffix and plugin_config is not None:
+        effective_paths = dict(plugin_config["paths"])
+        for key, configured in configured_paths.items():
+            if configured:
+                effective_paths[key] = configured
+        configured_paths = {}
+        album_token = re.compile(r"\$album(?![A-Za-z0-9_])")
+        for key, template in effective_paths.items():
+            if key == "singleton" and not album_token.search(template):
+                configured_paths[key] = template
+                continue
+            configured_paths[key] = append_album_path_suffix(
+                template,
+                album_path_suffix,
+            )
     _paths = []
-    if cfg.BEETS_PATH_DEFAULT:
-        _paths.append(f"  default: {_yaml_sq(cfg.BEETS_PATH_DEFAULT)}\n")
-    if cfg.BEETS_PATH_SINGLETON:
-        _paths.append(f"  singleton: {_yaml_sq(cfg.BEETS_PATH_SINGLETON)}\n")
-    if cfg.BEETS_PATH_COMP:
-        _paths.append(f"  comp: {_yaml_sq(cfg.BEETS_PATH_COMP)}\n")
+    for key, template in configured_paths.items():
+        if template:
+            rendered_key = (
+                key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else _yaml_sq(key)
+            )
+            _paths.append(f"  {rendered_key}: {_yaml_sq(template)}\n")
     if _paths:
         override_yaml += "paths:\n" + "".join(_paths)
 
@@ -4588,7 +4750,17 @@ def _build_import_override_yaml(plugin_config=None, *, ownership_enabled=False):
     return override_yaml
 
 
-def _prepare_for_beets_run(roots=None, ownership_out=None, source_files_out=None):
+def _render_beets_override(plugin_config: dict, *, album_path_suffix: str = "") -> str:
+    """Render the one-shot import override without changing user config."""
+    return _build_import_override_yaml(
+        plugin_config,
+        album_path_suffix=album_path_suffix,
+    )
+
+
+def _prepare_for_beets_run(
+        roots=None, ownership_out=None, source_files_out=None,
+        album_path_suffix: str = ""):
     """Common setup shared by the whole-staging and per-album entry points:
     resolve Beets' own runtime, prep tags on the staged FLACs, and write the
     one-shot override yaml. Returns ``(override_path, cleanup_fn, runtime)``
@@ -4626,6 +4798,21 @@ def _prepare_for_beets_run(roots=None, ownership_out=None, source_files_out=None
         )
         return None, None, None
 
+    ownership_enabled = ownership_out is not None
+    try:
+        override_yaml = _build_import_override_yaml(
+            plugin_config,
+            ownership_enabled=ownership_enabled,
+            album_path_suffix=album_path_suffix,
+        )
+    except ValueError as exc:
+        log.info(fmt(
+            C.RED,
+            "  ✗  identity-review: configured Beets album path template "
+            f"is unsupported ({exc}).",
+        ))
+        return None, None, None
+
     _prepare_staging_tags(roots=roots)
 
     if source_files_out is not None:
@@ -4643,13 +4830,14 @@ def _prepare_for_beets_run(roots=None, ownership_out=None, source_files_out=None
                     if path.is_file() and (explicit_roots or not _under_retry_dir(path))
                 )
             for path in candidates:
+                if is_release_manifest_name(path.name):
+                    continue
                 receipt = capture_file(path)
                 if receipt is not None:
                     source_files_out.append(receipt)
         except OSError:
             source_files_out.clear()
 
-    ownership_enabled = ownership_out is not None and plugin_config is not None
     if ownership_out is not None:
         ownership_out.clear()
 
@@ -4678,12 +4866,7 @@ def _prepare_for_beets_run(roots=None, ownership_out=None, source_files_out=None
         )
         override_path = Path(override_name)
         with os.fdopen(override_fd, "w", encoding="utf-8") as handle:
-            handle.write(
-                _build_import_override_yaml(
-                    plugin_config,
-                    ownership_enabled=ownership_enabled,
-                )
-            )
+            handle.write(override_yaml)
             handle.flush()
             os.fsync(handle.fileno())
     except OSError as e:
@@ -4805,7 +4988,8 @@ class _ManagedBeetsRunCleanup:
                 self._finalizer.detach()
 
 
-def _prepare_managed_beets_run(roots, bindings, owner, *, on_reservation):
+def _prepare_managed_beets_run(
+        roots, bindings, owner, *, on_reservation, album_path_suffix: str = ""):
     runtime = _resolve_beets_runtime()
     if runtime is None:
         return None
@@ -4815,6 +4999,14 @@ def _prepare_managed_beets_run(roots, bindings, owner, *, on_reservation):
         return None
     plugin_config = _configured_beets_plugins(runtime)
     if plugin_config is None:
+        return None
+    try:
+        _build_import_override_yaml(
+            plugin_config,
+            ownership_enabled=True,
+            album_path_suffix=album_path_suffix,
+        )
+    except ValueError:
         return None
 
     before = _normalise_managed_bindings(bindings, roots)
@@ -5134,7 +5326,9 @@ def _reclaim_ownership_capture(capture, payload=None):
                 pass
 
 
-def beets_import_paths(consolidate=True, *, source_files_out=None, album_dirs=None):
+def beets_import_paths(
+        consolidate=True, *, source_files_out=None, album_dirs=None,
+        album_path_suffix: str = ""):
     """Run beets on explicit staged albums and return a success bool.
 
     With no explicit list, legacy preflight recovery derives only public audio
@@ -5157,7 +5351,9 @@ def beets_import_paths(consolidate=True, *, source_files_out=None, album_dirs=No
         return True
     prepared_sources = source_files_out if source_files_out is not None else []
     override_path, cleanup, runtime = _prepare_for_beets_run(
-        roots=roots, source_files_out=prepared_sources
+        roots=roots,
+        source_files_out=prepared_sources,
+        album_path_suffix=album_path_suffix,
     )
     if cleanup is None:
         return False
@@ -5176,7 +5372,8 @@ def beets_import_paths(consolidate=True, *, source_files_out=None, album_dirs=No
     return ok
 
 
-def beets_import_albums(album_dirs, *, ownership_out=None):
+def beets_import_albums(
+        album_dirs, *, ownership_out=None, album_path_suffix: str = ""):
     """Run beets import scoped to ``album_dirs`` and return a tri-state code:
 
     - ``"ok"`` — import succeeded.
@@ -5195,6 +5392,7 @@ def beets_import_albums(album_dirs, *, ownership_out=None):
         roots=album_dirs,
         ownership_out=ownership_out,
         source_files_out=prepared_sources,
+        album_path_suffix=album_path_suffix,
     )
     if cleanup is None:
         return "error"
@@ -5213,7 +5411,14 @@ def beets_import_albums(album_dirs, *, ownership_out=None):
 
 
 def beets_import_managed(
-    album_dirs, bindings, *, owner, on_reservation, on_intent, authority_check=None
+    album_dirs,
+    bindings,
+    *,
+    owner,
+    on_reservation,
+    on_intent,
+    authority_check=None,
+    album_path_suffix: str = "",
 ):
     """Run one non-retrying import with durable slot-to-file evidence."""
     owner = normalise_recovery_owner(owner)
@@ -5235,6 +5440,7 @@ def beets_import_managed(
                 bindings,
                 owner,
                 on_reservation=on_reservation,
+                album_path_suffix=album_path_suffix,
             )
         )
     except Exception:
@@ -5274,7 +5480,11 @@ def beets_import_managed(
     try:
         current_intent = _normalise_managed_bindings(intent, roots)
         if current_intent == intent:
-            override_path = _prepare_managed_override(capture, plugin_config)
+            override_path = _prepare_managed_override(
+                capture,
+                plugin_config,
+                album_path_suffix=album_path_suffix,
+            )
     except Exception:
         current_intent = None
     except BaseException as exc:

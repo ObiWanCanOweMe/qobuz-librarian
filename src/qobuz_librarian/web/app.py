@@ -45,6 +45,11 @@ from qobuz_librarian.web.csrf import (
     SecurityHeadersMiddleware,
     StripServerHeaderMiddleware,
 )
+from qobuz_librarian.web.process_disposition import classify_process_result
+from qobuz_librarian.web.review_candidates import (
+    candidate_payload,
+    is_non_actionable,
+)
 
 # Held for the lifetime of the web process. Module-level so Python won't
 # garbage-collect it (which would silently release the flock).
@@ -1189,10 +1194,7 @@ def _review_job_from_library_state():
     specs = []
     for name, entry in (mstate.get("artists") or {}).items():
         for spec in (entry or {}).get("candidates") or []:
-            artist = spec.get("artist") or name
-            title = spec.get("title") or ""
-            if hidden_mod.is_hidden(
-                    hidden_mod.SCOPE_MISSING, artist, title, hidden):
+            if flows.candidate_is_hidden_missing(spec, hidden):
                 continue
             specs.append(spec)
     if not specs:
@@ -1630,6 +1632,9 @@ templates.env.globals["now_ts"] = time.time
 templates.env.globals["keeps_ds_originals"] = lambda: cfg.DOWNSAMPLE_KEEP_ORIGINALS == "keep"
 templates.env.globals["ds_originals_chosen"] = lambda: cfg.DOWNSAMPLE_KEEP_ORIGINALS in ("keep", "delete")
 templates.env.globals["backup_retention_days"] = cfg.UPGRADE_BACKUP_RETENTION_DAYS
+templates.env.globals["is_non_actionable"] = is_non_actionable
+templates.env.filters["actionable_candidates"] = lambda values: [
+    value for value in values if not is_non_actionable(value)]
 
 
 def _fmt_clock(ts):
@@ -2058,7 +2063,9 @@ def _find_job_touching_album(album_id: str, skip_single_track: bool = False):
         # Snapshot: a SCANNING job appends to candidates from the worker thread,
         # and iterating it live can raise "list changed size during iteration".
         for cand in list(j.candidates or []):
-            payload = cand.get("payload") or {}
+            if is_non_actionable(cand):
+                continue
+            payload = candidate_payload(cand)
             if payload.get("album_id") == album_id:
                 return j
             qa = (payload.get("candidate") or {}).get("qobuz_album") or {}
@@ -3057,6 +3064,9 @@ _DOWNLOAD_SUMMARY_LABELS = {
     "upgrade_aborted_backup_failed": "Upgrade aborted: couldn't back up the original.",
     "partial": "Re-download came back incomplete; kept your original.",
     "not_imported": "Downloaded, but the import didn't land. Library unchanged.",
+    "identity_attention": (
+        "Import needs release-identity attention and was not counted complete."
+    ),
 }
 
 
@@ -3159,6 +3169,7 @@ def _make_download_run(
                 r = process_album(album, args, allow_force=False,
                                   already_confirmed=True, token=token,
                                   treat_as_new=treat_as_new) or {}
+                disposition = classify_process_result(r)
             else:
                 try:
                     results, drained = _execute_download_queue(
@@ -3205,10 +3216,11 @@ def _make_download_run(
                     and type(results[0]) is dict
                     else None
                 )
+                disposition = classify_process_result(result)
                 accepted = (
                     drained is True
                     and result is not None
-                    and result.get("imported") is True
+                    and disposition.verified_success
                     and recovery_status == "clear"
                     and not refresh_failed
                 )
@@ -3226,6 +3238,8 @@ def _make_download_run(
                     completion_acknowledged = _durable_completion_status(j)
                     if (
                         completion_acknowledged is True
+                        and result is not None
+                        and disposition.verified_success
                         and recovery_status == "clear"
                         and _run_lock_intact()
                         and _reconcile_acknowledged_job(j)
@@ -3256,15 +3270,28 @@ def _make_download_run(
                             "completion. Its recovery state was retained; "
                             "use Retry to settle it and try again."
                         )
-        benign = {"already_complete", "skipped_already_higher_quality",
-                  "skipped_has_extras", "dry_run", "user_skipped",
-                  "lossy_only", "no_tracks", "cancelled"}
-        if durable_failure:
+        identity_attention = disposition.attention == "identity"
+        if identity_attention:
+            j._imported_any = (
+                j._imported_any or disposition.mutated_library
+            )
+            j.status = job_mgr.JobStatus.FAILED
+            j.attention = "identity"
+            j.error = (
+                "The import needs release-identity attention and was not "
+                "counted complete. See the job log before retrying."
+            )
+        elif durable_failure:
             pass
-        elif r.get("result") not in benign and not r.get("imported"):
+        elif not disposition.consume_candidate:
             j.status = job_mgr.JobStatus.FAILED
             if r.get("n_fail"):
                 j.error = f"{plural(r['n_fail'], 'track')} failed. See job log."
+            elif disposition.mutated_library:
+                j.error = (
+                    "The library may have changed, but the result could not "
+                    "be verified. Recovery evidence was retained."
+                )
             elif r.get("n_ok"):
                 j.error = "Downloaded, but the import failed. See job log."
             else:
@@ -3274,12 +3301,20 @@ def _make_download_run(
             j.error = f"{plural(r['n_fail'], 'track')} failed. See job log."
         # Surface a one-line outcome here so the /jobs page tells the user what
         # happened without expanding the log.
-        summary = _summarize_download_result(r)
+        summary = (
+            _summarize_download_result(r)
+            if (
+                identity_attention
+                or disposition.verified_success
+                or disposition.consume_candidate
+            )
+            else ""
+        )
         if summary:
             j.summary = summary
         # Claiming/completing the album the normal way graduates it out of the
         # "downloaded single" state, so the rest stops being suppressed in scans.
-        if r.get("imported"):
+        if disposition.publish_derived_state and disposition.mutated_library:
             _refresh_after_local_album_change(
                 album,
                 r,
@@ -6724,6 +6759,8 @@ async def job_approve(request: Request, job_id: str):
             admission_decisions = {}
 
             def selection_filter(candidate):
+                if is_non_actionable(candidate):
+                    return False
                 key = candidate.get("cid")
                 if not isinstance(key, str) or not key:
                     return False
@@ -6736,7 +6773,7 @@ async def job_approve(request: Request, job_id: str):
                         return False
                 if job.execute_kind in ("library", "new_releases"):
                     album_id = normalise_album_id(
-                        (candidate.get("payload") or {}).get("album_id")
+                        candidate_payload(candidate).get("album_id")
                     )
                     if album_id is None:
                         admission_decisions[key] = False
@@ -6909,6 +6946,7 @@ def _selection_payload(job, *, persist_failed=False):
     payload = {
         "selected": c["selected"],
         "total": c["total"],
+        "actionable_total": c["actionable_total"],
         "artists": c["artists"],
         "reclaimable": c["reclaimable"],
         "reclaimable_label": format_size(c["reclaimable"]) if c["reclaimable"] else "",
@@ -6919,6 +6957,8 @@ def _selection_payload(job, *, persist_failed=False):
         totals = _review_tab_totals(job)
         payload["missing_total"] = totals["missing"]
         payload["gap_total"] = totals["gaps"]
+        payload["missing_actionable"] = totals["missing_actionable"]
+        payload["gap_actionable"] = totals["gaps_actionable"]
         payload["missing_selected"] = totals["missing_selected"]
         payload["gap_selected"] = totals["gaps_selected"]
     return payload
@@ -6930,16 +6970,23 @@ def _review_tab_totals(job):
     truthful. Selected counts feed the tab-scoped bulk bar: what the user sees
     on the active tab is exactly what Download/Dismiss will act on."""
     from qobuz_librarian.web import flows
-    gaps = gaps_sel = missing_sel = 0
+    gaps = gaps_actionable = gaps_sel = 0
+    missing_actionable = missing_sel = 0
     with job._lock:
         total = len(job.candidates)
         for c in job.candidates:
+            non_actionable = is_non_actionable(c)
             if flows.is_gap_candidate(c):
                 gaps += 1
-                gaps_sel += 1 if c.get("selected") else 0
-            elif c.get("selected"):
-                missing_sel += 1
+                if not non_actionable:
+                    gaps_actionable += 1
+                    gaps_sel += 1 if c.get("selected") else 0
+            elif not non_actionable:
+                missing_actionable += 1
+                missing_sel += 1 if c.get("selected") else 0
     return {"missing": total - gaps, "gaps": gaps,
+            "missing_actionable": missing_actionable,
+            "gaps_actionable": gaps_actionable,
             "missing_selected": missing_sel, "gaps_selected": gaps_sel}
 
 
@@ -7145,6 +7192,8 @@ async def job_dismiss_rest(request: Request, job_id: str):
         artists, seen = [], set()
         for c in job.candidates:
             if c.get("selected"):
+                continue
+            if is_non_actionable(c):
                 continue
             if gap_only is not None and flows.is_gap_candidate(c) != gap_only:
                 continue

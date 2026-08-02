@@ -1,18 +1,75 @@
+import errno
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from qobuz_librarian import config as cfg
+from qobuz_librarian import run_lock
+from qobuz_librarian.library.album_placement import (
+    capture_legacy_adoption_receipt,
+    resolve_album_placement,
+)
+from qobuz_librarian.library.release_identity import (
+    MANIFEST_NAME,
+    ReleaseIdentity,
+    ReleaseManifestError,
+    publish_release_identity,
+    read_release_identity,
+)
 
-def _patch_download_receipts(monkeypatch, download, added):
-    from qobuz_librarian.integrations.staging import StagedFile
 
-    class _Run:
-        path = Path("/")
+def _nonblocking_writer_errno(path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os,sys; "
+                "\ntry: descriptor=os.open(sys.argv[1], os.O_WRONLY|os.O_NONBLOCK)"
+                "\nexcept OSError as error: sys.exit(error.errno)"
+                "\nelse: os.close(descriptor); sys.exit(0)"
+            ),
+            os.fspath(path),
+        ],
+        check=False,
+    )
+    return result.returncode
 
-        @staticmethod
-        def to_record():
-            return {"path": "/", "root_identity": [0, 0, 0, 0, 0, 0]}
+
+def _nonblocking_manifest_aba_errno(path, canonical):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os,sys; data=bytes.fromhex(sys.argv[2]); "
+                "\ntry: fd=os.open(sys.argv[1], os.O_WRONLY|os.O_NONBLOCK)"
+                "\nexcept OSError as error: sys.exit(error.errno)"
+                "\nelse:"
+                "\n os.ftruncate(fd,0); os.write(fd,b'corrupt'); os.fsync(fd)"
+                "\n os.ftruncate(fd,0); os.write(fd,data); os.fsync(fd)"
+                "\n os.close(fd); sys.exit(0)"
+            ),
+            os.fspath(path),
+            canonical.hex(),
+        ],
+        check=False,
+    )
+    return result.returncode
+
+
+def _patch_download_receipts(monkeypatch, download, added, run_root):
+    from qobuz_librarian.integrations.staging import StagedFile, StagingRun
+
+    value = run_root.stat()
+    run = StagingRun(run_root, (
+        value.st_dev, value.st_ino, value.st_mode, value.st_size,
+        value.st_mtime_ns, value.st_ctime_ns,
+    ))
 
     def sealed_added(_snapshot):
         receipts = []
@@ -25,11 +82,17 @@ def _patch_download_receipts(monkeypatch, download, added):
         return receipts
 
     monkeypatch.setattr(download, "files_added_since", sealed_added)
-    monkeypatch.setattr(download, "create_staging_run", lambda: _Run())
-    monkeypatch.setattr(
-        download,
-        "capture_staging_run",
-        lambda _run: SimpleNamespace(files=(object(),)),
+    monkeypatch.setattr(download, "create_staging_run", lambda: run)
+
+
+def _adopted_placement(album_dir, release_id="ALB"):
+    identity = ReleaseIdentity("qobuz", release_id)
+    receipt = capture_legacy_adoption_receipt(album_dir, identity)
+    return resolve_album_placement(
+        album_dir,
+        identity,
+        adopted_identity=identity,
+        adoption_receipt=receipt,
     )
 
 
@@ -40,6 +103,620 @@ def _args(**over):
                 auto_upgrade=False, prefer_hires=False)
     base.update(over)
     return SimpleNamespace(**base)
+
+
+@pytest.fixture
+def authority(tmp_path, monkeypatch):
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "process-run.lock")
+    lease = run_lock.acquire()
+    try:
+        yield lease
+    finally:
+        lease.close()
+
+
+def test_finalize_release_identity_rejects_wrong_destination_identity(
+    tmp_path, monkeypatch, authority
+):
+    from qobuz_librarian.library.release_identity import (
+        capture_directory_path_receipt,
+    )
+    from qobuz_librarian.modes import process as proc
+
+    final_dir = tmp_path / "Artist" / "Album (2020) [qobuz-200]"
+    final_dir.mkdir(parents=True)
+    publish_release_identity(final_dir, ReleaseIdentity("qobuz", "100"))
+    before = (final_dir / MANIFEST_NAME).read_bytes()
+    monkeypatch.setattr(
+        proc, "_final_release_inventory_matches", lambda *_args: True)
+
+    with pytest.raises(ReleaseManifestError, match="different release"):
+        proc.finalize_release_identity(
+            {"id": "200", "tracks": {"items": [{"title": "one"}]}},
+            final_dir,
+            expected_destination=final_dir,
+            expected_path_receipt=capture_directory_path_receipt(final_dir),
+            frozen_slots={"qobuz:1": ("artist", "album", 1, 1, "one")},
+            authority=authority,
+        )
+    assert (final_dir / MANIFEST_NAME).read_bytes() == before
+
+
+def test_non_audio_carry_publishes_identity_before_generic_companions(
+        tmp_path, monkeypatch):
+    from qobuz_librarian.modes import process as proc
+
+    replacement = tmp_path / "music" / "Artist" / "Album"
+    replacement.mkdir(parents=True)
+    backup = SimpleNamespace(path=tmp_path / "backups" / "Album")
+    identity_receipt = {"receipt": "after-identity"}
+    final_receipt = {"receipt": "after-companions"}
+    calls = []
+
+    def carry_identity(actual_backup, path, identity):
+        calls.append(("identity", actual_backup, path, identity))
+        return identity_receipt
+
+    def carry_companions(actual_backup, path, *, expected_replacement_receipt):
+        calls.append((
+            "companions",
+            actual_backup,
+            path,
+            expected_replacement_receipt,
+        ))
+        return final_receipt
+
+    monkeypatch.setattr(
+        proc, "carry_backup_release_identity", carry_identity, raising=False)
+    monkeypatch.setattr(proc, "carry_backup_companions", carry_companions)
+
+    carried = proc._carry_non_audio_from_backup(
+        {"id": "100"},
+        replacement,
+        backup,
+        replacement_dir=replacement,
+    )
+
+    assert carried == (replacement, final_receipt)
+    assert calls == [
+        (
+            "identity",
+            backup,
+            replacement,
+            ReleaseIdentity("qobuz", "100"),
+        ),
+        ("companions", backup, replacement, identity_receipt),
+    ]
+
+def test_finalize_release_identity_requires_the_exact_planned_destination(
+    tmp_path, authority,
+):
+    from qobuz_librarian.library.release_identity import (
+        capture_directory_path_receipt,
+    )
+    from qobuz_librarian.modes.process import finalize_release_identity
+
+    final_dir = tmp_path / "Artist" / "Album"
+    other = tmp_path / "Artist" / "Other"
+    final_dir.mkdir(parents=True)
+    other.mkdir()
+
+    with pytest.raises(ReleaseManifestError, match="planned destination"):
+        finalize_release_identity(
+            {"id": "200", "tracks": {"items": [{"title": "one"}]}},
+            final_dir,
+            expected_destination=other,
+            expected_path_receipt=capture_directory_path_receipt(final_dir),
+            frozen_slots={"qobuz:1": ("artist", "album", 1, 1, "one")},
+            authority=authority,
+        )
+
+    assert read_release_identity(final_dir) is None
+
+
+def test_finalize_release_identity_refuses_lost_authority(tmp_path, authority):
+    from qobuz_librarian.library.release_identity import (
+        capture_directory_path_receipt,
+    )
+    from qobuz_librarian.modes.process import finalize_release_identity
+
+    final_dir = tmp_path / "Artist" / "Album"
+    final_dir.mkdir(parents=True)
+    authority.close()
+    with pytest.raises(OSError, match="run lock"):
+        finalize_release_identity(
+            {"id": "200", "tracks": {"items": [{"title": "one"}]}},
+            final_dir,
+            expected_destination=final_dir,
+            expected_path_receipt=capture_directory_path_receipt(final_dir),
+            frozen_slots={"qobuz:1": ("artist", "album", 1, 1, "one")},
+            authority=authority,
+        )
+    assert read_release_identity(final_dir) is None
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="Linux inode leases are the authoritative write-exclusion backend",
+)
+def test_finalize_release_identity_refuses_existing_audio_writer(
+    tmp_path, monkeypatch, authority
+):
+    from qobuz_librarian.library.release_identity import (
+        capture_directory_path_receipt,
+    )
+    from qobuz_librarian.modes import process as proc
+
+    final_dir = tmp_path / "Artist" / "Album"
+    final_dir.mkdir(parents=True)
+    audio = final_dir / "01.flac"
+    audio.write_bytes(b"completed audio")
+    receipt = capture_directory_path_receipt(final_dir)
+    monkeypatch.setattr(
+        proc, "_final_release_inventory_matches", lambda *_args: True
+    )
+
+    writer = os.open(audio, os.O_RDWR)
+    try:
+        with pytest.raises(OSError, match="protect|authority|writer"):
+            proc.finalize_release_identity(
+                {"id": "200", "tracks": {"items": [{"title": "one"}]}},
+                final_dir,
+                expected_destination=final_dir,
+                expected_path_receipt=receipt,
+                frozen_slots={"qobuz:1": ("artist", "album", 1, 1, "one")},
+                authority=authority,
+            )
+    finally:
+        os.close(writer)
+
+    assert read_release_identity(final_dir) is None
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="Linux inode leases are the authoritative write-exclusion backend",
+)
+def test_finalize_release_identity_preserves_idempotent_change_result(
+    tmp_path, monkeypatch, authority
+):
+    from qobuz_librarian.library.release_identity import (
+        capture_directory_path_receipt,
+    )
+    from qobuz_librarian.modes import process as proc
+
+    final_dir = tmp_path / "Artist" / "Album"
+    final_dir.mkdir(parents=True)
+    (final_dir / "01.flac").write_bytes(b"completed audio")
+    receipt = capture_directory_path_receipt(final_dir)
+    monkeypatch.setattr(
+        proc, "_final_release_inventory_matches", lambda *_args: True
+    )
+    arguments = dict(
+        album={"id": "200", "tracks": {"items": [{"title": "one"}]}},
+        final_dir=final_dir,
+        expected_destination=final_dir,
+        expected_path_receipt=receipt,
+        frozen_slots={"qobuz:1": ("artist", "album", 1, 1, "one")},
+        authority=authority,
+    )
+
+    assert proc.finalize_release_identity(**arguments) is True
+    arguments["expected_path_receipt"] = capture_directory_path_receipt(final_dir)
+    assert proc.finalize_release_identity(**arguments) is False
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="Linux inode leases are the authoritative write-exclusion backend",
+)
+def test_finalize_release_identity_fails_closed_for_writer_after_final_audit(
+    tmp_path, monkeypatch, authority
+):
+    from qobuz_librarian.library.release_identity import (
+        capture_directory_path_receipt,
+    )
+    from qobuz_librarian.modes import process as proc
+
+    final_dir = tmp_path / "Artist" / "Album"
+    final_dir.mkdir(parents=True)
+    audio = final_dir / "01.flac"
+    audio.write_bytes(b"completed audio")
+    receipt = capture_directory_path_receipt(final_dir)
+    writer_errors = []
+
+    def final_audit(*_args):
+        writer_errors.append(_nonblocking_writer_errno(audio))
+        return True
+
+    monkeypatch.setattr(proc, "_final_release_inventory_matches", final_audit)
+
+    with pytest.raises(OSError, match="authority|namespace|writer"):
+        proc.finalize_release_identity(
+            {"id": "200", "tracks": {"items": [{"title": "one"}]}},
+            final_dir,
+            expected_destination=final_dir,
+            expected_path_receipt=receipt,
+            frozen_slots={"qobuz:1": ("artist", "album", 1, 1, "one")},
+            authority=authority,
+        )
+
+    assert writer_errors == [errno.EAGAIN]
+    assert read_release_identity(final_dir) is None
+    descriptor = os.open(audio, os.O_WRONLY | os.O_NONBLOCK)
+    os.close(descriptor)
+
+
+def test_final_slot_proof_rejects_same_count_substitution(monkeypatch, tmp_path):
+    from qobuz_librarian.modes import process as proc
+
+    final_dir = tmp_path / "Album"
+    final_dir.mkdir()
+    first = final_dir / "01.flac"
+    second = final_dir / "02.flac"
+    first.write_bytes(b"first")
+    second.write_bytes(b"substitute")
+    expected = {
+        "qobuz:1": ("artist", "album", 1, 1, "one"),
+        "qobuz:2": ("artist", "album", 1, 2, "two"),
+    }
+    signatures = {
+        first: expected["qobuz:1"],
+        second: ("artist", "album", 1, 2, "wrong recording"),
+    }
+    monkeypatch.setattr(proc, "_flac_signature", lambda path: signatures[path])
+
+    assert not proc._final_album_matches_frozen_slots(final_dir, expected)
+
+
+def test_slot_proof_freezes_requested_and_reviewed_baseline(monkeypatch, tmp_path):
+    from qobuz_librarian.modes import process as proc
+
+    staged = tmp_path / "staged.flac"
+    baseline = tmp_path / "baseline.flac"
+    staged.write_bytes(b"requested")
+    baseline.write_bytes(b"baseline")
+    requested = {
+        "id": "1", "title": "One", "media_number": 1,
+        "track_number": 1, "duration": 100,
+    }
+    present = {
+        "id": "2", "title": "Two", "media_number": 1,
+        "track_number": 2, "duration": 100,
+    }
+    album = {"tracks": {"items": [requested, present]}}
+    existing = [{
+        "title": "Two", "discnumber": 1, "tracknumber": 2,
+        "length": 100, "path": str(baseline),
+    }]
+    signatures = {
+        staged: ("artist", "album", 1, 1, "one"),
+        baseline: ("artist", "album", 1, 2, "two"),
+    }
+    monkeypatch.setattr(proc, "_flac_signature", lambda path: signatures[path])
+    monkeypatch.setattr(proc, "refresh_staged_track_bindings", lambda _result: ())
+    monkeypatch.setattr(
+        proc,
+        "exact_download_coverage",
+        lambda *_args: SimpleNamespace(bindings=(
+            SimpleNamespace(slot="qobuz:1", path=str(staged)),
+        )),
+    )
+
+    assert proc._freeze_release_slot_signatures(
+        album, [requested], [present], existing, {}
+    ) == {
+        "qobuz:1": signatures[staged],
+        "qobuz:2": signatures[baseline],
+    }
+
+
+def test_synchronous_partial_split_is_not_identity_authority(tmp_path):
+    from qobuz_librarian.modes import process as proc
+
+    source = tmp_path / "Other" / "Album"
+    destination = tmp_path / "Artist" / "Album"
+    source.mkdir(parents=True)
+    destination.mkdir(parents=True)
+    (source / "01.flac").write_bytes(b"source recording")
+    (destination / "01.flac").write_bytes(b"contradictory recording")
+    (destination / "02.flac").write_bytes(b"moved recording")
+    result = SimpleNamespace(
+        changed=True,
+        published_files=1,
+        destination=destination,
+        reason="kept 1 existing destination name(s)",
+    )
+
+    assert not proc._split_relocation_allows_identity(result)
+    assert (source / "01.flac").exists()
+    assert not (destination / MANIFEST_NAME).exists()
+
+
+@pytest.mark.parametrize(
+    ("beets_succeeds", "coverage_proven", "extra_audio", "late_cancel",
+     "split_noop", "swap_after_audit"),
+    [(False, True, False, False, False, False),
+     (True, False, False, False, False, False),
+     (True, True, False, False, False, False),
+     (True, True, True, False, False, False),
+     (True, True, False, True, False, False),
+     (True, True, False, False, True, False),
+     (True, True, False, False, False, True)],
+)
+def test_process_publishes_identity_only_after_exact_import_proof(
+    monkeypatch,
+    tmp_path,
+    beets_succeeds,
+    coverage_proven,
+    extra_audio,
+    late_cancel,
+    split_noop,
+    swap_after_audit,
+    authority,
+):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.library import post_import_relocation
+    from qobuz_librarian.modes import process as proc
+
+    staging = tmp_path / "staging" / "Artist" / "Album"
+    staging.mkdir(parents=True)
+    final_dir = tmp_path / "music" / "Artist" / "Album"
+    final_dir.mkdir(parents=True)
+    split_source = tmp_path / "music" / "Other" / "Album"
+    if split_noop:
+        split_source.mkdir(parents=True)
+        (split_source / "01.flac").write_bytes(b"source recording")
+    (final_dir / "01.flac").write_bytes(b"one")
+    if extra_audio:
+        (final_dir / "99.flac").write_bytes(b"contradictory")
+    monkeypatch.setattr(cfg, "STAGING_DIR", staging.parent.parent)
+    monkeypatch.setattr(cfg, "AUTO_UPGRADE_ENABLED", False)
+    tracks = [{"id": "10", "title": "One", "track_number": 1}]
+    album = {
+        "id": "200",
+        "title": "Album",
+        "artist": {"name": "Artist"},
+        "maximum_bit_depth": 24,
+        "maximum_sampling_rate": 96.0,
+        "tracks": {"items": tracks},
+    }
+
+    monkeypatch.setattr(proc, "is_lossless_album", lambda _album: True)
+    monkeypatch.setattr(
+        proc,
+        "find_existing_tracks",
+        lambda _album: ([], split_source if split_noop else None),
+    )
+    monkeypatch.setattr(proc, "compute_missing", lambda wanted, _have: (wanted, []))
+    monkeypatch.setattr(proc, "find_album_dir_filesystem", lambda _album: None)
+    monkeypatch.setattr(proc, "staging_preflight", lambda _args: None)
+    monkeypatch.setattr(proc, "snapshot_staging", lambda: set())
+    state = {"imported": False, "placement_revalidated": False}
+    monkeypatch.setattr(
+        proc,
+        "is_cancel_requested",
+        lambda: bool(late_cancel and state["imported"]),
+    )
+    monkeypatch.setattr(proc, "validated_staged_album_dirs", lambda _result: [staging])
+    monkeypatch.setattr(
+        proc,
+        "_pre_import_staging_hooks",
+        lambda _args, _dirs=None: ([], 0),
+    )
+    monkeypatch.setattr(proc, "track_signatures_for_album_dirs", lambda _dirs: ["sig"])
+    monkeypatch.setattr(
+        proc,
+        "find_album_dir_by_track_signatures",
+        lambda signatures: final_dir if signatures == ["sig"] else None,
+    )
+    monkeypatch.setattr(
+        proc,
+        "folder_holds_all_tracks",
+        lambda *_args, **_kwargs: coverage_proven,
+    )
+    monkeypatch.setattr(
+        proc,
+        "_freeze_release_slot_signatures",
+        lambda *_args, **_kwargs: {"qobuz:10": ("a", "b", 1, 1, "one")},
+    )
+    monkeypatch.setattr(
+        proc,
+        "_final_album_matches_frozen_slots",
+        lambda *_args, **_kwargs: _swap_after_final_audit()
+        if swap_after_audit else True,
+    )
+    monkeypatch.setattr(
+        proc,
+        "resolve_album_import_placement",
+        lambda _album, _token: _adopted_placement(final_dir, "200"),
+    )
+    monkeypatch.setattr(
+        proc,
+        "require_album_placement_current",
+        lambda _placement: state.update(placement_revalidated=True),
+        raising=False,
+    )
+    monkeypatch.setattr(proc, "write_post_import_sidecars", lambda _dirs: None)
+    monkeypatch.setattr(proc, "sweep_staging_artwork", lambda: None)
+    monkeypatch.setattr(proc, "print_album_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(proc, "log_fetch", lambda _event: None)
+    monkeypatch.setattr(proc, "warn_if_download_truncated", lambda *_args: None)
+    monkeypatch.setattr(proc, "_is_split_album_merge", lambda *_args: split_noop)
+    monkeypatch.setattr(
+        post_import_relocation,
+        "relocate_post_import_album",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            changed=False,
+            published_files=0,
+            destination=final_dir,
+            reason="all destination names already exist",
+        ),
+    )
+    monkeypatch.setattr(
+        proc,
+        "verify_and_recover",
+        lambda *_args, **_kwargs: {
+            "under": False,
+            "recovered": False,
+            "retried": False,
+            "staged_dirs": [staging],
+        },
+    )
+
+    def download(**kwargs):
+        kwargs["result"].update(
+            n_ok=1,
+            n_fail=0,
+            n_lossy=0,
+            failed_tracks=[],
+            lossy_tracks=[],
+            elapsed=0.0,
+            gap_fill_backup_path=None,
+        )
+
+    def import_album(*_args, **_kwargs):
+        assert not (final_dir / MANIFEST_NAME).exists()
+        assert state["placement_revalidated"] is True
+        state["imported"] = beets_succeeds
+        return beets_succeeds
+
+    monkeypatch.setattr(proc, "run_album_download", download)
+    monkeypatch.setattr(proc, "beets_import_paths", import_album)
+
+    displaced = tmp_path / "music" / "Artist" / "audited-album"
+
+    def _swap_after_final_audit():
+        final_dir.rename(displaced)
+        final_dir.mkdir()
+        return True
+
+    result = proc.process_album(album, _args(), token="token")
+
+    if (
+        beets_succeeds and coverage_proven and not extra_audio
+        and not late_cancel and not split_noop and not swap_after_audit
+    ):
+        assert read_release_identity(final_dir) == ReleaseIdentity("qobuz", "200")
+    elif not beets_succeeds:
+        assert result["result"] == "not_imported"
+        assert not (final_dir / MANIFEST_NAME).exists()
+    else:
+        assert result["imported"] is True
+        assert not (final_dir / MANIFEST_NAME).exists()
+
+
+def test_finalize_release_identity_rejects_post_publish_namespace_replacement(
+        tmp_path, monkeypatch, authority):
+    from qobuz_librarian.library.release_identity import (
+        capture_directory_path_receipt,
+    )
+    from qobuz_librarian.modes import process as proc
+    from qobuz_librarian.queue import post_import_finalizer
+
+    final_dir = tmp_path / "Artist" / "Album"
+    final_dir.mkdir(parents=True)
+    (final_dir / "01.flac").write_bytes(b"completed audio")
+    receipt = capture_directory_path_receipt(final_dir)
+    monkeypatch.setattr(
+        proc,
+        "_final_release_inventory_matches",
+        lambda *_args, **_kwargs: True,
+        raising=False,
+    )
+    displaced = tmp_path / "Artist" / "displaced"
+    real_publish = (
+        post_import_finalizer.publish_release_identity_authorized_retained
+    )
+
+    def publish_then_replace(album, identity):
+        retained = real_publish(album, identity)
+        final_dir.rename(displaced)
+        final_dir.mkdir()
+        return retained
+
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "publish_release_identity_authorized_retained",
+        publish_then_replace,
+    )
+
+    with pytest.raises(OSError, match="changed"):
+        proc.finalize_release_identity(
+            {"id": "200", "tracks": {"items": [{"title": "one"}]}},
+            final_dir,
+            expected_destination=final_dir,
+            expected_path_receipt=receipt,
+            frozen_slots={"qobuz:1": ("artist", "album", 1, 1, "one")},
+            authority=authority,
+        )
+
+    assert read_release_identity(final_dir) is None
+    assert read_release_identity(displaced) == ReleaseIdentity("qobuz", "200")
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="Linux inode leases are the authoritative write-exclusion backend",
+)
+def test_manifest_authority_transfers_without_an_aba_writer_gap(
+    tmp_path, monkeypatch, authority
+):
+    from qobuz_librarian.library import release_identity
+    from qobuz_librarian.library.release_identity import (
+        capture_directory_path_receipt,
+    )
+    from qobuz_librarian.modes import process as proc
+    from qobuz_librarian.queue import post_import_finalizer
+
+    final_dir = tmp_path / "Artist" / "Album"
+    final_dir.mkdir(parents=True)
+    (final_dir / "01.flac").write_bytes(b"completed audio")
+    receipt = capture_directory_path_receipt(final_dir)
+    monkeypatch.setattr(
+        proc,
+        "_final_release_inventory_matches",
+        lambda *_args, **_kwargs: True,
+    )
+    real_publish = (
+        release_identity.publish_release_identity_authorized_retained
+    )
+    writer_errors = []
+
+    def publish_then_attempt_aba(album, identity):
+        retained = real_publish(album, identity)
+        writer_errors.append(
+            _nonblocking_manifest_aba_errno(
+                final_dir / MANIFEST_NAME,
+                b'{"schema_version":1,"provider":"qobuz",'
+                b'"release_id":"200"}\n',
+            )
+        )
+        return retained
+
+    monkeypatch.setattr(
+        post_import_finalizer,
+        "publish_release_identity_authorized_retained",
+        publish_then_attempt_aba,
+    )
+
+    with pytest.raises(OSError, match="authority|namespace|manifest"):
+        proc.finalize_release_identity(
+            {"id": "200", "tracks": {"items": [{"title": "one"}]}},
+            final_dir,
+            expected_destination=final_dir,
+            expected_path_receipt=receipt,
+            frozen_slots={"qobuz:1": ("artist", "album", 1, 1, "one")},
+            authority=authority,
+        )
+
+    assert writer_errors == [errno.EAGAIN]
+    assert read_release_identity(final_dir) == ReleaseIdentity("qobuz", "200")
+    descriptor = os.open(
+        final_dir / MANIFEST_NAME,
+        os.O_WRONLY | os.O_NONBLOCK,
+    )
+    os.close(descriptor)
 
 
 def test_force_stops_after_an_interrupted_backup(monkeypatch, tmp_path):
@@ -200,15 +877,31 @@ def test_treat_as_new_downloads_an_owned_album_as_a_separate_edition(monkeypatch
     consolidate_seen = []
     monkeypatch.setattr(proc, "validated_staged_album_dirs",
                         lambda _result: [staging])
+    monkeypatch.setattr(
+        proc,
+        "resolve_album_import_placement",
+        lambda _album, _token: SimpleNamespace(suffix=" [qobuz-ED99]"),
+    )
     monkeypatch.setattr(proc, "beets_import_paths",
-                        lambda *a, **k: consolidate_seen.append(k.get("consolidate")) or True)
+                        lambda *a, **k: consolidate_seen.append((
+                            k.get("consolidate"), k.get("album_path_suffix"))) or True)
 
     assert proc.process_album(album, _args(), token="tok")["result"] == "already_complete"
     assert consolidate_seen == []
 
     result = proc.process_album(album, _args(), token="tok", treat_as_new=True)
     assert result.get("imported") is True
-    assert consolidate_seen == [False]
+    assert consolidate_seen == [(False, " [qobuz-ED99]")]
+
+    def ambiguous(_album, _token):
+        raise proc.AlbumImportIdentityAmbiguous(
+            "identity_ambiguous: friendly path matches multiple Qobuz releases")
+
+    monkeypatch.setattr(proc, "resolve_album_import_placement", ambiguous)
+    result = proc.process_album(album, _args(), token="tok", treat_as_new=True)
+    assert result["result"] == "identity_ambiguous"
+    assert result["imported"] is False
+    assert consolidate_seen == [(False, " [qobuz-ED99]")]
 
 
 def test_auto_downsample_marks_imported_folder_when_album_resolver_misses(
@@ -424,10 +1117,11 @@ def test_gap_fill_backup_restored_when_track_returns_lossy(monkeypatch, tmp_path
     owned.write_bytes(b"the-owned-original")
     existing = [{"path": str(owned), "title": "T1", "tracknumber": 1, "discnumber": 1}]
 
-    staging = tmp_path / "staging"
-    staging.mkdir()
+    staging_root = tmp_path / "staging"
+    staging = staging_root / ".qobuz-run-000000000000000000000000"
+    staging.mkdir(parents=True)
     monkeypatch.setattr(cfg, "MUSIC_ROOT", tmp_path / "music")
-    monkeypatch.setattr(cfg, "STAGING_DIR", staging)
+    monkeypatch.setattr(cfg, "STAGING_DIR", staging_root)
     monkeypatch.setattr(cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
     monkeypatch.setattr(cfg, "AUTO_UPGRADE_ENABLED", False)
 
@@ -451,7 +1145,19 @@ def test_gap_fill_backup_restored_when_track_returns_lossy(monkeypatch, tmp_path
     monkeypatch.setattr(proc, "is_cancel_requested", lambda: False)
     monkeypatch.setattr(
         proc, "_pre_import_staging_hooks", lambda _a, _dirs=None: ([], 0))
-    monkeypatch.setattr(proc, "beets_import_paths", lambda *a, **k: True)
+    def fake_import(*_a, **_k):
+        assert not owned.exists()
+        for file in new_flacs:
+            (album_dir / file.name).write_bytes(file.read_bytes())
+            file.unlink()
+        return True
+
+    monkeypatch.setattr(proc, "beets_import_paths", fake_import)
+    monkeypatch.setattr(
+        proc,
+        "resolve_album_import_placement",
+        lambda _album, _token: _adopted_placement(album_dir),
+    )
     monkeypatch.setattr(proc, "write_post_import_sidecars", lambda _ds: None)
     monkeypatch.setattr(proc, "sweep_staging_artwork", lambda: None)
     monkeypatch.setattr(proc, "log_fetch", lambda _e: None)
@@ -460,7 +1166,8 @@ def test_gap_fill_backup_restored_when_track_returns_lossy(monkeypatch, tmp_path
                         lambda _result: [staging])
 
     monkeypatch.setattr(dl, "rip_url", lambda *a, **k: (0, ""))
-    _patch_download_receipts(monkeypatch, dl, [*new_flacs, lossy_rip])
+    _patch_download_receipts(
+        monkeypatch, dl, [*new_flacs, lossy_rip], staging)
     monkeypatch.setattr(
         dl, "cleanup_lossy",
         lambda files: (
@@ -745,10 +1452,11 @@ def test_gap_fill_partial_import_restores_backup_despite_extra_track(
     (album_dir / "09 - Bonus.flac").write_bytes(b"\x00" * 500)
     existing = [{"path": str(owned), "title": "T1", "tracknumber": 1, "discnumber": 1}]
 
-    staging = tmp_path / "staging"
-    staging.mkdir()
+    staging_root = tmp_path / "staging"
+    staging = staging_root / ".qobuz-run-000000000000000000000000"
+    staging.mkdir(parents=True)
     monkeypatch.setattr(cfg, "MUSIC_ROOT", tmp_path / "music")
-    monkeypatch.setattr(cfg, "STAGING_DIR", staging)
+    monkeypatch.setattr(cfg, "STAGING_DIR", staging_root)
     monkeypatch.setattr(cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
     monkeypatch.setattr(cfg, "AUTO_UPGRADE_ENABLED", False)
 
@@ -780,16 +1488,22 @@ def test_gap_fill_partial_import_restores_backup_despite_extra_track(
     t1_rip.write_bytes(b"\x00" * 1000)
 
     def fake_import(*_a, **_k):
+        assert not owned.exists()
         for f in new_flacs:
             (album_dir / f.name).write_bytes(f.read_bytes())
             f.unlink()
         return True
     monkeypatch.setattr(proc, "beets_import_paths", fake_import)
+    monkeypatch.setattr(
+        proc,
+        "resolve_album_import_placement",
+        lambda _album, _token: _adopted_placement(album_dir),
+    )
     monkeypatch.setattr(proc, "validated_staged_album_dirs",
                         lambda _result: [staging])
 
     monkeypatch.setattr(dl, "rip_url", lambda *a, **k: (0, ""))
-    _patch_download_receipts(monkeypatch, dl, [*new_flacs, t1_rip])
+    _patch_download_receipts(monkeypatch, dl, [*new_flacs, t1_rip], staging)
     monkeypatch.setattr(dl, "cleanup_lossy", lambda f: (list(f), [], []))
     monkeypatch.setattr(dl, "snapshot_staging", lambda: set())
     monkeypatch.setattr(dl, "detect_auth_lost", lambda _o: False)

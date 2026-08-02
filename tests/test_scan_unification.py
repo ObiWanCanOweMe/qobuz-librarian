@@ -21,6 +21,112 @@ def _candidate(album_dir: Path):
     )
 
 
+def test_artist_fingerprint_tracks_exact_release_manifest_state(tmp_path):
+    from qobuz_librarian.library.artist_fingerprint import artist_fingerprint
+    from qobuz_librarian.library.release_identity import (
+        MANIFEST_NAME,
+        ReleaseIdentity,
+        publish_release_identity,
+    )
+
+    artist_dir = tmp_path / "Artist"
+    album_dir = artist_dir / "Album"
+    album_dir.mkdir(parents=True)
+    (album_dir / "01.flac").write_bytes(b"audio")
+
+    missing = artist_fingerprint(artist_dir)
+    publish_release_identity(album_dir, ReleaseIdentity("qobuz", "100"))
+    first = artist_fingerprint(artist_dir)
+    (album_dir / MANIFEST_NAME).unlink()
+    removed = artist_fingerprint(artist_dir)
+    publish_release_identity(album_dir, ReleaseIdentity("qobuz", "200"))
+    replaced = artist_fingerprint(artist_dir)
+    (album_dir / MANIFEST_NAME).write_text("not-json", encoding="utf-8")
+    malformed = artist_fingerprint(artist_dir)
+
+    assert first != missing
+    assert removed == missing
+    assert replaced not in {missing, first}
+    assert malformed not in {missing, first, replaced}
+
+
+def test_artist_fingerprint_fails_closed_if_manifest_vanishes_during_read(
+        tmp_path, monkeypatch):
+    from qobuz_librarian.library import artist_fingerprint as fingerprint_mod
+    from qobuz_librarian.library.release_identity import MANIFEST_NAME
+
+    album_dir = tmp_path / "Artist" / "Album"
+    album_dir.mkdir(parents=True)
+    (album_dir / MANIFEST_NAME).write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(fingerprint_mod, "read_release_identity", lambda _p: None)
+
+    value = fingerprint_mod.artist_fingerprint(album_dir.parent)
+
+    assert len(value) == 64
+
+
+def test_artist_fingerprint_never_follows_a_manifest_symlink(
+        tmp_path, monkeypatch):
+    from qobuz_librarian.library import artist_fingerprint as fingerprint_mod
+    from qobuz_librarian.library.release_identity import MANIFEST_NAME
+
+    album_dir = tmp_path / "Artist" / "Album"
+    album_dir.mkdir(parents=True)
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+    (album_dir / MANIFEST_NAME).symlink_to(outside)
+    monkeypatch.setattr(
+        fingerprint_mod,
+        "read_release_identity",
+        lambda _p: (_ for _ in ()).throw(
+            AssertionError("manifest symlink must not be opened")),
+    )
+
+    value = fingerprint_mod.artist_fingerprint(album_dir.parent)
+
+    assert len(value) == 64
+
+
+def test_artist_fingerprint_tracks_reserved_manifest_directory(tmp_path):
+    from qobuz_librarian.library.artist_fingerprint import artist_fingerprint
+    from qobuz_librarian.library.release_identity import MANIFEST_NAME
+
+    album_dir = tmp_path / "Artist" / "Album"
+    album_dir.mkdir(parents=True)
+    (album_dir / "01.flac").write_bytes(b"audio")
+    missing = artist_fingerprint(album_dir.parent)
+
+    reserved = album_dir / MANIFEST_NAME
+    reserved.mkdir()
+    invalid_directory = artist_fingerprint(album_dir.parent)
+    reserved.rmdir()
+    removed = artist_fingerprint(album_dir.parent)
+
+    assert invalid_directory != missing
+    assert removed == missing
+
+
+def test_artist_fingerprint_tracks_reserved_symlink_to_directory(tmp_path):
+    from qobuz_librarian.library.artist_fingerprint import artist_fingerprint
+    from qobuz_librarian.library.release_identity import MANIFEST_NAME
+
+    album_dir = tmp_path / "Artist" / "Album"
+    album_dir.mkdir(parents=True)
+    (album_dir / "01.flac").write_bytes(b"audio")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    missing = artist_fingerprint(album_dir.parent)
+
+    reserved = album_dir / MANIFEST_NAME
+    reserved.symlink_to(outside, target_is_directory=True)
+    invalid_symlink = artist_fingerprint(album_dir.parent)
+    reserved.unlink()
+    removed = artist_fingerprint(album_dir.parent)
+
+    assert invalid_symlink != missing
+    assert removed == missing
+
+
 def test_downsample_scan_uses_shared_refresh_state(tmp_path, monkeypatch):
     from qobuz_librarian.library import downsample_state
     from qobuz_librarian.web import flows
@@ -253,6 +359,7 @@ def test_execute_upgrades_refreshes_upgrade_and_downsample_state(
                         lambda album_id, token: {"id": album_id, "title": "Album"})
     monkeypatch.setattr("qobuz_librarian.modes.process.process_album",
                         lambda *a, **k: {"imported": True, "result": "downloaded",
+                                         "n_ok": 1, "n_fail": 0,
                                          "dir": album_dir})
     monkeypatch.setattr("qobuz_librarian.library.catalog.find_existing_tracks",
                         lambda album: ([], None))
@@ -297,6 +404,7 @@ def test_execute_upgrades_marks_partial_cap_before_refresh(
     monkeypatch.setattr(flows, "get_album", lambda album_id, token: album)
     monkeypatch.setattr("qobuz_librarian.modes.process.process_album",
                         lambda *a, **k: {"imported": True, "result": "downloaded",
+                                         "n_ok": 1, "n_fail": 0,
                                          "dir": album_dir,
                                          "quality_verdict": {
                                              "under": True,
@@ -357,6 +465,7 @@ def test_execute_upgrades_does_not_mark_cap_when_staging_verdict_passed(
     monkeypatch.setattr(flows, "get_album", lambda album_id, token: album)
     monkeypatch.setattr("qobuz_librarian.modes.process.process_album",
                         lambda *a, **k: {"imported": True, "result": "downloaded",
+                                         "n_ok": 1, "n_fail": 0,
                                          "dir": album_dir,
                                          "quality_verdict": {
                                              "under": False,
@@ -571,6 +680,7 @@ def test_resumed_baseline_scan_can_complete_saved_library_state(
         tmp_path, monkeypatch):
     from qobuz_librarian import config as cfg
     from qobuz_librarian.library import downsample_state, library_scan_state
+    from qobuz_librarian.library import hidden as hidden_mod
     from qobuz_librarian.quality import upgrade_state
     from qobuz_librarian.web import flows
 
@@ -578,25 +688,35 @@ def test_resumed_baseline_scan_can_complete_saved_library_state(
                         tmp_path / "library_scan.json")
     monkeypatch.setattr(cfg, "SCAN_CHECKPOINT_FILE",
                         tmp_path / "checkpoint.json")
+    monkeypatch.setattr(cfg, "HIDDEN_FILE", tmp_path / "hidden.json")
     good_dir = tmp_path / "Good"
     next_dir = tmp_path / "Next"
     good_dir.mkdir()
     next_dir.mkdir()
+    attention = {
+        "kind": "identity_attention",
+        "title": "Album",
+        "artist": "Good",
+        "detail": "Release identity needs manual review",
+        "payload": {"non_actionable": True, "_artist_dir": "Good"},
+        "selected": False,
+    }
     cfg.SCAN_CHECKPOINT_FILE.write_text(json.dumps({
         "missing": {
             "scanned": ["Good"],
-            "candidates": [],
+            "candidates": [attention],
             "seen": {"good-id": ["good-album"]},
             "artists": {
                 "Good": {
                     "fingerprint": "good-fp",
-                    "candidates": [],
+                    "candidates": [attention],
                     "artist_id": "good-id",
                     "catalog_ids": ["good-album"],
                 },
             },
         },
     }), encoding="utf-8")
+    hidden_mod.hide(hidden_mod.SCOPE_MISSING, [("Good", "Album", "")])
 
     def fake_downsample_refresh(_artists, **_kwargs):
         return downsample_state.RefreshResult(
@@ -628,12 +748,94 @@ def test_resumed_baseline_scan_can_complete_saved_library_state(
             (ad.name, ad.name, [], "next-id", ["next-album"]),
     )
 
-    flows.scan_library(jm.Job(title="baseline"), "tok")
+    job = jm.Job(title="baseline")
+    flows.scan_library(job, "tok")
 
     state = library_scan_state.kind_state("missing")
     assert state["complete"] is True
     assert sorted(state["artists"]) == ["Good", "Next"]
+    assert [c["kind"] for c in job.candidates] == ["identity_attention"]
     assert flows.scan_checkpoint.load("missing") is None
+
+
+def test_resume_rescans_artist_when_checkpoint_fingerprint_changed(
+        tmp_path, monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.library import downsample_state, library_scan_state
+    from qobuz_librarian.library.artist_fingerprint import artist_fingerprint
+    from qobuz_librarian.library.release_identity import (
+        ReleaseIdentity,
+        publish_release_identity,
+    )
+    from qobuz_librarian.quality import upgrade_state
+    from qobuz_librarian.web import flows
+
+    monkeypatch.setattr(cfg, "ARTIST_SCAN_WORKERS", 1)
+    monkeypatch.setattr(
+        cfg, "LIBRARY_SCAN_STATE_FILE", tmp_path / "library_scan.json")
+    monkeypatch.setattr(cfg, "SCAN_CHECKPOINT_FILE", tmp_path / "checkpoint.json")
+    artist_dir = tmp_path / "Artist"
+    album_dir = artist_dir / "Album"
+    album_dir.mkdir(parents=True)
+    (album_dir / "01.flac").write_bytes(b"audio")
+    saved_fingerprint = artist_fingerprint(artist_dir)
+    stale_attention = {
+        "kind": "identity_attention",
+        "title": "Album",
+        "artist": "Artist",
+        "detail": "stale warning",
+        "payload": {"non_actionable": True, "_artist_dir": "Artist"},
+        "selected": False,
+    }
+    cfg.SCAN_CHECKPOINT_FILE.write_text(json.dumps({
+        "missing": {
+            "scanned": ["Artist"],
+            "candidates": [stale_attention],
+            "seen": {"artist-id": ["old"]},
+            "artists": {
+                "Artist": {
+                    "fingerprint": saved_fingerprint,
+                    "candidates": [stale_attention],
+                    "artist_id": "artist-id",
+                    "catalog_ids": ["old"],
+                },
+            },
+        },
+    }), encoding="utf-8")
+    publish_release_identity(album_dir, ReleaseIdentity("qobuz", "100"))
+    scanned = []
+
+    monkeypatch.setattr(flows, "list_library_artists", lambda: [artist_dir])
+    monkeypatch.setattr(
+        flows.downsample_state,
+        "refresh_for_artists",
+        lambda *_a, **_k: downsample_state.RefreshResult(
+            [], ["Artist"], {}, True, {"Artist": "unused"}),
+    )
+    monkeypatch.setattr(
+        flows.upgrade_state,
+        "refresh_for_artists",
+        lambda *_a, **_k: upgrade_state.RefreshResult(
+            [], ["Artist"], {}, True, {"Artist": "unused"}),
+    )
+    monkeypatch.setattr(flows, "_record_last_scan", lambda: None)
+    monkeypatch.setattr(flows, "_flag_new_since_last_scan", lambda *a, **k: None)
+    monkeypatch.setattr(flows, "flush_resolve_cache", lambda: None)
+    monkeypatch.setattr(flows.new_releases_mod, "is_baseline_complete", lambda: True)
+
+    def fake_scan(ad, _token, _partial_only, _hidden):
+        scanned.append(ad.name)
+        return ad.name, ad.name, [], "artist-id", ["fresh"], []
+
+    monkeypatch.setattr(flows, "_scan_library_artist", fake_scan)
+    job = jm.Job(title="baseline")
+
+    flows.scan_library(job, "tok")
+
+    assert scanned == ["Artist"]
+    assert job.candidates == []
+    state = library_scan_state.kind_state("missing")
+    assert state["artists"]["Artist"]["catalog_ids"] == ["fresh"]
 
 
 def test_resumed_baseline_rescans_checkpoint_entries_without_artist_snapshot(
@@ -711,6 +913,7 @@ def test_scan_library_reuses_unchanged_artist_snapshot(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         cfg, "LIBRARY_SCAN_STATE_FILE", tmp_path / "library_scan.json")
+    monkeypatch.setattr(cfg, "HIDDEN_FILE", tmp_path / "hidden.json")
     artist_dir = tmp_path / "Artist"
     album_dir = artist_dir / "Album"
     album_dir.mkdir(parents=True)
@@ -722,13 +925,22 @@ def test_scan_library_reuses_unchanged_artist_snapshot(tmp_path, monkeypatch):
         "payload": {"album_id": "saved", "_artist_dir": "Artist"},
         "selected": False,
     }
+    attention = {
+        "kind": "identity_attention",
+        "title": "Album",
+        "artist": "Artist",
+        "detail": "Release identity needs manual review",
+        "payload": {"non_actionable": True, "_artist_dir": "Artist"},
+        "selected": False,
+    }
+    hidden_mod.hide(hidden_mod.SCOPE_MISSING, [("Artist", "Album", "")])
     hidden = hidden_mod.load()
     library_scan_state.save_kind(
         "missing",
         artists={
             "Artist": {
                 "fingerprint": "same",
-                "candidates": [saved_candidate],
+                "candidates": [saved_candidate, attention],
                 "artist_id": "artist-id",
                 "catalog_ids": ["saved"],
             },
@@ -789,7 +1001,90 @@ def test_scan_library_reuses_unchanged_artist_snapshot(tmp_path, monkeypatch):
 
     assert downsample_skip == [True]
     assert upgrade_skip == [True]
-    assert [c["title"] for c in job.candidates] == ["Saved Album"]
+    assert [c["title"] for c in job.candidates] == ["Saved Album", "Album"]
+
+
+def test_scan_library_rescans_saved_artist_after_manifest_publish(
+        tmp_path, monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.library import hidden as hidden_mod
+    from qobuz_librarian.library import library_scan_state
+    from qobuz_librarian.library.artist_fingerprint import artist_fingerprint
+    from qobuz_librarian.library.release_identity import (
+        ReleaseIdentity,
+        publish_release_identity,
+    )
+    from qobuz_librarian.web import flows
+
+    monkeypatch.setattr(cfg, "ARTIST_SCAN_WORKERS", 1)
+    monkeypatch.setattr(
+        cfg, "LIBRARY_SCAN_STATE_FILE", tmp_path / "library_scan.json")
+    monkeypatch.setattr(cfg, "HIDDEN_FILE", tmp_path / "hidden.json")
+    artist_dir = tmp_path / "Artist"
+    album_dir = artist_dir / "Album"
+    album_dir.mkdir(parents=True)
+    (album_dir / "01.flac").write_bytes(b"audio")
+    hidden = hidden_mod.load()
+    stale = {
+        "kind": "identity_attention",
+        "title": "Album",
+        "artist": "Artist",
+        "detail": "stale warning",
+        "payload": {"non_actionable": True, "_artist_dir": "Artist"},
+        "selected": False,
+    }
+    library_scan_state.save_kind(
+        "missing",
+        artists={
+            "Artist": {
+                "fingerprint": artist_fingerprint(artist_dir),
+                "candidates": [stale],
+                "artist_id": "artist-id",
+                "catalog_ids": ["stale"],
+            },
+        },
+        complete=True,
+        hidden_signature=library_scan_state.hidden_signature(
+            hidden, hidden_mod.SCOPE_MISSING),
+        quality_sig=library_scan_state.quality_signature(),
+    )
+    publish_release_identity(album_dir, ReleaseIdentity("qobuz", "100"))
+    scanned = []
+
+    monkeypatch.setattr(flows, "list_library_artists", lambda: [artist_dir])
+    monkeypatch.setattr(
+        flows.downsample_state, "refresh_for_artists",
+        lambda *_a, **_k: SimpleNamespace(
+            complete=True, candidates=[], artists_scanned=[], errors={},
+            fingerprints={}, hidden_signature=""),
+    )
+    monkeypatch.setattr(
+        flows.upgrade_state, "refresh_for_artists",
+        lambda *_a, **_k: SimpleNamespace(
+            complete=True, candidates=[], artists_scanned=[], errors={},
+            fingerprints={}, hidden_signature=""),
+    )
+    monkeypatch.setattr(flows.scan_checkpoint, "load", lambda _kind: None)
+    monkeypatch.setattr(flows.scan_checkpoint, "save", lambda *a, **k: None)
+    monkeypatch.setattr(flows.scan_checkpoint, "clear", lambda _kind: None)
+    monkeypatch.setattr(flows, "_record_last_scan", lambda: None)
+    monkeypatch.setattr(flows, "_flag_new_since_last_scan", lambda *a, **k: None)
+    monkeypatch.setattr(flows, "flush_resolve_cache", lambda: None)
+    monkeypatch.setattr(flows.new_releases_mod, "is_baseline_complete", lambda: True)
+
+    def fake_scan(ad, _token, _partial_only, _hidden):
+        scanned.append(ad.name)
+        return ad.name, ad.name, [], "artist-id", ["fresh"], []
+
+    monkeypatch.setattr(flows, "_scan_library_artist", fake_scan)
+    job = jm.Job(title="baseline")
+
+    flows.scan_library(job, "tok")
+
+    assert scanned == ["Artist"]
+    assert job.candidates == []
+    state = library_scan_state.kind_state("missing")
+    assert state["artists"]["Artist"]["catalog_ids"] == ["fresh"]
 
 
 def test_scan_library_force_full_ignores_saved_artist_snapshot(

@@ -14,6 +14,12 @@ from qobuz_librarian.library.catalog import (
     filter_owned_albums,
     find_album_dir_filesystem,
     find_extras_in_existing,
+    release_merge_allowed,
+)
+from qobuz_librarian.library.release_identity import (
+    MANIFEST_NAME,
+    ReleaseIdentity,
+    publish_release_identity,
 )
 
 
@@ -107,8 +113,8 @@ def _et(title, isrc="", disc=1, **kw):
             "normalized": normalize(title), **kw}
 
 
-def _qalbum(title, year, bd=16, sr=44.1, tc=10):
-    return {"title": title, "release_date_original": str(year),
+def _qalbum(title, year, bd=16, sr=44.1, tc=10, album_id=None):
+    return {"id": album_id, "title": title, "release_date_original": str(year),
             "maximum_bit_depth": bd, "maximum_sampling_rate": sr,
             "tracks_count": tc}
 
@@ -163,7 +169,19 @@ def test_album_year_keeps_a_new_years_eve_release_in_its_year():
 
 
 
-def test_dedup_album_versions_collapses_editions_but_keeps_distinct_years():
+def test_dedup_album_versions_preserves_distinct_qobuz_releases():
+    standard = _qalbum("Album", 2020, album_id="100")
+    deluxe = _qalbum("Album (Deluxe Edition)", 2020, album_id="200")
+    duplicate = dict(standard, maximum_bit_depth=24)
+
+    result = dedup_album_versions([standard, deluxe, duplicate], prefer_hires=True)
+
+    assert [str(album["id"]) for album, _count in result] == ["100", "200"]
+    assert result[0][1] == 2
+    assert result[0][0]["maximum_bit_depth"] == 24
+
+
+def test_dedup_album_versions_keeps_legacy_title_year_fallback():
     pairs = [_qalbum("Abbey Road", 1969), _qalbum("Abbey Road (Remaster)", 1969)]
     assert len(dedup_album_versions(pairs)) == 1
     pairs = [_qalbum("American Football", 1999), _qalbum("American Football", 2016)]
@@ -174,6 +192,28 @@ def test_dedup_album_versions_collapses_editions_but_keeps_distinct_years():
             _qalbum("Album", 2020, bd=24, sr=96)]
     result = dedup_album_versions(pair, prefer_hires=True)
     assert len(result) == 1 and result[0][0]["maximum_bit_depth"] == 24
+
+
+def test_album_candidates_keep_standard_and_deluxe_release_ids(tmp_path, monkeypatch):
+    folder = tmp_path / "Artist" / "Album (2020)"
+    folder.mkdir(parents=True)
+    standard = _qalbum("Album", 2020, album_id="100")
+    deluxe = _qalbum("Album (Deluxe Edition)", 2020, album_id="200")
+    full = {
+        "100": {**standard, "tracks": {"items": [_qt("one", isrc="A")]}},
+        "200": {**deluxe, "tracks": {"items": [
+            _qt("one", isrc="A"), _qt("bonus", isrc="B")]}},
+    }
+    monkeypatch.setattr(config, "MUSIC_ROOT", tmp_path)
+    monkeypatch.setattr(catalog, "get_album", lambda album_id, _token: full[str(album_id)])
+    monkeypatch.setattr(
+        catalog, "find_album_dir_filesystem", lambda _album: folder)
+
+    candidates = catalog.find_qobuz_album_candidates_for_dir(
+        folder, "Artist", "tok", catalog=[standard, deluxe], target_dir=folder)
+
+    assert [str(album["id"]) for album in candidates] == ["100", "200"]
+    assert all((album.get("tracks") or {}).get("items") for album in candidates)
 
 
 def test_filter_owned_albums_doesnt_swallow_sequels_or_distinct_years():
@@ -215,6 +255,124 @@ def test_split_album_merge_rules(tmp_path):
     (art / "Live (2011)").mkdir()
     assert _is_split_album_merge(art / "Live (2010)", art / "Live (2011)", "Bonobo") is False
 
+
+def test_release_merge_gate_requires_matching_valid_manifests(tmp_path):
+    unmarked_a = tmp_path / "unmarked-a"
+    unmarked_b = tmp_path / "unmarked-b"
+    same_100_a = tmp_path / "same-100-a"
+    same_100_b = tmp_path / "same-100-b"
+    release_200 = tmp_path / "release-200"
+    malformed = tmp_path / "malformed"
+    for directory in (
+        unmarked_a,
+        unmarked_b,
+        same_100_a,
+        same_100_b,
+        release_200,
+        malformed,
+    ):
+        directory.mkdir()
+    publish_release_identity(same_100_a, ReleaseIdentity("qobuz", "100"))
+    publish_release_identity(same_100_b, ReleaseIdentity("qobuz", "100"))
+    publish_release_identity(release_200, ReleaseIdentity("qobuz", "200"))
+    (malformed / MANIFEST_NAME).write_text("not json", encoding="utf-8")
+
+    assert release_merge_allowed(unmarked_a, unmarked_b) is True
+    assert release_merge_allowed(same_100_a, same_100_b) is True
+    assert release_merge_allowed(same_100_a, release_200) is False
+    assert release_merge_allowed(same_100_a, malformed) is False
+
+
+def test_split_and_consolidation_planners_reject_release_boundaries(
+        tmp_path, monkeypatch):
+    from qobuz_librarian.modes import consolidate
+
+    music = tmp_path / "music"
+    primary = music / "Artist" / "Album"
+    different = music / "Artist" / "Album (Remaster)"
+    malformed = music / "Artist" / "Album [Deluxe]"
+    split_different = music / "Artist, Other" / "Album"
+    split_malformed = music / "Artist, Other" / "Album (2020)"
+    for directory in (
+        primary,
+        different,
+        malformed,
+        split_different,
+        split_malformed,
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "01 - Track.flac").write_bytes(b"audio")
+    publish_release_identity(primary, ReleaseIdentity("qobuz", "100"))
+    publish_release_identity(different, ReleaseIdentity("qobuz", "200"))
+    (malformed / MANIFEST_NAME).write_text("not json", encoding="utf-8")
+    publish_release_identity(split_different, ReleaseIdentity("qobuz", "200"))
+    (split_malformed / MANIFEST_NAME).write_text("not json", encoding="utf-8")
+    monkeypatch.setattr(config, "MUSIC_ROOT", music)
+
+    assert _is_split_album_merge(split_different, primary, "Artist") is False
+    assert _is_split_album_merge(split_malformed, primary, "Artist") is False
+    assert consolidate.find_sibling_album_dirs(
+        {"title": "Album"}, primary
+    ) == []
+
+    primary_seal = consolidate._seal_album(primary)
+    different_seal = consolidate._seal_album(different)
+    try:
+        candidates = consolidate._sealed_sibling_albums(
+            {"title": "Album"}, primary_seal
+        )
+        try:
+            assert candidates == []
+        finally:
+            for sibling, _score in candidates:
+                sibling.close()
+        with pytest.raises(OSError, match="release"):
+            consolidate._bind_summary(
+                {"overlap": []}, primary_seal, different_seal
+            )
+    finally:
+        different_seal.close()
+        primary_seal.close()
+
+
+
+def test_sealed_consolidation_planner_rechecks_identity_after_seal(
+        tmp_path, monkeypatch):
+    from qobuz_librarian.modes import consolidate
+
+    music = tmp_path / "music"
+    primary = music / "Artist" / "Album"
+    sibling = music / "Artist" / "Album (Remaster)"
+    for directory in (primary, sibling):
+        directory.mkdir(parents=True)
+        (directory / "01 - Track.flac").write_bytes(b"audio")
+        publish_release_identity(directory, ReleaseIdentity("qobuz", "100"))
+    monkeypatch.setattr(config, "MUSIC_ROOT", music)
+    primary_seal = consolidate._seal_album(primary)
+    original_seal_album = consolidate._seal_album
+
+    def change_identity_after_seal(path, **kwargs):
+        seal = original_seal_album(path, **kwargs)
+        if seal.path == sibling:
+            (sibling / MANIFEST_NAME).write_text(
+                '{"schema_version":1,"provider":"qobuz",'
+                '"release_id":"200"}\n',
+                encoding="utf-8",
+            )
+        return seal
+
+    monkeypatch.setattr(consolidate, "_seal_album", change_identity_after_seal)
+    try:
+        candidates = consolidate._sealed_sibling_albums(
+            {"title": "Album"}, primary_seal
+        )
+        try:
+            assert candidates == []
+        finally:
+            for candidate, _score in candidates:
+                candidate.close()
+    finally:
+        primary_seal.close()
 
 
 def test_find_album_dir_does_not_match_a_live_release_to_the_studio_folder(tmp_path, monkeypatch):
@@ -334,5 +492,3 @@ def test_folder_completeness_requires_a_full_tree_walk(monkeypatch, tmp_path):
     monkeypatch.setattr(cat, "read_album_dir",
                         lambda f, walk_errors=None: list(tracks))
     assert cat.folder_holds_all_tracks(folder, qobuz) is True
-
-

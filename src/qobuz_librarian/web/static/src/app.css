@@ -3244,6 +3244,11 @@ details.ql-mobile-drawer[open] > .ql-mobile-menu {
   padding-inline: 0.32rem;
   font-size: 0.625rem;
 }
+.ql-badge-edition {
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 .ql-tab-count {
   display: inline-grid;
   min-width: 1.25rem;
@@ -5524,6 +5529,13 @@ details[open] > .ql-disclosure-summary::after {
 }
 .ql-review-candidate:hover {
   background-color: color-mix(in oklab, var(--ql-text) 3%, transparent);
+}
+.ql-review-candidate--attention {
+  cursor: default;
+  grid-template-columns: minmax(0, 1fr);
+}
+.ql-review-candidate--attention .ql-review-candidate-detail {
+  overflow-wrap: anywhere;
 }
 .ql-review-candidate:has(.ql-checkbox:checked) {
   background:

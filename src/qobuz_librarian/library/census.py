@@ -10,6 +10,7 @@ from typing import Callable
 
 from qobuz_librarian import config as cfg
 from qobuz_librarian.library import flac_cache, scanner
+from qobuz_librarian.library.release_identity import is_ignored_library_artifact
 
 STATE_VERSION = 1
 
@@ -72,7 +73,10 @@ def build(
             if cancel_check is not None and cancel_check():
                 return InventoryResult(
                     None, False, processed, [str(error) for error in errors], True)
-            if path.name.startswith("._") or path.suffix.lower() not in exts:
+            if (
+                is_ignored_library_artifact(path.name)
+                or path.suffix.lower() not in exts
+            ):
                 continue
             try:
                 if not path.is_file():

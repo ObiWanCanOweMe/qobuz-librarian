@@ -38,6 +38,7 @@ from qobuz_librarian.library.discovery import (
     flush_resolve_cache,
     resolve_artist_dir,
 )
+from qobuz_librarian.library.release_identity import normalise_release_id
 from qobuz_librarian.library.scanner import (
     clear_scan_caches,
     list_artist_album_dirs,
@@ -49,6 +50,13 @@ from qobuz_librarian.ui_cli.colors import format_size
 from qobuz_librarian.ui_cli.errors import plural
 from qobuz_librarian.ui_cli.logging import log
 from qobuz_librarian.web import job_persistence, review_badges
+from qobuz_librarian.web.process_disposition import classify_process_result
+from qobuz_librarian.web.review_candidates import (
+    candidate_album_dir_relative,
+    candidate_payload,
+    is_non_actionable,
+    safe_album_dir_relative,
+)
 
 
 def build_args():
@@ -212,12 +220,14 @@ def _album_candidate_spec(
 
 
 def _add_candidate_spec(job, spec):
+    if type(spec) is not dict:
+        return None
     return job.add_candidate(
         kind=spec.get("kind", "album"),
         title=spec.get("title") or "?",
         artist=spec.get("artist") or "",
         detail=spec.get("detail") or "",
-        payload=spec.get("payload") or {},
+        payload=candidate_payload(spec),
         selected=bool(spec.get("selected")),
     )
 
@@ -250,10 +260,81 @@ def _gap_candidate_spec(
     album = gap.qobuz_album
     if gap.on_disk_dir is not None:
         album = {**album, "_partial_missing_count": gap.missing_count}
-    extra_payload = {"_artist_dir": artist_key} if artist_key else None
+    extra_payload = {}
+    if artist_key:
+        extra_payload["_artist_dir"] = artist_key
+    if gap.edition_badge:
+        extra_payload["edition_badge"] = gap.edition_badge
     return _album_candidate_spec(
         album, artist_name, selected=selected, is_new=is_new,
-        extra_payload=extra_payload)
+        extra_payload=extra_payload or None)
+
+
+_IDENTITY_ATTENTION_DETAILS = {
+    "identity_ambiguous": "Multiple Qobuz editions match",
+    "identity_invalid": "Release identity manifest is invalid or unsupported",
+    "identity_conflict": "Release identity conflicts with the requested edition",
+    "identity_path_occupied": "The collision path belongs to another release",
+    "identity_changed": "Release identity changed while it was being reviewed",
+}
+
+
+def _identity_attention_spec(item: dict, artist_name: str,
+                             artist_key: str) -> dict:
+    """Build one durable, display-only release-identity review card.
+
+    The payload deliberately has no ``album_id``: it cannot satisfy the album
+    download admission boundary even if a stale or forged client submits its
+    candidate id. Candidate release IDs are normalized, deduplicated, sorted,
+    and retained in full for deterministic checkpoint and restart rendering.
+    """
+    item = item if isinstance(item, dict) else {}
+    raw_reason = item.get("reason")
+    reason = raw_reason if isinstance(raw_reason, str) else ""
+    detail = _IDENTITY_ATTENTION_DETAILS.get(
+        reason, "Release identity needs manual review")
+
+    candidate_ids = set()
+    releases = item.get("candidate_releases")
+    if isinstance(releases, list):
+        for release in releases:
+            if not isinstance(release, dict):
+                continue
+            raw_id = release.get("id")
+            if type(raw_id) not in (int, str):
+                continue
+            release_id = normalise_release_id(raw_id)
+            if release_id is not None:
+                candidate_ids.add(release_id)
+    candidate_ids = sorted(candidate_ids)
+    if candidate_ids:
+        detail += " · Qobuz IDs " + ", ".join(candidate_ids)
+
+    raw_dir = item.get("dir")
+    try:
+        title = Path(raw_dir).name if isinstance(raw_dir, (str, Path)) else ""
+    except (OSError, TypeError, ValueError):
+        title = ""
+    payload = {
+        "non_actionable": True,
+        "identity_reason": reason if reason in _IDENTITY_ATTENTION_DETAILS else "",
+        "candidate_ids": candidate_ids,
+    }
+    if artist_key:
+        payload["_artist_dir"] = artist_key
+    relative = safe_album_dir_relative(item.get("_album_dir_rel"))
+    if not relative:
+        relative = safe_album_dir_relative(title)
+    if relative:
+        payload["_album_dir_rel"] = relative
+    return {
+        "kind": "identity_attention",
+        "title": title or "Release identity",
+        "artist": artist_name,
+        "detail": detail,
+        "payload": payload,
+        "selected": False,
+    }
 
 
 def _add_gap_candidate(job, gap, artist_name, selected=False, is_new=False):
@@ -275,16 +356,43 @@ def is_gap_candidate(c):
     an owned album) rather than a fully missing album. New scans stamp the
     payload; candidates carried forward from older checkpoints only say so in
     their detail line, so fall back to that."""
-    if (c.get("payload") or {}).get("gap_fill"):
+    if candidate_payload(c).get("gap_fill"):
         return True
     return "gap-fill:" in (c.get("detail") or "")
+
+
+def candidate_is_hidden_missing(c, hidden):
+    """Whether an actionable missing-album candidate is durably hidden.
+
+    Release-identity attention cards are diagnostic filesystem state, not
+    album choices, so an album dismissal with the same artist/title must not
+    suppress them during checkpoint or saved-state restoration.
+    """
+    if is_non_actionable(c):
+        return False
+    return hidden_mod.is_hidden(
+        hidden_mod.SCOPE_MISSING,
+        c.get("artist") or "",
+        c.get("title") or "",
+        hidden,
+    )
 
 
 def fold_key(c):
     """A candidate's merge identity: Qobuz album id, falling back to
     artist+title for keyless carry-overs. Shared by the fold and its caller's
     before/after arithmetic so the summary counts what actually changed."""
-    album_id = str((c.get("payload") or {}).get("album_id") or "")
+    payload = candidate_payload(c)
+    if is_non_actionable(c):
+        return (
+            "non_actionable",
+            c.get("kind") or "",
+            (payload.get("_artist_dir")
+             if isinstance(payload.get("_artist_dir"), str)
+             else c.get("artist") or ""),
+            candidate_album_dir_relative(c),
+        )
+    album_id = str(payload.get("album_id") or "")
     if album_id:
         return album_id
     return ((c.get("artist") or "").lower(), (c.get("title") or "").lower())
@@ -323,6 +431,23 @@ def fold_new_candidates(parked, cands):
             key = _key(c)
             fresh = fresh_by_key.get(key)
             if (fresh is not None
+                    and is_non_actionable(c)
+                    and is_non_actionable(fresh)):
+                fields = {
+                    "kind": fresh.get("kind", "identity_attention"),
+                    "title": fresh.get("title") or "?",
+                    "artist": fresh.get("artist") or "",
+                    "detail": fresh.get("detail") or "",
+                    "payload": candidate_payload(fresh),
+                    "selected": False,
+                }
+                if any(c.get(name) != value for name, value in fields.items()):
+                    keep.append({**c, **fields})
+                    updated += 1
+                else:
+                    keep.append(c)
+                continue
+            if (fresh is not None
                     and is_gap_candidate(fresh) != is_gap_candidate(c)):
                 # Disk reality changed class — the fresh row replaces this one
                 # below, wearing the user's tick.
@@ -337,9 +462,10 @@ def fold_new_candidates(parked, cands):
             key = _key(c)
             if key in seen:
                 continue
-            if key not in swapped_ticks and hidden_mod.is_hidden(
+            if (not is_non_actionable(c)
+                    and key not in swapped_ticks and hidden_mod.is_hidden(
                     hidden_mod.SCOPE_MISSING, c.get("artist") or "",
-                    c.get("title") or "", hidden):
+                    c.get("title") or "", hidden)):
                 continue
             seen.add(key)
             # Class swaps ride past the cap: their old row was just removed,
@@ -356,8 +482,11 @@ def fold_new_candidates(parked, cands):
                 "title": c.get("title") or "?",
                 "artist": c.get("artist") or "",
                 "detail": c.get("detail") or "",
-                "payload": c.get("payload") or {},
-                "selected": swapped_ticks.get(key, bool(c.get("selected"))),
+                "payload": candidate_payload(c),
+                "selected": (
+                    False if is_non_actionable(c)
+                    else swapped_ticks.get(key, bool(c.get("selected")))
+                ),
             })
             if key not in swapped_ticks:
                 added += 1
@@ -476,7 +605,7 @@ def _park_library_failures(failed_cands, execute_kind="library",
             title=c.get("title") or "?",
             artist=c.get("artist") or "",
             detail=c.get("detail") or "",
-            payload=c.get("payload") or {},
+            payload=candidate_payload(c),
             selected=True if ticked else bool(c.get("selected")),
         )
     n = len(job.candidates)
@@ -506,7 +635,8 @@ def _return_new_release_picks(picks):
         _park_library_failures(picks, execute_kind="new_releases")
 
 
-def _fold_partial_gap_fill(full_album, artist_name, n_missing):
+def _fold_partial_gap_fill(
+        full_album, artist_name, n_missing, *, edition_badge=""):
     """A partial download (some tracks failed) leaves the album on disk with
     gaps. Fold it into the living Library review as an unticked Gap Fill
     candidate right away — the app tracks its own downloads, so the gap must
@@ -514,9 +644,12 @@ def _fold_partial_gap_fill(full_album, artist_name, n_missing):
     review parked, a fresh one is parked so /library shows it. Runs after
     prune_library_review_candidates, which just dropped the album's stale
     Missing candidates — this replaces them with the honest remainder."""
+    extra_payload = None
+    if isinstance(edition_badge, str) and edition_badge:
+        extra_payload = {"edition_badge": edition_badge}
     spec = _album_candidate_spec(
         {**full_album, "_partial_missing_count": n_missing},
-        artist_name, selected=False)
+        artist_name, selected=False, extra_payload=extra_payload)
     if refold_into_living_review([spec], ticked=False) is None:
         _park_library_failures(
             [spec], ticked=False,
@@ -544,7 +677,8 @@ def prune_library_review_candidates(album):
         try:
             with job._lock:
                 keep = [c for c in job.candidates
-                        if str((c.get("payload") or {}).get("album_id") or "")
+                        if is_non_actionable(c)
+                        or str(candidate_payload(c).get("album_id") or "")
                         != album_id]
                 n = len(job.candidates) - len(keep)
                 if not n:
@@ -577,10 +711,12 @@ def drop_owned_missing_candidates(job):
     from qobuz_librarian.web import job_persistence
     with job._lock:
         snapshot = [(c["cid"], bool(c.get("selected")),
-                     {"id": (c.get("payload") or {}).get("album_id"),
+                     {"id": candidate_payload(c).get("album_id"),
                       "title": c.get("title") or "",
                       "artist": {"name": c.get("artist") or ""}})
-                    for c in job.candidates if not is_gap_candidate(c)]
+                    for c in job.candidates
+                    if not is_gap_candidate(c)
+                    and not is_non_actionable(c)]
     # Disk probes happen outside the lock; a live scan can keep appending.
     owned = {}
     for cid, selected, alb in snapshot:
@@ -647,6 +783,8 @@ def _flag_new_since_last_scan(job, mode):
     seen_now = set()
     fps = {}
     for c in candidates:
+        if is_non_actionable(c):
+            continue
         fp = hidden_mod.album_fingerprint(c.get("artist"), c.get("title"))
         if fp:
             seen_now.add(fp)
@@ -707,12 +845,13 @@ def _dismiss_albums_locked(job, artist, scope=hidden_mod.SCOPE_MISSING,
             return None
         to_hide = [c for c in job.candidates
                    if c.get("artist") == artist and not c.get("selected")
+                   and not is_non_actionable(c)
                    and (gap_only is None or is_gap_candidate(c) == gap_only)
                    and (not query or candidate_matches_query(c, query))]
         if not to_hide:
             return 0
         specs = [(c.get("artist"), c.get("title"),
-                  (c.get("payload") or {}).get("year")) for c in to_hide]
+                  candidate_payload(c).get("year")) for c in to_hide]
     # Record the dismissals durably FIRST, outside the lock (disk I/O mustn't
     # stall the scan thread's next add_candidate).
     hidden_mod.hide(scope, specs)
@@ -744,10 +883,10 @@ def _dismiss_albums_locked(job, artist, scope=hidden_mod.SCOPE_MISSING,
 
 def _scan_library_artist(artist_dir, token, partial_only, hidden):
     """Worker: find one artist's gaps. Runs in a pool thread (its own HTTP
-    session); returns plain data so the caller adds candidates serially —
-    keeping job.candidates single-writer. Also returns the artist's id and its
-    lossless catalog ids so the caller can seed the new-release baseline (the
-    discography is already fetched here)."""
+    session); returns gaps and identity-attention inputs as plain data so the
+    caller adds every candidate serially — keeping job.candidates single-writer.
+    Also returns the artist's id and its lossless catalog ids so the caller can
+    seed the new-release baseline (the discography is already fetched here)."""
     result = find_missing_for_artist(
         artist_dir.name, token=token,
         opts=DiscoveryOpts(prefer_hires=cfg.PREFER_HIRES),
@@ -761,7 +900,25 @@ def _scan_library_artist(artist_dir, token, partial_only, hidden):
     catalog_ids = None if result.catalog_incomplete else [
         str(a["id"]) for a in result.catalog
         if is_lossless_album(a) and a.get("id") is not None]
-    return artist_dir.name, result.artist_name, result.gaps, artist_id, catalog_ids
+    identity_attention = []
+    for original in getattr(result, "skipped", []):
+        if (not isinstance(original, dict)
+                or not isinstance(original.get("reason"), str)
+                or original.get("reason") not in _IDENTITY_ATTENTION_DETAILS):
+            continue
+        item = dict(original)
+        raw_dir = item.get("dir")
+        if isinstance(raw_dir, (str, Path)):
+            try:
+                relative = Path(raw_dir).relative_to(artist_dir).as_posix()
+            except (OSError, TypeError, ValueError):
+                relative = ""
+            relative = safe_album_dir_relative(relative)
+            if relative:
+                item["_album_dir_rel"] = relative
+        identity_attention.append(item)
+    return (artist_dir.name, result.artist_name, result.gaps, artist_id,
+            catalog_ids, identity_attention)
 
 
 _CHECKPOINT_EVERY = 15  # artists between progress saves (resume granularity)
@@ -898,16 +1055,27 @@ def scan_library(job, token, partial_only=False, force_full=False):
         if _i % 25 == 0 or _i == len(artists):
             job.push_progress("Fingerprinting artist folders", _i, len(artists),
                               _ad.name, unit="folder")
+    if resuming:
+        changed = {
+            name for name in scanned
+            if (checkpoint_artists.get(name) or {}).get("fingerprint")
+            != fingerprints.get(name)
+        }
+        for name in changed:
+            scanned.discard(name)
+            saved_artist_id = (
+                checkpoint_artists.get(name) or {}).get("artist_id") or ""
+            if saved_artist_id:
+                baseline_seen.pop(str(saved_artist_id), None)
     previous_artists = (previous_scan.get("artists") or {}) if cheap_refresh else {}
     state_artists: dict[str, dict] = {}
     if resuming:
         restored_by_artist: dict[str, list[dict]] = {}
         for c in cp["candidates"]:
-            artist_key = (c.get("payload") or {}).get("_artist_dir") or c.get("artist")
+            artist_key = candidate_payload(c).get("_artist_dir") or c.get("artist")
             if artist_key not in scanned:
                 continue
-            if hidden_mod.is_hidden(hidden_mod.SCOPE_MISSING,
-                                    c.get("artist"), c.get("title"), hidden):
+            if candidate_is_hidden_missing(c, hidden):
                 continue
             _readd_candidate(job, c)
             total += 1
@@ -922,12 +1090,7 @@ def scan_library(job, token, partial_only=False, force_full=False):
                 continue
             candidates = [
                 c for c in saved.get("candidates", [])
-                if not hidden_mod.is_hidden(
-                    hidden_mod.SCOPE_MISSING,
-                    c.get("artist"),
-                    c.get("title"),
-                    hidden,
-                )
+                if not candidate_is_hidden_missing(c, hidden)
             ]
             state_artists[name] = {
                 "fingerprint": saved.get("fingerprint") or fingerprints.get(name, ""),
@@ -955,12 +1118,7 @@ def scan_library(job, token, partial_only=False, force_full=False):
         ):
             candidates = [
                 c for c in saved.get("candidates", [])
-                if not hidden_mod.is_hidden(
-                    hidden_mod.SCOPE_MISSING,
-                    c.get("artist"),
-                    c.get("title"),
-                    hidden,
-                )
+                if not candidate_is_hidden_missing(c, hidden)
             ]
             for c in candidates:
                 _readd_candidate(job, c)
@@ -1003,7 +1161,14 @@ def scan_library(job, token, partial_only=False, force_full=False):
                 break
             done += 1
             try:
-                name, artist_name, gaps, artist_id, catalog_ids = fut.result()
+                worker_result = fut.result()
+                if len(worker_result) == 5:
+                    (name, artist_name, gaps, artist_id,
+                     catalog_ids) = worker_result
+                    identity_attention = []
+                else:
+                    (name, artist_name, gaps, artist_id, catalog_ids,
+                     identity_attention) = worker_result
             except (AuthLost, QobuzUnavailable):
                 # A lost token or an unreachable API isn't a per-artist hiccup
                 # — cancel the rest and fail the scan rather than silently
@@ -1031,6 +1196,12 @@ def scan_library(job, token, partial_only=False, force_full=False):
                 if _add_candidate_spec(job, spec) is not None:
                     artist_candidates.append(spec)
                     total += 1
+            for item in identity_attention:
+                spec = _identity_attention_spec(
+                    item, artist_name or name, artist_key=name)
+                if _add_candidate_spec(job, spec) is not None:
+                    artist_candidates.append(spec)
+                    total += 1
             if catalog_ids is not None:
                 state_artists[name] = {
                     "fingerprint": fingerprints.get(name, ""),
@@ -1040,13 +1211,19 @@ def scan_library(job, token, partial_only=False, force_full=False):
                 }
             # Add the albums before the progress tick so a hit lands the live
             # preview the same moment the running total moves.
-            hit = ({"artist": artist_name or name, "albums": len(gaps)}
-                   if gaps else None)
+            found_for_artist = len(gaps) + len(identity_attention)
+            hit = ({"artist": artist_name or name, "albums": found_for_artist}
+                   if found_for_artist else None)
             job.push_progress("Scanning library", done, n, artist_name or name,
                               found=total, hit=hit, unit="artist")
             if gaps:
                 tail = "with Gap Fill candidates" if partial_only else "to fill"
                 log.info(f"  {artist_name} — {plural(len(gaps), 'album')} {tail}")
+            if identity_attention:
+                log.info(
+                    f"  {artist_name or name} — "
+                    f"{plural(len(identity_attention), 'release identity')} "
+                    "needs manual review")
             since_save += 1
             if since_save >= _CHECKPOINT_EVERY:
                 since_save = 0
@@ -1303,19 +1480,20 @@ def _note_staging_wait(job, phase, current, total):
 def execute_albums(job, chosen, token):
     """Download each selected album via the normal process_album path."""
     from qobuz_librarian.modes.process import process_album
+    from qobuz_librarian.web import jobs as job_mgr
     from qobuz_librarian.web.jobs import staging_lock
+
+    chosen = [c for c in chosen if not is_non_actionable(c)]
 
     # The web worker runs jobs back-to-back; a directory listing cached by
     # a previous job would otherwise be reused even though folders may
     # have moved since.
     clear_scan_caches()
     args = build_args()
-    _benign = {"already_complete", "skipped_already_higher_quality", "dry_run",
-               "user_skipped", "lossy_only", "no_tracks", "skipped_has_extras",
-               "cancelled"}
     ok = 0
     partial = 0
     failed = 0
+    identity_attention = 0
     processed = 0
     # Picks that didn't land (never fetched, errored, or came back empty).
     failed_cands = []
@@ -1345,7 +1523,7 @@ def execute_albums(job, chosen, token):
         if job.cancel_requested:
             break
         processed = i
-        album_id = cand["payload"].get("album_id")
+        album_id = candidate_payload(cand).get("album_id")
         label = f"[{i}/{len(chosen)}] {cand.get('artist','')} — {cand['title']}"
         log.info(label)
         job._progress_scope = (i, len(chosen), "album")
@@ -1366,6 +1544,7 @@ def execute_albums(job, chosen, token):
             with staging_lock():
                 result = process_album(full, args, allow_force=False,
                                        already_confirmed=True, token=token)
+                disposition = classify_process_result(result)
         except (AuthLost, QobuzUnavailable):
             _fold_back_unfinished()
             raise
@@ -1378,7 +1557,16 @@ def execute_albums(job, chosen, token):
             # Cancelled mid-download: processed already points past this album,
             # so the cancel fold-back below would drop its pick — remember it.
             cancelled_cand = cand
-        if result and result.get("imported") and result.get("n_ok", 0) > 0:
+        if disposition.attention == "identity":
+            # Audio may have landed, but release ownership was not proven.
+            # Keep the pick live and do not publish any derived library state
+            # from an unverified destination.
+            job._imported_any = (
+                job._imported_any or disposition.mutated_library
+            )
+            identity_attention += 1
+            failed_cands.append(cand)
+        elif disposition.verified_success:
             job._imported_any = True
             _refresh_after_local_album_change(
                 full,
@@ -1399,11 +1587,16 @@ def execute_albums(job, chosen, token):
                 if is_nr_run:
                     _return_new_release_picks([cand])
                 elif is_library_run:
-                    _fold_partial_gap_fill(full, cand.get("artist") or "",
-                                           result.get("n_fail", 0))
+                    badge = candidate_payload(cand).get("edition_badge")
+                    _fold_partial_gap_fill(
+                        full,
+                        cand.get("artist") or "",
+                        result.get("n_fail", 0),
+                        edition_badge=(badge if isinstance(badge, str) else ""),
+                    )
             else:
                 ok += 1
-        elif not (result and result.get("result") in _benign):
+        elif not disposition.consume_candidate:
             failed += 1
             failed_cands.append(cand)
         time.sleep(cfg.ARTIST_API_DELAY)
@@ -1419,27 +1612,50 @@ def execute_albums(job, chosen, token):
             refold_into_living_review(unrun)
         elif unrun and is_nr_run:
             _return_new_release_picks(unrun)
-        job.summary = (f"Stopped early. {ok} downloaded, "
-                       f"{len(chosen) - processed} not started.")
-        log.info(job.summary)
-        return
-    parts = [f"{ok}/{plural(len(chosen), 'album')} downloaded and imported"]
+        if not identity_attention:
+            job.summary = (f"Stopped early. {ok} downloaded, "
+                           f"{len(chosen) - processed} not started.")
+            log.info(job.summary)
+            return
+    if identity_attention:
+        parts = []
+        if ok:
+            parts.append(f"{plural(ok, 'album')} completed")
+    else:
+        parts = [f"{ok}/{plural(len(chosen), 'album')} downloaded and imported"]
     if partial:
         parts.append(f"{plural(partial, 'album')} only partly (some tracks failed)")
+    if identity_attention:
+        parts.append(
+            f"{plural(identity_attention, 'album')} needs release-identity "
+            "attention and was not counted complete"
+        )
     job.summary = "Finished. " + ", ".join(parts) + "."
-    log.info(f"Finished. {ok}/{plural(len(chosen), 'album')} downloaded and imported.")
+    log.info(job.summary)
     if partial:
         log.info(f"  {plural(partial, 'album')} downloaded only partly "
                  f"(some tracks failed); see the log.")
-    if failed:
+    if identity_attention:
+        job.status = job_mgr.JobStatus.FAILED
+        job.attention = "identity"
+        extra = f"; {failed} other failed" if failed else ""
+        job.error = (
+            f"{plural(identity_attention, 'album')} needs release-identity "
+            f"attention{extra}. Its review entry was retained for retry."
+        )
+    elif failed:
         job.error = f"{failed} of {plural(len(chosen), 'album')} didn't finish; see the log."
     # A whole-review download (every candidate ticked, nothing re-parked at
     # approval) consumed the entire living review.
     if getattr(job, "_consumed_whole_review", False):
         if failed_cands:
-            _park_library_failures(failed_cands)
-        from qobuz_librarian.library import library_scan_state
-        library_scan_state.mark_review_retired(reason="worked_through")
+            _park_library_failures(
+                failed_cands,
+                execute_kind=("new_releases" if is_nr_run else "library"),
+            )
+        if is_library_run and not identity_attention:
+            from qobuz_librarian.library import library_scan_state
+            library_scan_state.mark_review_retired(reason="worked_through")
     elif failed_cands and is_library_run:
         # Partial approve: the unticked picks stayed behind as a living split-
         # off review.
@@ -1547,6 +1763,7 @@ def execute_upgrades(job, chosen, token):
     """Re-rip the present tracks of each chosen album at higher quality."""
     from qobuz_librarian.modes.process import process_album
     from qobuz_librarian.modes.upgrade import BENIGN_UPGRADE_RESULTS
+    from qobuz_librarian.web import jobs as job_mgr
     from qobuz_librarian.web.jobs import staging_lock
 
     clear_scan_caches()
@@ -1561,6 +1778,7 @@ def execute_upgrades(job, chosen, token):
     ok = 0
     kept = 0
     failed = 0
+    identity_attention = 0
     processed = 0
     for i, cand in enumerate(chosen, 1):
         if job.cancel_requested:
@@ -1590,6 +1808,7 @@ def execute_upgrades(job, chosen, token):
                 result = process_album(album, args, allow_force=False,
                                        already_confirmed=True,
                                        upgrade_only=True, token=token)
+                disposition = classify_process_result(result)
         except (AuthLost, QobuzUnavailable):
             raise
         except Exception as e:
@@ -1597,12 +1816,17 @@ def execute_upgrades(job, chosen, token):
             failed += 1
             continue
         _res = (result or {}).get("result")
-        if result and result.get("upgrade_unverified"):
+        if disposition.attention == "identity":
+            identity_attention += 1
+            job._imported_any = (
+                job._imported_any or disposition.mutated_library
+            )
+        elif result and result.get("upgrade_unverified"):
             # Imported, but the rebuilt folder couldn't be verified as
             # complete as the original, so the backup was kept.
             kept += 1
             job._imported_any = True
-        elif result and result.get("imported") and _res not in (
+        elif disposition.verified_success and _res not in (
                 _skip | {"upgrade_aborted_backup_failed"}):
             ok += 1
             job._imported_any = True
@@ -1630,7 +1854,7 @@ def execute_upgrades(job, chosen, token):
             # The verified replace refreshed the whole album, so a parked
             # library review's candidates for it (incl. Gap Fill) are stale.
             prune_library_review_candidates(album)
-        elif result and _res in (_skip - {"cancelled", "dry_run"}):
+        elif disposition.publish_derived_state and _res in _skip:
             _refresh_after_local_album_change(
                 album,
                 result,
@@ -1640,11 +1864,11 @@ def execute_upgrades(job, chosen, token):
                 upgrade=True,
                 downsample=True,
             )
-        elif _res not in _skip:
+        elif not disposition.consume_candidate:
             failed += 1
         time.sleep(cfg.ARTIST_API_DELAY)
     job._progress_scope = None
-    if job.cancel_requested:
+    if job.cancel_requested and not identity_attention:
         job.summary = (f"Stopped early. {ok} upgraded, "
                        f"{len(chosen) - processed} not started.")
         log.info(job.summary)
@@ -1653,9 +1877,22 @@ def execute_upgrades(job, chosen, token):
     if kept:
         msg += (f" {kept} kept the original (upgrade couldn't be verified "
                 f"complete; backup retained).")
+    if identity_attention:
+        msg += (
+            f" {plural(identity_attention, 'album')} needs release-identity "
+            "attention and was not counted upgraded; its review was retained."
+        )
     job.summary = msg
     log.info(msg)
-    if failed:
+    if identity_attention:
+        job.status = job_mgr.JobStatus.FAILED
+        job.attention = "identity"
+        extra = f"; {failed} other failed" if failed else ""
+        job.error = (
+            f"{plural(identity_attention, 'album')} needs release-identity "
+            f"attention{extra}. Its review entry was retained for retry."
+        )
+    elif failed:
         job.error = f"{failed} of {plural(len(chosen), 'album')} couldn't be upgraded; see the log."
 
 
@@ -2194,6 +2431,7 @@ def _redownload_damaged_album(payload, token, *, recovery_checkpoint=None):
         with staging_lock():
             result = process_album(full, build_args(), allow_force=False,
                                    already_confirmed=True, token=token) or {}
+            disposition = classify_process_result(result)
     except Exception as exc:
         if backup:
             if restore_upgrade_backup(backup, album_dir):
@@ -2214,9 +2452,19 @@ def _redownload_damaged_album(payload, token, *, recovery_checkpoint=None):
                 )
                 raise RepairRecoveryRequired(recovery, exc) from exc
         raise
-    imported_ok = bool(result.get("imported")) and result.get("n_ok", 0) > 0
     if backup:
-        if imported_ok and _upgrade_replacement_verified(full, album_dir, backup):
+        if disposition.attention == "identity":
+            pin_repair_recovery(
+                "repair backup kept — replacement needs release-identity "
+                "attention"
+            )
+            checkpoint_recovery(
+                "identity",
+                "The replacement landed, but its release identity needs "
+                "attention before the original backup can be retired.",
+            )
+        elif disposition.retire_backup and _upgrade_replacement_verified(
+                full, album_dir, backup):
             # Carry useful companions, then retire the original's backup when
             # every file it holds is verifiably superseded in the new album.
             carried = _carry_non_audio_from_backup(
@@ -2261,7 +2509,7 @@ def _redownload_damaged_album(payload, token, *, recovery_checkpoint=None):
                     "The replacement landed, but its album or companion files "
                     "could not be flushed safely.",
                 )
-        elif imported_ok:
+        elif disposition.mutated_library:
             # Imported, but a decode pass alone doesn't prove the re-rip kept
             # every track — a truncated or short result could be WORSE than
             # the damaged original it replaced.
@@ -2370,12 +2618,14 @@ def execute_repairs(job, chosen, token):
         RepairRecoveryRequired,
         repair_album_dir,
     )
+    from qobuz_librarian.web import jobs as job_mgr
     from qobuz_librarian.web.jobs import staging_lock
 
     clear_scan_caches()
     args = build_args()
     fixed = 0
     failed = 0
+    identity_attention = 0
     processed = 0
     for i, cand in enumerate(chosen, 1):
         if job.cancel_requested:
@@ -2408,7 +2658,8 @@ def execute_repairs(job, chosen, token):
                                               recovery_checkpoint=lambda recovery: (
                                                   _checkpoint_repair_recovery(
                                                       job, recovery)
-                                              ))
+                                                  ))
+            disposition = classify_process_result(result)
         except RepairRecoveryRequired as exc:
             # The callback normally saved this before the exceptional
             # boundary.
@@ -2428,7 +2679,12 @@ def execute_repairs(job, chosen, token):
         # end up downloaded-and-imported is a real failure. A kept backup is
         # not one — a verified repair counts, and the backup is reported in
         # the summary's recovery tail.
-        if (result and result.get("n_ok", 0) > 0 and result.get("imported")
+        if disposition.attention == "identity":
+            identity_attention += 1
+            job._imported_any = (
+                job._imported_any or disposition.mutated_library
+            )
+        elif (disposition.verified_success
                 and result.get("n_fail", 0) == 0
                 and not result.get("repair_unverified")):
             fixed += 1
@@ -2447,7 +2703,7 @@ def execute_repairs(job, chosen, token):
         time.sleep(cfg.ARTIST_API_DELAY)
     job._progress_scope = None
     recovery_count = len(getattr(job, "recoveries", []) or [])
-    if job.cancel_requested:
+    if job.cancel_requested and not identity_attention:
         kept = (f", {recovery_count} kept for recovery"
                 if recovery_count else "")
         job.summary = (f"Stopped early. {fixed} repaired{kept}, "
@@ -2458,8 +2714,21 @@ def execute_repairs(job, chosen, token):
             if recovery_count else "")
     job.summary = (f"Finished. Repaired {fixed}/{plural(len(chosen), 'album')}."
                    f"{kept}")
+    if identity_attention:
+        job.summary += (
+            f" {plural(identity_attention, 'album')} needs release-identity "
+            "attention and was not counted repaired; its evidence was retained."
+        )
     log.info(job.summary)
-    if failed:
+    if identity_attention:
+        job.status = job_mgr.JobStatus.FAILED
+        job.attention = "identity"
+        extra = f"; {failed} other failed" if failed else ""
+        job.error = (
+            f"{plural(identity_attention, 'album')} needs release-identity "
+            f"attention{extra}. Its repair evidence was retained for retry."
+        )
+    elif failed:
         job.error = f"{failed} of {plural(len(chosen), 'album')} couldn't be repaired; see the log."
 
 
@@ -2636,8 +2905,20 @@ def scan_migration(job, src, dest, *, use_acoustid, in_place=False):
             group = groups.setdefault(
                 key, {"entries": [], "resume_entries": []})
             group[kind].append(entry)
+    resume_ids = {id(entry) for entry in resume_entries}
+    unsafe_albums = {
+        tuple(entry.dest_rel.parts[:2])
+        for entry in plan.collisions
+        if (
+            entry.dest_rel is not None
+            and len(entry.dest_rel.parts) >= 2
+            and id(entry) not in resume_ids
+        )
+    }
     migration_candidate_ids = []
     for (artist, album), group in sorted(groups.items()):
+        if (artist, album) in unsafe_albums:
+            continue
         entries = group["entries"]
         resumes = group["resume_entries"]
         source_folders = {
@@ -2673,6 +2954,15 @@ def scan_migration(job, src, dest, *, use_acoustid, in_place=False):
             "companion_receipts": [
                 receipt for receipt in plan.companion_receipts
                 if tuple(receipt.get("relative", ())[:-1]) in source_folders
+            ],
+            "release_identities": [
+                record for record in plan.release_identities
+                if any(
+                    tuple(folder) in source_folders
+                    for folder in record.get("mapped_source_folders", ())
+                )
+                and tuple(record.get("destination_folder", ()))
+                == (artist, album)
             ],
         }
         cid = job.add_candidate(
@@ -2761,6 +3051,8 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
     destination_name_semantics = None
     companion_receipts = []
     companion_seen = set()
+    release_identities = []
+    release_identity_seen = set()
     manifest_artifact = None
     for c in chosen:
         payload = c.get("payload", {})
@@ -2821,6 +3113,29 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
             if key not in companion_seen:
                 companion_seen.add(key)
                 companion_receipts.append(receipt)
+        for record in payload.get("release_identities", []):
+            if not isinstance(record, dict):
+                job.error = (
+                    "The saved migration preview is malformed. Nothing was "
+                    "changed; scan again.")
+                job.summary = job.error
+                return
+            try:
+                key = json.dumps(
+                    record,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                )
+            except (TypeError, ValueError):
+                job.error = (
+                    "The saved migration preview is malformed. Nothing was "
+                    "changed; scan again.")
+                job.summary = job.error
+                return
+            if key not in release_identity_seen:
+                release_identity_seen.add(key)
+                release_identities.append(record)
         for raw in payload.get("entries", []):
             if not isinstance(raw, (list, tuple)) or len(raw) != 4:
                 job.error = (
@@ -2857,6 +3172,7 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
         source_root_receipt=source_root_receipt,
         dest_root_receipt=dest_root_receipt,
         companion_receipts=companion_receipts,
+        release_identities=release_identities,
         destination_name_semantics=destination_name_semantics,
     )
     resume_entries = plan.collisions
@@ -2956,6 +3272,26 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
     for source, _destination, status, reason in companion_outcomes:
         if status == engine.FAILED:
             job.push_line(f"sidecar failed: {source} — {reason}")
+    release_identity_outcomes = getattr(
+        result, "release_identity_outcomes", ())
+    release_identity_published = sum(
+        status == engine.COPIED
+        for _source, _destination, status, _reason
+        in release_identity_outcomes
+    )
+    release_identity_reused = sum(
+        status == engine.SKIPPED
+        for _source, _destination, status, _reason
+        in release_identity_outcomes
+    )
+    release_identity_failed = sum(
+        status == engine.FAILED
+        for _source, _destination, status, _reason
+        in release_identity_outcomes
+    )
+    for source, _destination, status, reason in release_identity_outcomes:
+        if status == engine.FAILED:
+            job.push_line(f"release identity failed: {source} — {reason}")
     recoveries = tuple(getattr(result, "recoveries", ()))
     for recovery in recoveries:
         location = recovery.get("location", "unknown location")
@@ -2974,6 +3310,15 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
         )
     if companion_failed:
         parts.append(f"{plural(companion_failed, 'cover/sidecar file')} failed")
+    if release_identity_published:
+        parts.append(
+            f"published {plural(release_identity_published, 'release identity')}")
+    if release_identity_reused:
+        parts.append(
+            f"verified {plural(release_identity_reused, 'release identity')}")
+    if release_identity_failed:
+        parts.append(
+            f"{plural(release_identity_failed, 'release identity')} failed")
     if result.lingered:
         parts.append(f"{result.lingered} moved but the original couldn't be removed")
     if result.failed:
@@ -2982,6 +3327,11 @@ def execute_migration(job, chosen, dest, *, in_place, src=None,
         # failed copies ends red, like every other execute path, instead of a
         # green DONE that buries "N failed" mid-sentence.
         job.error = f"{plural(result.failed, 'file')} couldn't be migrated; see the log."
+    elif release_identity_failed:
+        job.error = (
+            f"{plural(release_identity_failed, 'release identity')} couldn't "
+            "be migrated; see the log."
+        )
     if pruned:
         parts.append(f"cleared {plural(pruned, 'empty source folder')}")
     if result.cancelled:

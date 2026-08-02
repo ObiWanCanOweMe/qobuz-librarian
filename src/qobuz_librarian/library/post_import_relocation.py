@@ -34,6 +34,7 @@ from qobuz_librarian.library.catalog import (
     _close_migration_database_anchor,
     _migration_database_anchor_matches,
     _open_migration_database_anchor,
+    release_merge_allowed,
 )
 from qobuz_librarian.library.post_import_relocation_db import (
     DatabaseRowsState,
@@ -41,6 +42,11 @@ from qobuz_librarian.library.post_import_relocation_db import (
     classify_relocation_rows,
     publish_relocation_rows,
     rollback_relocation_rows,
+)
+from qobuz_librarian.library.release_identity import (
+    MANIFEST_NAME,
+    ReleaseManifestError,
+    read_release_identity,
 )
 from qobuz_librarian.library.sqlite_atomic import (
     SQLitePublicationUncertain,
@@ -1114,6 +1120,51 @@ def _build_plan(source, destination) -> dict:
         "selected_files": sorted(set(selected)),
         "conflicts": sorted(conflicts),
     }
+
+
+def _prefer_destination_release_manifest(plan, source, destination) -> None:
+    """Keep an equal validated destination manifest without a byte comparison."""
+    if (
+        destination is None
+        or MANIFEST_NAME not in source["files"]
+        or MANIFEST_NAME not in destination["files"]
+    ):
+        return
+    plan["conflicts"] = [
+        relative
+        for relative in plan["conflicts"]
+        if relative != MANIFEST_NAME
+    ]
+    plan["duplicates"] = sorted(
+        {*plan["duplicates"], MANIFEST_NAME}
+    )
+    plan["selected_files"] = sorted(
+        {*plan["selected_files"], MANIFEST_NAME}
+    )
+
+
+def _whole_album_release_allowed(
+    source_path, destination_path, source_snapshot, destination_snapshot
+) -> bool:
+    source_has_manifest = MANIFEST_NAME in source_snapshot["files"]
+    if destination_snapshot is None:
+        if not source_has_manifest:
+            return True
+        try:
+            return read_release_identity(source_path) is not None
+        except (ReleaseManifestError, TypeError, ValueError):
+            return False
+    if release_merge_allowed(source_path, destination_path):
+        return True
+    if (
+        source_has_manifest
+        and MANIFEST_NAME not in destination_snapshot["files"]
+    ):
+        try:
+            return read_release_identity(source_path) is not None
+        except (ReleaseManifestError, TypeError, ValueError):
+            return False
+    return False
 
 
 def _relative_parent(root_fd, relative, *, create=False):
@@ -3527,6 +3578,7 @@ def relocate_post_import_album(
     authority: RunLockLease,
     await_handoff: bool = False,
     retain_completion: bool = False,
+    require_no_conflicts: bool = False,
     expected=None,
 ) -> RelocationResult:
     """Copy, publish, and commit one additive post-import relocation."""
@@ -3537,6 +3589,8 @@ def relocate_post_import_album(
         raise ValueError("relocation handoff mode is invalid")
     if type(retain_completion) is not bool:
         raise ValueError("relocation retained completion mode is invalid")
+    if type(require_no_conflicts) is not bool:
+        raise ValueError("relocation conflict policy is invalid")
     if retain_completion and not await_handoff:
         raise ValueError("retained completion requires a deferred handoff")
     root, source_path, source_parts = _absolute_album_path(source)
@@ -3640,8 +3694,30 @@ def relocate_post_import_album(
                         "relocation inputs changed since the filing action "
                         "was recorded",
                     )
+            if kind is RelocationKind.SPLIT_GAP_FILL:
+                release_allowed = release_merge_allowed(
+                    source_path, destination_path
+                )
+            else:
+                release_allowed = _whole_album_release_allowed(
+                    source_path,
+                    destination_path,
+                    source_snapshot,
+                    destination_snapshot,
+                )
+            if not release_allowed:
+                raise PostImportRelocationUnavailable(
+                    errno.EINVAL,
+                    "release identities do not permit this album relocation",
+                )
             plan = _build_plan(source_snapshot, destination_snapshot)
-            if kind is RelocationKind.WHOLE_ALBUM and plan["conflicts"]:
+            _prefer_destination_release_manifest(
+                plan, source_snapshot, destination_snapshot
+            )
+            if (
+                kind is RelocationKind.WHOLE_ALBUM
+                or require_no_conflicts
+            ) and plan["conflicts"]:
                 return RelocationResult(
                     source_path,
                     0,

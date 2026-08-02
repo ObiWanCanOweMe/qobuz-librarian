@@ -7,17 +7,27 @@ the Qobuz API stubbed. They pin the reconciled behaviour the two interfaces
 must now agree on; the per-interface tests elsewhere prove each face presents
 this same result.
 """
+import hashlib
+import shutil
+import subprocess
 from datetime import date
 
 import pytest
 
 from qobuz_librarian import config as cfg
+from qobuz_librarian import run_lock
+from qobuz_librarian.library import album_placement, discovery
 from qobuz_librarian.library import catalog as cat
-from qobuz_librarian.library import discovery
 from qobuz_librarian.library.discovery import (
     DiscoveryOpts,
     find_missing_for_artist,
     find_new_releases_for_artist,
+)
+from qobuz_librarian.library.release_identity import (
+    MANIFEST_NAME,
+    ReleaseIdentity,
+    publish_release_identity,
+    read_release_identity,
 )
 from qobuz_librarian.library.scanner import clear_scan_caches
 
@@ -48,15 +58,41 @@ def _catalog_entry(album):
     return {k: v for k, v in album.items() if k != "tracks"}
 
 
+def _make_tagged_adoption_flac(path, *, frequency, title, isrc):
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not available")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i",
+            f"sine=frequency={frequency}:sample_rate=44100:duration=0.2",
+            "-c:a", "flac", str(path),
+        ],
+        check=True,
+    )
+    from mutagen.flac import FLAC
+
+    audio = FLAC(str(path))
+    audio["title"] = title
+    audio["isrc"] = isrc
+    audio["tracknumber"] = "1"
+    audio["discnumber"] = "1"
+    audio.save()
+
+
+_AUTO_TOTAL = object()
+
+
 class FakeQobuz:
     """Stands in for the Qobuz search/catalog API. Holds artist search hits,
     one catalog per artist id, and full album dicts keyed by id."""
 
-    def __init__(self, *, artists, catalog, total=None):
+    def __init__(self, *, artists, catalog, total=_AUTO_TOTAL):
         self._artists = artists                       # search_artists results
         self._full = {a["id"]: a for a in catalog}    # get_album by id
         self._catalog = [_catalog_entry(a) for a in catalog]
-        self._total = total if total is not None else len(catalog)
+        self._total = len(catalog) if total is _AUTO_TOTAL else total
 
     def search_artists(self, query, token, limit=5):
         return self._artists
@@ -91,8 +127,9 @@ def _library(monkeypatch, tmp_path, layout):
         for album, tracks in albums.items():
             d = tmp_path / artist / album
             d.mkdir(parents=True)
-            for i in range(len(tracks)):
-                (d / f"{i + 1:02d}.flac").write_bytes(b"")
+            for i, track in enumerate(tracks):
+                title = str(track.get("title") or "track").replace("/", "_")
+                (d / f"{i + 1:02d} - {title}.flac").write_bytes(b"")
             track_map[str(d)] = tracks
     monkeypatch.setattr(cfg, "MUSIC_ROOT", tmp_path)
     monkeypatch.setattr(cat, "read_album_dir", lambda d: track_map.get(str(d), []))
@@ -105,7 +142,7 @@ def beatles_search():
 
 
 def _run(monkeypatch, tmp_path, *, layout, catalog, artists,
-         query="The Beatles", artist_folder="The Beatles", total=None,
+         query="The Beatles", artist_folder="The Beatles", total=_AUTO_TOTAL,
          hidden=None, want_missing=True, prefer_hires=True):
     _library(monkeypatch, tmp_path, layout)
     FakeQobuz(artists=artists, catalog=catalog, total=total).install(monkeypatch)
@@ -159,6 +196,373 @@ def test_partial_owned_album_reports_the_real_track_gap(monkeypatch, tmp_path, b
     assert gap.on_disk_dir.name == "Abbey Road (1969)"
     assert len(gap.present) == 6
     assert len(gap.missing) == 4
+
+
+def test_missing_and_gap_fill_receive_badges_from_catalog_family(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(cfg, "MISSING_ALBUMS_MIN_TRACKS", 1)
+    standard = _album("100", "Album", "Artist", 2020,
+                      [_qt("one", "A"), _qt("two", "B")])
+    deluxe = _album("200", "Album (Deluxe Edition)", "Artist", 2020,
+                    [_qt("remixed", "Z"), _qt("bonus", "C")])
+    missing_standard = _album("300", "Other", "Artist", 2021,
+                              [_qt("x", "X")])
+    missing_deluxe = _album("400", "Other (Deluxe Edition)", "Artist", 2021,
+                            [_qt("x", "X"), _qt("y", "Y")])
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        query="Artist",
+        artist_folder="Artist",
+        layout={"Artist": {"Album (2020)": [_et("one", "A")]}},
+        catalog=[standard, deluxe, missing_standard, missing_deluxe],
+        artists=[{"name": "Artist", "id": "artist", "albums_count": 4}],
+    )
+
+    gap_fill = next(g for g in result.gaps if g.on_disk_dir is not None)
+    missing = next(g for g in result.gaps if g.qobuz_album["id"] == "300")
+    assert gap_fill.edition_badge == "Standard Edition · Qobuz 100"
+    assert missing.edition_badge == "Standard Edition · Qobuz 300"
+
+
+def test_unambiguous_catalog_album_has_no_badge(monkeypatch, tmp_path):
+    monkeypatch.setattr(cfg, "MISSING_ALBUMS_MIN_TRACKS", 1)
+    only = _album("100", "Only Album", "Artist", 2020, [_qt("one", "A")])
+    result = _run(
+        monkeypatch, tmp_path, query="Artist", artist_folder="Artist",
+        layout={"Artist": {}}, catalog=[only],
+        artists=[{"name": "Artist", "id": "artist", "albums_count": 1}],
+    )
+    assert result.gaps[0].edition_badge == ""
+
+
+def test_incomplete_catalog_never_attaches_edition_badges(monkeypatch, tmp_path):
+    standard = _album("100", "Album", "Artist", 2020,
+                      [_qt("one", "A"), _qt("two", "B")])
+    deluxe = _album("200", "Album (Deluxe Edition)", "Artist", 2020,
+                    [_qt("one", "A"), _qt("two", "B"), _qt("bonus", "C")])
+    result = _run(
+        monkeypatch, tmp_path, query="Artist", artist_folder="Artist",
+        layout={"Artist": {}}, catalog=[standard, deluxe], total=3,
+        artists=[{"name": "Artist", "id": "artist", "albums_count": 3}],
+    )
+
+    assert result.catalog_incomplete is True
+    assert all(gap.edition_badge == "" for gap in result.gaps)
+
+
+def test_capped_catalog_never_attaches_edition_badges(monkeypatch, tmp_path):
+    monkeypatch.setattr(cfg, "ARTIST_CATALOG_LIMIT", 2)
+    monkeypatch.setattr(cfg, "MISSING_ALBUMS_MIN_TRACKS", 1)
+    standard = _album("100", "Album", "Artist", 2020, [_qt("one", "A")])
+    deluxe = _album("200", "Album (Deluxe Edition)", "Artist", 2020,
+                    [_qt("one", "A"), _qt("bonus", "B")])
+    result = _run(
+        monkeypatch, tmp_path, query="Artist", artist_folder="Artist",
+        layout={"Artist": {}}, catalog=[standard, deluxe], total=3,
+        artists=[{"name": "Artist", "id": "artist", "albums_count": 3}],
+    )
+
+    assert result.catalog_incomplete is False
+    assert all(gap.edition_badge == "" for gap in result.gaps)
+
+
+def test_limit_sized_catalog_without_total_never_attaches_edition_badges(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(cfg, "ARTIST_CATALOG_LIMIT", 2)
+    monkeypatch.setattr(cfg, "MISSING_ALBUMS_MIN_TRACKS", 1)
+    standard = _album("100", "Album", "Artist", 2020, [_qt("one", "A")])
+    deluxe = _album("200", "Album (Deluxe Edition)", "Artist", 2020,
+                    [_qt("one", "A"), _qt("bonus", "B")])
+    result = _run(
+        monkeypatch, tmp_path, query="Artist", artist_folder="Artist",
+        layout={"Artist": {}}, catalog=[standard, deluxe], total=None,
+        artists=[{"name": "Artist", "id": "artist", "albums_count": 2}],
+    )
+
+    assert result.catalog_incomplete is False
+    assert all(gap.edition_badge == "" for gap in result.gaps)
+
+
+def test_manifest_selects_exact_release_even_when_title_rank_prefers_another(
+        monkeypatch, tmp_path):
+    standard = _album("100", "Album", "Artist", 2020, [_qt("one", "A")])
+    deluxe = _album("200", "Album (Deluxe Edition)", "Artist", 2020,
+                    [_qt("one", "A"), _qt("bonus", "B")])
+    _library(monkeypatch, tmp_path,
+             {"Artist": {"Album (2020)": [_et("one", "A"), _et("bonus", "B")]}})
+    folder = tmp_path / "Artist" / "Album (2020)"
+    publish_release_identity(folder, ReleaseIdentity("qobuz", "200"))
+    FakeQobuz(artists=[], catalog=[standard, deluxe]).install(monkeypatch)
+
+    match = discovery.match_album_dir(
+        folder, "Artist", "tok",
+        catalog=[_catalog_entry(standard), _catalog_entry(deluxe)],
+        prefer_hires=False,
+    )
+
+    assert match.qobuz_album["id"] == "200"
+    assert match.status == "complete"
+
+
+def test_unique_partial_legacy_match_publishes_manifest(monkeypatch, tmp_path):
+    wanted = _album("100", "Album", "Artist", 2020,
+                    [_qt("one", "A"), _qt("two", "B")])
+    wrong = _album("200", "Album (Deluxe Edition)", "Artist", 2020,
+                   [_qt("other", "Z")])
+    _library(monkeypatch, tmp_path,
+             {"Artist": {"Album (2020)": [_et("one", "A")]}})
+    folder = tmp_path / "Artist" / "Album (2020)"
+    FakeQobuz(artists=[], catalog=[wanted, wrong]).install(monkeypatch)
+
+    match = discovery.match_album_dir(
+        folder, "Artist", "tok",
+        catalog=[_catalog_entry(wanted), _catalog_entry(wrong)],
+        prefer_hires=False,
+    )
+
+    assert match.status == "partial"
+    assert read_release_identity(folder) == ReleaseIdentity("qobuz", "100")
+
+
+def test_legacy_adoption_returns_identity_attention_when_run_lock_is_busy(
+        monkeypatch, tmp_path):
+    wanted = _album(
+        "100", "Album", "Artist", 2020,
+        [_qt("one", "A"), _qt("two", "B")],
+    )
+    _library(
+        monkeypatch,
+        tmp_path,
+        {"Artist": {"Album (2020)": [_et("one", "A")]}},
+    )
+    folder = tmp_path / "Artist" / "Album (2020)"
+    FakeQobuz(artists=[], catalog=[wanted]).install(monkeypatch)
+    monkeypatch.setattr(run_lock, "current_lease", lambda: None)
+
+    def busy():
+        raise run_lock.LockBusy("123")
+
+    monkeypatch.setattr(run_lock, "acquire", busy)
+
+    match = discovery.match_album_dir(
+        folder,
+        "Artist",
+        "tok",
+        catalog=[_catalog_entry(wanted)],
+        prefer_hires=False,
+    )
+
+    assert match.status == "identity_invalid"
+    assert match.qobuz_album is None
+    assert read_release_identity(folder) is None
+
+
+def test_legacy_adoption_aba_never_selects_replacement_release(
+        monkeypatch, tmp_path):
+    wanted = _album(
+        "100", "Album", "Artist", 2020,
+        [_qt("Alpha", "USAAA0000001")],
+    )
+    replacement = _album(
+        "200", "Album (Deluxe Edition)", "Artist", 2020,
+        [_qt("Beta", "USBBB0000002")],
+    )
+    friendly = tmp_path / "Artist" / "Album (2020)"
+    a_away = tmp_path / "a-away"
+    b_source = tmp_path / "b-source"
+    b_away = tmp_path / "b-away"
+    a_track = friendly / "01.flac"
+    b_track = b_source / "01.flac"
+    _make_tagged_adoption_flac(
+        a_track,
+        frequency=330,
+        title="Alpha",
+        isrc="USAAA0000001",
+    )
+    _make_tagged_adoption_flac(
+        b_track,
+        frequency=660,
+        title="Beta",
+        isrc="USBBB0000002",
+    )
+    a_digest = hashlib.sha256(a_track.read_bytes()).hexdigest()
+    b_digest = hashlib.sha256(b_track.read_bytes()).hexdigest()
+    assert a_digest != b_digest
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "discovery-adoption.lock")
+    monkeypatch.setattr(
+        discovery,
+        "find_qobuz_album_candidates_for_dir",
+        lambda *_args, **_kwargs: [wanted, replacement],
+    )
+    real_reader = album_placement._read_held_audio_meta
+    observed = []
+
+    def read_a_during_public_aba(path):
+        friendly.rename(a_away)
+        b_source.rename(friendly)
+        value = real_reader(path)
+        observed.append((value["title"], value["isrc"], hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()))
+        friendly.rename(b_away)
+        a_away.rename(friendly)
+        return value
+
+    monkeypatch.setattr(
+        album_placement,
+        "_read_held_audio_meta",
+        read_a_during_public_aba,
+    )
+    real_select = discovery.select_legacy_release
+    selected_ids = []
+
+    def record_selection(*args, **kwargs):
+        selected, compatible = real_select(*args, **kwargs)
+        selected_ids.append(
+            str(selected.album["id"]) if selected is not None else None
+        )
+        return selected, compatible
+
+    monkeypatch.setattr(discovery, "select_legacy_release", record_selection)
+    lease = run_lock.acquire()
+    assert lease is not None
+    try:
+        match = discovery.match_album_dir(
+            friendly,
+            "Artist",
+            "token",
+            catalog=[_catalog_entry(wanted), _catalog_entry(replacement)],
+            prefer_hires=False,
+        )
+    finally:
+        lease.close()
+
+    assert observed == [("Alpha", "USAAA0000001", a_digest)]
+    assert "200" not in selected_ids
+    assert match.status == "identity_invalid"
+    assert match.qobuz_album is None
+    assert read_release_identity(friendly) is None
+
+
+def test_legacy_candidate_handoff_never_publishes_a_identity_to_compatible_b(
+        monkeypatch, tmp_path):
+    wanted = _album(
+        "100", "Album", "Artist", 2020,
+        [_qt("Shared", "USAAA0000001")],
+    )
+    friendly = tmp_path / "Artist" / "Album (2020)"
+    a_away = tmp_path / "a-away"
+    b_source = tmp_path / "b-source"
+    a_track = friendly / "01.flac"
+    b_track = b_source / "01.flac"
+    _make_tagged_adoption_flac(
+        a_track,
+        frequency=330,
+        title="Shared",
+        isrc="USAAA0000001",
+    )
+    _make_tagged_adoption_flac(
+        b_track,
+        frequency=660,
+        title="Shared",
+        isrc="USAAA0000001",
+    )
+    assert hashlib.sha256(a_track.read_bytes()).digest() != hashlib.sha256(
+        b_track.read_bytes()
+    ).digest()
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "candidate-handoff.lock")
+
+    def capture_a_candidates_then_install_b(*_args, **_kwargs):
+        friendly.rename(a_away)
+        b_source.rename(friendly)
+        return [wanted]
+
+    monkeypatch.setattr(
+        discovery,
+        "find_qobuz_album_candidates_for_dir",
+        capture_a_candidates_then_install_b,
+    )
+    lease = run_lock.acquire()
+    assert lease is not None
+    try:
+        match = discovery.match_album_dir(
+            friendly,
+            "Artist",
+            "token",
+            catalog=[_catalog_entry(wanted)],
+            prefer_hires=False,
+        )
+    finally:
+        lease.close()
+
+    assert match.status == "identity_invalid"
+    assert match.qobuz_album is None
+    assert read_release_identity(friendly) is None
+
+
+def test_shared_standard_tracks_leave_legacy_folder_ambiguous(monkeypatch, tmp_path):
+    standard = _album("100", "Album", "Artist", 2020,
+                      [_qt("one", "A"), _qt("two", "B")])
+    deluxe = _album("200", "Album (Deluxe Edition)", "Artist", 2020,
+                    [_qt("one", "A"), _qt("two", "B"), _qt("bonus", "C")])
+    _library(monkeypatch, tmp_path,
+             {"Artist": {"Album (2020)": [_et("one", "A")]}})
+    folder = tmp_path / "Artist" / "Album (2020)"
+    FakeQobuz(artists=[], catalog=[standard, deluxe]).install(monkeypatch)
+
+    match = discovery.match_album_dir(
+        folder, "Artist", "tok",
+        catalog=[_catalog_entry(standard), _catalog_entry(deluxe)],
+        prefer_hires=False,
+    )
+
+    assert match.status == "identity_ambiguous"
+    assert [str(album["id"]) for album in match.candidate_releases] == ["100", "200"]
+    assert not (folder / MANIFEST_NAME).exists()
+
+
+def test_invalid_manifest_keeps_candidate_releases_for_review(monkeypatch, tmp_path):
+    standard = _album("100", "Album", "Artist", 2020,
+                      [_qt("one", "A"), _qt("two", "B")])
+    deluxe = _album("200", "Album (Deluxe Edition)", "Artist", 2020,
+                    [_qt("one", "A"), _qt("two", "B"), _qt("bonus", "C")])
+    _library(monkeypatch, tmp_path,
+             {"Artist": {"Album (2020)": [_et("one", "A")]}})
+    folder = tmp_path / "Artist" / "Album (2020)"
+    manifest = folder / MANIFEST_NAME
+    malformed = '{"schema_version":1,"provider":"qobuz","release_id":"100","extra":true}'
+    manifest.write_text(malformed, encoding="utf-8")
+    FakeQobuz(
+        artists=[{"name": "Artist", "id": "artist", "albums_count": 2}],
+        catalog=[standard, deluxe],
+    ).install(monkeypatch)
+    real_existing_tracks = discovery.find_existing_tracks
+
+    def reviewed_tracks_only(album, *, album_dir=None):
+        if album_dir is None:
+            return [], None
+        return real_existing_tracks(album, album_dir=album_dir)
+
+    # The catalog pass must rely on the IDs classified from the invalid folder,
+    # rather than resolving its path or hiding it by its owned title.
+    monkeypatch.setattr(discovery, "find_existing_tracks", reviewed_tracks_only)
+    monkeypatch.setattr(discovery, "_owned_by_name", lambda *_args: False)
+
+    result = find_missing_for_artist(
+        "Artist", token="tok", opts=DiscoveryOpts(prefer_hires=False),
+        artist_dir=tmp_path / "Artist")
+
+    assert result.gaps == []
+    assert result.skipped == [{
+        "dir": folder,
+        "reason": "identity_invalid",
+        "candidate_releases": [
+            {"id": "100", "title": "Album"},
+            {"id": "200", "title": "Album (Deluxe Edition)"},
+        ],
+    }]
+    assert manifest.read_text(encoding="utf-8") == malformed
 
 
 def test_deluxe_edition_gap_measured_against_the_owned_edition(monkeypatch, tmp_path, beatles_search):

@@ -1,6 +1,7 @@
 """Tests for integrations/rip.py, integrations/beets.py, integrations/lyrics.py
 — the streamrip/beets seams where most real bugs live."""
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -398,6 +399,53 @@ def test_beets_pruning_stays_bound_to_the_captured_staging_roots(monkeypatch, tm
 # ── beets: staging tag prep (quarantine, never delete) ────────────────────
 
 
+def test_beets_source_capture_omits_release_manifest(tmp_path, monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.integrations import beets
+
+    staging = tmp_path / "staging"
+    album = staging / "Artist" / "Album"
+    album.mkdir(parents=True)
+    (album / "01 - Track.flac").write_bytes(b"audio")
+    (album / "cover.json").write_text("{}")
+    (album / ".qobuz-librarian-release.json").write_text(
+        '{"schema_version":1,"provider":"qobuz","release_id":"123"}'
+    )
+    config_dir = tmp_path / "beets-config"
+    config_dir.mkdir()
+    (config_dir / "config.yaml").write_text("{}")
+    monkeypatch.setattr(cfg, "STAGING_DIR", staging)
+    monkeypatch.setattr(cfg, "BEETS_CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cfg, "BEETS_DB_PATH", tmp_path / "beets" / "library.db")
+    monkeypatch.setattr(beets, "_resolve_beets_runtime", lambda: object())
+    monkeypatch.setattr(
+        beets,
+        "_configured_beets_plugins",
+        lambda _runtime: {
+            "plugins": [],
+            "plugin_paths": [],
+            "musicbrainz_enabled": False,
+            "disabled": [],
+        },
+    )
+    monkeypatch.setattr(beets, "_prepare_staging_tags", lambda roots=None: None)
+
+    prepared_sources = []
+    _override, cleanup, _runtime = beets._prepare_for_beets_run(
+        roots=[album], source_files_out=prepared_sources
+    )
+    try:
+        assert all(
+            receipt.path.name != ".qobuz-librarian-release.json"
+            for receipt in prepared_sources
+        )
+        assert {receipt.path.name for receipt in prepared_sources} == {
+            "01 - Track.flac", "cover.json"}
+    finally:
+        if cleanup is not None:
+            cleanup()
+
+
 def test_prepare_staging_tags_sets_aside_untagged_keeps_tagged(tmp_path, monkeypatch, _need_ffmpeg):
     # A cancelled/crashed rip leaves untagged FLACs beets would file under
     # '/_/'. They're moved out of the import set — but set aside, never deleted.
@@ -535,6 +583,549 @@ def test_prepare_managed_staging_tags_returns_bindings_in_input_order(
 
 
 # ── beets: import override pins non-destructive duplicate handling ─────────
+
+
+def test_append_album_path_suffix_changes_only_album_component():
+    from qobuz_librarian.integrations.beets import append_album_path_suffix
+
+    assert append_album_path_suffix(
+        "$albumartist/$album ($year)/$track - $title",
+        " [qobuz-200]",
+    ) == "$albumartist/$album ($year) [qobuz-200]/$track - $title"
+
+
+@pytest.mark.parametrize("template", [
+    "$artist/$track - $title",
+    "$album/$album/$track - $title",
+])
+def test_append_album_path_suffix_refuses_ambiguous_templates(template):
+    from qobuz_librarian.integrations.beets import append_album_path_suffix
+
+    with pytest.raises(ValueError, match="album path component"):
+        append_album_path_suffix(template, " [qobuz-200]")
+
+
+def test_collision_suffix_is_written_to_each_effective_album_path(monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.integrations.beets import (
+        _build_import_override_yaml,
+        _render_beets_override,
+    )
+
+    monkeypatch.setattr(cfg, "BEETS_DB_PATH", Path("/config/beets/musiclibrary.db"))
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", Path("/music"))
+    monkeypatch.setattr(cfg, "BEETS_PATH_DEFAULT", "")
+    monkeypatch.setattr(cfg, "BEETS_PATH_SINGLETON", "")
+    monkeypatch.setattr(cfg, "BEETS_PATH_COMP", "")
+    monkeypatch.setattr(cfg, "BEETS_PLUGINS", [])
+    monkeypatch.setattr(cfg, "ARTWORK", "sidecar")
+    configured = {
+        "plugins": [],
+        "disabled": [],
+        "musicbrainz_enabled": False,
+        "plugin_paths": [],
+        "paths": {
+            "default": "$albumartist/$album ($year)/$track - $title",
+            "comp": "Compilations/$album ($year)/$track - $title",
+            "singleton": "Singletons/$artist - $title",
+            "albumtype:soundtrack": (
+                "Soundtracks/$albumartist/$album ($year)/$track - $title"
+            ),
+        },
+    }
+
+    plain = _render_beets_override(configured)
+    collision = _render_beets_override(
+        configured, album_path_suffix=" [qobuz-200]")
+
+    assert "$album ($year) [qobuz-200]/$track" in collision
+    assert "Compilations/$album ($year) [qobuz-200]/$track" in collision
+    assert "Singletons/$artist - $title" in collision
+    assert (
+        "  'albumtype:soundtrack': "
+        "'Soundtracks/$albumartist/$album ($year) [qobuz-200]/$track - $title'"
+        in collision
+    )
+    assert "[qobuz-200]" not in plain
+    assert plain == _build_import_override_yaml(configured)
+
+    configured["paths"]["singleton"] = "Singletons/$album/$track - $title"
+    singleton_album = _render_beets_override(
+        configured, album_path_suffix=" [qobuz-200]")
+    assert "Singletons/$album [qobuz-200]/$track" in singleton_album
+
+
+def test_empty_collision_suffix_preserves_frozen_override_yaml(monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.integrations import beets
+
+    monkeypatch.setattr(cfg, "BEETS_DB_PATH", Path("/config/beets/musiclibrary.db"))
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", Path("/music"))
+    monkeypatch.setattr(cfg, "BEETS_PATH_DEFAULT", "")
+    monkeypatch.setattr(cfg, "BEETS_PATH_SINGLETON", "")
+    monkeypatch.setattr(cfg, "BEETS_PATH_COMP", "")
+    monkeypatch.setattr(cfg, "BEETS_PLUGINS", [])
+    monkeypatch.setattr(cfg, "ARTWORK", "sidecar")
+    monkeypatch.setattr(
+        beets,
+        "__file__",
+        "/app/qobuz_librarian/integrations/beets.py",
+    )
+    configured = {
+        "plugins": [],
+        "disabled": [],
+        "musicbrainz_enabled": False,
+        "plugin_paths": [],
+        "paths": {
+            "default": "$albumartist/$album/$track - $title",
+            "comp": "Compilations/$album/$track - $title",
+            "singleton": "Singletons/$artist - $title",
+            "albumtype:soundtrack": "Soundtracks/$album/$track - $title",
+        },
+    }
+
+    assert beets._render_beets_override(configured, album_path_suffix="") == (
+        "library: '/config/beets/musiclibrary.db'\n"
+        "directory: '/music'\n"
+        "import:\n"
+        "  quiet: yes\n"
+        "  incremental: no\n"
+        "  autotag: no\n"
+        "  move: yes\n"
+        "  duplicate_action: merge\n"
+        "pluginpath:\n"
+        "  - '/app/qobuz_librarian/integrations/beets_plugins'\n"
+        "disabled_plugins: []\n"
+        "plugins: [qobuz_art_guard]\n"
+    )
+
+
+def test_config_probe_returns_effective_album_paths(monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from qobuz_librarian.integrations import beets
+
+    runtime = SimpleNamespace(python="/beets/python")
+    monkeypatch.setattr(beets, "_beets_runtime_matches", lambda _runtime: True)
+    payload = {
+        "version": beets._BEETS_CONFIG_PROTOCOL_VERSION,
+        "beets_version": beets._SUPPORTED_BEETS_VERSION,
+        "python": [3, 12],
+        "plugins": [],
+        "plugin_paths": [],
+        "disabled": [],
+        "musicbrainz_enabled": False,
+        "paths": {
+            "default": "$albumartist/$album/$track - $title",
+            "comp": "Compilations/$album/$track - $title",
+            "singleton": "Singletons/$artist - $title",
+            "albumtype:soundtrack": "Soundtracks/$album/$track - $title",
+        },
+    }
+    monkeypatch.setattr(
+        beets.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(payload).encode() + b"\n",
+            stderr=b"",
+        ),
+    )
+
+    paths = beets._configured_beets_plugins(runtime)["paths"]
+    assert paths == payload["paths"]
+    assert list(paths) == [
+        "default",
+        "comp",
+        "singleton",
+        "albumtype:soundtrack",
+    ]
+
+
+def test_unsupported_collision_template_stops_before_staging_or_beets(
+        monkeypatch, tmp_path):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.integrations import beets
+
+    config_dir = tmp_path / "beets-config"
+    config_dir.mkdir()
+    (config_dir / "config.yaml").write_text("{}")
+    monkeypatch.setattr(cfg, "BEETS_CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cfg, "BEETS_DB_PATH", tmp_path / "beets" / "library.db")
+    monkeypatch.setattr(beets, "_resolve_beets_runtime", lambda: object())
+    monkeypatch.setattr(
+        beets,
+        "_configured_beets_plugins",
+        lambda _runtime: {
+            "plugins": [],
+            "plugin_paths": [],
+            "musicbrainz_enabled": False,
+            "disabled": [],
+            "paths": {
+                "default": "$albumartist/$album/$track - $title",
+                "comp": "Compilations/$album/$track - $title",
+                "singleton": "Singletons/$artist - $title",
+                "genre:Classical": "Classical/$album/$album/$track - $title",
+            },
+        },
+    )
+    prepared = []
+    monkeypatch.setattr(
+        beets, "_prepare_staging_tags", lambda roots=None: prepared.append(roots))
+    lines = []
+    monkeypatch.setattr(beets.log, "info", lines.append)
+
+    assert beets._prepare_for_beets_run(
+        album_path_suffix=" [qobuz-200]") == (None, None, None)
+    assert prepared == []
+    assert any("identity-review" in line for line in lines)
+
+
+def test_unsupported_managed_collision_template_stops_before_staging(
+        monkeypatch, tmp_path):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.integrations import beets
+
+    config_dir = tmp_path / "beets-config"
+    config_dir.mkdir()
+    (config_dir / "config.yaml").write_text("{}")
+    monkeypatch.setattr(cfg, "BEETS_CONFIG_DIR", config_dir)
+    monkeypatch.setattr(beets, "_resolve_beets_runtime", lambda: object())
+    monkeypatch.setattr(
+        beets,
+        "_configured_beets_plugins",
+        lambda _runtime: {
+            "plugins": [],
+            "plugin_paths": [],
+            "musicbrainz_enabled": False,
+            "disabled": [],
+            "paths": {
+                "default": "$albumartist/$album/$track - $title",
+                "comp": "Compilations/$album/$track - $title",
+                "singleton": "Singletons/$artist - $title",
+                "genre:Classical": "Classical/$album/$album/$track - $title",
+            },
+        },
+    )
+    prepared = []
+    reservations = []
+    monkeypatch.setattr(
+        beets,
+        "_prepare_staging_tags",
+        lambda **kwargs: prepared.append(kwargs),
+    )
+
+    assert beets._prepare_managed_beets_run(
+        [],
+        [],
+        {"operation_id": "a" * 64, "item_id": "b" * 64},
+        on_reservation=reservations.append,
+        album_path_suffix=" [qobuz-200]",
+    ) is None
+    assert prepared == []
+    assert reservations == []
+
+
+def test_collision_suffix_reaches_both_beets_import_entry_points(
+        monkeypatch, tmp_path):
+    from qobuz_librarian.integrations import beets
+
+    album_dir = tmp_path / "staging" / "Artist" / "Album"
+    album_dir.mkdir(parents=True)
+    seen = []
+
+    def prepare(*, roots, ownership_out=None, source_files_out=None,
+                album_path_suffix=""):
+        seen.append(album_path_suffix)
+        return Path("/override.yaml"), lambda: None, object()
+
+    monkeypatch.setattr(beets, "_prepare_for_beets_run", prepare)
+    monkeypatch.setattr(beets, "_beets_direct", lambda *_args, **_kwargs: (True, "ok"))
+
+    assert beets.beets_import_paths(
+        consolidate=False,
+        album_dirs=[album_dir],
+        album_path_suffix=" [qobuz-200]",
+    ) is True
+    assert beets.beets_import_albums(
+        [album_dir], album_path_suffix=" [qobuz-200]") == "ok"
+    assert seen == [" [qobuz-200]", " [qobuz-200]"]
+
+
+def test_import_placement_uses_collision_suffix_for_manifested_friendly_path(
+        monkeypatch, tmp_path):
+    from qobuz_librarian.integrations import beets
+    from qobuz_librarian.library.release_identity import (
+        ReleaseIdentity,
+        publish_release_identity,
+    )
+
+    friendly = tmp_path / "music" / "Artist" / "Album (2020)"
+    friendly.mkdir(parents=True)
+    publish_release_identity(friendly, ReleaseIdentity("qobuz", "100"))
+    monkeypatch.setattr(beets, "find_album_dir_filesystem", lambda _album: friendly)
+
+    placement = beets.resolve_album_import_placement(
+        {"id": "200", "title": "Album", "artist": {"name": "Artist"}},
+        "token",
+    )
+
+    assert placement.suffix == " [qobuz-200]"
+
+
+def test_import_placement_reports_ambiguous_unmarked_friendly_path(
+        monkeypatch, tmp_path):
+    from qobuz_librarian.integrations import beets
+
+    friendly = tmp_path / "music" / "Artist" / "Album (2020)"
+    friendly.mkdir(parents=True)
+    candidates = [{"id": "100"}, {"id": "200"}]
+    monkeypatch.setattr(beets, "find_album_dir_filesystem", lambda _album: friendly)
+    monkeypatch.setattr(
+        beets,
+        "find_qobuz_album_candidates_for_dir",
+        lambda *_args, **_kwargs: candidates,
+    )
+    monkeypatch.setattr(
+        beets,
+        "select_legacy_release",
+        lambda _existing, _candidates, **_kwargs: (
+            None, [object(), object()]
+        ),
+    )
+
+    with pytest.raises(beets.AlbumImportIdentityAmbiguous):
+        beets.resolve_album_import_placement(
+            {"id": "200", "title": "Album", "artist": {"name": "Artist"}},
+            "token",
+        )
+
+
+def test_import_placement_refuses_unmarked_path_without_compatible_release(
+        monkeypatch, tmp_path):
+    from qobuz_librarian.integrations import beets
+
+    friendly = tmp_path / "music" / "Artist" / "Album (2020)"
+    friendly.mkdir(parents=True)
+    monkeypatch.setattr(beets, "find_album_dir_filesystem", lambda _album: friendly)
+    monkeypatch.setattr(
+        beets,
+        "find_qobuz_album_candidates_for_dir",
+        lambda *_args, **_kwargs: [{"id": "200"}],
+    )
+    monkeypatch.setattr(
+        beets,
+        "select_legacy_release",
+        lambda _existing, _candidates, **_kwargs: (None, []),
+    )
+
+    with pytest.raises(beets.AlbumPlacementAttention, match="unmarked"):
+        beets.resolve_album_import_placement(
+            {"id": "200", "title": "Album", "artist": {"name": "Artist"}},
+            "token",
+        )
+
+
+def test_import_placement_rejects_directory_swapped_after_legacy_selection(
+        monkeypatch, tmp_path):
+    from qobuz_librarian.integrations import beets
+
+    friendly = tmp_path / "music" / "Artist" / "Album (2020)"
+    reviewed = tmp_path / "reviewed-album"
+    replacement = tmp_path / "empty-replacement"
+    friendly.mkdir(parents=True)
+    replacement.mkdir()
+    (friendly / "01 - One.flac").write_bytes(b"reviewed audio")
+    candidates = [{
+        "id": "200",
+        "tracks": {"items": [{
+            "title": "One",
+            "isrc": "A",
+            "media_number": 1,
+            "track_number": 0,
+        }]},
+    }]
+    monkeypatch.setattr(beets, "find_album_dir_filesystem", lambda _album: friendly)
+    monkeypatch.setattr(
+        beets,
+        "find_qobuz_album_candidates_for_dir",
+        lambda *_args, **_kwargs: candidates,
+    )
+    real_select = beets.select_legacy_release
+
+    def select_then_swap(*args, **kwargs):
+        result = real_select(*args, **kwargs)
+        friendly.rename(reviewed)
+        replacement.rename(friendly)
+        return result
+
+    monkeypatch.setattr(beets, "select_legacy_release", select_then_swap)
+
+    with pytest.raises(beets.AlbumPlacementAttention, match="changed|proof"):
+        beets.resolve_album_import_placement(
+            {"id": "200", "title": "Album", "artist": {"name": "Artist"}},
+            "token",
+        )
+
+    assert not (friendly / ".qobuz-librarian-release.json").exists()
+    assert (reviewed / "01 - One.flac").read_bytes() == b"reviewed audio"
+
+
+def test_import_placement_aba_reads_held_a_and_never_adopts_b(
+        monkeypatch, tmp_path, _need_ffmpeg):
+    from mutagen.flac import FLAC
+
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian import run_lock
+    from qobuz_librarian.integrations import beets
+    from qobuz_librarian.library import album_placement
+    from qobuz_librarian.library.release_identity import read_release_identity
+
+    friendly = tmp_path / "music" / "Artist" / "Album (2020)"
+    a_away = tmp_path / "a-away"
+    b_source = tmp_path / "b-source"
+    b_away = tmp_path / "b-away"
+    a_track = friendly / "01.flac"
+    b_track = b_source / "01.flac"
+    _make_silent_flac(a_track)
+    _make_silent_flac(b_track)
+    a_tags = FLAC(str(a_track))
+    a_tags["title"] = "Alpha"
+    a_tags["isrc"] = "USAAA0000001"
+    a_tags["tracknumber"] = "1"
+    a_tags.save()
+    b_tags = FLAC(str(b_track))
+    b_tags["title"] = "Beta"
+    b_tags["isrc"] = "USBBB0000002"
+    b_tags["tracknumber"] = "1"
+    b_tags["comment"] = "replacement-b-has-different-audio-and-tags"
+    b_tags.save()
+    a_digest = hashlib.sha256(a_track.read_bytes()).hexdigest()
+    b_digest = hashlib.sha256(b_track.read_bytes()).hexdigest()
+    assert a_digest != b_digest
+    wanted = {
+        "id": "100",
+        "tracks": {"items": [{
+            "title": "Alpha",
+            "isrc": "USAAA0000001",
+            "media_number": 1,
+            "track_number": 1,
+        }]},
+    }
+    replacement = {
+        "id": "200",
+        "tracks": {"items": [{
+            "title": "Beta",
+            "isrc": "USBBB0000002",
+            "media_number": 1,
+            "track_number": 1,
+        }]},
+    }
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "beets-adoption.lock")
+    monkeypatch.setattr(beets, "find_album_dir_filesystem", lambda _album: friendly)
+    monkeypatch.setattr(
+        beets,
+        "find_qobuz_album_candidates_for_dir",
+        lambda *_args, **_kwargs: [wanted, replacement],
+    )
+    real_reader = album_placement._read_held_audio_meta
+    observed = []
+
+    def read_a_during_public_aba(path):
+        friendly.rename(a_away)
+        b_source.rename(friendly)
+        value = real_reader(path)
+        observed.append((value["title"], value["isrc"], hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()))
+        friendly.rename(b_away)
+        a_away.rename(friendly)
+        return value
+
+    monkeypatch.setattr(
+        album_placement,
+        "_read_held_audio_meta",
+        read_a_during_public_aba,
+    )
+    real_select = beets.select_legacy_release
+    selected_ids = []
+
+    def record_selection(*args, **kwargs):
+        selected, compatible = real_select(*args, **kwargs)
+        selected_ids.append(
+            str(selected.album["id"]) if selected is not None else None
+        )
+        return selected, compatible
+
+    monkeypatch.setattr(beets, "select_legacy_release", record_selection)
+    lease = run_lock.acquire()
+    assert lease is not None
+    try:
+        with pytest.raises(beets.AlbumPlacementAttention, match="changed|authority"):
+            beets.resolve_album_import_placement(
+                {"id": "100", "title": "Album", "artist": {"name": "Artist"}},
+                "token",
+            )
+    finally:
+        lease.close()
+
+    assert observed == [("Alpha", "USAAA0000001", a_digest)]
+    assert "200" not in selected_ids
+    assert read_release_identity(friendly) is None
+
+
+def test_import_placement_uses_held_manifest_and_audio_count_while_scan_is_live(
+        monkeypatch, tmp_path):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.integrations import beets
+    from qobuz_librarian.library import catalog
+    from qobuz_librarian.library.album_placement import PlacementDisposition
+
+    friendly = tmp_path / "music" / "Artist" / "Album (2020)"
+    friendly.mkdir(parents=True)
+    (friendly / "01 - One.flac").write_bytes(b"held legacy audio")
+    intended = {
+        "id": "100",
+        "title": "Album",
+        "artist": {"name": "Artist"},
+        "release_date_original": "2020-01-01",
+        "maximum_bit_depth": 16,
+        "maximum_sampling_rate": 44.1,
+        "tracks_count": 1,
+        "tracks": {"items": [{
+            "title": "One",
+            "isrc": "",
+            "media_number": 1,
+            "track_number": 1,
+        }]},
+    }
+    candidate = {key: value for key, value in intended.items() if key != "tracks"}
+    public_reads = []
+    real_read_identity = catalog.read_release_identity
+    real_count_audio = catalog._count_audio_files_in
+
+    def read_identity(path):
+        public_reads.append(("manifest", Path(path)))
+        return real_read_identity(path)
+
+    def count_audio(path):
+        public_reads.append(("audio_count", Path(path)))
+        return real_count_audio(path)
+
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "held-catalog-state.lock")
+    monkeypatch.setattr(beets, "find_album_dir_filesystem", lambda _album: friendly)
+    monkeypatch.setattr(catalog, "find_album_dir_filesystem", lambda _album: friendly)
+    monkeypatch.setattr(catalog, "search_albums", lambda *_args, **_kwargs: [candidate])
+    monkeypatch.setattr(catalog, "get_album", lambda *_args, **_kwargs: intended)
+    monkeypatch.setattr(catalog, "read_release_identity", read_identity)
+    monkeypatch.setattr(catalog, "_count_audio_files_in", count_audio)
+
+    placement = beets.resolve_album_import_placement(intended, "token")
+
+    assert placement.disposition is PlacementDisposition.ADOPTED
+    assert placement.destination == friendly
+    assert public_reads == []
 
 
 def test_import_override_pins_duplicate_action_merge(monkeypatch):

@@ -22,6 +22,7 @@ from pathlib import Path
 
 from qobuz_librarian import config
 from qobuz_librarian.library import flac_cache
+from qobuz_librarian.library.release_identity import is_release_manifest_name
 from qobuz_librarian.library.tags import normalize
 from qobuz_librarian.ui_cli.logging import vlog
 
@@ -49,9 +50,14 @@ def iter_tree_no_symlinks(root: Path, errors=None):
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False,
                                                 onerror=_onerror):
         dp = Path(dirpath)
+        dirnames[:] = [
+            name for name in dirnames if not is_release_manifest_name(name)
+        ]
         for name in dirnames:
             yield dp / name
         for name in filenames:
+            if is_release_manifest_name(name):
+                continue
             yield dp / name
 
 log = logging.getLogger("qobuz_librarian")

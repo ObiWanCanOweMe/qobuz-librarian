@@ -217,7 +217,9 @@ CREATE TABLE IF NOT EXISTS migration_candidate_entries (
     job_id              TEXT NOT NULL,
     candidate_id        TEXT NOT NULL,
     entry_kind          TEXT NOT NULL
-                        CHECK (entry_kind IN ('entry', 'resume', 'companion')),
+                        CHECK (entry_kind IN (
+                            'entry', 'resume', 'companion', 'release_identity'
+                        )),
     ordinal             INTEGER NOT NULL CHECK (ordinal >= 0),
     source              TEXT,
     destination         TEXT,
@@ -228,7 +230,86 @@ CREATE TABLE IF NOT EXISTS migration_candidate_entries (
 """
 
 
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
+
+
+def _table_schema(conn, name: str):
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (name,),
+    ).fetchone()
+    return None if row is None else (row[0] or "")
+
+
+def _upgrade_schema_transaction(conn, version: int) -> None:
+    """Atomically upgrade jobs.db and recover an interrupted v6 rebuild."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if version < _SCHEMA_VERSION:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+            if "single" not in cols:
+                conn.execute(
+                    "ALTER TABLE jobs ADD COLUMN single TEXT NOT NULL "
+                    "DEFAULT '{}'"
+                )
+            if "attention" not in cols:
+                conn.execute(
+                    "ALTER TABLE jobs ADD COLUMN attention TEXT NOT NULL "
+                    "DEFAULT ''"
+                )
+            if "recoveries" not in cols:
+                conn.execute(
+                    "ALTER TABLE jobs ADD COLUMN recoveries TEXT NOT NULL "
+                    "DEFAULT '[]'"
+                )
+
+        current_schema = _table_schema(
+            conn, "migration_candidate_entries")
+        leftover_schema = _table_schema(
+            conn, "migration_candidate_entries_v6")
+        if leftover_schema is not None:
+            if current_schema is None:
+                conn.execute(_MIGRATION_CANDIDATE_ENTRY_SCHEMA)
+                current_schema = _table_schema(
+                    conn, "migration_candidate_entries")
+            if "release_identity" not in (current_schema or ""):
+                raise sqlite3.DatabaseError(
+                    "cannot safely recover migration candidate entry schema"
+                )
+            conn.execute(
+                "INSERT OR IGNORE INTO migration_candidate_entries "
+                "SELECT * FROM migration_candidate_entries_v6"
+            )
+            conn.execute("DROP TABLE migration_candidate_entries_v6")
+        elif (
+            current_schema is not None
+            and "release_identity" not in current_schema
+        ):
+            conn.execute(
+                "ALTER TABLE migration_candidate_entries "
+                "RENAME TO migration_candidate_entries_v6"
+            )
+            conn.execute(_MIGRATION_CANDIDATE_ENTRY_SCHEMA)
+            conn.execute(
+                "INSERT INTO migration_candidate_entries "
+                "SELECT * FROM migration_candidate_entries_v6"
+            )
+            conn.execute("DROP TABLE migration_candidate_entries_v6")
+        elif current_schema is None:
+            conn.execute(_MIGRATION_CANDIDATE_ENTRY_SCHEMA)
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_migration_candidate_entries "
+            "ON migration_candidate_entries(job_id, candidate_id, "
+            "entry_kind, ordinal)"
+        )
+        if version < _SCHEMA_VERSION:
+            conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        conn.commit()
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
 
 
 def init() -> None:
@@ -245,11 +326,6 @@ def init() -> None:
             conn.execute(_MIGRATION_CANDIDATE_PAYLOAD_SCHEMA)
             conn.execute(_MIGRATION_CANDIDATE_ENTRY_SCHEMA)
             conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_migration_candidate_entries "
-                "ON migration_candidate_entries(job_id, candidate_id, "
-                "entry_kind, ordinal)"
-            )
-            conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_durable_job_completion_album "
                 "ON durable_job_completions(job_id, job_created_at, album_id)"
             )
@@ -264,27 +340,23 @@ def init() -> None:
             # jobs.db — that failure is swallowed by _note_write_failure,
             # leaving the archive non-durable with no visible sign.
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version < _SCHEMA_VERSION:
-                # v2: persist Job.single (single-track download undo info) so
-                # a restart doesn't drop the Undo affordance on a completed
-                # one-track download.
-                cols = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
-                if "single" not in cols:
-                    conn.execute(
-                        "ALTER TABLE jobs ADD COLUMN single TEXT NOT NULL DEFAULT '{}'")
-                # v3: persist Job.attention (finished-job needs-review marker,
-                # e.g. a download that stayed under the quality target) so the
-                # History chip and nav dot survive a restart.
-                if "attention" not in cols:
-                    conn.execute(
-                        "ALTER TABLE jobs ADD COLUMN attention TEXT NOT NULL DEFAULT ''")
-                # v4: exact retained Repair-backup state.
-                if "recoveries" not in cols:
-                    conn.execute(
-                        "ALTER TABLE jobs ADD COLUMN recoveries TEXT NOT NULL DEFAULT '[]'")
-                conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+            if (
+                version < _SCHEMA_VERSION
+                or _table_schema(
+                    conn, "migration_candidate_entries_v6") is not None
+            ):
+                _upgrade_schema_transaction(conn, version)
+            else:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "idx_migration_candidate_entries "
+                    "ON migration_candidate_entries(job_id, candidate_id, "
+                    "entry_kind, ordinal)"
+                )
             conn.commit()
         except sqlite3.Error as e:
+            if conn.in_transaction:
+                conn.rollback()
             # A transient/locked/full/corrupt jobs.db here would otherwise
             # propagate out of restore_jobs() into the caller's broad
             # "couldn't restore prior jobs — starting fresh" handler, masking
@@ -437,7 +509,7 @@ def persist_preserving_single(job) -> bool:
 _MIGRATION_PAYLOAD_KEYS = {
     "entries", "resume_entries", "source_root", "source_root_receipt",
     "dest_root_receipt", "destination_name_semantics", "manifest_artifact",
-    "companion_receipts",
+    "companion_receipts", "release_identities",
 }
 
 
@@ -504,6 +576,14 @@ def _migration_payload_rows(payload: dict) -> tuple[tuple, list[tuple]]:
         rows.append((
             "companion", ordinal, None, None,
             _migration_json_dump(receipt), None,
+        ))
+    release_identities = payload["release_identities"]
+    if type(release_identities) not in (list, tuple):
+        raise TypeError("migration release identities are malformed")
+    for ordinal, record in enumerate(release_identities):
+        rows.append((
+            "release_identity", ordinal, None, None,
+            _migration_json_dump(record), None,
         ))
     return parent, rows
 
@@ -643,17 +723,28 @@ def load_migration_candidate_payload(
             "destination_name_semantics": _migration_json_load(parent[3]),
             "manifest_artifact": manifest_artifact,
             "companion_receipts": [],
+            "release_identities": [],
         }
-        expected = {"entry": 0, "resume": 0, "companion": 0}
+        expected = {
+            "entry": 0,
+            "resume": 0,
+            "companion": 0,
+            "release_identity": 0,
+        }
         for kind, ordinal, source, destination, source_json, dest_json in rows:
             if kind not in expected or ordinal != expected[kind]:
                 return None
             expected[kind] += 1
             source_receipt = _migration_json_load(source_json)
-            if kind == "companion":
+            if kind in {"companion", "release_identity"}:
                 if source is not None or destination is not None or dest_json is not None:
                     return None
-                payload["companion_receipts"].append(source_receipt)
+                target = (
+                    "companion_receipts"
+                    if kind == "companion"
+                    else "release_identities"
+                )
+                payload[target].append(source_receipt)
                 continue
             if type(source) is not str or type(destination) is not str:
                 return None

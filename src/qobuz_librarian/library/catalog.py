@@ -33,6 +33,12 @@ from pathlib import Path
 from qobuz_librarian import config
 from qobuz_librarian.api.auth import QobuzError
 from qobuz_librarian.api.search import get_album, search_albums
+from qobuz_librarian.library.album_placement import LegacyAdoptionCandidateState
+from qobuz_librarian.library.release_identity import (
+    ReleaseManifestError,
+    normalise_release_id,
+    read_release_identity,
+)
 from qobuz_librarian.library.scanner import (
     _list_artist_subdirs_cached,
     iter_tree_no_symlinks,
@@ -138,6 +144,19 @@ def _paths_equal(a: Path, b: Path) -> bool:
         return os.path.normpath(str(a)) == os.path.normpath(str(b))
 
 
+def release_merge_allowed(left: Path, right: Path) -> bool:
+    """Return whether two existing album folders may enter one merge plan."""
+    try:
+        left_identity = read_release_identity(Path(left))
+        right_identity = read_release_identity(Path(right))
+    except (ReleaseManifestError, TypeError, ValueError):
+        return False
+    return (
+        left_identity is None and right_identity is None
+        or left_identity is not None and left_identity == right_identity
+    )
+
+
 _DECORATION_YEAR_RE = re.compile(
     r"[(\[](\d{4})[)\]]\s*$"      # trailing '(2010)' / '[2010]'
     r"|^\[(\d{4})\]\s+"          # leading '[2010] Title'
@@ -169,6 +188,8 @@ def _is_split_album_merge(album_dir, post_dir, qartist):
     except OSError:
         return False
     if _paths_equal(post_dir, album_dir) or not qartist:
+        return False
+    if not release_merge_allowed(album_dir, post_dir):
         return False
     a = normalize(strip_year_decoration(album_dir.name))
     if not a or a != normalize(strip_year_decoration(post_dir.name)):
@@ -977,12 +998,12 @@ def filter_short_releases(catalog_pairs, min_tracks=None):
 
 
 def dedup_album_versions(albums, prefer_hires=False):
-    """Collapse multiple editions of the same album into one canonical entry.
+    """Collapse duplicate Qobuz rows into one canonical entry.
 
-    Two albums dedup if their stripped-decoration titles normalize identically
-    AND share the same release year. Different years are kept as separate groups
-    so self-titled albums from different years (Weezer's colour records, Peter
-    Gabriel's four eponymous LPs) are not collapsed into one canonical entry.
+    Rows carrying the same normalized Qobuz release ID dedup regardless of
+    title/year metadata variations. ID-less rows retain the legacy grouping by
+    stripped title and year, so self-titled albums from different years (Weezer's
+    colour records, Peter Gabriel's four eponymous LPs) remain separate.
     Within a group, picks (see _best_edition):
       - prefer_hires=True:  best resolution at the standard track count
       - prefer_hires=False: the original (untagged) edition
@@ -1001,8 +1022,11 @@ def dedup_album_versions(albums, prefer_hires=False):
         key_title = normalize(bare) or bare.strip().casefold()
         if not key_title:
             continue
-        # Include year in the group key.
-        key = (key_title, album_year_int(a))
+        release_id = normalise_release_id(a.get("id"))
+        if release_id is not None:
+            key = ("qobuz", release_id)
+        else:
+            key = ("legacy", key_title, album_year_int(a))
         groups.setdefault(key, []).append(a)
 
     representatives = []
@@ -2233,22 +2257,28 @@ def match_dir_to_catalog(album_dir, catalog, artist_name, prefer_hires=False):
     return best
 
 
-def _pick_best_target_dir_match(scored_cands, target_dir):
-    """Among candidates whose predicted on-disk path resolves to target_dir, pick
-    the one whose tracks_count best fits the on-disk audio count.
-    scored_cands: iterable of (combined_score: float, album_dict).
+def _target_dir_candidates(scored_cands, target_dir, *, audio_count=None):
+    """Rank candidates whose predicted path resolves to ``target_dir``.
+
+    ``scored_cands`` is an iterable of ``(combined_score, album)`` pairs.
+    The first result follows the longstanding track-count-fit choice; later
+    results remain available to identity-aware callers.
     """
-    n_disk = _count_audio_files_in(target_dir)
+    n_disk = (
+        _count_audio_files_in(target_dir)
+        if audio_count is None
+        else audio_count
+    )
     resolving = []
     for score, cand in scored_cands:
         predicted = find_album_dir_filesystem(cand)
         if predicted is not None and _paths_equal(predicted, target_dir):
             resolving.append((score, cand))
     if not resolving:
-        return None, 0
+        return []
     if n_disk == 0:
         # Empty folder — nothing to fit against; trust score order.
-        return resolving[0][1], resolving[0][0]
+        return resolving
 
     def rank(item):
         score, cand = item
@@ -2264,45 +2294,23 @@ def _pick_best_target_dir_match(scored_cands, target_dir):
         return (dist, -score)
 
     resolving.sort(key=rank)
+    return resolving
+
+
+def _pick_best_target_dir_match(scored_cands, target_dir):
+    """Return the best target-dir candidate and its score.
+
+    Kept as the compatibility helper for callers that need only one result.
+    """
+    resolving = _target_dir_candidates(scored_cands, target_dir)
+    if not resolving:
+        return None, 0
     return resolving[0][1], resolving[0][0]
 
 
-def find_qobuz_album_for_dir(album_dir: Path, artist_name: str, token,
-                             prefer_hires=False, catalog=None, target_dir=None):
-    """Search Qobuz for the album matching an existing dir. Returns a fully-
-    populated album dict (with track list) or None. Picks the highest-
-    similarity match between the dir's bare name (stripped of year/edition
-    decorations) and the candidate's bare title.
-    """
-    # Fast path: try pre-fetched catalog first.
-    if catalog:
-        if target_dir is None:
-            local = match_dir_to_catalog(album_dir, catalog, artist_name, prefer_hires)
-            if local is not None:
-                try:
-                    return get_album(local["id"], token)
-                except QobuzError as e:
-                    log.info(fmt(C.YELLOW,
-                        f"    ⚠  Catalog match get_album failed for "
-                        f"album_id={local.get('id')} ({e}); trying per-folder search."))
-        else:
-            cands = _catalog_candidates_for_dir(
-                album_dir, catalog, artist_name, prefer_hires)
-            # Pick by tracks_count fit (not first-resolving).
-            scored = [(1.0 - 0.001 * i, c) for i, c in enumerate(cands)]
-            best, _bs = _pick_best_target_dir_match(scored, target_dir)
-            if best is not None:
-                vlog(f"    catalog target-dir match: {best.get('title')!r} "
-                     f"(tc={best.get('tracks_count')})")
-                try:
-                    return get_album(best["id"], token)
-                except QobuzError as e:
-                    log.info(fmt(C.YELLOW,
-                        f"    ⚠  Catalog target-dir match failed for "
-                        f"album_id={best.get('id')} ({e}); trying per-folder search."))
-
+def _search_candidates_for_dir(album_dir, artist_name, token, prefer_hires):
+    """Return ranked, viable search candidates as ``(score, bonus, album)``."""
     bare = strip_album_decorations(album_dir.name)
-
     # Build query variants. Underscore is how beets sanitizes :, /, etc;
     # replacing it with space matches Qobuz's actual titles much better.
     queries = [f"{artist_name} {bare}".strip()]
@@ -2324,12 +2332,12 @@ def find_qobuz_album_for_dir(album_dir: Path, artist_name: str, token,
             vlog(f"    search variant {q!r} failed: {e}")
             continue
         for r in batch:
-            rid = r.get("id")
-            if rid and rid not in seen_ids:
-                seen_ids.add(rid)
+            release_id = normalise_release_id(r.get("id"))
+            if release_id is not None and release_id not in seen_ids:
+                seen_ids.add(release_id)
                 results.append(r)
     if not results:
-        return None
+        return []
 
     # Year from dir name for the same self-titled-tie reason as
     # match_dir_to_catalog. See that function for the rationale.
@@ -2349,7 +2357,7 @@ def find_qobuz_album_for_dir(album_dir: Path, artist_name: str, token,
 
     if not candidates:
         vlog(f"    no candidates after artist+lossless filter for {album_dir.name!r}")
-        return None
+        return []
 
     _sort_by_match(candidates, prefer_hires)
     # Threshold on the RAW score, not the year-boosted sort rank: a nearby-
@@ -2360,36 +2368,110 @@ def find_qobuz_album_for_dir(album_dir: Path, artist_name: str, token,
         top = candidates[0]
         vlog(f"    best Qobuz match {top[2].get('title')!r} scored "
              f"{top[0]:.2f} — under threshold")
-        return None
-    best_score, _best_year_bonus, best = passing[0]
+        return []
+    return passing
 
-    # When a specific on-disk target is required, walk all viable candidates
-    # and return the first whose predicted path resolves back to target_dir.
-    if target_dir is not None:
-        # Pick among the viable candidates by track-count fit, not score, so a
-        # box set doesn't outrank the standard album the folder actually holds.
-        viable = [(s + yb, r) for (s, yb, r) in candidates
-                  if s >= config.ARTIST_DIR_MATCH_THRESH]
-        best, best_score = _pick_best_target_dir_match(viable, target_dir)
-        if best is not None:
-            vlog(f"    Qobuz match (target-dir aligned): {best.get('title')!r} "
-                 f"(score {best_score:.2f}, tc={best.get('tracks_count')})")
-            try:
-                return get_album(best["id"], token)
-            except QobuzError as e:
-                log.info(fmt(C.YELLOW, f"    ⚠  Couldn't fetch album details: {e}."))
-                return None
-        vlog(f"    no candidate resolves to {target_dir.name!r}; returning None")
-        return None
 
-    vlog(f"    Qobuz match: {best.get('title')!r} (score {best_score:.2f})")
+def _materialize_album_candidates(candidates, token):
+    """Fetch each distinct, valid release candidate's full track listing."""
+    full_albums = []
+    seen_ids = set()
+    for candidate in candidates:
+        release_id = normalise_release_id(candidate.get("id"))
+        if release_id is None or release_id in seen_ids:
+            continue
+        seen_ids.add(release_id)
+        try:
+            full = get_album(release_id, token)
+        except QobuzError as e:
+            log.info(fmt(C.YELLOW, f"    ⚠  Couldn't fetch album details for "
+                         f"album_id={release_id} ({e})."))
+            continue
+        if isinstance(full, dict):
+            full_albums.append(full)
+    return full_albums
 
-    # Pull the full track list
+
+def find_qobuz_album_candidates_for_dir(
+        album_dir, artist_name, token, *, prefer_hires=False, catalog=None,
+        target_dir=None, ignore_manifest=False,
+        legacy_adoption_state: LegacyAdoptionCandidateState | None = None,
+) -> list[dict]:
+    """Return fully materialized Qobuz release candidates in ranked order.
+
+    A valid on-disk release manifest is authoritative unless
+    ``ignore_manifest`` is explicitly requested for invalid-manifest review.
+    Legacy folders retain every distinct normalized release ID that passes the
+    existing title, artist, lossless, year, and optional target-path gates.
+    """
+    held_audio_count = None
+    if legacy_adoption_state is not None:
+        if type(legacy_adoption_state) is not LegacyAdoptionCandidateState:
+            raise TypeError("legacy adoption candidate state is invalid")
+        legacy_adoption_state.validate(album_dir)
+        if target_dir is not None:
+            legacy_adoption_state.validate(target_dir)
+        held_audio_count = legacy_adoption_state.audio_count
     try:
-        return get_album(best["id"], token)
-    except QobuzError as e:
-        log.info(fmt(C.YELLOW, f"    ⚠  Couldn't fetch album details: {e}."))
-        return None
+        if (
+            legacy_adoption_state is None
+            and not ignore_manifest
+            and album_dir.is_dir()
+        ):
+            identity = read_release_identity(album_dir)
+            if identity is not None:
+                result = _materialize_album_candidates(
+                    [{"id": identity.release_id}], token)
+                if not result:
+                    log.info(fmt(C.YELLOW, f"    ⚠  Manifested Qobuz release "
+                                 f"album_id={identity.release_id} is unavailable."))
+                return result
+
+        # Fast path: use the pre-fetched catalog before per-folder search.
+        if catalog:
+            catalog_candidates = _catalog_candidates_for_dir(
+                album_dir, catalog, artist_name, prefer_hires)
+            if target_dir is not None:
+                scored = [(1.0 - 0.001 * i, candidate)
+                          for i, candidate in enumerate(catalog_candidates)]
+                catalog_candidates = [candidate for _, candidate in
+                                      _target_dir_candidates(
+                                          scored,
+                                          target_dir,
+                                          audio_count=held_audio_count,
+                                      )]
+            result = _materialize_album_candidates(catalog_candidates, token)
+            if result:
+                return result
+
+        search_candidates = _search_candidates_for_dir(
+            album_dir, artist_name, token, prefer_hires)
+        if target_dir is not None:
+            viable = [(score + year_bonus, candidate)
+                      for score, year_bonus, candidate in search_candidates]
+            search_candidates = [candidate for _, candidate in
+                                 _target_dir_candidates(
+                                     viable,
+                                     target_dir,
+                                     audio_count=held_audio_count,
+                                 )]
+        else:
+            search_candidates = [candidate for _, _, candidate in search_candidates]
+        return _materialize_album_candidates(search_candidates, token)
+    finally:
+        if legacy_adoption_state is not None:
+            legacy_adoption_state.validate(album_dir)
+            if target_dir is not None:
+                legacy_adoption_state.validate(target_dir)
+
+
+def find_qobuz_album_for_dir(album_dir: Path, artist_name: str, token,
+                             prefer_hires=False, catalog=None, target_dir=None):
+    """Return the first fully materialized Qobuz release candidate, if any."""
+    candidates = find_qobuz_album_candidates_for_dir(
+        album_dir, artist_name, token, prefer_hires=prefer_hires,
+        catalog=catalog, target_dir=target_dir)
+    return candidates[0] if candidates else None
 
 
 def find_expanded_edition(album, album_dir, existing, token, _args=None):

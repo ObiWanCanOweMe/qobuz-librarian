@@ -1,4 +1,17 @@
 {% for c in items %}
+{% if is_non_actionable(c) %}
+<div class="ql-review-candidate ql-review-candidate--attention"
+     data-identity-attention role="note"
+     aria-label="Release identity needs manual review">
+  <span class="ql-review-candidate-body">
+    <span class="ql-review-candidate-heading">
+      <span class="ql-review-candidate-title">{{ c.title }}</span>
+      <span class="ql-badge ql-badge-xs">manual review</span>
+    </span>
+    <span class="ql-review-candidate-detail">{{ c.detail }}</span>
+  </span>
+</div>
+{% else %}
 <label class="ql-review-candidate">
   <input type="checkbox" class="ql-checkbox cb" name="cid"
          value="{{ c.cid }}" data-seq="{{ c.seq }}"
@@ -12,7 +25,8 @@
   <span class="ql-review-candidate-body">
     <span class="ql-review-candidate-heading">
       <span class="ql-review-candidate-title">{{ c.title }}</span>{% if c.payload.is_new %}
-      <span class="ql-badge ql-badge-new ql-badge-xs">new</span>{% endif %}
+      <span class="ql-badge ql-badge-new ql-badge-xs">new</span>{% endif %}{% if c.payload.edition_badge %}
+      <span class="ql-badge ql-badge-xs ql-badge-edition">{{ c.payload.edition_badge }}</span>{% endif %}
     </span>
     <span class="ql-review-candidate-detail">{% if review_tab|default('') == 'gaps' %}{{ c.detail | replace('gap-fill: ', '') }}{% else %}{{ c.detail }}{% endif %}</span>
     {% if c.payload.verified_truncated %}
@@ -30,4 +44,5 @@
     {% endif %}
   </span>
 </label>
+{% endif %}
 {% endfor %}

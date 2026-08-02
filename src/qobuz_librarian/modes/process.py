@@ -1,31 +1,48 @@
 """Core album processing — detect gaps, prompt, download, import, consolidate."""
 import math
+import os
 from datetime import datetime, timezone
+from pathlib import Path
 
 from qobuz_librarian import config as cfg
 from qobuz_librarian import run_lock
 from qobuz_librarian.download import (
+    album_track_slots,
     download_staged_files,
+    exact_download_coverage,
+    refresh_staged_track_bindings,
     retain_download_staging,
     retire_download_staging_after_import,
     retire_empty_download_staging,
     run_album_download,
     validated_staged_album_dirs,
 )
-from qobuz_librarian.integrations.beets import beets_import_paths, staging_preflight
+from qobuz_librarian.integrations.beets import (
+    AlbumImportIdentityAmbiguous,
+    AlbumPlacementAttention,
+    beets_import_paths,
+    resolve_album_import_placement,
+    staging_preflight,
+)
 from qobuz_librarian.integrations.lyrics import (
     _record_post_import_lyric_retry,
     _resolve_signatures_to_paths,
     write_post_import_sidecars,
 )
 from qobuz_librarian.integrations.rip import (
+    _flac_signature,
     is_cancel_requested,
     snapshot_staging,
+)
+from qobuz_librarian.library.album_placement import (
+    AlbumPlacement,
+    require_album_placement_current,
 )
 from qobuz_librarian.library.backup import (
     backup_album_dir,
     capture_album_source_receipt,
     carry_backup_companions,
+    carry_backup_release_identity,
     dispose_backup,
     pin_unverified_upgrade_backup,
     restore_gap_fill_backup,
@@ -34,6 +51,7 @@ from qobuz_librarian.library.backup import (
     warn_pin_failed,
 )
 from qobuz_librarian.library.catalog import (
+    _destructive_track_match,
     _disc_scoped_match,
     _is_split_album_merge,
     album_quality_label,
@@ -47,6 +65,15 @@ from qobuz_librarian.library.catalog import (
     is_lossless_album,
     prompt_and_migrate_multi_artist_folder,
     track_signatures_for_album_dirs,
+)
+from qobuz_librarian.library.release_identity import (
+    DirectoryPathReceipt,
+    ReleaseManifestError,
+    _close_descriptors,
+    _directory_chain_matches,
+    _open_album_directory,
+    capture_directory_path_receipt,
+    identity_from_album,
 )
 from qobuz_librarian.library.scanner import (
     clear_scan_caches,
@@ -75,6 +102,9 @@ from qobuz_librarian.quality.verify import (
 from qobuz_librarian.queue.executor import (
     _pre_import_staging_hooks,
 )
+from qobuz_librarian.queue.post_import_finalizer import (
+    open_verified_album_inventory,
+)
 from qobuz_librarian.repair_log import warn_if_download_truncated
 from qobuz_librarian.ui_cli.colors import C, fmt, format_size, section, truncate
 from qobuz_librarian.ui_cli.errors import plural
@@ -85,6 +115,218 @@ from qobuz_librarian.ui_cli.prompts import (
     print_album_summary,
     prompt_edition_pick,
 )
+
+
+def finalize_release_identity(
+    album: dict,
+    final_dir: Path,
+    *,
+    expected_destination: Path,
+    expected_path_receipt: DirectoryPathReceipt,
+    frozen_slots,
+    authority: run_lock.RunLockLease,
+    cancel_check=None,
+) -> bool:
+    """Publish one Qobuz identity only at its exact completed destination."""
+    identity = identity_from_album(album)
+    tracks = (album.get("tracks") or {}).get("items") if type(album) is dict else None
+    try:
+        final_path = os.fspath(final_dir)
+        expected_path = os.fspath(expected_destination)
+    except TypeError as exc:
+        raise ReleaseManifestError("release finalization has an invalid path") from exc
+    if (
+        identity is None
+        or not isinstance(tracks, list)
+        or not tracks
+    ):
+        raise ReleaseManifestError("release finalization has no canonical identity")
+    if (
+        not os.path.isabs(final_path)
+        or os.path.abspath(final_path) != final_path
+        or not os.path.isabs(expected_path)
+        or os.path.abspath(expected_path) != expected_path
+        or final_path != expected_path
+    ):
+        raise ReleaseManifestError(
+            "release finalization did not reach the planned destination"
+        )
+    path_receipt = expected_path_receipt
+    if (
+        not isinstance(path_receipt, DirectoryPathReceipt)
+        or path_receipt.path != final_path
+        or not path_receipt.exists
+        or path_receipt.directory_identity is None
+    ):
+        raise ReleaseManifestError("release destination is not an exact directory")
+    if type(authority) is not run_lock.RunLockLease or authority.intact() is not True:
+        raise ReleaseManifestError("the shared run lock was lost before publication")
+    if cancel_check is not None and cancel_check():
+        raise ReleaseManifestError("release identity publication was cancelled")
+    try:
+        expected_audio = {
+            candidate.relative_to(Path(final_path)): (None, None)
+            for candidate in Path(final_path).rglob("*")
+            if candidate.suffix.lower() in cfg.AUDIO_EXTS
+        }
+    except (OSError, ValueError) as exc:
+        raise ReleaseManifestError(
+            "release destination audio inventory changed"
+        ) from exc
+    with open_verified_album_inventory(
+        Path(final_path),
+        authority,
+        path_receipt,
+        expected_audio,
+    ) as inventory:
+        if not _final_release_inventory_matches(
+            Path(final_path),
+            tracks,
+            frozen_slots,
+            path_receipt,
+        ):
+            raise ReleaseManifestError(
+                "release destination audio inventory changed"
+            )
+        if cancel_check is not None and cancel_check():
+            raise ReleaseManifestError(
+                "release identity publication was cancelled"
+            )
+        changed = inventory.read_identity() != identity
+        inventory.publish(identity)
+        inventory.validate_namespace()
+    return changed
+
+
+def _freeze_release_slot_signatures(album, missing, present, existing, result):
+    """Freeze exact requested and reviewed-baseline recordings before Beets."""
+    try:
+        refresh_staged_track_bindings(result)
+    except OSError:
+        return None
+    coverage = exact_download_coverage(result, album)
+    tracks = (album.get("tracks") or {}).get("items") if type(album) is dict else None
+    slots = album_track_slots(album) if isinstance(tracks, list) else ()
+    if coverage is None or not slots or len(slots) != len(tracks):
+        return None
+    track_by_slot = dict(zip(slots, tracks))
+    missing_ids = {id(track) for track in missing}
+    present_ids = {id(track) for track in present}
+    if missing_ids & present_ids or missing_ids | present_ids != {id(t) for t in tracks}:
+        return None
+    frozen = {}
+    for binding in coverage.bindings:
+        track = track_by_slot.get(binding.slot)
+        signature = _flac_signature(Path(binding.path))
+        if (
+            track is None
+            or signature is None
+            or signature[2:4] != canonical_track_slot(
+                track, "media_number", "track_number"
+            )
+        ):
+            return None
+        frozen[binding.slot] = signature
+    for slot, track in track_by_slot.items():
+        if slot in frozen:
+            continue
+        if id(track) not in present_ids:
+            continue
+        candidates = [
+            value for value in existing
+            if _destructive_track_match(track, value)
+        ]
+        if len(candidates) != 1:
+            return None
+        path = candidates[0].get("path")
+        signature = _flac_signature(Path(path)) if path else None
+        if signature is None or signature[2:4] != canonical_track_slot(
+            track, "media_number", "track_number"
+        ):
+            return None
+        frozen[slot] = signature
+    return frozen if set(frozen) == set(slots) else None
+
+
+def _final_album_matches_frozen_slots(folder: Path, frozen) -> bool:
+    if type(frozen) is not dict or not frozen:
+        return False
+    try:
+        signatures = [
+            _flac_signature(path)
+            for path in sorted(folder.rglob("*.flac"))
+            if path.is_file() and not path.is_symlink()
+        ]
+    except OSError:
+        return False
+    return (
+        None not in signatures
+        and len(signatures) == len(frozen)
+        and len(set(signatures)) == len(signatures)
+        and set(signatures) == set(frozen.values())
+    )
+
+
+def _final_release_inventory_matches(
+    folder: Path,
+    qobuz_tracks,
+    frozen_slots,
+    path_receipt: DirectoryPathReceipt,
+) -> bool:
+    """Audit the exact held destination named by *path_receipt*.
+
+    The descriptor-root alias keeps both existing scanners on the opened
+    directory inode.  A public-path swap cannot redirect either inventory
+    proof, and the complete directory chain is checked again afterwards.
+    """
+    descriptors = ()
+    try:
+        receipt, descriptors = _open_album_directory(
+            folder,
+            expected_path_receipt=path_receipt,
+        )
+        if receipt != path_receipt or not _directory_chain_matches(
+            receipt, descriptors
+        ):
+            return False
+        held_root = Path(f"/proc/self/fd/{descriptors[-1]}")
+        matches = (
+            _folder_holds_exact_tracks(held_root, qobuz_tracks)
+            and _final_album_matches_frozen_slots(held_root, frozen_slots)
+        )
+        return bool(
+            matches and _directory_chain_matches(receipt, descriptors)
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+    finally:
+        _close_descriptors(descriptors)
+
+
+def _split_relocation_allows_identity(result) -> bool:
+    """Only an exact, nonempty split reunion can authorise publication."""
+    return bool(
+        getattr(result, "changed", False) is True
+        and type(getattr(result, "published_files", None)) is int
+        and result.published_files > 0
+        and getattr(result, "reason", None) is None
+    )
+
+
+def _folder_holds_exact_tracks(folder: Path, qobuz_tracks) -> bool:
+    """Require a complete one-to-one album inventory with no extra audio."""
+    try:
+        audio = [
+            path for path in folder.rglob("*")
+            if path.suffix.lower() in cfg.AUDIO_EXTS
+            and path.is_file()
+            and not path.is_symlink()
+        ]
+    except OSError:
+        return False
+    return len(audio) == len(qobuz_tracks) and folder_holds_all_tracks(
+        folder, qobuz_tracks, destructive=True
+    )
 
 
 def _recover_incomplete_upgrade_backup(backup, album_dir, *, operation):
@@ -522,7 +764,14 @@ def _carry_non_audio_from_backup(album, album_dir, backup_path,
         dest = album_dir
     if not dest or not dest.exists():
         return None
-    receipt = capture_album_source_receipt(dest)
+    expected_identity = identity_from_album(album)
+    if expected_identity is None:
+        return None
+    receipt = carry_backup_release_identity(
+        backup_path,
+        dest,
+        expected_identity,
+    )
     if receipt is None:
         return None
     updated = carry_backup_companions(
@@ -1016,10 +1265,13 @@ def process_album(album, args, *, allow_force=True, label=None,
     transient_lyric_sigs = []
     resampled_n = 0
     post_import_signatures = []
+    release_slot_signatures = None
     staged_dirs_for_import = []
     download_result = {}
     quality_verdict = None
     _gap_fill_not_located = False  # gap-fill succeeded on paper but album not found on disk
+    placement = None
+    release_identity_attention = False
 
     try:
         snapshot = snapshot_staging()
@@ -1169,6 +1421,9 @@ def process_album(album, args, *, allow_force=True, label=None,
                 args, staged_dirs_for_import)
             post_import_signatures = track_signatures_for_album_dirs(
                 staged_dirs_for_import)
+            release_slot_signatures = _freeze_release_slot_signatures(
+                album, missing, present, existing, download_result
+            )
 
         # ── Beets import ─────────────────────────────────────────────────────────
         imported = False
@@ -1178,12 +1433,35 @@ def process_album(album, args, *, allow_force=True, label=None,
             log.info(fmt(C.YELLOW, "\n  Skipping beets import — nothing succeeded."))
         else:
             log.info("")
+            try:
+                placement = resolve_album_import_placement(album, token)
+                if isinstance(placement, AlbumPlacement):
+                    require_album_placement_current(placement)
+            except AlbumImportIdentityAmbiguous as exc:
+                log.info(fmt(C.RED, f"  ✗  identity-review: {exc}"))
+                return {
+                    "result": "identity_ambiguous",
+                    "imported": False,
+                    "n_ok": n_ok,
+                    "n_fail": n_fail,
+                    "n_lossy": n_lossy,
+                }
+            except AlbumPlacementAttention as exc:
+                log.info(fmt(C.RED, f"  ✗  identity-review: {exc}"))
+                return {
+                    "result": "identity_attention",
+                    "imported": False,
+                    "n_ok": n_ok,
+                    "n_fail": n_fail,
+                    "n_lossy": n_lossy,
+                }
             # A brand-new album (no folder found on disk) lands in a fresh
             # directory, so it can't split an existing beets album into
             # duplicate rows — skip the full-library de-dup scan for it.
             imported = beets_import_paths(
                 consolidate=album_dir is not None,
                 album_dirs=staged_dirs_for_import,
+                album_path_suffix=placement.suffix,
             )
             if (
                 imported
@@ -1454,6 +1732,7 @@ def process_album(album, args, *, allow_force=True, label=None,
     if imported:
         strict_success = n_fail == 0 and n_lossy == 0
         post_dir_exact = False
+        relocation_identity_ready = True
         if getattr(args, "migrate_multi_artist", False) and strict_success:
             migration_source = (
                 find_album_dir_by_track_signatures(post_import_signatures)
@@ -1511,10 +1790,12 @@ def process_album(album, args, *, allow_force=True, label=None,
                         post_dir,
                         kind=RelocationKind.SPLIT_GAP_FILL,
                         authority=run_lock.current_lease(),
+                        require_no_conflicts=True,
                     )
                 except PostImportRelocationAttention:
                     raise
                 except (PostImportRelocationUnavailable, OSError, ValueError) as exc:
+                    relocation_identity_ready = False
                     log.info(fmt(
                         C.YELLOW,
                         "  ⚠  Beets split this album across two artist folders; "
@@ -1522,7 +1803,7 @@ def process_album(album, args, *, allow_force=True, label=None,
                     ))
                     vlog(f"split-folder reunion refused: {exc}")
                 else:
-                    if relocation.changed:
+                    if _split_relocation_allows_identity(relocation):
                         message = (
                             f"  ✓  Reunited {relocation.published_files} existing "
                             f"file(s) in the primary-artist folder."
@@ -1531,11 +1812,42 @@ def process_album(album, args, *, allow_force=True, label=None,
                             message += f" {relocation.reason.capitalize()}."
                         log.info(fmt(C.GREEN, message))
                     else:
+                        relocation_identity_ready = False
                         log.info(fmt(
                             C.YELLOW,
                             "  ⚠  Split-folder detected, but every source name "
                             "already exists at the destination; both were kept.",
                         ))
+            if (
+                strict_success
+                and post_dir_exact
+                and placement is not None
+                and relocation_identity_ready
+                and post_import_signatures
+                and release_slot_signatures is not None
+                and len(post_import_signatures) == n_ok
+                and n_ok == len(missing)
+                and not is_cancel_requested()
+            ):
+                try:
+                    final_path_receipt = capture_directory_path_receipt(
+                        post_dir
+                    )
+                    finalize_release_identity(
+                        album,
+                        post_dir,
+                        expected_destination=placement.destination,
+                        expected_path_receipt=final_path_receipt,
+                        frozen_slots=release_slot_signatures,
+                        authority=run_lock.current_lease(),
+                        cancel_check=is_cancel_requested,
+                    )
+                except (ReleaseManifestError, OSError) as exc:
+                    release_identity_attention = True
+                    log.info(fmt(
+                        C.RED,
+                        f"  ✗  identity-review: {exc}",
+                    ))
             # Resolve transient-lyric signatures captured pre-beets
             if transient_lyric_sigs:
                 resolved = _resolve_signatures_to_paths(
@@ -1603,7 +1915,9 @@ def process_album(album, args, *, allow_force=True, label=None,
                 log.info(f"     {truncate(t, 60)}")
         log.info("")
 
-    if n_ok and n_fail:
+    if release_identity_attention:
+        result_status = "identity_attention"
+    elif n_ok and n_fail:
         result_status = "partial"
     elif n_ok and not imported and not args.no_import:
         # Tracks ripped but didn't make it into the library (a beets failure, or
@@ -1659,4 +1973,5 @@ def process_album(album, args, *, allow_force=True, label=None,
         "upgrade_unverified": upgrade_unverified,
         "auto_upgrade": bool(auto_upgrade_active),
         "quality_verdict": quality_verdict,
+        "release_identity_attention": release_identity_attention,
     }

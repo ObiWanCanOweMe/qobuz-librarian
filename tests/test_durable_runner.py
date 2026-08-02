@@ -1,3 +1,4 @@
+import hashlib
 from argparse import Namespace
 from contextlib import contextmanager
 
@@ -28,6 +29,13 @@ from qobuz_librarian.integrations.beets import (
 from qobuz_librarian.integrations.staging import (
     StagingReferenceInspection,
     StagingReferenceStatus,
+)
+from qobuz_librarian.library.album_placement import resolve_album_placement
+from qobuz_librarian.library.backup import backup_album_dir
+from qobuz_librarian.library.release_identity import (
+    ReleaseIdentity,
+    publish_release_identity,
+    read_release_identity,
 )
 from qobuz_librarian.queue import durable_runner
 from qobuz_librarian.queue import journal as queue_state
@@ -65,6 +73,143 @@ def _single_track_item(label):
         auto_upgrade=False,
         quality=4,
     )
+
+
+def test_durable_import_refuses_a_changed_planned_path_before_mutation(
+        tmp_path, monkeypatch, authority):
+    from qobuz_librarian.queue.durable_runner import DurableAlbumUnavailable
+
+    monkeypatch.setattr(cfg, "QUEUE_JOURNAL_DIR", tmp_path / "journals")
+    item = _single_track_item("Bound Album")
+    args = Namespace(no_import=False)
+    friendly = tmp_path / "music" / "Artist" / "Bound Album"
+    friendly.parent.mkdir(parents=True)
+    placement = resolve_album_placement(
+        friendly, ReleaseIdentity("qobuz", "42"))
+    plan = plan_durable_new_album(
+        item,
+        args,
+        album_path_suffix=placement.suffix,
+        release_identity=placement.identity,
+        placement_destination=placement.destination,
+        placement=placement,
+    )
+    assert plan is not None
+
+    friendly.mkdir()
+    publish_release_identity(friendly, placement.identity)
+    started = []
+    monkeypatch.setattr(
+        durable_runner, "snapshot_staging", lambda: started.append("snapshot"))
+
+    with pytest.raises(DurableAlbumUnavailable, match="path binding changed"):
+        durable_runner.execute_durable_new_album(
+            [item],
+            item,
+            args,
+            plan=plan,
+            origin=CompletionOrigin(CompletionOriginKind.CLI, "album queue"),
+            mode="cli:album",
+            authority=authority,
+        )
+
+    assert started == []
+    assert queue_state.list_queue_journals() == ()
+
+
+def test_durable_upgrade_rebinds_placement_after_owned_source_retirement(
+        tmp_path, monkeypatch, authority):
+    item = _single_track_item("Upgrade Album")
+    music = tmp_path / "music"
+    friendly = music / "Artist" / "Upgrade Album"
+    friendly.mkdir(parents=True)
+    (friendly / "01.flac").write_bytes(b"reviewed release audio")
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    monkeypatch.setattr(cfg, "DOWNSAMPLE_HIRES_ENABLED", False)
+    args = Namespace(no_import=False, no_downsample=True)
+    identity = ReleaseIdentity("qobuz", "42")
+    publish_release_identity(friendly, identity)
+    placement = resolve_album_placement(friendly, identity)
+    item["album_dir"] = friendly
+    item["auto_upgrade"] = True
+    plan = plan_durable_new_album(
+        item,
+        args,
+        album_path_suffix=placement.suffix,
+        release_identity=placement.identity,
+        placement_destination=placement.destination,
+        placement=placement,
+    )
+    assert plan is not None
+    assert plan.library_backup_kind == "upgrade"
+
+    backup = backup_album_dir(friendly)
+    assert backup is not None and backup.complete is True
+    item["backup_path"] = backup
+    refreshed = durable_runner._refresh_plan_after_upgrade_backup(
+        item,
+        args,
+        plan,
+        authority=authority,
+    )
+
+    assert refreshed.placement is not None
+    assert refreshed.placement.destination == friendly
+    assert refreshed.placement.destination_receipt is not None
+    assert refreshed.placement.destination_receipt.exists is False
+    durable_runner._require_current_plan(item, args, refreshed)
+
+
+def test_durable_upgrade_rebind_refuses_lost_authority_before_resolution(
+    tmp_path, monkeypatch, authority
+):
+    item = _single_track_item("Upgrade Album")
+    music = tmp_path / "music"
+    friendly = music / "Artist" / "Upgrade Album"
+    friendly.mkdir(parents=True)
+    (friendly / "01.flac").write_bytes(b"reviewed release audio")
+    monkeypatch.setattr(cfg, "MUSIC_ROOT", music)
+    monkeypatch.setattr(cfg, "UPGRADE_BACKUP_DIR", tmp_path / "backups")
+    monkeypatch.setattr(cfg, "DOWNSAMPLE_HIRES_ENABLED", False)
+    args = Namespace(no_import=False, no_downsample=True)
+    identity = ReleaseIdentity("qobuz", "42")
+    publish_release_identity(friendly, identity)
+    placement = resolve_album_placement(friendly, identity)
+    item["album_dir"] = friendly
+    item["auto_upgrade"] = True
+    plan = plan_durable_new_album(
+        item,
+        args,
+        album_path_suffix=placement.suffix,
+        release_identity=placement.identity,
+        placement_destination=placement.destination,
+        placement=placement,
+    )
+    assert plan is not None
+    backup = backup_album_dir(friendly)
+    assert backup is not None and backup.complete is True
+    item["backup_path"] = backup
+    resolved = []
+    monkeypatch.setattr(
+        durable_runner,
+        "resolve_album_placement",
+        lambda *_args: resolved.append(True),
+    )
+    authority.close()
+
+    with pytest.raises(
+        durable_runner.DurableAlbumUnavailable,
+        match="authority",
+    ):
+        durable_runner._refresh_plan_after_upgrade_backup(
+            item,
+            args,
+            plan,
+            authority=authority,
+        )
+
+    assert resolved == []
 
 
 def test_download_quarantine_checkpoint_is_persisted_before_error_propagates(
@@ -288,7 +433,7 @@ def test_failed_download_leaving_only_art_stays_retryable(
     assert saved.recovery_references == ()
 
 
-def test_durable_album_removes_queue_only_under_live_completion_proof(
+def test_durable_collision_suffix_reaches_managed_import_with_completion_proof(
     tmp_path, monkeypatch, authority
 ):
     staging = tmp_path / "staging"
@@ -297,11 +442,24 @@ def test_durable_album_removes_queue_only_under_live_completion_proof(
     monkeypatch.setattr(cfg, "QUEUE_JOURNAL_DIR", tmp_path / "journals")
     monkeypatch.setattr(cfg, "BEETS_DB_PATH", beets_dir / "library.db")
     monkeypatch.setattr(cfg, "MUSIC_ROOT", tmp_path / "music")
+    friendly = tmp_path / "music" / "Artist" / "Safe Album"
+    friendly.mkdir(parents=True)
+    publish_release_identity(friendly, ReleaseIdentity("qobuz", "100"))
+    placement = resolve_album_placement(
+        friendly, ReleaseIdentity("qobuz", "42"))
+    final_dir = placement.destination
 
     item = _single_track_item("Safe Album")
     queue = [item]
     args = Namespace(no_import=False)
-    plan = plan_durable_new_album(item, args)
+    plan = plan_durable_new_album(
+        item,
+        args,
+        album_path_suffix=placement.suffix,
+        release_identity=placement.identity,
+        placement_destination=placement.destination,
+        placement=placement,
+    )
     assert plan is not None
 
     slot = plan.expectation.catalogue_slots[0]
@@ -375,8 +533,11 @@ def test_durable_album_removes_queue_only_under_live_completion_proof(
         on_reservation,
         on_intent,
         authority_check,
+        album_path_suffix,
     ):
+        observed["album_path_suffix"] = album_path_suffix
         authority_check()
+        final_dir.mkdir()
         reservation = {
             "version": 1,
             "path": str(beets_dir / f".qobuz-managed-beets-{nonce}.jsonl"),
@@ -411,20 +572,36 @@ def test_durable_album_removes_queue_only_under_live_completion_proof(
                 "carrier": carrier,
             }
         )
+        final_audio = final_dir / "01.flac"
+        final_audio.write_bytes(b"durable collision audio")
+        audio_identity = final_audio.stat()
+        final_identity = final_dir.stat()
         managed = ManagedImportEvidence(
             owner=RecoveryOwner(owner["operation_id"], owner["item_id"]),
             library_root=str(tmp_path / "music"),
             library_root_identity=(8, 9, 0, 10, 11),
-            album_path="Artist/Safe Album",
-            album_identity=(8, 10, 0, 12, 13),
+            album_path="Artist/Safe Album [qobuz-42]",
+            album_identity=(
+                final_identity.st_dev,
+                final_identity.st_ino,
+                final_identity.st_size,
+                final_identity.st_mtime_ns,
+                final_identity.st_ctime_ns,
+            ),
             manifest_hash="c" * 64,
             mappings=(
                 ManagedMapping(
                     slot,
                     bindings[0]["path"],
                     tuple(bindings[0]["identity"]),
-                    "Artist/Safe Album/01.flac",
-                    (8, 11, 100, 14, 15),
+                    "Artist/Safe Album [qobuz-42]/01.flac",
+                    (
+                        audio_identity.st_dev,
+                        audio_identity.st_ino,
+                        audio_identity.st_size,
+                        audio_identity.st_mtime_ns,
+                        audio_identity.st_ctime_ns,
+                    ),
                 ),
             ),
         )
@@ -488,7 +665,7 @@ def test_durable_album_removes_queue_only_under_live_completion_proof(
             mapping.slot,
             mapping.destination_path,
             mapping.destination_identity,
-            "e" * 64,
+            hashlib.sha256((final_dir / "01.flac").read_bytes()).hexdigest(),
         )
         target = expectation.quality_targets[0]
         assessment = assess_completion(
@@ -537,6 +714,8 @@ def test_durable_album_removes_queue_only_under_live_completion_proof(
 
     assert result.status is durable_runner.DurableAlbumStatus.COMPLETE
     assert observed["active_before_download"] is True
+    assert observed["album_path_suffix"] == " [qobuz-42]"
     assert observed["live_queue"] and observed["live_queue"][0] is True
+    assert read_release_identity(final_dir) == ReleaseIdentity("qobuz", "42")
     assert queue == []
     assert queue_state.list_queue_journals() == ()
