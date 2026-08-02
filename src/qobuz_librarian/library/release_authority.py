@@ -47,6 +47,14 @@ class AlbumAuthorityUnavailable(OSError):
     """The requested album mutation cannot be authorised safely."""
 
 
+@dataclass(frozen=True, slots=True)
+class AlbumDirectorySnapshot:
+    """Exact album-directory state immediately before an authorised mutation."""
+
+    entries: tuple[str, ...]
+    version: FileVersion
+
+
 @dataclass(slots=True)
 class _DirectoryBinding:
     descriptor: int
@@ -586,14 +594,99 @@ class AlbumAuthority:
         with self._lock:
             self._validate_namespace_locked()
 
-    def _validate_namespace_locked(
+    @staticmethod
+    def _entry_names(descriptor: int) -> tuple[str, ...]:
+        return tuple(sorted(os.listdir(descriptor), key=os.fsencode))
+
+    def snapshot_directory(self) -> AlbumDirectorySnapshot:
+        """Freeze the exact album entries before this authority mutates them."""
+        with self._lock:
+            self._validate_namespace_locked()
+            descriptor = self._directories[-1].descriptor
+            before = os.fstat(descriptor)
+            entries = self._entry_names(descriptor)
+            after = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(before.st_mode)
+                or not stat.S_ISDIR(after.st_mode)
+                or file_version(before) != file_version(after)
+                or file_version(after) != self._directories[-1].version
+            ):
+                raise AlbumAuthorityUnavailable(
+                    "album namespace changed while mutation was prepared"
+                )
+            self._require_run_lock()
+            return AlbumDirectorySnapshot(entries, file_version(after))
+
+    def commit_directory_mutation(
+        self,
+        snapshot: AlbumDirectorySnapshot,
+        expected_entries: tuple[str, ...],
+    ) -> None:
+        """Adopt one exact descriptor-relative entry transition.
+
+        The public album inode and every held file remain fixed. Only the leaf
+        directory's full version may advance, and only when its complete entry
+        set is exactly the caller's expected post-mutation set.
+        """
+        with self._lock:
+            self._require_open()
+            self._require_run_lock()
+            if (
+                not isinstance(snapshot, AlbumDirectorySnapshot)
+                or snapshot.version != self._directories[-1].version
+                or not isinstance(expected_entries, tuple)
+                or any(type(name) is not str for name in expected_entries)
+                or tuple(sorted(expected_entries, key=os.fsencode)) != expected_entries
+            ):
+                raise AlbumAuthorityUnavailable(
+                    "album directory mutation evidence is invalid"
+                )
+            if not all(
+                _directory_binding_intact(binding)
+                for binding in self._directories[:-1]
+            ):
+                raise AlbumAuthorityUnavailable(
+                    "album namespace changed during authorised mutation"
+                )
+            leaf = self._directories[-1]
+            try:
+                held_before = os.fstat(leaf.descriptor)
+                entries = self._entry_names(leaf.descriptor)
+                if leaf.parent_descriptor is None:
+                    named = os.stat(os.path.sep, follow_symlinks=False)
+                else:
+                    named = os.stat(
+                        leaf.name,
+                        dir_fd=leaf.parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                held_after = os.fstat(leaf.descriptor)
+            except (OSError, TypeError, ValueError) as exc:
+                raise AlbumAuthorityUnavailable(
+                    "album namespace changed during authorised mutation"
+                ) from exc
+            version = file_version(held_before)
+            if (
+                not stat.S_ISDIR(held_before.st_mode)
+                or not stat.S_ISDIR(named.st_mode)
+                or not stat.S_ISDIR(held_after.st_mode)
+                or version != file_version(named)
+                or version != file_version(held_after)
+                or entries != expected_entries
+                or not directory_path_receipt_matches(self.path_receipt)
+            ):
+                raise AlbumAuthorityUnavailable(
+                    "album namespace changed during authorised mutation"
+                )
+            self._validate_file_bindings_locked()
+            leaf.version = version
+            self._validate_namespace_locked()
+
+    def _validate_file_bindings_locked(
         self,
         additional: tuple[_FileBinding, ...] = (),
     ) -> None:
-        self._require_open()
-        self._require_run_lock()
-        if not self._album_namespace_intact():
-            raise AlbumAuthorityUnavailable("album namespace changed under authority")
         for binding in (*self._files, *additional):
             try:
                 held_value = os.fstat(binding.held.descriptor)
@@ -622,6 +715,16 @@ class AlbumAuthority:
                 raise AlbumAuthorityUnavailable(
                     "album file namespace changed under authority"
                 )
+
+    def _validate_namespace_locked(
+        self,
+        additional: tuple[_FileBinding, ...] = (),
+    ) -> None:
+        self._require_open()
+        self._require_run_lock()
+        if not self._album_namespace_intact():
+            raise AlbumAuthorityUnavailable("album namespace changed under authority")
+        self._validate_file_bindings_locked(additional)
         self._require_run_lock()
 
     def _close_resources(self) -> BaseException | None:

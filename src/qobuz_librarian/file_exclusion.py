@@ -268,9 +268,11 @@ class _InodeLeaseLifetime:
     """Resources behind one lease; held only by its one-shot finaliser."""
 
     def __init__(self, descriptor: io.FileIO,
-                 signal_reference: _LeaseSignalReference):
+                 signal_reference: _LeaseSignalReference,
+                 lease_type: int = fcntl.F_RDLCK):
         self.descriptor = descriptor
         self.signal_reference = signal_reference
+        self.lease_type = lease_type
         self.lock = threading.RLock()
 
     def intact(self) -> bool:
@@ -284,7 +286,7 @@ class _InodeLeaseLifetime:
                 return (
                     fcntl.fcntl(
                         self.descriptor.fileno(), fcntl.F_GETLEASE)
-                    == fcntl.F_RDLCK
+                    == self.lease_type
                 )
             except (OSError, TypeError, ValueError):
                 return False
@@ -312,13 +314,24 @@ class _InodeLeaseLifetime:
 
 
 class InodeWriteExclusion:
-    """A read lease that excludes existing and newly opened writers."""
+    """A Linux inode lease that excludes access outside its held boundary."""
 
     def __init__(self, descriptor: io.FileIO,
-                 signal_reference: _LeaseSignalReference):
-        lifetime = _InodeLeaseLifetime(descriptor, signal_reference)
+                 signal_reference: _LeaseSignalReference,
+                 lease_type: int = fcntl.F_RDLCK,
+                 owns_source_descriptor: bool = False):
+        lifetime = _InodeLeaseLifetime(
+            descriptor,
+            signal_reference,
+            lease_type,
+        )
+        self._owns_source_descriptor = owns_source_descriptor
         self._lifetime = weakref.ref(lifetime)
         self._finalizer = weakref.finalize(self, lifetime.release)
+
+    @property
+    def owns_source_descriptor(self) -> bool:
+        return self._owns_source_descriptor
 
     def intact(self) -> bool:
         if not self._finalizer.alive:
@@ -465,5 +478,93 @@ def acquire_inode_write_exclusion(descriptor: int) -> InodeWriteExclusion | None
     finally:
         if owned_descriptor is not None:
             owned_descriptor.close()
+        if signal_reference is not None:
+            signal_reference.close()
+
+
+def acquire_inode_write_lease(descriptor: io.FileIO) -> InodeWriteExclusion | None:
+    """Continuously exclude access through one owning O_RDWR creator object.
+
+    Unlike :func:`acquire_inode_write_exclusion`, this installs ``F_WRLCK``
+    directly on the caller's existing ``FileIO`` open-file description. The
+    lease lifetime retains that same finalizable owner and closes it after
+    unlocking. The caller may safely call ``close()`` again; FileIO cleanup is
+    idempotent even if an asynchronous exception loses the lease return value.
+    """
+    required = (
+        "F_GETLEASE",
+        "F_SETLEASE",
+        "F_WRLCK",
+        "F_UNLCK",
+        "F_SETSIG",
+    )
+    if sys.platform != "linux" or any(
+        not hasattr(fcntl, name) for name in required
+    ):
+        return None
+    if not all(
+        hasattr(signal, name)
+        for name in ("SIGIO", "SIG_BLOCK", "pthread_sigmask", "sigtimedwait")
+    ):
+        return None
+    signal_reference = None
+    lease_set = False
+    held = -1
+
+    def release_if_still_owned() -> None:
+        if not lease_set:
+            return
+        try:
+            current = descriptor.fileno()
+        except (OSError, TypeError, ValueError):
+            return
+        if current != held:
+            return
+        try:
+            fcntl.fcntl(current, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+        except (OSError, TypeError, ValueError):
+            pass
+
+    try:
+        if not isinstance(descriptor, io.FileIO) or descriptor.closed:
+            return None
+        held = descriptor.fileno()
+        flags = fcntl.fcntl(held, fcntl.F_GETFL)
+        path_flag = getattr(os, "O_PATH", 0)
+        original = os.fstat(held)
+        if (
+            (flags & os.O_ACCMODE) != os.O_RDWR
+            or (path_flag and flags & path_flag)
+            or not stat.S_ISREG(original.st_mode)
+        ):
+            return None
+        signal_reference = _LeaseSignalTarget.acquire()
+        if signal_reference is None:
+            return None
+        fcntl.fcntl(
+            held,
+            _F_SETOWN_EX,
+            struct.pack("=ii", _F_OWNER_TID, signal_reference.tid),
+        )
+        fcntl.fcntl(held, fcntl.F_SETSIG, signal.SIGIO)
+        fcntl.fcntl(held, fcntl.F_SETLEASE, fcntl.F_WRLCK)
+        lease_set = True
+        if fcntl.fcntl(held, fcntl.F_GETLEASE) != fcntl.F_WRLCK:
+            return None
+        exclusion = InodeWriteExclusion(
+            descriptor,
+            signal_reference,
+            fcntl.F_WRLCK,
+            True,
+        )
+        signal_reference = None
+        return exclusion
+    except (OSError, TypeError, ValueError, struct.error):
+        release_if_still_owned()
+        return None
+    except BaseException:
+        release_if_still_owned()
+        raise
+    finally:
         if signal_reference is not None:
             signal_reference.close()
