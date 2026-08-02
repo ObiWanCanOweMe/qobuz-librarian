@@ -424,6 +424,7 @@ class AlbumAuthority:
         normalised, parts, key = _safe_relative(relative)
         existing = self._files_by_relative.get(normalised)
         if existing is not None:
+            self._validate_namespace_locked()
             if expected_digest is not None and not secrets.compare_digest(
                 existing.held.digest, expected_digest
             ):
@@ -518,6 +519,7 @@ class AlbumAuthority:
                 parent,
                 name,
             )
+            self._validate_namespace_locked((binding,))
             self._files.append(binding)
             self._files_by_relative[normalised] = binding
             self._last_file_key = key
@@ -553,12 +555,15 @@ class AlbumAuthority:
         with self._lock:
             self._validate_namespace_locked()
 
-    def _validate_namespace_locked(self) -> None:
+    def _validate_namespace_locked(
+        self,
+        additional: tuple[_FileBinding, ...] = (),
+    ) -> None:
         self._require_open()
         self._require_run_lock()
         if not self._album_namespace_intact():
             raise AlbumAuthorityUnavailable("album namespace changed under authority")
-        for binding in self._files:
+        for binding in (*self._files, *additional):
             try:
                 held_value = os.fstat(binding.held.descriptor)
                 named_value = os.stat(

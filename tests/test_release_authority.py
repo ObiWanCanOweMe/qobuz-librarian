@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import os
 import subprocess
@@ -72,6 +73,24 @@ def _finish_writer(process):
         process.communicate()
         raise
     assert process.returncode == 0, (stdout, stderr)
+
+
+def _nonblocking_writer_errno(path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os,sys; "
+                "\ntry: descriptor=os.open(sys.argv[1], os.O_WRONLY|os.O_NONBLOCK)"
+                "\nexcept OSError as error: sys.exit(error.errno)"
+                "\nelse: os.close(descriptor); sys.exit(0)"
+            ),
+            os.fspath(path),
+        ],
+        check=False,
+    )
+    return result.returncode
 
 
 def _assert_descriptor_closed(descriptor):
@@ -196,6 +215,100 @@ def test_album_authority_refuses_out_of_order_acquisition(
             authority.open_file(Path("01.flac"))
 
     _assert_descriptor_closed(held.descriptor)
+
+
+def test_album_authority_revalidates_cached_file_name_before_return(
+    tmp_path, live_run_lock
+):
+    lease, _lock_file = live_run_lock
+    album = _album(tmp_path)
+    track = album / "01.flac"
+    displaced = album / "displaced.flac"
+    track.write_bytes(b"one")
+
+    with open_album_authority(album, lease) as authority:
+        authority.open_file(Path("01.flac"))
+        track.rename(displaced)
+        track.write_bytes(b"replacement")
+        with pytest.raises(AlbumAuthorityUnavailable, match="namespace changed"):
+            authority.open_file(Path("01.flac"))
+
+
+def test_album_authority_revalidates_cached_file_lease_before_return(
+    tmp_path, live_run_lock
+):
+    lease, _lock_file = live_run_lock
+    album = _album(tmp_path)
+    track = album / "01.flac"
+    track.write_bytes(b"one")
+
+    with open_album_authority(album, lease) as authority:
+        authority.open_file(Path("01.flac"))
+        assert _nonblocking_writer_errno(track) == errno.EAGAIN
+        with pytest.raises(AlbumAuthorityUnavailable, match="namespace changed"):
+            authority.open_file(Path("01.flac"))
+
+
+def test_album_authority_revalidates_run_lock_after_file_hashing(
+    tmp_path, live_run_lock, monkeypatch
+):
+    from qobuz_librarian.library import release_authority
+
+    lease, lock_file = live_run_lock
+    album = _album(tmp_path)
+    track = album / "01.flac"
+    track.write_bytes(b"one")
+    real_hash = release_authority._sha256_fd
+
+    def hash_then_replace_run_lock(descriptor):
+        digest = real_hash(descriptor)
+        lock_file.unlink()
+        return digest
+
+    monkeypatch.setattr(
+        release_authority,
+        "_sha256_fd",
+        hash_then_replace_run_lock,
+    )
+    with pytest.raises(RuntimeError, match="run-lock regression observed"):
+        with open_album_authority(album, lease) as authority:
+            with pytest.raises(AlbumAuthorityUnavailable, match="live run-lock"):
+                authority.open_file(Path("01.flac"))
+            writer = os.open(track, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(writer)
+            raise RuntimeError("run-lock regression observed")
+
+
+def test_album_authority_revalidates_prior_files_after_new_file_hashing(
+    tmp_path, live_run_lock, monkeypatch
+):
+    from qobuz_librarian.library import release_authority
+
+    lease, _lock_file = live_run_lock
+    album = _album(tmp_path)
+    first = album / "01.flac"
+    second = album / "02.flac"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+    real_hash = release_authority._sha256_fd
+
+    with open_album_authority(album, lease) as authority:
+        authority.open_file(Path("01.flac"))
+
+        def hash_then_break_prior_lease(descriptor):
+            digest = real_hash(descriptor)
+            assert _nonblocking_writer_errno(first) == errno.EAGAIN
+            return digest
+
+        monkeypatch.setattr(
+            release_authority,
+            "_sha256_fd",
+            hash_then_break_prior_lease,
+        )
+        with pytest.raises(AlbumAuthorityUnavailable, match="namespace changed"):
+            authority.open_file(Path("02.flac"))
+        writer = os.open(second, os.O_WRONLY | os.O_NONBLOCK)
+        os.close(writer)
 
 
 def test_album_authority_serializes_concurrent_file_acquisition(
