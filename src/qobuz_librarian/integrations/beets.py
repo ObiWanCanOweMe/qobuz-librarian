@@ -40,6 +40,7 @@ from enum import Enum
 from pathlib import Path
 
 from qobuz_librarian import config as cfg
+from qobuz_librarian import run_lock
 from qobuz_librarian.completion import (
     ManagedImportEvidence,
     ManagedMapping,
@@ -48,7 +49,7 @@ from qobuz_librarian.completion import (
 from qobuz_librarian.file_exclusion import acquire_inode_write_exclusion
 from qobuz_librarian.library.album_placement import (
     AlbumPlacementAttention,
-    capture_legacy_adoption_receipt,
+    LegacyAdoptionScan,
     resolve_album_placement,
 )
 from qobuz_librarian.library.catalog import (
@@ -63,7 +64,7 @@ from qobuz_librarian.library.release_identity import (
     is_release_manifest_name,
     read_release_identity,
 )
-from qobuz_librarian.library.scanner import clear_scan_caches, read_album_dir
+from qobuz_librarian.library.scanner import clear_scan_caches
 from qobuz_librarian.library.sqlite_atomic import (
     AtomicSQLiteWrite,
     _SQLiteDatabaseExclusion,
@@ -4572,35 +4573,54 @@ def resolve_album_import_placement(album, token):
         return resolve_album_placement(friendly, identity)
 
     artist_name = (album.get("artist") or {}).get("name") or ""
-    adoption_receipt = capture_legacy_adoption_receipt(friendly, identity)
-    existing = read_album_dir(friendly)
-    candidates = find_qobuz_album_candidates_for_dir(
-        friendly,
-        artist_name,
-        token,
-        target_dir=friendly,
-    )
-    selected, compatible = select_legacy_release(
-        existing,
-        candidates,
-        adoption_receipt=adoption_receipt,
-    )
-    if len(compatible) > 1:
-        raise AlbumImportIdentityAmbiguous(
-            "identity_ambiguous: friendly path matches multiple Qobuz releases"
-        )
-    adopted_identity = (
-        identity_from_album(selected.album) if selected is not None else None
-    )
-    selected_receipt = (
-        selected.adoption_receipt if selected is not None else None
-    )
-    return resolve_album_placement(
-        friendly,
-        identity,
-        adopted_identity=adopted_identity,
-        adoption_receipt=selected_receipt,
-    )
+    lease = run_lock.current_lease()
+    owned_lease = False
+    try:
+        if lease is None:
+            lease = run_lock.acquire()
+            owned_lease = True
+        if lease is None:
+            raise AlbumPlacementAttention(
+                "legacy adoption authority is unavailable"
+            )
+        with LegacyAdoptionScan(friendly, lease) as scan:
+            existing = scan.read_tracks()
+            candidates = find_qobuz_album_candidates_for_dir(
+                friendly,
+                artist_name,
+                token,
+                target_dir=friendly,
+            )
+            selected, compatible = select_legacy_release(
+                existing,
+                candidates,
+                adoption_proof=scan.proof(identity),
+            )
+            if len(compatible) > 1:
+                raise AlbumImportIdentityAmbiguous(
+                    "identity_ambiguous: friendly path matches multiple Qobuz releases"
+                )
+            adopted_identity = (
+                identity_from_album(selected.album)
+                if selected is not None
+                else None
+            )
+            selected_proof = (
+                selected.adoption_proof if selected is not None else None
+            )
+            return resolve_album_placement(
+                friendly,
+                identity,
+                adopted_identity=adopted_identity,
+                adoption_proof=selected_proof,
+            )
+    except run_lock.LockBusy as exc:
+        raise AlbumPlacementAttention(
+            "legacy adoption requires the live run lock"
+        ) from exc
+    finally:
+        if owned_lease and lease is not None:
+            lease.close()
 
 
 def _build_import_override_yaml(

@@ -5,12 +5,19 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+import sys
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
 from qobuz_librarian import config as cfg
 from qobuz_librarian.library.migrate import _truncate_component
+from qobuz_librarian.library.release_authority import (
+    AlbumAuthority,
+    AlbumAuthorityUnavailable,
+    HeldFileAuthority,
+    open_album_authority,
+)
 from qobuz_librarian.library.release_identity import (
     DirectoryPathReceipt,
     ReleaseIdentity,
@@ -19,8 +26,11 @@ from qobuz_librarian.library.release_identity import (
     _directory_chain_matches,
     _open_album_directory,
     capture_directory_path_receipt,
+    is_ignored_library_artifact,
+    is_release_manifest_name,
     read_release_identity_with_receipt,
 )
+from qobuz_librarian.run_lock import RunLockLease
 
 
 class PlacementDisposition(str, Enum):
@@ -56,6 +66,16 @@ class LegacyAdoptionReceipt:
     identity: ReleaseIdentity
     path_receipt: DirectoryPathReceipt
     audio: tuple[LegacyAudioReceipt, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyAdoptionProof:
+    """Live descriptor-backed evidence for one legacy placement decision."""
+
+    identity: ReleaseIdentity
+    path_receipt: DirectoryPathReceipt
+    audio_receipts: tuple[LegacyAudioReceipt, ...]
+    authority_generation: object
 
 
 class AlbumPlacementAttention(OSError):
@@ -313,12 +333,314 @@ def legacy_adoption_receipt_matches(
         return False
 
 
+def _read_held_audio_meta(path: Path):
+    """Read one held descriptor path without consulting the pathname cache."""
+    from qobuz_librarian.library import scanner
+
+    if not scanner.HAVE_MUTAGEN:
+        return None
+    try:
+        audio = scanner.mutagen.File(os.fspath(path), easy=True)
+    except OSError:
+        raise
+    except Exception:
+        return None
+    if audio is None:
+        return None
+    tags = audio.tags
+
+    def first(key):
+        value = tags.get(key) if tags else None
+        return value[0] if value and isinstance(value, list) else ""
+
+    title = first("title")
+    if not title:
+        return None
+    info = audio.info
+    return {
+        "title": title,
+        "isrc": first("isrc").strip().replace("-", "").upper(),
+        "mb_trackid": first("musicbrainz_trackid").strip().lower(),
+        "album": first("album"),
+        "albumartist": first("albumartist") or first("artist"),
+        "tracknumber": scanner.parse_track_num(first("tracknumber")),
+        "discnumber": scanner.parse_track_num(first("discnumber")) or 1,
+        "bits": getattr(info, "bits_per_sample", 0) if info else 0,
+        "sample_rate": getattr(info, "sample_rate", 0) if info else 0,
+        "channels": getattr(info, "channels", 0) if info else 0,
+        "length": getattr(info, "length", 0.0) if info else 0.0,
+        "path": os.fspath(path),
+    }
+
+
+def _legacy_audio_relatives_at(directory_descriptor: int, prefix=()):
+    before = os.fstat(directory_descriptor)
+    if not stat.S_ISDIR(before.st_mode):
+        raise AlbumAuthorityUnavailable("legacy adoption source is not a directory")
+    relatives = []
+    for name in sorted(os.listdir(directory_descriptor), key=os.fsencode):
+        if name in {"", ".", ".."}:
+            raise AlbumAuthorityUnavailable("legacy adoption source has an unsafe entry")
+        named_before = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if stat.S_ISLNK(named_before.st_mode):
+            raise AlbumAuthorityUnavailable("legacy adoption does not accept links")
+        if is_release_manifest_name(name):
+            raise AlbumAuthorityUnavailable("legacy adoption source is already marked")
+        parts = (*prefix, name)
+        if stat.S_ISDIR(named_before.st_mode):
+            child = os.open(
+                name,
+                _legacy_directory_flags(),
+                dir_fd=directory_descriptor,
+            )
+            try:
+                held_before = os.fstat(child)
+                if _legacy_file_version(named_before) != _legacy_file_version(held_before):
+                    raise AlbumAuthorityUnavailable(
+                        "legacy adoption directory changed during enumeration"
+                    )
+                relatives.extend(_legacy_audio_relatives_at(child, parts))
+                named_after = os.stat(
+                    name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                held_after = os.fstat(child)
+                if len({
+                    _legacy_file_version(named_before),
+                    _legacy_file_version(held_before),
+                    _legacy_file_version(named_after),
+                    _legacy_file_version(held_after),
+                }) != 1:
+                    raise AlbumAuthorityUnavailable(
+                        "legacy adoption directory changed during enumeration"
+                    )
+            finally:
+                os.close(child)
+            continue
+        if is_ignored_library_artifact(name) or Path(name).suffix.lower() not in cfg.AUDIO_EXTS:
+            continue
+        if not stat.S_ISREG(named_before.st_mode):
+            raise AlbumAuthorityUnavailable(
+                "legacy adoption requires regular audio files"
+            )
+        relatives.append(Path(*parts))
+    after = os.fstat(directory_descriptor)
+    if _legacy_file_version(before) != _legacy_file_version(after):
+        raise AlbumAuthorityUnavailable(
+            "legacy adoption directory changed during enumeration"
+        )
+    return relatives
+
+
+class _LegacyAdoptionGeneration:
+    __slots__ = ("scan",)
+
+    def __init__(self, scan):
+        self.scan = scan
+
+    def validate(self, proof, path, identity) -> None:
+        scan = self.scan
+        if (
+            type(scan) is not LegacyAdoptionScan
+            or not scan._entered
+            or scan._closed
+            or scan._generation is not self
+            or proof.path_receipt != scan.path_receipt
+            or proof.audio_receipts != scan.audio_receipts
+            or proof.identity != identity
+            or proof.path_receipt.path != os.path.abspath(os.fspath(path))
+        ):
+            raise AlbumPlacementAttention(
+                "legacy adoption proof is detached or its authority is closed"
+            )
+        scan.validate_namespace()
+
+
+class LegacyAdoptionScan:
+    """One live held album source for legacy tags, receipts, and placement."""
+
+    def __init__(self, path: Path, authority: RunLockLease):
+        self.path = Path(path)
+        self._run_lock = authority
+        self._authority_context = None
+        self._album: AlbumAuthority | None = None
+        self._held_audio: tuple[HeldFileAuthority, ...] = ()
+        self._generation: _LegacyAdoptionGeneration | None = None
+        self._entered = False
+        self._closed = False
+
+    @property
+    def album_authority(self) -> AlbumAuthority:
+        if not self._entered or self._closed or self._album is None:
+            raise AlbumPlacementAttention("legacy adoption scan authority is not live")
+        return self._album
+
+    @property
+    def path_receipt(self) -> DirectoryPathReceipt:
+        return self.album_authority.path_receipt
+
+    @property
+    def audio_receipts(self) -> tuple[LegacyAudioReceipt, ...]:
+        return tuple(
+            LegacyAudioReceipt(
+                held.relative.as_posix(),
+                (
+                    held.version.device,
+                    held.version.inode,
+                    held.version.size,
+                    held.version.mtime_ns,
+                    held.version.ctime_ns,
+                ),
+                held.digest,
+            )
+            for held in self._held_audio
+        )
+
+    def __enter__(self):
+        if self._entered or self._closed:
+            raise AlbumPlacementAttention("legacy adoption scan is one-shot")
+        self._entered = True
+        try:
+            context = open_album_authority(self.path, self._run_lock)
+            self._authority_context = context
+            self._album = context.__enter__()
+            relatives = _legacy_audio_relatives_at(
+                self._album.directory_descriptor
+            )
+            relatives.sort(key=lambda value: os.fsencode(value.as_posix()))
+            self._held_audio = tuple(
+                self._album.open_file(relative) for relative in relatives
+            )
+            self._album.validate_namespace()
+            self._generation = _LegacyAdoptionGeneration(self)
+            return self
+        except BaseException as exc:
+            context = self._authority_context
+            if context is not None:
+                context.__exit__(*sys.exc_info())
+            self._closed = True
+            if isinstance(exc, AlbumPlacementAttention):
+                raise
+            if isinstance(exc, (AlbumAuthorityUnavailable, OSError)):
+                raise AlbumPlacementAttention(
+                    "legacy adoption authority is unavailable"
+                ) from exc
+            raise
+
+    def __exit__(self, exc_type, exc, traceback):
+        generation = self._generation
+        if generation is not None:
+            generation.scan = None
+        self._closed = True
+        context = self._authority_context
+        if context is None:
+            return None
+        try:
+            return context.__exit__(exc_type, exc, traceback)
+        except (AlbumAuthorityUnavailable, OSError) as caught:
+            if exc_type is None:
+                raise AlbumPlacementAttention(
+                    "legacy adoption authority changed before close"
+                ) from caught
+            return None
+
+    def validate_namespace(self) -> None:
+        try:
+            self.album_authority.validate_namespace()
+        except AlbumAuthorityUnavailable as exc:
+            raise AlbumPlacementAttention(
+                "legacy adoption authority changed"
+            ) from exc
+
+    def proof(self, identity: ReleaseIdentity) -> LegacyAdoptionProof:
+        if type(identity) is not ReleaseIdentity or self._generation is None:
+            raise AlbumPlacementAttention("legacy adoption identity is invalid")
+        self.validate_namespace()
+        return LegacyAdoptionProof(
+            identity,
+            self.path_receipt,
+            self.audio_receipts,
+            self._generation,
+        )
+
+    def read_tracks(self) -> list[dict]:
+        from qobuz_librarian.library.tags import normalize
+
+        self.validate_namespace()
+        tracks = []
+        for held in self._held_audio:
+            proc_path = Path(f"/proc/self/fd/{held.descriptor}")
+            try:
+                tags = _read_held_audio_meta(proc_path)
+            except OSError as exc:
+                raise AlbumPlacementAttention(
+                    "legacy adoption audio tags could not be read"
+                ) from exc
+            if tags is None:
+                stem = held.relative.stem
+                import re
+
+                match = re.match(r"^(\d+)[\s.\-]+(.+)$", stem)
+                disc_match = re.match(
+                    r"(?:disc|cd)\s*0*(\d+)",
+                    held.relative.parent.name,
+                    re.IGNORECASE,
+                )
+                tags = {
+                    "title": match.group(2) if match else stem,
+                    "tracknumber": int(match.group(1)) if match else 0,
+                    "isrc": "",
+                    "mb_trackid": "",
+                    "album": "",
+                    "albumartist": "",
+                    "discnumber": int(disc_match.group(1)) if disc_match else 1,
+                    "bits": 0,
+                    "sample_rate": 0,
+                    "channels": 0,
+                    "length": 0.0,
+                    "path": os.fspath(proc_path),
+                }
+            else:
+                tags = dict(tags)
+            tags["normalized"] = normalize(tags["title"])
+            tags["size"] = held.version.size
+            tracks.append(tags)
+        self.validate_namespace()
+        return tracks
+
+
+def _require_live_adoption_proof(
+    proof: LegacyAdoptionProof,
+    path: Path,
+    identity: ReleaseIdentity,
+) -> LegacyAdoptionReceipt:
+    if (
+        type(proof) is not LegacyAdoptionProof
+        or type(proof.authority_generation) is not _LegacyAdoptionGeneration
+    ):
+        raise AlbumPlacementAttention(
+            "legacy adoption proof is detached or its authority is closed"
+        )
+    proof.authority_generation.validate(proof, path, identity)
+    return LegacyAdoptionReceipt(
+        proof.identity,
+        proof.path_receipt,
+        proof.audio_receipts,
+    )
+
+
 def resolve_album_placement(
     friendly_path: Path,
     identity: ReleaseIdentity,
     *,
     adopted_identity: ReleaseIdentity | None = None,
     adoption_receipt: LegacyAdoptionReceipt | None = None,
+    adoption_proof: LegacyAdoptionProof | None = None,
 ) -> AlbumPlacement:
     """Resolve *identity* to its friendly path or deterministic collision sibling.
 
@@ -326,6 +648,26 @@ def resolve_album_placement(
     is reusable only with the exact adoption proof supplied by discovery.
     """
     friendly_path = Path(friendly_path)
+    if adoption_proof is not None:
+        live_receipt = _require_live_adoption_proof(
+            adoption_proof,
+            friendly_path,
+            identity,
+        )
+        if adopted_identity != identity:
+            raise AlbumPlacementAttention(
+                "legacy adoption proof does not select the requested release"
+            )
+        return _placement(
+            identity,
+            friendly_path,
+            friendly_path,
+            PlacementDisposition.ADOPTED,
+            live_receipt.path_receipt,
+            live_receipt.path_receipt,
+            live_receipt,
+        )
+
     friendly_receipt = _path_receipt(friendly_path, role="friendly")
     if not friendly_receipt.exists:
         return _placement(
@@ -340,8 +682,11 @@ def resolve_album_placement(
     friendly_identity, friendly_receipt = _manifest_identity(
         friendly_path, role="friendly")
     if friendly_identity is None:
+        # Detached receipts remain only for compatibility with already-frozen
+        # placement records. New adoption decisions must use a live proof.
         if (
-            adopted_identity == identity
+            adoption_proof is None
+            and adopted_identity == identity
             and adoption_receipt is not None
             and adoption_receipt.path_receipt == friendly_receipt
             and legacy_adoption_receipt_matches(

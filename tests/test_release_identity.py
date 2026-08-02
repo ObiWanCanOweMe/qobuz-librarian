@@ -1,6 +1,7 @@
 import json
 import os
 import stat
+from pathlib import Path
 
 import pytest
 
@@ -34,6 +35,40 @@ def test_manifest_round_trip_and_no_replace(tmp_path):
         "provider": "qobuz",
         "release_id": "123",
     }
+
+
+def test_authorized_publication_sees_first_post_rename_entry_on_overlayfs(
+        tmp_path, monkeypatch):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian import run_lock
+    from qobuz_librarian.library.release_authority import open_album_authority
+    from qobuz_librarian.library.release_identity import (
+        publish_release_identity_authorized,
+    )
+
+    album = tmp_path / "Album"
+    album.mkdir()
+    (album / "01.flac").write_bytes(b"held audio")
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "overlay-enumeration.lock")
+    lease = run_lock.acquire()
+    assert lease is not None
+    try:
+        with open_album_authority(album, lease) as authority:
+            authority.open_file(Path("01.flac"))
+            publish_release_identity_authorized(
+                authority,
+                ReleaseIdentity("qobuz", "overlay-123"),
+            )
+            assert authority.snapshot_directory().entries == (
+                MANIFEST_NAME,
+                "01.flac",
+            )
+    finally:
+        lease.close()
+
+    assert read_release_identity(album) == ReleaseIdentity(
+        "qobuz", "overlay-123"
+    )
 
 
 def test_manifest_rejects_links_unknown_fields_and_oversize(tmp_path):

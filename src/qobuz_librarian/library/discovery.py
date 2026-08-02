@@ -21,20 +21,21 @@ prefers the deepest catalog over a bare-name twin, cached to disk).
 import json
 import os
 import re
-import stat
 import tempfile
 import threading
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from qobuz_librarian import config as cfg
+from qobuz_librarian import run_lock
 from qobuz_librarian.api.auth import AuthLost, QobuzError, QobuzUnavailable
 from qobuz_librarian.api.search import get_album, get_artist_albums, search_artists
 from qobuz_librarian.library import hidden as hidden_mod
 from qobuz_librarian.library.album_placement import (
+    AlbumPlacementAttention,
+    LegacyAdoptionProof,
     LegacyAdoptionReceipt,
-    capture_legacy_adoption_receipt,
-    legacy_adoption_receipt_matches,
+    LegacyAdoptionScan,
 )
 from qobuz_librarian.library.catalog import (
     _dir_year,
@@ -51,17 +52,13 @@ from qobuz_librarian.library.catalog import (
 )
 from qobuz_librarian.library.edition_badges import build_edition_badges
 from qobuz_librarian.library.release_identity import (
-    MANIFEST_NAME,
-    ReleaseIdentity,
     ReleaseManifestError,
-    capture_directory_path_receipt,
     identity_from_album,
     normalise_release_id,
-    publish_release_identity,
+    publish_release_identity_authorized,
     read_release_identity,
 )
 from qobuz_librarian.library.scanner import (
-    iter_tree_no_symlinks,
     list_artist_album_dirs,
     list_library_artists,
 )
@@ -327,6 +324,7 @@ class LegacyReleaseEvidence:
     missing: list
     extras: list
     adoption_receipt: LegacyAdoptionReceipt | None = None
+    adoption_proof: LegacyAdoptionProof | None = None
 
 
 def _record_owned_title(owned_titles, album_dir):
@@ -412,6 +410,7 @@ def select_legacy_release(
     candidates: list[dict],
     *,
     adoption_receipt: LegacyAdoptionReceipt | None = None,
+    adoption_proof: LegacyAdoptionProof | None = None,
 ):
     """Select a legacy folder's sole compatible release, if it has one.
 
@@ -435,49 +434,21 @@ def select_legacy_release(
                 and selected_identity is not None
                 else None
             )
+            selected_proof = (
+                replace(adoption_proof, identity=selected_identity)
+                if adoption_proof is not None
+                and selected_identity is not None
+                else None
+            )
             compatible.append(LegacyReleaseEvidence(
                 album,
                 list(present),
                 list(missing),
                 list(extras),
                 selected_receipt,
+                selected_proof,
             ))
     return (compatible[0] if len(compatible) == 1 else None, compatible)
-
-
-def _directory_identity(album_dir: Path) -> tuple[int, int]:
-    value = album_dir.stat()
-    if not stat.S_ISDIR(value.st_mode):
-        raise OSError(f"album path is not a directory: {album_dir}")
-    return value.st_dev, value.st_ino
-
-
-def _reviewed_audio_inventory(album_dir: Path):
-    """Signature every audio file the legacy comparison can review.
-
-    Track matching reads the scanner's complete no-symlink walk.  Recording
-    the same set of files and their stable identities lets adoption refuse a
-    folder whose contents move while that comparison is in flight.
-    """
-    inventory = []
-    errors = []
-    audio_exts = set(cfg.AUDIO_EXTS)
-    for path in iter_tree_no_symlinks(album_dir, errors=errors):
-        if path.name == MANIFEST_NAME or path.suffix.lower() not in audio_exts:
-            continue
-        try:
-            value = path.stat()
-        except OSError as exc:
-            errors.append(exc)
-            continue
-        if not stat.S_ISREG(value.st_mode):
-            continue
-        inventory.append((str(path.relative_to(album_dir)), value.st_dev,
-                          value.st_ino, value.st_size,
-                          getattr(value, "st_mtime_ns", None)))
-    if errors:
-        raise OSError("unable to review complete album audio inventory")
-    return tuple(sorted(inventory))
 
 
 def _legacy_identity_invalid(album_dir, candidates, existing):
@@ -550,90 +521,68 @@ def match_album_dir(album_dir, artist_name, token, *, catalog, prefer_hires):
         existing, _ = find_existing_tracks(album, album_dir=album_dir)
         return _compare_matched_album(album_dir, album, existing, candidates)
 
-    # A legacy folder gains an identity only when its observed tracks rule out
-    # every other viable release.  Hold a filesystem snapshot over the review
-    # and validate it again before the one irreversible side effect.
+    # A legacy folder gains an identity only while the exact descriptors used
+    # for tag selection remain leased and live through manifest publication.
+    lease = run_lock.current_lease()
+    owned_lease = False
     try:
-        expected_path_receipt = capture_directory_path_receipt(album_dir)
-        expected_directory = expected_path_receipt.directory_identity
-        if expected_directory is None:
-            raise OSError("reviewed album directory is missing")
+        if lease is None:
+            lease = run_lock.acquire()
+            owned_lease = True
+        if lease is None:
+            return _legacy_identity_invalid(album_dir, candidates, [])
         first_identity = identity_from_album(candidates[0])
         if first_identity is None:
-            raise OSError("reviewed album candidate has no identity")
-        adoption_receipt = capture_legacy_adoption_receipt(
-            album_dir, first_identity
-        )
-        initial_inventory = _reviewed_audio_inventory(album_dir)
-        existing, _ = find_existing_tracks(candidates[0], album_dir=album_dir)
-    except OSError:
-        return _legacy_identity_invalid(album_dir, candidates, [])
-
-    selected, compatible = select_legacy_release(
-        existing,
-        candidates,
-        adoption_receipt=adoption_receipt,
-    )
-    compatible_albums = [evidence.album for evidence in compatible]
-    if selected is None:
-        if compatible:
-            return DirMatch("identity_ambiguous", album_dir, existing=existing,
-                            candidate_releases=compatible_albums)
-        # There is no edition choice to guess for a sole candidate.  Preserve
-        # the established false-match/low-overlap diagnostics, but never stamp
-        # a manifest when its tracks contradict the folder.
-        if len(candidates) == 1:
+            return _legacy_identity_invalid(album_dir, candidates, [])
+        with LegacyAdoptionScan(album_dir, lease) as scan:
+            existing = scan.read_tracks()
+            adoption_proof = scan.proof(first_identity)
+            selected, compatible = select_legacy_release(
+                existing,
+                candidates,
+                adoption_proof=adoption_proof,
+            )
+            compatible_albums = [evidence.album for evidence in compatible]
+            if selected is None:
+                if compatible:
+                    return DirMatch(
+                        "identity_ambiguous",
+                        album_dir,
+                        existing=existing,
+                        candidate_releases=compatible_albums,
+                    )
+                if len(candidates) == 1:
+                    return _compare_matched_album(
+                        album_dir, candidates[0], existing, candidates
+                    )
+                return _legacy_identity_invalid(album_dir, candidates, existing)
+            selected_identity = identity_from_album(selected.album)
+            if selected_identity is None or selected.adoption_proof is None:
+                return _legacy_identity_invalid(album_dir, candidates, existing)
+            selected.adoption_proof.authority_generation.validate(
+                selected.adoption_proof,
+                album_dir,
+                selected_identity,
+            )
+            publish_release_identity_authorized(
+                scan.album_authority,
+                selected_identity,
+            )
+            scan.validate_namespace()
             return _compare_matched_album(
-                album_dir, candidates[0], existing, candidates)
-        return _legacy_identity_invalid(album_dir, candidates, existing)
-
-    try:
-        refreshed_existing, _ = find_existing_tracks(
-            selected.album, album_dir=album_dir)
-        current_directory = _directory_identity(album_dir)
-        current_inventory = _reviewed_audio_inventory(album_dir)
-    except OSError:
-        return _legacy_identity_invalid(album_dir, candidates, existing)
-    if (current_directory != expected_directory
-            or current_inventory != initial_inventory):
-        return _legacy_identity_invalid(album_dir, candidates, existing)
-
-    refreshed, refreshed_compatible = select_legacy_release(
-        refreshed_existing,
-        candidates,
-        adoption_receipt=adoption_receipt,
-    )
-    if refreshed is None:
-        if refreshed_compatible:
-            return DirMatch(
-                "identity_ambiguous", album_dir, existing=refreshed_existing,
-                candidate_releases=[evidence.album for evidence in refreshed_compatible])
-        return _legacy_identity_invalid(album_dir, candidates, refreshed_existing)
-    if refreshed.album.get("id") != selected.album.get("id"):
-        return _legacy_identity_invalid(album_dir, candidates, refreshed_existing)
-    selected_identity = identity_from_album(selected.album)
-    if (
-        selected_identity is None
-        or selected.adoption_receipt is None
-        or not legacy_adoption_receipt_matches(
-            selected.adoption_receipt,
-            album_dir,
-            selected_identity,
-        )
+                album_dir, selected.album, existing, candidates
+            )
+    except (
+        AlbumPlacementAttention,
+        ReleaseManifestError,
+        run_lock.LockBusy,
+        OSError,
+        KeyError,
     ):
-        return _legacy_identity_invalid(album_dir, candidates, refreshed_existing)
-
-    try:
-        publish_release_identity(
-            album_dir,
-            ReleaseIdentity("qobuz", str(selected.album["id"])),
-            expected_directory=expected_directory,
-            expected_path_receipt=expected_path_receipt,
-        )
-    except (ReleaseManifestError, OSError, KeyError):
-        return _legacy_identity_invalid(album_dir, candidates, refreshed_existing)
-    return _compare_matched_album(album_dir, selected.album,
-                                  refreshed_existing, candidates)
+        return _legacy_identity_invalid(album_dir, candidates, [])
+    finally:
+        if owned_lease and lease is not None:
+            lease.close()
 
 
 def discover_fully_missing(artist_name, catalog, opts, *, hidden=None,

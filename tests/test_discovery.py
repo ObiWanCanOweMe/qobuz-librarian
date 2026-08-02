@@ -7,13 +7,17 @@ the Qobuz API stubbed. They pin the reconciled behaviour the two interfaces
 must now agree on; the per-interface tests elsewhere prove each face presents
 this same result.
 """
+import hashlib
+import shutil
+import subprocess
 from datetime import date
 
 import pytest
 
 from qobuz_librarian import config as cfg
+from qobuz_librarian import run_lock
+from qobuz_librarian.library import album_placement, discovery
 from qobuz_librarian.library import catalog as cat
-from qobuz_librarian.library import discovery
 from qobuz_librarian.library.discovery import (
     DiscoveryOpts,
     find_missing_for_artist,
@@ -52,6 +56,29 @@ def _album(album_id, title, artist, year, tracks, bd=16, sr=44.1):
 def _catalog_entry(album):
     """The lighter shape get_artist_albums returns — no track list."""
     return {k: v for k, v in album.items() if k != "tracks"}
+
+
+def _make_tagged_adoption_flac(path, *, frequency, title, isrc):
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not available")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i",
+            f"sine=frequency={frequency}:sample_rate=44100:duration=0.2",
+            "-c:a", "flac", str(path),
+        ],
+        check=True,
+    )
+    from mutagen.flac import FLAC
+
+    audio = FLAC(str(path))
+    audio["title"] = title
+    audio["isrc"] = isrc
+    audio["tracknumber"] = "1"
+    audio["discnumber"] = "1"
+    audio.save()
 
 
 _AUTO_TOTAL = object()
@@ -100,8 +127,9 @@ def _library(monkeypatch, tmp_path, layout):
         for album, tracks in albums.items():
             d = tmp_path / artist / album
             d.mkdir(parents=True)
-            for i in range(len(tracks)):
-                (d / f"{i + 1:02d}.flac").write_bytes(b"")
+            for i, track in enumerate(tracks):
+                title = str(track.get("title") or "track").replace("/", "_")
+                (d / f"{i + 1:02d} - {title}.flac").write_bytes(b"")
             track_map[str(d)] = tracks
     monkeypatch.setattr(cfg, "MUSIC_ROOT", tmp_path)
     monkeypatch.setattr(cat, "read_album_dir", lambda d: track_map.get(str(d), []))
@@ -295,6 +323,126 @@ def test_unique_partial_legacy_match_publishes_manifest(monkeypatch, tmp_path):
 
     assert match.status == "partial"
     assert read_release_identity(folder) == ReleaseIdentity("qobuz", "100")
+
+
+def test_legacy_adoption_returns_identity_attention_when_run_lock_is_busy(
+        monkeypatch, tmp_path):
+    wanted = _album(
+        "100", "Album", "Artist", 2020,
+        [_qt("one", "A"), _qt("two", "B")],
+    )
+    _library(
+        monkeypatch,
+        tmp_path,
+        {"Artist": {"Album (2020)": [_et("one", "A")]}},
+    )
+    folder = tmp_path / "Artist" / "Album (2020)"
+    FakeQobuz(artists=[], catalog=[wanted]).install(monkeypatch)
+    monkeypatch.setattr(run_lock, "current_lease", lambda: None)
+
+    def busy():
+        raise run_lock.LockBusy("123")
+
+    monkeypatch.setattr(run_lock, "acquire", busy)
+
+    match = discovery.match_album_dir(
+        folder,
+        "Artist",
+        "tok",
+        catalog=[_catalog_entry(wanted)],
+        prefer_hires=False,
+    )
+
+    assert match.status == "identity_invalid"
+    assert match.qobuz_album is None
+    assert read_release_identity(folder) is None
+
+
+def test_legacy_adoption_aba_never_selects_replacement_release(
+        monkeypatch, tmp_path):
+    wanted = _album(
+        "100", "Album", "Artist", 2020,
+        [_qt("Alpha", "USAAA0000001")],
+    )
+    replacement = _album(
+        "200", "Album (Deluxe Edition)", "Artist", 2020,
+        [_qt("Beta", "USBBB0000002")],
+    )
+    friendly = tmp_path / "Artist" / "Album (2020)"
+    a_away = tmp_path / "a-away"
+    b_source = tmp_path / "b-source"
+    b_away = tmp_path / "b-away"
+    a_track = friendly / "01.flac"
+    b_track = b_source / "01.flac"
+    _make_tagged_adoption_flac(
+        a_track,
+        frequency=330,
+        title="Alpha",
+        isrc="USAAA0000001",
+    )
+    _make_tagged_adoption_flac(
+        b_track,
+        frequency=660,
+        title="Beta",
+        isrc="USBBB0000002",
+    )
+    a_digest = hashlib.sha256(a_track.read_bytes()).hexdigest()
+    b_digest = hashlib.sha256(b_track.read_bytes()).hexdigest()
+    assert a_digest != b_digest
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "discovery-adoption.lock")
+    monkeypatch.setattr(
+        discovery,
+        "find_qobuz_album_candidates_for_dir",
+        lambda *_args, **_kwargs: [wanted, replacement],
+    )
+    real_reader = album_placement._read_held_audio_meta
+    observed = []
+
+    def read_a_during_public_aba(path):
+        friendly.rename(a_away)
+        b_source.rename(friendly)
+        value = real_reader(path)
+        observed.append((value["title"], value["isrc"], hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()))
+        friendly.rename(b_away)
+        a_away.rename(friendly)
+        return value
+
+    monkeypatch.setattr(
+        album_placement,
+        "_read_held_audio_meta",
+        read_a_during_public_aba,
+    )
+    real_select = discovery.select_legacy_release
+    selected_ids = []
+
+    def record_selection(*args, **kwargs):
+        selected, compatible = real_select(*args, **kwargs)
+        selected_ids.append(
+            str(selected.album["id"]) if selected is not None else None
+        )
+        return selected, compatible
+
+    monkeypatch.setattr(discovery, "select_legacy_release", record_selection)
+    lease = run_lock.acquire()
+    assert lease is not None
+    try:
+        match = discovery.match_album_dir(
+            friendly,
+            "Artist",
+            "token",
+            catalog=[_catalog_entry(wanted), _catalog_entry(replacement)],
+            prefer_hires=False,
+        )
+    finally:
+        lease.close()
+
+    assert observed == [("Alpha", "USAAA0000001", a_digest)]
+    assert "200" not in selected_ids
+    assert match.status == "identity_invalid"
+    assert match.qobuz_album is None
+    assert read_release_identity(friendly) is None
 
 
 def test_shared_standard_tracks_leave_legacy_folder_ambiguous(monkeypatch, tmp_path):

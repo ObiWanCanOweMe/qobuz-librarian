@@ -1,6 +1,7 @@
 """Tests for integrations/rip.py, integrations/beets.py, integrations/lyrics.py
 — the streamrip/beets seams where most real bugs live."""
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -881,7 +882,6 @@ def test_import_placement_reports_ambiguous_unmarked_friendly_path(
     friendly.mkdir(parents=True)
     candidates = [{"id": "100"}, {"id": "200"}]
     monkeypatch.setattr(beets, "find_album_dir_filesystem", lambda _album: friendly)
-    monkeypatch.setattr(beets, "read_album_dir", lambda _path: [{"title": "Track"}])
     monkeypatch.setattr(
         beets,
         "find_qobuz_album_candidates_for_dir",
@@ -909,7 +909,6 @@ def test_import_placement_refuses_unmarked_path_without_compatible_release(
     friendly = tmp_path / "music" / "Artist" / "Album (2020)"
     friendly.mkdir(parents=True)
     monkeypatch.setattr(beets, "find_album_dir_filesystem", lambda _album: friendly)
-    monkeypatch.setattr(beets, "read_album_dir", lambda _path: [{"title": "Unknown"}])
     monkeypatch.setattr(
         beets,
         "find_qobuz_album_candidates_for_dir",
@@ -937,8 +936,7 @@ def test_import_placement_rejects_directory_swapped_after_legacy_selection(
     replacement = tmp_path / "empty-replacement"
     friendly.mkdir(parents=True)
     replacement.mkdir()
-    (friendly / "01.flac").write_bytes(b"reviewed audio")
-    existing = [{"title": "One", "isrc": "A", "discnumber": 1}]
+    (friendly / "01 - One.flac").write_bytes(b"reviewed audio")
     candidates = [{
         "id": "200",
         "tracks": {"items": [{
@@ -949,7 +947,6 @@ def test_import_placement_rejects_directory_swapped_after_legacy_selection(
         }]},
     }]
     monkeypatch.setattr(beets, "find_album_dir_filesystem", lambda _album: friendly)
-    monkeypatch.setattr(beets, "read_album_dir", lambda _path: existing)
     monkeypatch.setattr(
         beets,
         "find_qobuz_album_candidates_for_dir",
@@ -972,7 +969,110 @@ def test_import_placement_rejects_directory_swapped_after_legacy_selection(
         )
 
     assert not (friendly / ".qobuz-librarian-release.json").exists()
-    assert (reviewed / "01.flac").read_bytes() == b"reviewed audio"
+    assert (reviewed / "01 - One.flac").read_bytes() == b"reviewed audio"
+
+
+def test_import_placement_aba_reads_held_a_and_never_adopts_b(
+        monkeypatch, tmp_path, _need_ffmpeg):
+    from mutagen.flac import FLAC
+
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian import run_lock
+    from qobuz_librarian.integrations import beets
+    from qobuz_librarian.library import album_placement
+    from qobuz_librarian.library.release_identity import read_release_identity
+
+    friendly = tmp_path / "music" / "Artist" / "Album (2020)"
+    a_away = tmp_path / "a-away"
+    b_source = tmp_path / "b-source"
+    b_away = tmp_path / "b-away"
+    a_track = friendly / "01.flac"
+    b_track = b_source / "01.flac"
+    _make_silent_flac(a_track)
+    _make_silent_flac(b_track)
+    a_tags = FLAC(str(a_track))
+    a_tags["title"] = "Alpha"
+    a_tags["isrc"] = "USAAA0000001"
+    a_tags["tracknumber"] = "1"
+    a_tags.save()
+    b_tags = FLAC(str(b_track))
+    b_tags["title"] = "Beta"
+    b_tags["isrc"] = "USBBB0000002"
+    b_tags["tracknumber"] = "1"
+    b_tags["comment"] = "replacement-b-has-different-audio-and-tags"
+    b_tags.save()
+    a_digest = hashlib.sha256(a_track.read_bytes()).hexdigest()
+    b_digest = hashlib.sha256(b_track.read_bytes()).hexdigest()
+    assert a_digest != b_digest
+    wanted = {
+        "id": "100",
+        "tracks": {"items": [{
+            "title": "Alpha",
+            "isrc": "USAAA0000001",
+            "media_number": 1,
+            "track_number": 1,
+        }]},
+    }
+    replacement = {
+        "id": "200",
+        "tracks": {"items": [{
+            "title": "Beta",
+            "isrc": "USBBB0000002",
+            "media_number": 1,
+            "track_number": 1,
+        }]},
+    }
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "beets-adoption.lock")
+    monkeypatch.setattr(beets, "find_album_dir_filesystem", lambda _album: friendly)
+    monkeypatch.setattr(
+        beets,
+        "find_qobuz_album_candidates_for_dir",
+        lambda *_args, **_kwargs: [wanted, replacement],
+    )
+    real_reader = album_placement._read_held_audio_meta
+    observed = []
+
+    def read_a_during_public_aba(path):
+        friendly.rename(a_away)
+        b_source.rename(friendly)
+        value = real_reader(path)
+        observed.append((value["title"], value["isrc"], hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()))
+        friendly.rename(b_away)
+        a_away.rename(friendly)
+        return value
+
+    monkeypatch.setattr(
+        album_placement,
+        "_read_held_audio_meta",
+        read_a_during_public_aba,
+    )
+    real_select = beets.select_legacy_release
+    selected_ids = []
+
+    def record_selection(*args, **kwargs):
+        selected, compatible = real_select(*args, **kwargs)
+        selected_ids.append(
+            str(selected.album["id"]) if selected is not None else None
+        )
+        return selected, compatible
+
+    monkeypatch.setattr(beets, "select_legacy_release", record_selection)
+    lease = run_lock.acquire()
+    assert lease is not None
+    try:
+        with pytest.raises(beets.AlbumPlacementAttention, match="changed|authority"):
+            beets.resolve_album_import_placement(
+                {"id": "100", "title": "Album", "artist": {"name": "Artist"}},
+                "token",
+            )
+    finally:
+        lease.close()
+
+    assert observed == [("Alpha", "USAAA0000001", a_digest)]
+    assert "200" not in selected_ids
+    assert read_release_identity(friendly) is None
 
 
 def test_import_override_pins_duplicate_action_merge(monkeypatch):

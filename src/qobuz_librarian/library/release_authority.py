@@ -583,7 +583,6 @@ class AlbumAuthority:
         expected = self._expected_path
         return bool(
             expected is not None
-            and directory_path_receipt_matches(expected)
             and all(
                 _directory_binding_intact(binding)
                 for binding in self._directories
@@ -596,7 +595,15 @@ class AlbumAuthority:
 
     @staticmethod
     def _entry_names(descriptor: int) -> tuple[str, ...]:
-        return tuple(sorted(os.listdir(descriptor), key=os.fsencode))
+        # A directory fd carries a readdir cursor and, on overlayfs, may expose
+        # a cached entry set on the first enumeration after a rename. Reopen
+        # the already-held directory descriptor-relatively so each inventory
+        # uses a fresh open-file description without touching the public path.
+        fresh = os.open(".", _directory_flags(), dir_fd=descriptor)
+        try:
+            return tuple(sorted(os.listdir(fresh), key=os.fsencode))
+        finally:
+            os.close(fresh)
 
     def snapshot_directory(self) -> AlbumDirectorySnapshot:
         """Freeze the exact album entries before this authority mutates them."""
@@ -674,7 +681,6 @@ class AlbumAuthority:
                 or version != file_version(named)
                 or version != file_version(held_after)
                 or entries != expected_entries
-                or not directory_path_receipt_matches(self.path_receipt)
             ):
                 raise AlbumAuthorityUnavailable(
                     "album namespace changed during authorised mutation"
