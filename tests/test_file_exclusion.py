@@ -2,10 +2,35 @@ import errno
 import fcntl
 import mmap
 import os
+import subprocess
+import sys
 
 import pytest
 
 from qobuz_librarian import file_exclusion
+
+
+def _start_waiting_writer(path):
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os,sys; print('ready', flush=True); "
+                "descriptor=os.open(sys.argv[1], os.O_WRONLY); "
+                "os.close(descriptor)"
+            ),
+            os.fspath(path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdout is not None
+    assert process.stdout.readline().strip() == "ready"
+    with pytest.raises(subprocess.TimeoutExpired):
+        process.wait(timeout=0.2)
+    return process
 
 
 @pytest.mark.parametrize("busy_kind", ["writer", "writable-mapping"])
@@ -51,3 +76,25 @@ def test_inode_write_exclusion_fails_closed_when_the_kernel_refuses_it(
         os.close(lease_fd)
 
     assert target.read_bytes() == b"audio"
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="Linux inode leases are the authoritative write-exclusion backend",
+)
+def test_inode_write_exclusion_blocks_a_new_writer_until_close(tmp_path):
+    target = tmp_path / "track.flac"
+    target.write_bytes(b"audio")
+    descriptor = os.open(target, os.O_RDONLY)
+    exclusion = file_exclusion.acquire_inode_write_exclusion(descriptor)
+    assert exclusion is not None
+    writer = None
+    try:
+        writer = _start_waiting_writer(target)
+    finally:
+        exclusion.close()
+        os.close(descriptor)
+
+    assert writer is not None
+    stdout, stderr = writer.communicate(timeout=3)
+    assert writer.returncode == 0, (stdout, stderr)
