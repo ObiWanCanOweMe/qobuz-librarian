@@ -445,6 +445,62 @@ def test_legacy_adoption_aba_never_selects_replacement_release(
     assert read_release_identity(friendly) is None
 
 
+def test_legacy_candidate_handoff_never_publishes_a_identity_to_compatible_b(
+        monkeypatch, tmp_path):
+    wanted = _album(
+        "100", "Album", "Artist", 2020,
+        [_qt("Shared", "USAAA0000001")],
+    )
+    friendly = tmp_path / "Artist" / "Album (2020)"
+    a_away = tmp_path / "a-away"
+    b_source = tmp_path / "b-source"
+    a_track = friendly / "01.flac"
+    b_track = b_source / "01.flac"
+    _make_tagged_adoption_flac(
+        a_track,
+        frequency=330,
+        title="Shared",
+        isrc="USAAA0000001",
+    )
+    _make_tagged_adoption_flac(
+        b_track,
+        frequency=660,
+        title="Shared",
+        isrc="USAAA0000001",
+    )
+    assert hashlib.sha256(a_track.read_bytes()).digest() != hashlib.sha256(
+        b_track.read_bytes()
+    ).digest()
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "candidate-handoff.lock")
+
+    def capture_a_candidates_then_install_b(*_args, **_kwargs):
+        friendly.rename(a_away)
+        b_source.rename(friendly)
+        return [wanted]
+
+    monkeypatch.setattr(
+        discovery,
+        "find_qobuz_album_candidates_for_dir",
+        capture_a_candidates_then_install_b,
+    )
+    lease = run_lock.acquire()
+    assert lease is not None
+    try:
+        match = discovery.match_album_dir(
+            friendly,
+            "Artist",
+            "token",
+            catalog=[_catalog_entry(wanted)],
+            prefer_hires=False,
+        )
+    finally:
+        lease.close()
+
+    assert match.status == "identity_invalid"
+    assert match.qobuz_album is None
+    assert read_release_identity(friendly) is None
+
+
 def test_shared_standard_tracks_leave_legacy_folder_ambiguous(monkeypatch, tmp_path):
     standard = _album("100", "Album", "Artist", 2020,
                       [_qt("one", "A"), _qt("two", "B")])

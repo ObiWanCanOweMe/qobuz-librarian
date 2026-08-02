@@ -4585,12 +4585,15 @@ def resolve_album_import_placement(album, token):
             )
         with LegacyAdoptionScan(friendly, lease) as scan:
             existing = scan.read_tracks()
+            candidate_state = scan.candidate_state()
             candidates = find_qobuz_album_candidates_for_dir(
                 friendly,
                 artist_name,
                 token,
                 target_dir=friendly,
+                legacy_adoption_state=candidate_state,
             )
+            candidate_state.validate(friendly)
             selected, compatible = select_legacy_release(
                 existing,
                 candidates,

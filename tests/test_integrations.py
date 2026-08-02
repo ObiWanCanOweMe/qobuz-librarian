@@ -1075,6 +1075,59 @@ def test_import_placement_aba_reads_held_a_and_never_adopts_b(
     assert read_release_identity(friendly) is None
 
 
+def test_import_placement_uses_held_manifest_and_audio_count_while_scan_is_live(
+        monkeypatch, tmp_path):
+    from qobuz_librarian import config as cfg
+    from qobuz_librarian.integrations import beets
+    from qobuz_librarian.library import catalog
+    from qobuz_librarian.library.album_placement import PlacementDisposition
+
+    friendly = tmp_path / "music" / "Artist" / "Album (2020)"
+    friendly.mkdir(parents=True)
+    (friendly / "01 - One.flac").write_bytes(b"held legacy audio")
+    intended = {
+        "id": "100",
+        "title": "Album",
+        "artist": {"name": "Artist"},
+        "release_date_original": "2020-01-01",
+        "maximum_bit_depth": 16,
+        "maximum_sampling_rate": 44.1,
+        "tracks_count": 1,
+        "tracks": {"items": [{
+            "title": "One",
+            "isrc": "",
+            "media_number": 1,
+            "track_number": 1,
+        }]},
+    }
+    candidate = {key: value for key, value in intended.items() if key != "tracks"}
+    public_reads = []
+    real_read_identity = catalog.read_release_identity
+    real_count_audio = catalog._count_audio_files_in
+
+    def read_identity(path):
+        public_reads.append(("manifest", Path(path)))
+        return real_read_identity(path)
+
+    def count_audio(path):
+        public_reads.append(("audio_count", Path(path)))
+        return real_count_audio(path)
+
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "held-catalog-state.lock")
+    monkeypatch.setattr(beets, "find_album_dir_filesystem", lambda _album: friendly)
+    monkeypatch.setattr(catalog, "find_album_dir_filesystem", lambda _album: friendly)
+    monkeypatch.setattr(catalog, "search_albums", lambda *_args, **_kwargs: [candidate])
+    monkeypatch.setattr(catalog, "get_album", lambda *_args, **_kwargs: intended)
+    monkeypatch.setattr(catalog, "read_release_identity", read_identity)
+    monkeypatch.setattr(catalog, "_count_audio_files_in", count_audio)
+
+    placement = beets.resolve_album_import_placement(intended, "token")
+
+    assert placement.disposition is PlacementDisposition.ADOPTED
+    assert placement.destination == friendly
+    assert public_reads == []
+
+
 def test_import_override_pins_duplicate_action_merge(monkeypatch):
     # OUR importer must pin duplicate_action: merge regardless of the user's
     # config.

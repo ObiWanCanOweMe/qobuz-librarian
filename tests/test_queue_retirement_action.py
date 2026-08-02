@@ -197,6 +197,145 @@ def test_verified_inventory_releases_persistent_resources_in_reverse_order(
     assert closed == ["manifest", "directories", "audio"]
 
 
+def test_verified_inventory_preserves_body_error_when_directory_close_interrupts(
+    tmp_path, monkeypatch
+):
+    album = tmp_path / "Artist" / "Album"
+    nested = album / "Disc 1"
+    nested.mkdir(parents=True)
+    audio = nested / "01.flac"
+    audio.write_bytes(b"verified audio")
+    value = audio.stat()
+    expected_audio = {
+        Path("Disc 1/01.flac"): (
+            (
+                value.st_dev,
+                value.st_ino,
+                value.st_size,
+                value.st_mtime_ns,
+                value.st_ctime_ns,
+            ),
+            hashlib.sha256(audio.read_bytes()).hexdigest(),
+        )
+    }
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "body-cleanup.lock")
+    directory_descriptors = []
+    real_hold_directories = (
+        post_import_finalizer.VerifiedAlbumInventory._hold_directories
+    )
+    real_close = os.close
+    interrupted = []
+
+    def hold_directories(instance, descriptor):
+        real_hold_directories(instance, descriptor)
+        directory_descriptors.extend(
+            binding.descriptor for binding in instance._directories
+        )
+
+    def close(descriptor):
+        if descriptor in directory_descriptors and not interrupted:
+            interrupted.append(descriptor)
+            real_close(descriptor)
+            raise KeyboardInterrupt("injected directory close interrupt")
+        return real_close(descriptor)
+
+    monkeypatch.setattr(
+        post_import_finalizer.VerifiedAlbumInventory,
+        "_hold_directories",
+        hold_directories,
+    )
+    monkeypatch.setattr(post_import_finalizer.os, "close", close)
+    authority = run_lock.acquire()
+    assert authority is not None
+    try:
+        with pytest.raises(RuntimeError, match="original body failure"):
+            with post_import_finalizer.open_verified_album_inventory(
+                album,
+                authority,
+                capture_directory_path_receipt(album),
+                expected_audio,
+            ):
+                raise RuntimeError("original body failure")
+        assert interrupted == [directory_descriptors[-1]]
+        assert not _read_lease_is_live(audio)
+        assert _nonblocking_writer_errno(audio) == 0
+    finally:
+        authority.close()
+
+
+def test_verified_inventory_clean_exit_surfaces_interrupt_and_is_idempotent(
+    tmp_path, monkeypatch
+):
+    album = tmp_path / "Artist" / "Album"
+    nested = album / "Disc 1"
+    nested.mkdir(parents=True)
+    audio = nested / "01.flac"
+    audio.write_bytes(b"verified audio")
+    value = audio.stat()
+    expected_audio = {
+        Path("Disc 1/01.flac"): (
+            (
+                value.st_dev,
+                value.st_ino,
+                value.st_size,
+                value.st_mtime_ns,
+                value.st_ctime_ns,
+            ),
+            hashlib.sha256(audio.read_bytes()).hexdigest(),
+        )
+    }
+    monkeypatch.setattr(cfg, "LOCK_FILE", tmp_path / "clean-cleanup.lock")
+    directory_descriptors = []
+    real_hold_directories = (
+        post_import_finalizer.VerifiedAlbumInventory._hold_directories
+    )
+    real_close = os.close
+    close_calls = []
+
+    def hold_directories(instance, descriptor):
+        real_hold_directories(instance, descriptor)
+        directory_descriptors.extend(
+            binding.descriptor for binding in instance._directories
+        )
+
+    def close(descriptor):
+        if descriptor in directory_descriptors:
+            close_calls.append(descriptor)
+            real_close(descriptor)
+            if len(close_calls) == 1:
+                raise KeyboardInterrupt("injected directory close interrupt")
+            return None
+        return real_close(descriptor)
+
+    monkeypatch.setattr(
+        post_import_finalizer.VerifiedAlbumInventory,
+        "_hold_directories",
+        hold_directories,
+    )
+    monkeypatch.setattr(post_import_finalizer.os, "close", close)
+    authority = run_lock.acquire()
+    assert authority is not None
+    inventory = post_import_finalizer.open_verified_album_inventory(
+        album,
+        authority,
+        capture_directory_path_receipt(album),
+        expected_audio,
+    )
+    try:
+        inventory.__enter__()
+        directory_binding = inventory._directories[-1]
+        with pytest.raises(KeyboardInterrupt, match="directory close interrupt"):
+            inventory.__exit__(None, None, None)
+        first_exit_close_count = len(close_calls)
+        assert directory_binding.owned_descriptor is None
+        assert inventory.__exit__(None, None, None) is False
+        assert len(close_calls) == first_exit_close_count
+        assert not _read_lease_is_live(audio)
+        assert _nonblocking_writer_errno(audio) == 0
+    finally:
+        authority.close()
+
+
 def _queue_item(*, album_dir=None):
     return _build_queue_item(
         album={"id": "1", "title": "Album"},

@@ -9,7 +9,7 @@ import secrets
 import stat
 import sys
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from qobuz_librarian import config as cfg
@@ -73,6 +73,10 @@ class _HeldInventoryDirectory:
     name: str
     version: FileVersion
     entries: tuple[str, ...]
+    owned_descriptor: int | None = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.owned_descriptor = self.descriptor
 
 
 def _inventory_directory_flags() -> int:
@@ -413,9 +417,13 @@ class VerifiedAlbumInventory(AbstractContextManager):
                 if cleanup_error is None:
                     cleanup_error = caught
         for binding in reversed(self._directories):
+            descriptor = binding.owned_descriptor
+            if descriptor is None:
+                continue
+            binding.owned_descriptor = None
             try:
-                os.close(binding.descriptor)
-            except OSError as caught:
+                os.close(descriptor)
+            except BaseException as caught:
                 if cleanup_error is None:
                     cleanup_error = caught
         self._directories = []

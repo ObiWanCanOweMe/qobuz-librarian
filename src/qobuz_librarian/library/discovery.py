@@ -504,19 +504,18 @@ def match_album_dir(album_dir, artist_name, token, *, catalog, prefer_hires):
             album_dir, artist_name, token, catalog, prefer_hires)
         return _legacy_identity_invalid(album_dir, candidates, [])
 
-    try:
-        candidates = find_qobuz_album_candidates_for_dir(
-            album_dir, artist_name, token, prefer_hires=prefer_hires,
-            catalog=catalog, target_dir=album_dir)
-    except (ReleaseManifestError, OSError):
-        candidates = _candidates_for_invalid_manifest(
-            album_dir, artist_name, token, catalog, prefer_hires)
-        return _legacy_identity_invalid(album_dir, candidates, [])
-    if not candidates:
-        return DirMatch("no_match", album_dir)
-
     # The manifest chooses the release exactly, bypassing title/path ranking.
     if identity is not None:
+        try:
+            candidates = find_qobuz_album_candidates_for_dir(
+                album_dir, artist_name, token, prefer_hires=prefer_hires,
+                catalog=catalog, target_dir=album_dir)
+        except (ReleaseManifestError, OSError):
+            candidates = _candidates_for_invalid_manifest(
+                album_dir, artist_name, token, catalog, prefer_hires)
+            return _legacy_identity_invalid(album_dir, candidates, [])
+        if not candidates:
+            return DirMatch("no_match", album_dir)
         album = candidates[0]
         existing, _ = find_existing_tracks(album, album_dir=album_dir)
         return _compare_matched_album(album_dir, album, existing, candidates)
@@ -525,17 +524,31 @@ def match_album_dir(album_dir, artist_name, token, *, catalog, prefer_hires):
     # for tag selection remain leased and live through manifest publication.
     lease = run_lock.current_lease()
     owned_lease = False
+    candidates = []
     try:
         if lease is None:
             lease = run_lock.acquire()
             owned_lease = True
         if lease is None:
             return _legacy_identity_invalid(album_dir, candidates, [])
-        first_identity = identity_from_album(candidates[0])
-        if first_identity is None:
-            return _legacy_identity_invalid(album_dir, candidates, [])
         with LegacyAdoptionScan(album_dir, lease) as scan:
             existing = scan.read_tracks()
+            candidate_state = scan.candidate_state()
+            candidates = find_qobuz_album_candidates_for_dir(
+                album_dir,
+                artist_name,
+                token,
+                prefer_hires=prefer_hires,
+                catalog=catalog,
+                target_dir=album_dir,
+                legacy_adoption_state=candidate_state,
+            )
+            candidate_state.validate(album_dir)
+            if not candidates:
+                return DirMatch("no_match", album_dir)
+            first_identity = identity_from_album(candidates[0])
+            if first_identity is None:
+                return _legacy_identity_invalid(album_dir, candidates, [])
             adoption_proof = scan.proof(first_identity)
             selected, compatible = select_legacy_release(
                 existing,

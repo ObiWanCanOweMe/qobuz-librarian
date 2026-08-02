@@ -33,6 +33,7 @@ from pathlib import Path
 from qobuz_librarian import config
 from qobuz_librarian.api.auth import QobuzError
 from qobuz_librarian.api.search import get_album, search_albums
+from qobuz_librarian.library.album_placement import LegacyAdoptionCandidateState
 from qobuz_librarian.library.release_identity import (
     ReleaseManifestError,
     normalise_release_id,
@@ -2256,14 +2257,18 @@ def match_dir_to_catalog(album_dir, catalog, artist_name, prefer_hires=False):
     return best
 
 
-def _target_dir_candidates(scored_cands, target_dir):
+def _target_dir_candidates(scored_cands, target_dir, *, audio_count=None):
     """Rank candidates whose predicted path resolves to ``target_dir``.
 
     ``scored_cands`` is an iterable of ``(combined_score, album)`` pairs.
     The first result follows the longstanding track-count-fit choice; later
     results remain available to identity-aware callers.
     """
-    n_disk = _count_audio_files_in(target_dir)
+    n_disk = (
+        _count_audio_files_in(target_dir)
+        if audio_count is None
+        else audio_count
+    )
     resolving = []
     for score, cand in scored_cands:
         predicted = find_album_dir_filesystem(cand)
@@ -2389,7 +2394,9 @@ def _materialize_album_candidates(candidates, token):
 
 def find_qobuz_album_candidates_for_dir(
         album_dir, artist_name, token, *, prefer_hires=False, catalog=None,
-        target_dir=None, ignore_manifest=False) -> list[dict]:
+        target_dir=None, ignore_manifest=False,
+        legacy_adoption_state: LegacyAdoptionCandidateState | None = None,
+) -> list[dict]:
     """Return fully materialized Qobuz release candidates in ranked order.
 
     A valid on-disk release manifest is authoritative unless
@@ -2397,39 +2404,65 @@ def find_qobuz_album_candidates_for_dir(
     Legacy folders retain every distinct normalized release ID that passes the
     existing title, artist, lossless, year, and optional target-path gates.
     """
-    if not ignore_manifest and album_dir.is_dir():
-        identity = read_release_identity(album_dir)
-        if identity is not None:
-            result = _materialize_album_candidates(
-                [{"id": identity.release_id}], token)
-            if not result:
-                log.info(fmt(C.YELLOW, f"    ⚠  Manifested Qobuz release "
-                             f"album_id={identity.release_id} is unavailable."))
-            return result
-
-    # Fast path: use the pre-fetched catalog before per-folder search.
-    if catalog:
-        catalog_candidates = _catalog_candidates_for_dir(
-            album_dir, catalog, artist_name, prefer_hires)
+    held_audio_count = None
+    if legacy_adoption_state is not None:
+        if type(legacy_adoption_state) is not LegacyAdoptionCandidateState:
+            raise TypeError("legacy adoption candidate state is invalid")
+        legacy_adoption_state.validate(album_dir)
         if target_dir is not None:
-            scored = [(1.0 - 0.001 * i, candidate)
-                      for i, candidate in enumerate(catalog_candidates)]
-            catalog_candidates = [candidate for _, candidate in
-                                  _target_dir_candidates(scored, target_dir)]
-        result = _materialize_album_candidates(catalog_candidates, token)
-        if result:
-            return result
+            legacy_adoption_state.validate(target_dir)
+        held_audio_count = legacy_adoption_state.audio_count
+    try:
+        if (
+            legacy_adoption_state is None
+            and not ignore_manifest
+            and album_dir.is_dir()
+        ):
+            identity = read_release_identity(album_dir)
+            if identity is not None:
+                result = _materialize_album_candidates(
+                    [{"id": identity.release_id}], token)
+                if not result:
+                    log.info(fmt(C.YELLOW, f"    ⚠  Manifested Qobuz release "
+                                 f"album_id={identity.release_id} is unavailable."))
+                return result
 
-    search_candidates = _search_candidates_for_dir(
-        album_dir, artist_name, token, prefer_hires)
-    if target_dir is not None:
-        viable = [(score + year_bonus, candidate)
-                  for score, year_bonus, candidate in search_candidates]
-        search_candidates = [candidate for _, candidate in
-                             _target_dir_candidates(viable, target_dir)]
-    else:
-        search_candidates = [candidate for _, _, candidate in search_candidates]
-    return _materialize_album_candidates(search_candidates, token)
+        # Fast path: use the pre-fetched catalog before per-folder search.
+        if catalog:
+            catalog_candidates = _catalog_candidates_for_dir(
+                album_dir, catalog, artist_name, prefer_hires)
+            if target_dir is not None:
+                scored = [(1.0 - 0.001 * i, candidate)
+                          for i, candidate in enumerate(catalog_candidates)]
+                catalog_candidates = [candidate for _, candidate in
+                                      _target_dir_candidates(
+                                          scored,
+                                          target_dir,
+                                          audio_count=held_audio_count,
+                                      )]
+            result = _materialize_album_candidates(catalog_candidates, token)
+            if result:
+                return result
+
+        search_candidates = _search_candidates_for_dir(
+            album_dir, artist_name, token, prefer_hires)
+        if target_dir is not None:
+            viable = [(score + year_bonus, candidate)
+                      for score, year_bonus, candidate in search_candidates]
+            search_candidates = [candidate for _, candidate in
+                                 _target_dir_candidates(
+                                     viable,
+                                     target_dir,
+                                     audio_count=held_audio_count,
+                                 )]
+        else:
+            search_candidates = [candidate for _, _, candidate in search_candidates]
+        return _materialize_album_candidates(search_candidates, token)
+    finally:
+        if legacy_adoption_state is not None:
+            legacy_adoption_state.validate(album_dir)
+            if target_dir is not None:
+                legacy_adoption_state.validate(target_dir)
 
 
 def find_qobuz_album_for_dir(album_dir: Path, artist_name: str, token,

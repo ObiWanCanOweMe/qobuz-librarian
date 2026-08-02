@@ -78,6 +78,23 @@ class LegacyAdoptionProof:
     authority_generation: object
 
 
+@dataclass(frozen=True, slots=True)
+class LegacyAdoptionCandidateState:
+    """Descriptor-backed filesystem inputs for legacy candidate ranking."""
+
+    path_receipt: DirectoryPathReceipt
+    audio_count: int
+    authority_generation: object
+
+    def validate(self, path: Path) -> None:
+        generation = self.authority_generation
+        if type(generation) is not _LegacyAdoptionGeneration:
+            raise AlbumPlacementAttention(
+                "legacy adoption candidate state is detached"
+            )
+        generation.validate_candidate_state(self, path)
+
+
 class AlbumPlacementAttention(OSError):
     """The selected path cannot be safely associated with a release identity."""
 
@@ -460,6 +477,22 @@ class _LegacyAdoptionGeneration:
             )
         scan.validate_namespace()
 
+    def validate_candidate_state(self, state, path) -> None:
+        scan = self.scan
+        if (
+            type(scan) is not LegacyAdoptionScan
+            or not scan._entered
+            or scan._closed
+            or scan._generation is not self
+            or state.path_receipt != scan.path_receipt
+            or state.audio_count != len(scan._held_audio)
+            or state.path_receipt.path != os.path.abspath(os.fspath(path))
+        ):
+            raise AlbumPlacementAttention(
+                "legacy adoption candidate state is detached"
+            )
+        scan.validate_namespace()
+
 
 class LegacyAdoptionScan:
     """One live held album source for legacy tags, receipts, and placement."""
@@ -565,6 +598,18 @@ class LegacyAdoptionScan:
             identity,
             self.path_receipt,
             self.audio_receipts,
+            self._generation,
+        )
+
+    def candidate_state(self) -> LegacyAdoptionCandidateState:
+        if self._generation is None:
+            raise AlbumPlacementAttention(
+                "legacy adoption candidate state is unavailable"
+            )
+        self.validate_namespace()
+        return LegacyAdoptionCandidateState(
+            self.path_receipt,
+            len(self._held_audio),
             self._generation,
         )
 
