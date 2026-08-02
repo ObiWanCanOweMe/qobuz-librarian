@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import os
 import secrets
@@ -146,12 +145,12 @@ def _sha256_fd(descriptor: int) -> str:
         offset += len(chunk)
 
 
-_CLOSE_ATTEMPTS = 2
+_RETRYABLE_CLOSE_ATTEMPTS = 2
 
 
-def _close_with_retry(close) -> BaseException | None:
+def _close_retryable_resource(close) -> BaseException | None:
     error = None
-    for _attempt in range(_CLOSE_ATTEMPTS):
+    for _attempt in range(_RETRYABLE_CLOSE_ATTEMPTS):
         try:
             close()
             return None
@@ -160,43 +159,12 @@ def _close_with_retry(close) -> BaseException | None:
     return error
 
 
-def _close_descriptor(
-    descriptor: int,
-    expected_identity: tuple[int, int] | None = None,
-) -> BaseException | None:
-    error = None
-    for _attempt in range(_CLOSE_ATTEMPTS):
-        try:
-            current = os.fstat(descriptor)
-        except BaseException as exc:
-            if isinstance(exc, OSError) and exc.errno == errno.EBADF:
-                return None
-            error = exc
-            continue
-
-        if expected_identity is None:
-            expected_identity = _identity(current)
-        elif _identity(current) != expected_identity:
-            return None
-
-        try:
-            os.close(descriptor)
-            return None
-        except BaseException as exc:
-            error = exc
-
-        try:
-            current = os.fstat(descriptor)
-        except BaseException as exc:
-            if isinstance(exc, OSError) and exc.errno == errno.EBADF:
-                return None
-            error = exc
-            continue
-
-        if _identity(current) != expected_identity:
-            return None
-
-    return error
+def _close_descriptor(descriptor: int) -> BaseException | None:
+    try:
+        os.close(descriptor)
+    except BaseException as exc:
+        return exc
+    return None
 
 
 def _close_directory_binding(
@@ -205,19 +173,14 @@ def _close_directory_binding(
     descriptor = binding.owned_descriptor
     if descriptor is None:
         return None
-    error = _close_descriptor(
-        descriptor,
-        (binding.version.device, binding.version.inode),
-    )
-    if error is None:
-        binding.owned_descriptor = None
-    return error
+    binding.owned_descriptor = None
+    return _close_descriptor(descriptor)
 
 
 def _close_partial_file_resources(exclusion, descriptor, parents):
     error = None
     if exclusion is not None:
-        error = _close_with_retry(exclusion.close)
+        error = _close_retryable_resource(exclusion.close)
     if descriptor >= 0:
         caught = _close_descriptor(descriptor)
         if error is None and caught is not None:
@@ -667,7 +630,7 @@ class AlbumAuthority:
         for binding in reversed(self._files):
             exclusion = binding.owned_exclusion
             if exclusion is not None:
-                caught = _close_with_retry(exclusion.close)
+                caught = _close_retryable_resource(exclusion.close)
                 if caught is None:
                     binding.owned_exclusion = None
                 elif error is None:
@@ -675,13 +638,9 @@ class AlbumAuthority:
 
             descriptor = binding.owned_descriptor
             if descriptor is not None:
-                caught = _close_descriptor(
-                    descriptor,
-                    (binding.held.version.device, binding.held.version.inode),
-                )
-                if caught is None:
-                    binding.owned_descriptor = None
-                elif error is None:
+                binding.owned_descriptor = None
+                caught = _close_descriptor(descriptor)
+                if error is None and caught is not None:
                     error = caught
 
             for parent in reversed(binding.parents):
@@ -707,7 +666,7 @@ class AlbumAuthority:
             caught = _close_directory_binding(binding)
             if error is None and caught is not None:
                 error = caught
-            if caught is not None:
+            if binding.owned_descriptor is not None:
                 retained_directories.append(binding)
         self._directories = list(reversed(retained_directories))
         return error

@@ -277,7 +277,7 @@ def test_album_authority_bounds_cleanup_retry_and_retains_failed_ownership(
 
 
 @pytest.mark.parametrize("descriptor_kind", ["file", "root-directory"])
-def test_album_authority_retries_interrupted_descriptor_cleanup(
+def test_album_authority_consumes_interrupted_descriptor_cleanup_ownership(
     tmp_path, live_run_lock, monkeypatch, descriptor_kind
 ):
     from qobuz_librarian.library import release_authority
@@ -306,6 +306,11 @@ def test_album_authority_retries_interrupted_descriptor_cleanup(
                 if descriptor_kind == "file"
                 else authority._directories[0].descriptor
             )
+            other_descriptor = (
+                authority._directories[0].descriptor
+                if descriptor_kind == "file"
+                else held.descriptor
+            )
             monkeypatch.setattr(
                 release_authority.os,
                 "close",
@@ -313,13 +318,21 @@ def test_album_authority_retries_interrupted_descriptor_cleanup(
             )
             raise RuntimeError("original body failure")
 
-    assert close_calls == 2
-    _assert_descriptor_closed(target)
+    try:
+        assert close_calls == 1
+        assert authority._closed is True
+        os.fstat(target)
+        _assert_descriptor_closed(other_descriptor)
+    finally:
+        try:
+            real_close(target)
+        except OSError as exc:
+            if exc.errno != errno.EBADF:
+                raise
 
 
-@pytest.mark.parametrize("probe_position", ["initial", "post-close"])
-def test_album_authority_contains_interrupted_descriptor_cleanup_probe(
-    tmp_path, live_run_lock, monkeypatch, probe_position
+def test_album_authority_never_retries_reused_same_inode_descriptor(
+    tmp_path, live_run_lock, monkeypatch
 ):
     from qobuz_librarian.library import release_authority
 
@@ -327,64 +340,55 @@ def test_album_authority_contains_interrupted_descriptor_cleanup_probe(
     album = _album(tmp_path)
     track = album / "01.flac"
     track.write_bytes(b"one")
-    real_fstat = release_authority.os.fstat
     real_close = release_authority.os.close
     target = -1
-    cleanup_started = False
-    interrupt_post_close_probe = False
-    probe_interruptions = 0
     close_calls = 0
+    outsider_descriptor = -1
 
-    def interrupt_probe_once(descriptor):
-        nonlocal probe_interruptions
-        if (
-            descriptor == target
-            and cleanup_started
-            and probe_interruptions == 0
-            and (
-                probe_position == "initial"
-                or interrupt_post_close_probe
-            )
-        ):
-            probe_interruptions += 1
-            raise KeyboardInterrupt
-        return real_fstat(descriptor)
-
-    def interrupt_close_once(descriptor):
-        nonlocal close_calls, interrupt_post_close_probe
+    def close_then_reuse_same_inode(descriptor):
+        nonlocal close_calls, outsider_descriptor
         if descriptor == target:
             close_calls += 1
-            if probe_position == "post-close" and close_calls == 1:
-                interrupt_post_close_probe = True
+            if close_calls == 1:
+                real_close(descriptor)
+                opened = os.open(track, os.O_RDONLY)
+                if opened != descriptor:
+                    os.dup2(opened, descriptor)
+                    real_close(opened)
+                outsider_descriptor = descriptor
                 raise KeyboardInterrupt
         real_close(descriptor)
 
-    with pytest.raises(RuntimeError, match="original body failure"):
-        with open_album_authority(album, lease) as authority:
-            held = authority.open_file(Path("01.flac"))
-            target = held.descriptor
-            root_descriptor = authority._directories[0].descriptor
-            real_validate = authority._validate_namespace_locked
+    try:
+        with pytest.raises(RuntimeError, match="original body failure"):
+            with open_album_authority(album, lease) as authority:
+                held = authority.open_file(Path("01.flac"))
+                target = held.descriptor
+                root_descriptor = authority._directories[0].descriptor
+                monkeypatch.setattr(
+                    release_authority.os,
+                    "close",
+                    close_then_reuse_same_inode,
+                )
+                raise RuntimeError("original body failure")
 
-            def validate_then_start_cleanup(*args, **kwargs):
-                nonlocal cleanup_started
-                real_validate(*args, **kwargs)
-                cleanup_started = True
-
+        assert close_calls == 1
+        assert authority._closed is True
+        assert outsider_descriptor == target
+        assert os.pread(outsider_descriptor, 3, 0) == b"one"
+        _assert_descriptor_closed(root_descriptor)
+    finally:
+        if outsider_descriptor >= 0:
             monkeypatch.setattr(
-                authority,
-                "_validate_namespace_locked",
-                validate_then_start_cleanup,
+                release_authority.os,
+                "close",
+                real_close,
             )
-            monkeypatch.setattr(release_authority.os, "fstat", interrupt_probe_once)
-            monkeypatch.setattr(release_authority.os, "close", interrupt_close_once)
-            raise RuntimeError("original body failure")
-
-    assert probe_interruptions == 1
-    assert close_calls == (1 if probe_position == "initial" else 2)
-    assert authority._closed is True
-    _assert_descriptor_closed(held.descriptor)
-    _assert_descriptor_closed(root_descriptor)
+            try:
+                real_close(outsider_descriptor)
+            except OSError as exc:
+                if exc.errno != errno.EBADF:
+                    raise
 
 
 def test_album_authority_opens_files_in_required_bytewise_order_and_cleans_reverse(
